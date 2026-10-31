@@ -1031,22 +1031,27 @@ async fn batch_resp_proxy(client_side: DuplexStream, server_side: DuplexStream) 
                 return;
             }
             if !batched && hdr[4] == RT_REKEY_RESP {
-                // RESP + 后续 3 帧拼成一个缓冲一次写出（同批到达）
+                // RESP + 后续帧（至多 3 帧，每帧限时 100ms 到达）拼成一个缓冲一次写出
+                // （同批到达）。限时是必须的：对端 bulk 已发尽时后续帧永不到来，
+                // 无条件 read_exact 会把 RESP 永久扣住 ⇒ 发起方 epoch 卡 0（门禁 flake
+                // 的实测签名）；100ms 窗口在持续流量下足以收齐、静默对端下退化为单帧。
                 let mut buf = Vec::new();
                 buf.extend_from_slice(&hdr);
                 buf.extend_from_slice(&body);
                 for _ in 0..3 {
-                    let mut h2 = [0u8; 5];
-                    if s_rd.read_exact(&mut h2).await.is_err() {
-                        break;
+                    let got = tokio::time::timeout(Duration::from_millis(100), async {
+                        let mut h2 = [0u8; 5];
+                        s_rd.read_exact(&mut h2).await?;
+                        let l2 = u32::from_le_bytes(h2[..4].try_into().expect("4B")) as usize;
+                        let mut b2 = vec![0u8; l2 - 1];
+                        s_rd.read_exact(&mut b2).await?;
+                        Ok::<Vec<u8>, std::io::Error>([&h2[..], &b2[..]].concat())
+                    })
+                    .await;
+                    match got {
+                        Ok(Ok(frame)) => buf.extend_from_slice(&frame),
+                        _ => break,
                     }
-                    let l2 = u32::from_le_bytes(h2[..4].try_into().expect("4B")) as usize;
-                    let mut b2 = vec![0u8; l2 - 1];
-                    if s_rd.read_exact(&mut b2).await.is_err() {
-                        break;
-                    }
-                    buf.extend_from_slice(&h2);
-                    buf.extend_from_slice(&b2);
                 }
                 let _ = c_wr.write_all(&buf).await;
                 let _ = c_wr.flush().await;
