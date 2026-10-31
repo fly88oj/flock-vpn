@@ -44,3 +44,9 @@ futures = "0.3"
 # 8MiB aes-gcm 在 -O0 0.61s vs -O1 0.013s，46×）。
 [profile.test]
 opt-level = 1
+
+# bench（§7-M1 aead 门槛）：跨 crate 内联（aes 的 AES-NI 轮函数 ↔ gcm 的 GHASH CLMUL 路径）
+# 对吞吐敏感——LTO thin + 单 codegen unit 收回默认 release 配置下的损失。
+[profile.bench]
+lto = true
+codegen-units = 1

@@ -9,7 +9,9 @@
 //! - [`compress`]：压缩档位与帧格式（§1.3.3e / §3.7，P0-4/P1-7）；
 //! - [`session`]：隧道会话——握手双形态（已钉扎 1-RTT Noise-IK 结构 / TOFU 首连 2-RTT）、
 //!   记录层计数器 nonce AEAD、抗重放、双阈值 rekey、伪造断链（§1.3.3c / §3.5，P0-2/P1-8/P1-10）；
-//! - [`mux`]：yamux 0.14.1 复用 + 显式 FIN + PacketChannel（§1.3.3d / §3.6，P1-9/VPN-14）。
+//! - [`mux`]：yamux 0.14.1 复用 + 显式 FIN + PacketChannel（§1.3.3d / §3.6，P1-9/VPN-14）；
+//! - [`trust`]：首登信任锚——PinStore（集群根级钉扎）、ClusterDirectory（根签目录，端点与
+//!   条目同签、dir_version 递增）、InviteFile v3（§1.3.3f / §3.8，P0-5）。
 //!
 //! feature 矩阵（§1.3.1）：默认 = 全 VPN 档；`legacy` / `anchor` / `pq-sign` / `wasm` 默认关
 //! （`anchor` / `pq-sign` / `wasm` 本批次仅占位，见各 feature 注释）。
@@ -20,7 +22,9 @@
 //! 版本收口（§1.2）：本 crate 再导出其锁定的 `ed25519_dalek` / `x25519_dalek` / `ml_kem` /
 //! `rand`（`legacy` 下另含 `rsa`），两项目不得另引版本——下游直接复用，避免类型不兼容。
 
-#![forbid(unsafe_code)]
+// wasm32 getrandom 桥（src/wasm_bridge.rs）需裸指针（getrandom custom 后端契约），
+// 其余目标维持 forbid(unsafe_code)（showroom-common lib.rs:4-5 同款豁免）。
+#![cfg_attr(not(all(feature = "wasm", target_arch = "wasm32")), forbid(unsafe_code))]
 
 pub mod compress;
 pub mod envelope;
@@ -29,6 +33,16 @@ pub mod mux;
 pub mod pake;
 pub mod session;
 pub mod sig;
+pub mod trust;
+
+/// wasm32 getrandom 自定义后端桥（`wasm` feature + wasm32 目标；§1.3.1）。
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub mod wasm_bridge;
+
+// getrandom 0.2（opaque-ke → rand_core 0.6 路径）的 custom 后端注册
+// （showroom-common lib.rs:41-42 同法）。
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+getrandom02::register_custom_getrandom!(wasm_bridge::custom_getrandom_02);
 
 // 兼容常量（§1.3.2 工具/常量面；showroom-common lib.rs:51-55 原值）
 pub use envelope::{KEY_LEN, NONCE_LEN, SEG, TAG_LEN};

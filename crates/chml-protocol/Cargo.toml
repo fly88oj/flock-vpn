@@ -29,12 +29,31 @@ lz4_flex = { workspace = true }
 yamux = { workspace = true }
 chacha20poly1305 = { workspace = true }
 aes-gcm-siv = { workspace = true }
+futures = { workspace = true}
+
+# wasm32：tokio net 不支持该目标（tokio Cargo.toml 将 socket2 限定非 wasm）；
+# session/mux 库代码只用 io-util/time/sync/rt/macros。原生构建仍走 workspace 全量（含 net）。
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
-futures = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["io-util", "time", "sync", "rt", "macros"] }
+# getrandom custom 后端（.cargo/config.toml 的 rustflags cfg）：桥见 src/wasm_bridge.rs。
+# 两代并存：0.3（rand 0.9 代际）走 extern 符号；0.2（rand_core 0.6 ← opaque-ke 路径）
+# 走 register_custom_getrandom! 宏（showroom wasm_shim 同法），同一熵池供两代。
+getrandom = "0.3"
+getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
 
 [dev-dependencies]
 serde_json = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# bench（§7-M1）：criterion 0.8 + aes-gcm（与库锁定同版本，仅基准用途）
+criterion = "0.8"
+aes-gcm = { workspace = true }
+
+[[bench]]
+name = "aead"
+harness = false
 
 [features]
 default = []
@@ -48,5 +67,5 @@ legacy = ["dep:rsa", "rsa/sha2"]
 anchor = []
 # ML-DSA-65 并行公钥档（P2-12）：ml-dsa 0.1.1 未审计（crypto-2026 §5），默认关（本批次仅占位）。
 pq-sign = []
-# showroom wasm 约束（getrandom custom 后端桥等，showroom-analysis §6.3）：默认关（本批次仅占位）。
+# showroom wasm 约束（getrandom custom 后端桥 src/wasm_bridge.rs，showroom-analysis §6.3）：默认关。
 wasm = []

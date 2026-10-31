@@ -726,6 +726,24 @@ impl DeviceStaticKeys {
     fn signing(&self) -> &SigningKey {
         &self.ed25519
     }
+
+    /// 序列化：32B X25519 私钥 ‖ 32B Ed25519 seed（密钥材料，落盘 0600 由调用方负责）。
+    pub fn to_bytes(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&self.x25519.to_bytes());
+        out[32..].copy_from_slice(&self.ed25519.to_bytes());
+        out
+    }
+
+    /// 由 [] 恢复。
+    pub fn from_bytes(bytes: &[u8; 64]) -> Self {
+        let x: [u8; 32] = bytes[..32].try_into().expect("32B");
+        let seed: [u8; 32] = bytes[32..].try_into().expect("32B");
+        DeviceStaticKeys {
+            x25519: StaticSecret::from(x),
+            ed25519: SigningKey::from_bytes(&seed),
+        }
+    }
 }
 
 impl fmt::Debug for DeviceStaticKeys {
@@ -1960,6 +1978,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> TofuBootstrap<S> {
     /// 集群根公钥指纹（展示给用户确认的本体）。
     pub fn root_fingerprint(&self) -> Fingerprint {
         fingerprint_ed25519(&self.pin.cluster_root_pub)
+    }
+
+    /// R0 出示的集群根公钥（确认后交 `trust::PinStore` 钉扎的本体）。
+    pub fn root_pub(&self) -> &VerifyingKey {
+        &self.pin.cluster_root_pub
     }
 
     /// 期望集群。
