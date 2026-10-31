@@ -652,6 +652,28 @@ mod v1_tests {
         }
     }
 
+    // sealed 输入翻转一个字节（密文区 / 封装头区）→ 报错不 panic
+    // （showroom lib.rs:587-604 tampered_envelope_rejected 平移）
+    #[test]
+    fn v1_tampered_envelope_rejected() {
+        let p = platform();
+        let plain = vec![7u8; SEG + 100];
+        let mut sealed = Vec::new();
+        seal_v1_legacy(&p.public(), Cursor::new(plain.as_slice()), &mut sealed).unwrap();
+
+        let mut t = sealed.clone();
+        t[WRAP_LEN + NONCE_LEN + 10] ^= 1; // 第一段密文区内
+        let mut out = Vec::new();
+        let e = open_v1_legacy(p.private(), Cursor::new(t.as_slice()), &mut out);
+        assert!(e.is_err(), "flipped ciphertext byte must error");
+        assert!(out.is_empty());
+
+        let mut t2 = sealed;
+        t2[10] ^= 1; // 384B 封装头内
+        let mut out2 = Vec::new();
+        assert!(open_v1_legacy(p.private(), Cursor::new(t2.as_slice()), &mut out2).is_err());
+    }
+
     // PlatformKeys::save_pem/load_pem/public_pem 往返（unix 文件接缝）
     #[cfg(unix)]
     #[test]
