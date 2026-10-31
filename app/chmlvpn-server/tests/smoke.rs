@@ -105,7 +105,11 @@ fn compose_exec_status(profile: Profile, args: &[&str]) -> (bool, String) {
 }
 
 fn cli(profile: Profile, sub: &[&str]) -> String {
-    let mut args = vec!["--config", "/etc/chmlvpn/server.toml"];
+    let mut args = vec![
+        "/usr/local/bin/chmlvpn-server",
+        "--config",
+        "/etc/chmlvpn/server.toml",
+    ];
     args.extend_from_slice(sub);
     compose_exec(profile, &args)
 }
@@ -122,6 +126,30 @@ async fn wait_tcp(addr: &str) {
         );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+}
+
+/// 每次运行唯一的用户名（named volume 跨次保留状态 ⇒ 冒烟必须可重入：同库再开户）。
+fn uname(base: &str) -> String {
+    use chml_protocol::rand::RngCore as _;
+    let mut rng = chml_protocol::rand::rng();
+    let mut b = [0u8; 3];
+    rng.fill_bytes(&mut b);
+    format!("{base}-{}", hex::encode(b))
+}
+
+/// 解析 CLI 输出中的 `vip=a.b.c.d`。
+fn parse_vip(out: &str) -> Option<u32> {
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("vip="))
+        .and_then(|v| v.parse::<std::net::Ipv4Addr>().ok())
+        .map(u32::from)
+}
+
+/// VIP 必须落在 100.64.0.0/10 池（RFC 6598，§2.1；.1 起保留给服务器）。
+fn assert_vip_in_pool(vip: u32) {
+    let lo = u32::from_be_bytes([100, 64, 0, 0]);
+    let hi = u32::from_be_bytes([100, 127, 255, 255]);
+    assert!((lo..=hi).contains(&vip), "VIP {vip} 不在 100.64.0.0/10 池");
 }
 
 fn now() -> i64 {
@@ -147,6 +175,7 @@ async fn smoke_full_chain(profile: Profile) {
     let (ep1, _ep2) = profile.endpoints();
     wait_tcp(&ep1).await;
 
+    let user = uname("smoke-alice");
     // 邀请（容器内 CLI 签发；admin 端点 = 进程内单写者入口）。
     let invite_b64 = cli(profile, &["invite", "--ttl-secs", "3600"])
         .trim()
@@ -164,7 +193,7 @@ async fn smoke_full_chain(profile: Profile) {
         &[
             "redeem",
             "--user",
-            "smoke-alice",
+            &user,
             "--invite-b64",
             &invite_b64,
             "--device-x",
@@ -173,10 +202,10 @@ async fn smoke_full_chain(profile: Profile) {
             &common_b64(dev_a.ed25519_public().as_bytes()),
         ],
     );
-    assert!(
-        out.contains("vip=100.64.0.2"),
-        "首个 VIP = 100.64.0.2：{out}"
-    );
+    // VIP 在 100.64.0.0/10 池内（named volume 跨次运行保留分配 ⇒ 断言池归属而非绝对值；
+    // 「IP 不复用」由下方 key-bind 的单调性断言承担）。
+    let vip_a = parse_vip(&out).expect("redeem 输出 vip=");
+    assert_vip_in_pool(vip_a);
     // 同 invite_id 二次兑换拒（邀请一次性，容器内实证）。
     let dev_x = DeviceStaticKeys::generate();
     let dup = cli_status(
@@ -184,7 +213,7 @@ async fn smoke_full_chain(profile: Profile) {
         &[
             "redeem",
             "--user",
-            "smoke-dup",
+            &uname("smoke-dup"),
             "--invite-b64",
             &invite_b64,
             "--device-x",
@@ -200,17 +229,17 @@ async fn smoke_full_chain(profile: Profile) {
     let mut a = CtrlClient::open(tunnel_a).await.expect("ctrl open");
     a.hello().await;
     assert!(matches!(
-        a.set_password("smoke-alice", "pw").await,
+        a.set_password(&user, "pw").await,
         CtrlResponse::Ok
     ));
 
     // anchor 负路径（容器路径同样生效）：篡改 anchor_sig ⇒ 客户端拒绝。
     {
         let mut rng = rand::rngs::OsRng;
-        let (state, ke1) = login_start(&mut rng, "pw", "smoke-alice").unwrap();
+        let (state, ke1) = login_start(&mut rng, "pw", &user).unwrap();
         match a
             .req(chmlvpn_server::control::CtrlRequest::LoginBegin {
-                user: "smoke-alice".into(),
+                user: user.clone(),
                 ke1_b64: ke1,
             })
             .await
@@ -227,7 +256,7 @@ async fn smoke_full_chain(profile: Profile) {
                     client_login_finish_anchored(
                         state,
                         "pw",
-                        "smoke-alice",
+                        &user,
                         &ke2_b64,
                         chmlvpn_server::control::AnchorLoginExpectation {
                             server_id: pin.entry.server_id.0,
@@ -245,10 +274,7 @@ async fn smoke_full_chain(profile: Profile) {
     }
 
     // OPAQUE 登录（anchor）→ 票据（部署 TTL 6s，见 deploy/server-*.toml）。
-    let (ticket_a, bind_token) = a
-        .login_anchored("smoke-alice", "pw", &pin)
-        .await
-        .expect("login");
+    let (ticket_a, bind_token) = a.login_anchored(&user, "pw", &pin).await.expect("login");
 
     // key-bind：设备 B 公钥登记。
     let dev_b = DeviceStaticKeys::generate();
@@ -257,7 +283,7 @@ async fn smoke_full_chain(profile: Profile) {
         .key_bind(
             &ticket_a,
             bind_token,
-            "smoke-alice",
+            &user,
             &invite.directory.cluster_id.0,
             &dev_b,
             &sr_key,
@@ -266,7 +292,9 @@ async fn smoke_full_chain(profile: Profile) {
     {
         CtrlResponse::KeyBound { device_id, vip } => {
             assert_eq!(device_id, dev_id(&dev_b));
-            assert_eq!(vip, [100, 64, 0, 3], "VIP 单调");
+            let vip_b = u32::from_be_bytes(vip);
+            assert!(vip_b > vip_a, "VIP 单调不复用：{vip_b} > {vip_a}");
+            assert_vip_in_pool(vip_b);
         }
         other => panic!("key bind: {other:?}"),
     }
@@ -280,7 +308,7 @@ async fn smoke_full_chain(profile: Profile) {
 
     // SR-SIG1 验签通过。
     let auth = CtrlClient::sr_auth(
-        "smoke-alice",
+        &user,
         &sr_key,
         CtrlClient::path_ticket_renew(),
         b"",
@@ -295,7 +323,7 @@ async fn smoke_full_chain(profile: Profile) {
     // 票据三态：
     // (1) 无票据。
     let no_tkt = CtrlClient::sr_auth(
-        "smoke-alice",
+        &user,
         &sr_key,
         CtrlClient::path_ticket_renew(),
         b"",
@@ -311,7 +339,7 @@ async fn smoke_full_chain(profile: Profile) {
     bad.epoch += 1;
     let n = sr_sig::nonce_hex();
     let auth_n = CtrlClient::sr_auth(
-        "smoke-alice",
+        &user,
         &sr_key,
         CtrlClient::path_ticket_renew(),
         b"",
@@ -329,7 +357,7 @@ async fn smoke_full_chain(profile: Profile) {
     // (3) 过期票据（部署 TTL 6s）。
     tokio::time::sleep(std::time::Duration::from_secs(7)).await;
     let late = CtrlClient::sr_auth(
-        "smoke-alice",
+        &user,
         &sr_key,
         CtrlClient::path_ticket_renew(),
         b"",
@@ -342,20 +370,14 @@ async fn smoke_full_chain(profile: Profile) {
     );
 
     // 吊销后握手被拒（重新登录拿新票据——旧票据已因 (3) 过期）。
-    let (ticket2, _) = a
-        .login_anchored("smoke-alice", "pw", &pin)
-        .await
-        .expect("re-login");
-    let (ticket_b, _) = b
-        .login_anchored("smoke-alice", "pw", &pin)
-        .await
-        .expect("B login");
+    let (ticket2, _) = a.login_anchored(&user, "pw", &pin).await.expect("re-login");
+    let (ticket_b, _) = b.login_anchored(&user, "pw", &pin).await.expect("B login");
     let body = postcard::to_allocvec(&DeviceOp::Revoke {
         device: dev_id(&dev_a),
     })
     .unwrap();
     let rv = CtrlClient::sr_auth(
-        "smoke-alice",
+        &user,
         &sr_key,
         CtrlClient::path_device_op(),
         &body,
@@ -376,7 +398,7 @@ async fn smoke_full_chain(profile: Profile) {
     // 低 epoch 票据：吊销推进 epoch ⇒ B 的旧票据失效。
     let lb = postcard::to_allocvec(&DeviceOp::List).unwrap();
     let stale = CtrlClient::sr_auth(
-        "smoke-alice",
+        &user,
         &sr_key,
         CtrlClient::path_device_op(),
         &lb,
@@ -422,7 +444,11 @@ fn common_b64d(s: &str) -> Vec<u8> {
 }
 
 fn cli_status(profile: Profile, sub: &[&str]) -> (bool, String) {
-    let mut args = vec!["--config", "/etc/chmlvpn/server.toml"];
+    let mut args = vec![
+        "/usr/local/bin/chmlvpn-server",
+        "--config",
+        "/etc/chmlvpn/server.toml",
+    ];
     args.extend_from_slice(sub);
     compose_exec_status(profile, &args)
 }
@@ -437,12 +463,13 @@ async fn smoke_tofu(profile: Profile) {
 
     // TOFU 设备管理面预置（TOFU 解决信任引导，非账号开通）。
     let dev = DeviceStaticKeys::generate();
+    let tofu_user = uname("smoke-tofu");
     let out = cli(
         profile,
         &[
             "device-add",
             "--user",
-            "smoke-tofu",
+            &tofu_user,
             "--device-x",
             &common_b64(&dev.x25519_public().to_bytes()),
             "--device-ed",

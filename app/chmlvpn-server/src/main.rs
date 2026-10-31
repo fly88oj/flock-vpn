@@ -204,32 +204,31 @@ fn run_cli() -> Result<(), String> {
                 Ok(())
             }
             Cmd::Invite { ttl_secs } => {
-                // init 兼容：状态库未初始化时先引导（服务未运行的首次签发路径）。
-                let (core, created) =
-                    chmlvpn_server::server::ServerCore::open_or_init(cfg.clone())?;
-                if created {
-                    eprintln!("note: 已引导新状态库（建议改用 init-cluster）");
-                }
-                // 服务在跑 ⇒ 走 admin（单写者）；服务未跑 ⇒ 本进程直写。
-                match tokio::net::TcpStream::connect(cfg.admin_bind).await {
-                    Ok(_) => match client(cfg.admin_bind, AdminRequest::Invite { ttl_secs }).await?
-                    {
+                // 服务在跑 ⇒ 先探 admin（单写者）——探测必须先于任何 redb 打开：
+                // 运行中的服务持库锁，先 open_or_init 会以「Database already open」失败。
+                if tokio::net::TcpStream::connect(cfg.admin_bind).await.is_ok() {
+                    match client(cfg.admin_bind, AdminRequest::Invite { ttl_secs }).await? {
                         AdminResponse::Invite { invite_b64 } => {
                             println!("{invite_b64}");
                             Ok(())
                         }
                         AdminResponse::Err { msg } => Err(msg),
                         _ => Err("admin 响应形态不符".into()),
-                    },
-                    Err(_) => {
-                        let bytes = core.mint_invite(ttl_secs)?;
-                        use base64::Engine as _;
-                        println!(
-                            "{}",
-                            base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
-                        );
-                        Ok(())
                     }
+                } else {
+                    // 服务未跑：本进程直写（状态库未初始化时先引导——首次签发的兜底路径）。
+                    let (core, created) =
+                        chmlvpn_server::server::ServerCore::open_or_init(cfg.clone())?;
+                    if created {
+                        eprintln!("note: 已引导新状态库（建议改用 init-cluster）");
+                    }
+                    let bytes = core.mint_invite(ttl_secs)?;
+                    use base64::Engine as _;
+                    println!(
+                        "{}",
+                        base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
+                    );
+                    Ok(())
                 }
             }
             Cmd::Redeem {

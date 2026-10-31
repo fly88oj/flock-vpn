@@ -21,5 +21,5 @@ services:
       - server-state:/var/lib/chmlvpn
     restart: unless-stopped
 
-networks:
-  default: {}
+volumes:
+  server-state: {}

@@ -5,7 +5,10 @@
 # （§2.1 硬约束：Direct 代码路径不触碰 chml-frpc；容器内 pgrep -f frp 恒无命中）。
 # 免 prepare 步骤：build context 不需要 deploy/build/。
 
-FROM rust:1.98-slim AS builder
+# 构建段与运行段必须同一 Debian suite（glibc 符号版本兼容）：binary 链接的
+# GLIBC_2.x 取决于构建段基底；rust:1.98-slim 当前=trixie(glibc 2.41)，而运行段若用
+# bookworm(2.36) 会 crash（GLIBC_2.39 not found）——两侧显式钉 bookworm。
+FROM rust:1.98-slim-bookworm AS builder
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc \
  && rm -rf /var/lib/apt/lists/*
@@ -14,8 +17,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/chml-protocol/Cargo.toml crates/chml-protocol/
 COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
 COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
-RUN mkdir -p crates/chml-protocol/src crates/chml-frpc/src app/chmlvpn-server/src \
+RUN mkdir -p crates/chml-protocol/src crates/chml-protocol/benches \
+             crates/chml-frpc/src app/chmlvpn-server/src \
  && echo 'pub fn _stub() {}' > crates/chml-protocol/src/lib.rs \
+ && echo 'fn main() {}' > crates/chml-protocol/benches/aead.rs \
  && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
  && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
  && echo 'fn main() {}' > app/chmlvpn-server/src/main.rs \
