@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+# chmlvpn-server —— Direct 模式镜像（docs/design.md §7-M2：m2-direct.yml 的唯一服务）。
+#
+# 与 Dockerfile.server 的差异即「Direct 形态」的物化：**镜像内没有任何 frp 二进制**
+# （§2.1 硬约束：Direct 代码路径不触碰 chml-frpc；容器内 pgrep -f frp 恒无命中）。
+# 免 prepare 步骤：build context 不需要 deploy/build/。
+
+FROM rust:1.98-slim AS builder
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/chml-protocol/Cargo.toml crates/chml-protocol/
+COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
+COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
+RUN mkdir -p crates/chml-protocol/src crates/chml-frpc/src app/chmlvpn-server/src \
+ && echo 'pub fn _stub() {}' > crates/chml-protocol/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
+ && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
+ && echo 'fn main() {}' > app/chmlvpn-server/src/main.rs \
+ && cargo build --release --locked -p chmlvpn-server \
+ && rm -rf target/release/deps/chmlvpn_server* target/release/deps/chmlvpn_server_lib* \
+          target/release/deps/chml_protocol* target/release/deps/chml_frpc* \
+ && rm -f target/release/chmlvpn-server
+COPY crates/chml-protocol/src crates/chml-protocol/src
+COPY crates/chml-frpc/src crates/chml-frpc/src
+COPY app/chmlvpn-server/src app/chmlvpn-server/src
+RUN touch crates/chml-protocol/src/lib.rs crates/chml-frpc/src/lib.rs \
+      app/chmlvpn-server/src/lib.rs app/chmlvpn-server/src/main.rs \
+ && cargo build --release --locked -p chmlvpn-server
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends procps \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/chmlvpn-server /usr/local/bin/chmlvpn-server
+RUN mkdir -p /var/lib/chmlvpn
+COPY deploy/server-direct.toml /etc/chmlvpn/server.toml
+ENTRYPOINT ["/usr/local/bin/chmlvpn-server"]
+CMD ["--config", "/etc/chmlvpn/server.toml"]

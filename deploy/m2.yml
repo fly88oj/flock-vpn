@@ -1,0 +1,45 @@
+# m2.yml —— M2 frp 中转路径（docs/design.md §7-M2 完成标准第一项）。
+#
+#   bash deploy/prepare-frp-bin.sh            # 一次性：.tmp 的 frps/frpc 拷进 deploy/build/
+#   docker compose -f deploy/m2.yml up -d --build
+#   cargo test -p chmlvpn-server --test smoke -- --ignored relay
+#
+# 拓扑（隔离网络 frpnet = 「模拟不可信公网」，§6.2 同思路）：
+#   frps（原版 v0.71.1，用户口 27500/27501 映射宿主）
+#     └─ server（Frp 模式：内嵌 frpc 双 proxy 注册 → 本地 9443；admin 仅容器 loopback）
+#   client-skeleton（M3 骨架占位：宿主冒烟测试承担 M2 的客户端角色）
+
+name: chmlvpn-m2
+
+services:
+  frps:
+    build:
+      context: build            # 仅 frps 二进制 + frps.toml + Dockerfile.frps（context 保持小）
+      dockerfile: Dockerfile.frps
+    image: chmlvpn/frps:0.71.1
+    networks: [frpnet]
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ..               # workspace 根（源码 + deploy/build/frpc；.dockerignore 裁剪）
+      dockerfile: deploy/Dockerfile.server
+    image: chmlvpn/server:m2
+    depends_on: [frps]
+    networks: [frpnet]
+    volumes:
+      - server-state:/var/lib/chmlvpn
+    restart: unless-stopped
+
+  # M3 客户端骨架占位（§7-M2「1 client 骨架」）；M2 的客户端断言由宿主冒烟测试执行。
+  client-skeleton:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    depends_on: [server]
+    networks: [frpnet]
+
+networks:
+  frpnet: {}
+
+volumes:
+  server-state: {}

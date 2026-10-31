@@ -16,7 +16,9 @@
 
 ## 0. 设计总览
 
-一句话：**ChmlVPN = showroom 协议层的「升级档位化抽库」+ 长寿命隧道会话层 + FRP 双栈接入 + openraft 多主多活控制面**。协议层抽成独立库 `chml-protocol`（深模块：文件信封/签名/认证/会话/复用/压缩/信任锚七个小接口藏大实现），ChmlVPN 与 showroom 两项目共用；VPN 特有的 tun 适配、frpc 托管、多主同步以「接缝 + 适配器」形式落在协议库外圈的 ChmlVPN workspace crate 里。
+一句话：**ChmlVPN = showroom 协议层的「升级档位化抽库」+ 长寿命隧道会话层 + 接入端点（Direct 缺省 / FRP 中转可选）+ openraft 多主多活控制面**。协议层抽成独立库 `chml-protocol`（深模块：文件信封/签名/认证/会话/复用/压缩/信任锚七个小接口藏大实现），ChmlVPN 与 showroom 两项目共用；VPN 特有的 tun 适配、frpc 托管、多主同步以「接缝 + 适配器」形式落在协议库外圈的 ChmlVPN workspace crate 里。
+
+**硬约束（用户令，最高优先级，覆盖任何相反表述）**：ChmlVPN **不得与 frp/chmlfrp 强绑定**。frp 只服务于「服务端无公网 IP 或客户端无法直连服务端 IP」的场景；服务端可直连时**不执行任何 frp 相关逻辑**（无 frpc 子进程、无配置生成）——listener mode 缺省 = `Direct`，`Frp` 是可选适配器而非前提（§2.1/§2.2/§3.11/§5）。
 
 分层（自下而上）：
 
@@ -25,20 +27,22 @@
 │ tun(tun-rs) → PacketChannel → yamux 流 ─┐                        │
 │ 路由（rtnetlink/wintun/VpnService）      │                        │
 └──────────────────────────────────────────┼────────────────────────┘
-                                            │ 单条 TCP（经 FRP 中转，密文）
+                                            │ 单条 TCP（密文；路径=接入端点：
+                                            │  Direct 直连 或 经 FRP 中转）
 ┌─ chml-protocol（会话层）──────────────────┼───────────────────────┐
 │ SecureStream(记录层: 计数器nonce AEAD+抗重放+rekey) ← yamux 跑在加密内 │
 │ 握手: 已钉扎 1-RTT Noise-IK / TOFU 首连 2-RTT；X25519+ML-KEM-768 混合 │
 │       KEM + 服务端身份签名（邀请文件携带静态混合公钥）                  │
 └──────────────────────────────────────────┼───────────────────────┘
-                                            │ TCP 字节流（中转透明）
+                                            │ TCP 字节流（直连或中转，均透明）
 ┌─ 服务端 app（chmlvpn-server）─────────────┼────────────────────────┐
-│ 监听器 ← frpc 托管（chml-frpc）经 FRP 暴露 │ tun + 路由 + peer 转发   │
-│ 控制流: OPAQUE 登录 + 设备注册表 + 配置下发 │ chml-sync: openraft+租约│
+│ 监听器 ListenerMode: Direct(缺省,零 frp) │ tun + 路由 + peer 转发   │
+│   或 Frp(chml-frpc Supervisor 托管中转)  │ chml-sync: openraft+租约│
+│ 控制流: OPAQUE 登录 + 设备注册表 + 配置下发 │                        │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-FRP 中转全程只见密文（frp useEncryption/useCompression 默认关，frp-compat §0.1/S20；字节透传经 T1/T2 实证，含 0x00–0xFF 全字符集与 0x16/0x17 首字节）。
+走 FRP 中转时全程只见密文（frp useEncryption/useCompression 默认关，frp-compat §0.1/S20；字节透传经 T1/T2 实证，含 0x00–0xFF 全字符集与 0x16/0x17 首字节）；直连时链路上只有本协议密文。
 
 ---
 
@@ -211,7 +215,7 @@ impl Tunnel {
   - **TOFU 首连引导形态（无任何集群材料，仅一次，2-RTT）**：
     I0 = 版本+算法集+客户端 X25519 临时（此时无服务器静态公钥，无法封装/加密，明文发起）；
     R0 = 该服务器的**入群凭证公开部分**（server_id + identity_pub + static_hybrid_pub 全量
-    + relay_endpoint）+ **集群根公钥** + 服务器身份对 I0‖R0 的签名。客户端验证：入群凭证
+    + access_endpoint）+ **集群根公钥** + 服务器身份对 I0‖R0 的签名。客户端验证：入群凭证
     = 根公钥对 ServerEntry 的签名 ⇒ 材料链可信；随后展示**集群根指纹**、用户确认后
     **只钉扎根公钥**（cluster_id → root_pub），并即以该 ServerEntry 按 1-RTT 形态发 I1/R1。
     其他端点/新服务器材料经控制流 `dir_pull`（根签 ClusterDirectory，dir_version 递增）
@@ -278,7 +282,11 @@ pub struct ServerIdentity { ed: VerifyingKey /* + 可选 ml_dsa */, … } // 长
 pub struct ServerEntry {                // = §4 入群凭证的「公开部分」，同一凭证两用：
                                         //   服务器互认（§4）/ 客户端接入材料（此处）
     pub server_id: ServerId,
-    pub relay_endpoint: SocketAddr,     // 该服务器对应的中转用户口（frps host:port）
+    pub access_endpoint: SocketAddr,    // 该服务器的**接入端点**：Direct 形态=直连地址（公网/
+                                        // 内网 host:port，零 frp），Frp 形态=中转用户口（frps
+                                        // host:port）——两种形态对客户端无感知差异，都是拨号
+                                        // 目标（第四轮更名自 relay_endpoint，语义扩大）
+    pub endpoint_form: Direct | Frp,    // 标注形态（客户端仅作展示/诊断，选路逻辑不变）
     pub identity_pub: VerifyingKey,     // 该服务器身份 Ed25519 公钥
     pub static_hybrid_pub: HybridPubkey,// 该服务器静态混合公钥（1216B；I1 的 ML-KEM ct 必须封装给它）
 }
@@ -351,15 +359,24 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
 
 ### 2.1 部署形态（对标 Tailscale「控制面集中、数据面分布」模型，vpn-mesh §2）
 
-- **服务端 ×3 起**（Raft 奇数 voter，容 1 故障）：每台各自挂一个 FRP 中转节点（ChmlFrp 节点
-  或自建原版 frps），本地跑 `chmlvpn-server` + `chml-frpc`（frpc 出站注册，把服务端监听口
-  经中转暴露成用户口）。服务端互连（Raft + gossip + 跨服转发）走各自中转或公网直连，跑
-  **服务器-服务器 profile** 的同一 E2E 会话协议（双向入群凭证认证，§4 准入）。
-- **客户端 ×N**（Windows/macOS/Linux 首发，Android/iOS 接缝预留）：`chmlvpn-client` 直连
-  中转用户口（tcp 代理类型下客户端**不需要** frpc——frp-compat §1.1 proxy 模型：用户连
-  frps 用户口即达），持有「中转端点列表 + 探活切换」，任意服务端接入效果一致。
+- **接入端点模型（硬约束落地，最高优先级）**：每台服务器暴露**一个接入端点**，形态二选一，
+  由 `server.toml` 的 `listener.mode` 配置，**`Direct` 为缺省**：
+  - `Direct`（缺省）：服务器直接监听公网/内网地址，客户端 TCP 直连——**零 frp 逻辑**
+    （无 frpc 子进程、无配置生成、不装配 chml-frpc）；
+  - `Frp(RelaySpec)`：仅当「服务端无公网 IP 或客户端无法直连服务端 IP」时选用——
+    `chml-frpc` 托管 frpc（§3.9/§5）把监听口经中转节点暴露成用户口。
+  两种形态对协议层完全同构（都是「一条 TCP 字节流」，§1.4），同一集群可按机器混布
+  （server-a 直连、server-b 经中转、server-c 直连）。服务端互连（Raft + gossip +
+  跨服转发）同理走直连或经各自接入路径，跑**服务器-服务器 profile** 的同一 E2E 会话协议
+  （双向入群凭证认证，§4 准入）。
+- **服务端 ×3 起**（Raft 奇数 voter，容 1 故障）：每台按上文二选一暴露接入端点；只有无公网
+  IP/不可直连的机器才挂 FRP 中转节点（ChmlFrp 节点或自建原版 frps）并运行 `chml-frpc`。
+- **客户端 ×N**（Windows/macOS/Linux 首发，Android/iOS 接缝预留）：`chmlvpn-client` 按
+  ClusterDirectory 中的接入端点拨号——**直连地址或中转用户口客户端无感知差异**（都是 TCP
+  拨号目标；tcp 代理形态下客户端本来就不需要 frpc，frp-compat §1.1 proxy 模型），持有
+  「接入端点列表 + 探活切换」，任意服务端接入效果一致。
 - 数据面：客户端 ↔ 服务端会话型隧道（首版 hub-and-spoke，peer 间经服务端路由；不做 P2P
-  直连，vpn-mesh §6 明示首发策略）；FRP 全程只见密文。
+  直连，vpn-mesh §6 明示首发策略）；任何链路形态下第三方只见本协议密文。
 - 虚拟网：`100.64.0.0/10`（RFC 6598 CGNAT 段，Tailscale/NetBird 双先例，vpn-mesh §3.1），
   内部保留 /24 若干；分配由 Raft 状态机裁决（强一致防撞）；**禁用不删除、IP 不复用**
   （innernet 先例，安全优先，vpn-mesh §3.1）；MTU 1280（Tailscale 同款、IPv6 下限，
@@ -369,7 +386,10 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
 
 职责链：**接入 → 认证 → 注册表 → 会话 → 转发 → 同步**。
 
-- 监听器（TCP :9443，经 frpc 暴露）：每条入连一个 E2E 会话（`session::respond`）。
+- 监听器（TCP :9443）：每条入连一个 E2E 会话（`session::respond`）。暴露形态 =
+  `server.toml` 的 `listener.mode`（§3.11 ListenerMode 接缝）——**`Direct` 缺省**（直接
+  监听，零 frp 逻辑）/`Frp(RelaySpec)`（chml-frpc Supervisor 路径）；**Direct 模式的代码
+  路径不触碰 chml-frpc**（不实例化 Supervisor、不生成配置、不启动任何子进程）。
 - 控制流（yamux stream 0，postcard 编码消息）：OPAQUE 登录（`anchor` 开：身份签名 + TOFU/
   邀请钉扎校验）→ 会话票据签发（本地短 TTL 票据，密钥根来自 Raft，VPN-15 下放）；
   设备注册/配置拉取（网络视图：peer VIP/公钥/路由）。
@@ -417,7 +437,8 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
 
 ### 2.3 客户端（`app/chmlvpn-client`）
 
-- 接入器：中转端点列表 → TCP 拨号 → `session::initiate`（带 ServerPin）；断线指数退避
+- 接入器：接入端点列表（来自根签 ClusterDirectory 的 `access_endpoint`——直连地址或中转
+  用户口，无感知差异）→ TCP 拨号 → `session::initiate`（带 ServerPin）；断线指数退避
   （5s 起步 + 抖动，wireguard-go RekeyTimeout 节奏，crypto-2026 §6）+ 端点轮询切换。
 - tun 数据面：`tun-rs 2.8.16`（平台矩阵最全、活跃度最高、内置 wintun/iOS fd/Android
   establish 示例，vpn-mesh §1.2）创建 TUN（MTU 1280）；IP 包 ↔ `PacketChannel`。
@@ -528,8 +549,9 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
 ### 3.8 `chml-protocol::trust`（TOFU/邀请）
 - **接口**：`PinStore`（钉扎粒度 = cluster_id → 集群根公钥）、`InviteFile`（v3：根签
   ClusterDirectory 全套服务器接入材料 + 一次性 invite_id + expiry 默认 7 天，§1.3.3f）、
-  `ClusterDirectory/ServerEntry`（= §4 入群凭证公开部分）、`fingerprint`、
-  集群根密钥/入群凭证类型（§4 准入用）。
+  `ClusterDirectory/ServerEntry`（= §4 入群凭证公开部分；`access_endpoint` = 接入端点——
+  Direct 直连地址或 Frp 中转用户口，**客户端无感知差异**，选路/探活逻辑不分形态）、
+  `fingerprint`、集群根密钥/入群凭证类型（§4 准入用）。
 - **接缝**：钉扎存储（文件适配器首发；钥匙库适配器给移动端）；邀请文件版本（v2 单服务器
   材料与 v1 指纹-only 均不再接受——多服务器集群下无法支撑任意端点 1-RTT）；目录刷新
   （dir_pull，根验签 + dir_version 递增）。
@@ -550,8 +572,9 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
   ⇔ ChmlFrp frpc、自建节点 ⇔ 同代原版 frpc，禁交叉——两代控制面互不兼容，frp-compat §1.3）；
   **usertoken 安全档**：`-u/-p` 自举的 cfg API 是 InsecureSkipVerify 的 HTTPS
   （frp-compat §2.2，chml/pkg/api/api.go:30-46），面板全权凭据可被中间人截获 ⇒ 默认走
-  `-c` 配置文件模式，UserTokenAuto 保留但文档标注风险（R20）。仅服务端用（tcp 代理下客户端
-  直连用户口）。
+  `-c` 配置文件模式，UserTokenAuto 保留但文档标注风险（R20）。仅服务端
+  `listener.mode = Frp` 时装配（Direct 模式零 frp 逻辑，§3.11）；tcp 代理形态下客户端
+  直连用户口、自身从不需要 frpc。
 
 ### 3.10 `crates/chml-sync`（多主多活，VPN-15）
 - **接口**：`NetState::{register_device, revoke, allocate_ip, redeem_invite,
@@ -575,9 +598,19 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
 ### 3.11 `app/chmlvpn-server`（服务端装配）
 - **接口**：`chmlvpn-server --config server.toml` / `init-cluster` / `enroll`（进程入口）
   + 控制流消息协议（版本化，票据强制契约见 §2.2；含 dir_pull/开户兑换流程 §1.3.3f）。
-- **接缝**：对下注入 session::respond 的 `DeviceDirectory`（= 「NetState 缓存 + epoch
-  两级读 + lag 熔断」，§4 读与缓存）、对上挂 tun 适配器与 chml-frpc、chml-sync（含 FRWD
-  转发面）。
+- **接缝**：`ListenerMode`（接入端点形态，server.toml `listener.mode`，**Direct 缺省**）：
+  ```rust
+  enum ListenerMode {
+      Direct { bind: SocketAddr },                 // 直接监听公网/内网地址——零 frp 逻辑，
+                                                   // 代码路径不触碰 chml-frpc（不实例化
+                                                   // Supervisor/不生成配置/不启动子进程）
+      Frp { bind: SocketAddr, relay: RelaySpec },  // 无公网 IP/不可直连时：本地监听 +
+                                                   // chml-frpc Supervisor 托管中转（§3.9/§5）
+  }
+  ```
+  对下注入 session::respond 的 `DeviceDirectory`（= 「NetState 缓存 + epoch 两级读 + lag
+  熔断」，§4 读与缓存）；对上挂 tun 适配器、chml-sync（含 FRWD 转发面）与
+  **仅 Frp 模式下的** chml-frpc（装配期按 mode 分派，Direct 分支无 chml-frpc 类型引用）。
 - **实现要点**：tokio 运行时；每入连一会话任务；转发面 = **第 0 步源 VIP 绑定校验** →
   租约表定位 → 本机投递或 ForwardEnvelope 跨服转发（NOT_HERE → 一次性 location_query
   重定向 + hop=1 防环 + 失败丢包/ICMP，§2.2）；吊销在 apply 回调内本地执行（无额外广播依赖）。
@@ -631,7 +664,7 @@ apply lag，**lag > 2s（= A6 时序预算）即停用本地缓存路径、降�
 
 1. **集群引导**：运维运行 `chmlvpn-server init-cluster --voters 3` 生成**集群根密钥**
    （Ed25519，离线保管，只签名不组网）与每台初始 voter 的**入群凭证（enrollment cert）**
-   = `{cluster_id, server_id, role, identity_pub, static_hybrid_pub, raft_addr, relay_endpoint,
+   = `{cluster_id, server_id, role, identity_pub, static_hybrid_pub, raft_addr, access_endpoint,
    expiry}` 的根密钥签名。每台服务器持有：自己的身份/静态混合私钥 + 自己的入群凭证 + 集群
    根公钥。**同一信任根两用**：入群凭证的公开部分（ServerEntry，§1.3.3f）就是客户端接入
    材料——根密钥既做服务器互认（本节）也签客户端邀请文件/集群目录（§1.3.3f），不引入第二
@@ -652,7 +685,11 @@ apply lag，**lag > 2s（= A6 时序预算）即停用本地缓存路径、降�
 
 ---
 
-## 5. FRP 兼容策略（择型：方案 A 子进程托管，双栈定版）
+## 5. FRP 兼容策略（择型：方案 A 子进程托管，双栈定版）——**可选适配器，非前提**
+
+> **硬约束（§0）**：frp 只服务于「服务端无公网 IP 或客户端无法直连服务端 IP」的场景；
+> `listener.mode = Direct`（缺省）时**不执行任何 frp 相关逻辑**。本章全部内容仅适用于
+> 显式选择 `Frp` 形态的服务器。
 
 **选择**：frp-compat §3 的**方案 A**——子进程托管两套定版 frpc：ChmlFrp 节点用
 `ChmlFrp-0.51.2_251023`（已有 Linux 包：`.tmp/chmlfrpc/ChmlFrp-0.51.2_251023_linux_amd64/`，
@@ -689,32 +726,37 @@ apply lag，**lag > 2s（= A6 时序预算）即停用本地缓存路径、降�
 ### 6.2 拓扑（deploy/e2e.yml，三网隔离——单网段会让「模拟不可信公网」名不副实）
 
 ```
-网络划分（关键：服务器对 chmlpub 不可直连，杜绝实现走直连回退骗过断言）：
-  chmlpub  172.28.0.0/24  bridge，模拟不可信公网——只挂 frps 与 frpc 边车与 client；只有密文流经它
+网络划分（关键：Frp 形态的 server-a/b 对 chmlpub 不可直连，杜绝实现走直连回退骗过断言；
+server-c 故意以 Direct 形态直挂 chmlpub——两种 listener mode 同拓扑共存，验证硬约束）：
+  chmlpub  172.28.0.0/24  bridge，模拟不可信公网——挂 frps、frpc 边车、client、
+                          以及 Direct 形态的 server-c；密文流经它
   srvmesh  172.29.0.0/24  internal——只挂三台 server（Raft/gossip/FRWD 互连，不出公网）
-  link-a/b/c 各 /30 内联网——frpc 边车 ↔ 对应 server（边车把 server:9443 经中转暴露出去）
+  link-a/b 各 /30 内联网——frpc 边车 ↔ 对应 server（边车把 server:9443 经中转暴露出去）
 
 frps-a   [chmlpub]  原版 frps 0.71.1  :7000(frpc 控制) :23000(用户口A)
-frps-b   [chmlpub]  原版 frps 0.71.1  :7000           :23001(用户口B) :23002(用户口C)
+frps-b   [chmlpub]  原版 frps 0.71.1  :7000           :23001(用户口B)
 frpc-a   [chmlpub+link-a] frpc 0.71.1 → 注册到 frps-a，转发至 server-a:9443
 frpc-b   [chmlpub+link-b] frpc 0.71.1 → 注册到 frps-b，转发至 server-b:9443
-frpc-c   [chmlpub+link-c] frpc 0.71.1 → 注册到 frps-b(:23002)，转发至 server-c:9443
-server-a [link-a+srvmesh] chmlvpn-server :9443  tun0 VIP 100.64.0.1
-server-b [link-b+srvmesh] chmlvpn-server :9443  tun0 VIP 100.64.0.2
-server-c [link-c+srvmesh] chmlvpn-server :9443  tun0 VIP 100.64.0.3
+server-a [link-a+srvmesh]  chmlvpn-server listener.mode=Frp   tun0 VIP 100.64.0.1
+server-b [link-b+srvmesh]  chmlvpn-server listener.mode=Frp   tun0 VIP 100.64.0.2
+server-c [chmlpub+srvmesh] chmlvpn-server listener.mode=Direct（缺省）:9443 直挂公网
+                                                                  tun0 VIP 100.64.0.3
          （C 为 Raft 仲裁 voter：2 节点 Raft 容错为 0，故障切换断言需 3 voter——
-           对题目「服务端×2 各挂中转」的必要扩展，理由见 §4）
+           对题目「服务端×2 各挂中转」的必要扩展，理由见 §4；第四轮起 C 兼任
+           Direct 形态样板：无 frpc 边车、无 frp 进程，接入端点=172.28.0.22:9443）
 client-1 [chmlpub] chmlvpn-client  tun0 VIP 100.64.0.11  ——配置钉死经 frps-a:23000 接入
 client-2 [chmlpub] chmlvpn-client  tun0 VIP 100.64.0.12  ——配置钉死经 frps-b:23001 接入
+client-3 [chmlpub] chmlvpn-client  tun0 VIP 100.64.0.13  ——配置钉死直连 172.28.0.22:9443
          （钉死映射是断言语义要求：A2 的 client-1↔client-2 互 ping 必然跨服（server-a↔server-b
            的 ForwardEnvelope 路径），不能让两 client 连同一服务器绕过跨服转发面）
 （client-N 可复制；全部 chmlvpn 容器 --cap-add NET_ADMIN --device /dev/net/tun，MTU 1280）
 ```
 
-服务端容器内：`chmlvpn-server` 监听 :9443（仅 link 网可达）；frpc 边车经中转把 9443 暴露成
-frps 用户口 23000/23001/23002；客户端只配置中转端点、拨 `frps-a:23000` / `frps-b:23001`
-（= 模拟「不同中转节点接入」）。生产形态中 frpc 是 server 进程内子进程（§3.9），测试拓扑用
-独立边车容器只是组网需要——同一 Supervisor 代码两种部署。
+服务端容器内：`chmlvpn-server` 监听 :9443——server-a/b 仅 link 网可达（经 frpc 边车暴露成
+frps 用户口 23000/23001）；server-c 以 Direct 形态直接监听 chmlpub 地址（**容器内无 frpc
+边车、无任何 frp 进程**）。客户端拨接入端点（直连地址或中转用户口，逻辑同构，§2.1）。
+Frp 形态生产部署中 frpc 是 server 进程内子进程（§3.9），测试拓扑用独立边车容器只是组网
+需要——同一 Supervisor 代码两种部署。
 构建：Windows 主机写码与跑主机单测；Linux 二进制在容器内构建——构建镜像的 C 工具链问题
 **本会话已实测闭环**（修订轮，附录 B-9）：`rust:1-slim-bookworm` 实测自带 `/usr/bin/cc`、
 `/usr/bin/gcc`（Debian gcc 12.2.0），且在该镜像内 `cargo add zstd@0.14 && cargo build
@@ -740,7 +782,8 @@ CI 校验 `rustc --version` ≥1.98）；若追求更稳可用完整版 `rust:1-
 | A10 | rekey 无感 | iperf3 持续负载 ≥5min，epoch 递增 ≥2 次，吞吐无 >1s 平台（P0-2） |
 | A11 | 压缩默认关 | 默认配置抓记录长度=原始+常数开销；开压缩档后非膨胀回退生效（P0-4） |
 | A12 | 抗重放（单元级注入） | 会话层注入重复/回退计数记录被拒且计入伪造限额（M1 单测在 M5 复跑入口） |
-| A13 | 无直连回退（拓扑有效性） | 从 client-1 容器 `timeout 2 bash -c '</dev/tcp/172.28.0.20/9443'` 等 3 台 server 的 chmlpub 直连全部失败（server 不挂 chmlpub ⇒ 必须失败，否则 A1/A5 的「经中转」语义已被绕过） |
+| A13 | 无直连回退（拓扑有效性，Frp 形态服务器） | 从 client-1 容器 `timeout 2 bash -c '</dev/tcp/172.28.0.20/9443'`、`…/172.28.0.21/9443` 对 server-a/b 的 chmlpub 直连失败（两台不挂 chmlpub ⇒ 必须失败，否则 A1/A5 的「经中转」语义已被绕过；server-c 除外——它是 Direct 形态，本就该直达，由 A16 正面断言） |
+| A16 | Direct 形态（硬约束守门） | client-3 直连 `172.28.0.22:9443` 完成 1-RTT 握手（同一 ServerEntry 材料体系）且 ping 100.64.0.3 通；client-1/2 ↔ client-3 互 ping 通（Direct↔Frp 跨服转发同构）；server-c 容器内 `pgrep -f frp` 无任何进程、无 frpc 边车容器（Direct 模式零 frp 逻辑的运行时证明） |
 | A14 | 跨服转发面 + 源 VIP 校验 | client-1（挂 server-a）↔client-2（挂 server-b）互 ping 的抓包计数：server-a 的 FRWD 流出现 ForwardEnvelope（非零计数），且 kill srvmesh 连接后互 ping 断、本服 ping server-a 仍通（隔离跨服面故障）；另以 client-1 内 `hping3/scapy` 伪造 src=100.64.0.12（client-2 的 VIP）发包 ⇒ server-a 丢包计数递增、client-2 收不到（§2.2 第 0 步源 VIP 绑定校验） |
 | A15 | 租约陈旧容错 | 迁移 client-2 配置从 frps-b 切到 frps-a 并重启（新端点握手同样 1-RTT），旧租约窗口内 client-1→client-2 丢包 ≤ 租约 TTL(30s)+反熵(5s) 后恢复（§2.2 容错策略：NOT_HERE→location_query 重定向路径被走到，FRWD 计数可见重定向帧） |
 
@@ -773,10 +816,18 @@ P2-11/12/13（协议库部分）。
 - `cargo clippy -p chml-protocol --all-features -- -D warnings` 通过。
 
 ### M2 服务端（app/chmlvpn-server + chml-frpc，单服形态）
-范围：监听器/控制流/OPAQUE 登录+锚/设备注册（本地 NetState 适配器：redb 单机版，接口与
-chml-sync 相同）/frpc 托管双栈/配置生成 golden-file。
+范围：监听器（ListenerMode：Direct 缺省 / Frp）/控制流/OPAQUE 登录+锚/设备注册（本地
+NetState 适配器：redb 单机版，接口与 chml-sync 相同）/frpc 托管双栈（仅 Frp 模式装配）/
+配置生成 golden-file。
 完成标准：
-- `docker compose -f deploy/m2.yml up -d --build`（1 frps + 1 server + 1 client 骨架）起稳；
+- `docker compose -f deploy/m2.yml up -d --build`（1 frps + 1 server(Frp 模式) + 1 client
+  骨架）起稳；
+- **直连冒烟变体（硬约束守门，第四轮新增）**：`docker compose -f deploy/m2-direct.yml up
+  -d --build` 起稳——**无 frps 容器**，server 以 `listener.mode = Direct` 监听并映射到
+  宿主端口，client 直连该端口跑完与 m2.yml 完全相同的 smoke 断言集（`cargo test -p
+  chmlvpn-server --test smoke -- --ignored --direct` 或等效 env 切换端点）；并断言
+  Direct 形态 server 容器内 `pgrep -f frp` 无进程、Supervisor 未实例化（Direct 代码路径
+  零 frp 逻辑的运行时证明）；
 - `cargo test -p chmlvpn-server --test smoke -- --ignored`（对容器实跑）断言：
   邀请文件（含静态混合公钥）→1-RTT 首连→OPAQUE 登录→key-bind（签名校验路径）→设备出现
   在注册表→SR-SIG1 请求验签通过→吊销后握手被拒；
@@ -824,7 +875,7 @@ chml-sync 相同）/frpc 托管双栈/配置生成 golden-file。
   5s，期间注入吊销 ⇒ 该 follower 拒用缓存（降级线性一致读）且新握手被拒（§4 陈旧读边界）。
 
 ### M5 Docker 多机实测（deploy/e2e.yml + e2e_assert.sh）
-范围：§6.2 全拓扑（三网隔离 + 接入映射钉死）+ §6.3 断言 A1–A15。
+范围：§6.2 全拓扑（三网隔离 + 接入映射钉死 + Direct/Frp 混布）+ §6.3 断言 A1–A16。
 完成标准：`docker compose -f deploy/e2e.yml up -d --build && deploy/e2e_assert.sh` 全 PASS，
 脚本输出逐项 PASS/FAIL 汇总（A5/A6/A7/A15 允许显式重试窗口内通过）。
 **桌面真机手工清单（M5 验收必填项，主机执行非容器）**：
@@ -868,6 +919,7 @@ ChmlFrp 节点）；移动端（Android/iOS）真机（M3 后独立排期，接�
 | R23 | 未兑换邀请文件泄露 = expiry 内被抢先兑换一次入网 | §1.3.3f 邀请一生 | invite_id 进 Raft 单次消费（二次拒）+ revoke_invite 吊销 + expiry 默认 7 天 + 文件按一次性凭据管理（0600） | 抢先兑换窗口存在（与 innernet 同边界），部署文档明示 |
 | R24 | follower 落后（分区恢复/追赶）时本地缓存放行已吊销设备 | §4 读与缓存的陈旧读边界披露 | apply-lag >2s 熔断本地缓存、降级线性一致读 + 票据 epoch/TTL 60s 兜底；M4 落后 5s 用例 | 熔断阈值内的 ≤2s 放行窗口与 A6 预算一致（健康前提显式化） |
 | R25 | 多服务器钉扎模型三选一的坑（共享密钥毁逐服务器封装/逐台 TOFU 不可扩展/切换降 2-RTT） | §1.3.3f 定型理由（第三轮评审 blocking） | 方案②：客户端锚定集群根公钥 + 根签 ClusterDirectory 全套材料（端点↔材料映射同签防拼接）；换钥=根签新条目+dir_pull，任意端点 1-RTT | 根密钥泄露=全网重引导（与 R19 同灾难路径） |
+| R26 | 架构强绑 frp 致直连场景多余进程/故障面（可直连的服务器被迫跑 frpc：多余子进程、配置生成、ChmlFrp 三退守护、中转带宽瓶颈与故障点） | 用户硬约束（第四轮，§0）——**已消除**：ListenerMode `Direct` 缺省、Direct 代码路径不触碰 chml-frpc；frp 降级为「无公网 IP/不可直连」场景的可选适配器（§2.1/§2.2/§3.11/§5） | 守门断言：M2 `m2-direct.yml` 直连冒烟（无 frps、容器内无 frp 进程）+ M5 A16（Direct/Frp 同拓扑混布） | — |
 
 ---
 
@@ -890,7 +942,7 @@ ChmlFrp 节点）；移动端（Android/iOS）真机（M3 后独立排期，接�
 | P2-13 | nonce 长度文档回改（以实现为准 16B/32hex） | §1.3.2（库文档+showroom 侧迁移说明） | M1 |
 | ★VPN-14 | tun 数据面接口（帧化/tun-rs/rtnetlink/MTU 1280/移动 fd 缝） | §3.6 `PacketChannel` + §3.12 `TunDevice` 接缝 + §2.3 | M3 |
 | ★VPN-15 | 多主多活同步接口（强一致状态机/gossip 租约/票据下放/重封装权限点） | §3.10 `chml-sync` + §4（含集群准入/rewrap 授权）+ §2.4 + §2.2（票据契约/吊销传播界/跨服转发面） | M4 |
-| ★VPN-16 | frp 中转适配接口（心跳/断链重连/不依赖半关闭/单隧道多会话/frpc 双栈托管） | §1.4（协议侧约束）+ §3.9 `chml-frpc` + §5 | M2/M5 |
+| ★VPN-16 | frp 中转适配接口（心跳/断链重连/不依赖半关闭/单隧道多会话/frpc 双栈托管）——**可选适配器非前提：Direct 缺省零 frp 逻辑（§0 硬约束/§3.11）** | §1.4（协议侧约束，直连/中转同构）+ §3.9 `chml-frpc`（仅 Frp 模式装配）+ §5 + §2.1 接入端点模型；守门=M2 m2-direct + M5 A16 | M2/M5 |
 
 ## 附录 B：本会话执行的核实（命令与关键输出）
 
@@ -965,3 +1017,19 @@ ChmlFrp 节点）；移动端（Android/iOS）真机（M3 后独立排期，接�
      一次性 location_query，杜绝 Raft 写风暴与双源不一致）；**邀请一生 + 开户流程**定死
      （invite_id 进 Raft 单次消费、revoke_invite、expiry 默认 7 天、用户/设备/口令三分离，
      R23；M2 开户测试）。
+
+- 2026-11-01 第四轮（**用户硬约束：ChmlVPN 不得与 frp/chmlfrp 强绑定**，最高优先级）：
+  1. §0 增硬约束声明并改分层图（接入端点 = Direct 缺省 / Frp 可选，frp 只服务「服务端无
+     公网 IP 或客户端不可直连」场景，可直连时不执行任何 frp 逻辑）。
+  2. §2.1/§2.2 接入端点模型：每台服务器一个接入端点，`server.toml` `listener.mode`
+     二选一、**Direct 缺省**；同一集群可混布；两种形态对协议层同构。
+  3. §3.11 `ListenerMode` 接缝（Direct 直接监听零 frp 逻辑 / Frp(RelaySpec) 走 Supervisor），
+     Direct 分支不实例化 Supervisor、不生成配置、无 chml-frpc 类型引用；§3.9/§5 标注
+     「仅 Frp 模式装配、可选适配器非前提」。
+  4. §1.3.3f/§3.8：`ServerEntry.relay_endpoint` 更名 `access_endpoint`（+endpoint_form
+     标注），语义=接入端点（直连地址或中转用户口，客户端无感知差异）；客户端选路/探活不变。
+  5. §6/§7：M2 新增直连冒烟变体 `deploy/m2-direct.yml`（无 frps、宿主映射直连、容器内
+     pgrep frp 为空）；§6.2 server-c 改 Direct 形态直挂 chmlpub（去 frpc-c 边车）+ 新增
+     client-3 直连；A13 收窄为仅 Frp 形态 server-a/b；新增 A16（Direct 会话连通 + 容器内
+     无 frp 进程 + Direct↔Frp 跨服转发同构）；M5 断言范围 A1–A16；R 表新增 R26（本约束
+     消除的风险）。A2/A5/A15 语义核对不受影响（client-1/2 的接入映射与跨服路径未变）。

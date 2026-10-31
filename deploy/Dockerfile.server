@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1
+# chmlvpn-server —— Frp 模式镜像（docs/design.md §7-M2：m2.yml 的 server 服务）。
+#
+# 依赖层缓存：先只拷 manifest + stub 源构建依赖层，再拷真实源重编——源码改动不重拉依赖。
+# 前置：deploy/prepare-frp-bin.sh（把 .tmp/frp_0.71.1_linux_amd64/frpc 拷进 deploy/build/）。
+# 直连变体用 Dockerfile.server-direct（镜像内连 frpc 二进制都没有）。
+
+FROM rust:1.98-slim AS builder
+# zstd-sys（chml-protocol 默认档）含 C 源，需要 gcc
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/chml-protocol/Cargo.toml crates/chml-protocol/
+COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
+COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
+# —— 依赖层（stub 源）——
+RUN mkdir -p crates/chml-protocol/src crates/chml-frpc/src app/chmlvpn-server/src \
+ && echo 'pub fn _stub() {}' > crates/chml-protocol/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
+ && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
+ && echo 'fn main() {}' > app/chmlvpn-server/src/main.rs \
+ && cargo build --release --locked -p chmlvpn-server \
+ && rm -rf target/release/deps/chmlvpn_server* target/release/deps/chmlvpn_server_lib* \
+          target/release/deps/chml_protocol* target/release/deps/chml_frpc* \
+ && rm -f target/release/chmlvpn-server
+
+# —— 源码层 ——
+COPY crates/chml-protocol/src crates/chml-protocol/src
+COPY crates/chml-frpc/src crates/chml-frpc/src
+COPY app/chmlvpn-server/src app/chmlvpn-server/src
+RUN touch crates/chml-protocol/src/lib.rs crates/chml-frpc/src/lib.rs \
+      app/chmlvpn-server/src/lib.rs app/chmlvpn-server/src/main.rs \
+ && cargo build --release --locked -p chmlvpn-server
+
+FROM debian:bookworm-slim
+# procps：§7-M2 的 Direct 形态断言（容器内 pgrep -f frp 无进程）需要 pgrep
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends procps \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/chmlvpn-server /usr/local/bin/chmlvpn-server
+# 原版 frpc v0.71.1 定版二进制（deploy/build/frpc；.tmp 拷入，见 prepare-frp-bin.sh）
+COPY deploy/build/frpc /usr/local/bin/frpc
+RUN chmod +x /usr/local/bin/frpc && mkdir -p /var/lib/chmlvpn
+COPY deploy/server-frp.toml /etc/chmlvpn/server.toml
+ENTRYPOINT ["/usr/local/bin/chmlvpn-server"]
+CMD ["--config", "/etc/chmlvpn/server.toml"]

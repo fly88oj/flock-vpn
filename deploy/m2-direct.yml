@@ -1,0 +1,25 @@
+# m2-direct.yml —— M2 直连路径（docs/design.md §7-M2「直连冒烟变体」，§2.1 硬约束守门）。
+#
+#   docker compose -f deploy/m2-direct.yml up -d --build     # 无需 prepare（零 frp 资产）
+#   cargo test -p chmlvpn-server --test smoke -- --ignored direct
+#
+# 仅 server 容器：无 frps 容器、无 frpc 进程、镜像内无 frp 二进制
+# （Dockerfile.server-direct）。宿主直连映射口：9443 主端点 + 9444→9443 第二暴露口。
+
+name: chmlvpn-m2-direct
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server-direct
+    image: chmlvpn/server:m2-direct
+    ports:
+      - "9443:9443"
+      - "9444:9443"   # 第二暴露口 = 同一容器端口的第二宿主映射（换端点模拟，§7-M2）
+    volumes:
+      - server-state:/var/lib/chmlvpn
+    restart: unless-stopped
+
+networks:
+  default: {}

@@ -1,0 +1,8 @@
+# Docker build context 裁剪（server 镜像 context = 仓库根；保持小，§7-M2）。
+# 注意：deploy/build/frpc 不排除——Dockerfile.server 需要 COPY 它（未 prepare 时该文件
+# 缺失 ⇒ frp 镜像构建明确失败并提示跑 prepare-frp-bin.sh；direct 镜像不受影响）。
+target/
+.tmp/
+.git/
+docs/
+*.md

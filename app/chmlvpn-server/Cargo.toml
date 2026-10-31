@@ -1,0 +1,32 @@
+[package]
+name = "chmlvpn-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ChmlVPN 服务端装配（单服形态）：TCP :9443 E2E 会话 + 控制流（OPAQUE 登录锚/票据/设备注册表）+ ListenerMode 直连|frp（docs/design.md §2.2/§3.11/§7-M2）"
+
+[dependencies]
+chml-protocol = { path = "../../crates/chml-protocol", features = ["anchor"] }
+chml-frpc = { path = "../../crates/chml-frpc" }
+# 控制流消息编码（§2.2：yamux stream0 postcard）与 server.toml 反序列化。
+postcard = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+redb = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+futures = { workspace = true }
+# 每入连一会话任务 + accept 循环 + admin loopback 端点：workspace tokio 之上加多线程 rt。
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+# 集成测试（tests/control_flow.rs 全链 in-process）多线程运行时。
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
+
+# Direct 模式零 frp 逻辑（§2.1/§3.11 硬约束）：chml-frpc 的类型只允许出现在 src/frp.rs
+# （Frp 分支装配）与 src/config.rs 的 FrpPlan 字段；Direct 代码路径（listener.rs 的
+# Direct 分派、server.rs 的 accept/会话/控制流）不引用之——tests/listener_mode.rs 以
+# 「Direct 起服后 frp run 目录不存在、监听句柄为 Direct 变体」做运行时守门。

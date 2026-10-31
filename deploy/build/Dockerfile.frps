@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1
+# frps（原版 v0.71.1 定版，docs/design.md §5/§7-M2：m2.yml 的中转节点）。
+#
+# build context = deploy/build/（仅 frps 二进制 + frps.toml，保持小）。
+# 二进制由 deploy/prepare-frp-bin.sh 从 .tmp/frp_0.71.1_linux_amd64/ 拷入。
+# frps 为静态 Go 二进制 ⇒ scratch 基底即可。
+
+FROM scratch
+COPY frps /usr/local/bin/frps
+COPY frps.toml /etc/frps.toml
+ENTRYPOINT ["/usr/local/bin/frps", "-c", "/etc/frps.toml"]

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/chml-protocol", "crates/chml-frpc"]
+members = ["crates/chml-protocol", "crates/chml-frpc", "app/chmlvpn-server"]
 
 # 布局与成员规划见 docs/design.md §1.1：
-# crates/chml-sync 与 app/chmlvpn-server、chmlvpn-client 按里程碑（§7）陆续挂入。
+# crates/chml-sync 与 chmlvpn-client 按里程碑（§7）陆续挂入。
 
 [workspace.package]
 version = "0.1.0"
@@ -41,6 +41,11 @@ tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "ma
 futures = "0.3"
 # chml-frpc（§3.9/M2）：原版 frpc TOML 只读解析 + admin basic auth 编码。
 toml = "0.9"
+# chmlvpn-server（§3.11/M2）：控制流消息（yamux stream0）postcard 编码 + server.toml 反序列化。
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+# 单服 NetState 适配器（§3.11/M2：redb 单机版，接口与 M4 chml-sync 对齐，§3.10）。
+redb = "3"
 
 # 性能归因参考 showroom workspace 的 [profile.test] opt-level=1（docs/research/showroom-analysis §3：
 # 8MiB aes-gcm 在 -O0 0.61s vs -O1 0.013s，46×）。

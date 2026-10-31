@@ -360,6 +360,173 @@ pub fn server_login_finish(state_bytes: &[u8], ke3_b64: &str) -> PakeResult<()> 
     Ok(())
 }
 
+// ============================================================================
+// anchor：OPAQUE 登录的服务端身份签名层（§1.3.3f / §3.4，P0-5 登录锚）
+// ============================================================================
+
+#[cfg(feature = "anchor")]
+mod anchor {
+    use super::{login_finish_profile, ClientLogin, PakeResult, Profile, Suite};
+    use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+
+    /// anchor 签名域分离标签。
+    pub const ANCHOR_LABEL: &[u8] = b"chml-protocol/pake/anchor/v1";
+
+    /// 客户端对 OPAQUE 登录的期望服务端身份（来自隧道层钉扎 ServerPin：
+    /// cluster_root_pub 背书的 entry.identity_pub / server_id）。
+    #[derive(Debug, Clone)]
+    pub struct AnchorExpectation {
+        /// 期望服务器标识（16B）。
+        pub server_id: [u8; 16],
+        /// 期望服务器身份 Ed25519 公钥（anchor 验签锚）。
+        pub identity_pub: VerifyingKey,
+        /// 登录会话的一次性绑定凭据（key-bind 消费；进 anchor 签名防截获重挂）。
+        pub bind_token: [u8; 16],
+    }
+
+    /// anchor 签名覆盖的规范化字节：`ANCHOR_LABEL ‖ server_id ‖ user ‖ ke2_b64 ‖ bind_token`
+    /// （§1.3.3f：签名覆盖 SERVER_ID‖user‖ke2 transcript‖bind_token）。user 变长 ⇒ 前置
+    /// 长度域，防拼接歧义。
+    pub fn anchor_canonical_bytes(
+        server_id: &[u8; 16],
+        user: &str,
+        ke2_b64: &str,
+        bind_token: &[u8; 16],
+    ) -> Vec<u8> {
+        let mut v = Vec::with_capacity(ANCHOR_LABEL.len() + 16 + 4 + user.len() + ke2_b64.len() + 16);
+        v.extend_from_slice(ANCHOR_LABEL);
+        v.extend_from_slice(server_id);
+        v.extend_from_slice(&(user.len() as u32).to_le_bytes());
+        v.extend_from_slice(user.as_bytes());
+        v.extend_from_slice(ke2_b64.as_bytes());
+        v.extend_from_slice(bind_token);
+        v
+    }
+
+    /// 服务端侧签发（服务器身份 Ed25519 密钥 = 隧道层 `ServerIdentity::identity`）。
+    pub fn anchor_sign(
+        server_identity: &SigningKey,
+        server_id: &[u8; 16],
+        user: &str,
+        ke2_b64: &str,
+        bind_token: &[u8; 16],
+    ) -> Signature {
+        server_identity.sign(&anchor_canonical_bytes(server_id, user, ke2_b64, bind_token))
+    }
+
+    /// 客户端侧 anchor 版 login-finish（§3.4 `login_finish_anchored`）：
+    /// ① 以期望身份（钉扎 ServerEntry）验 anchor 签名——不符即拒（RFC 9807 aPAKE 模型要求
+    /// 客户端持有已认证服务端身份；防「持 OPRF key 的伪服务器」对登录的静默替身）；
+    /// ② 通过后执行常规 [`super::login_finish_profile`]（ke3 产出；错密码本地 Err）。
+    pub fn login_finish_anchored(
+        state: ClientLogin<Suite>,
+        pw: &str,
+        user: &str,
+        ke2_b64: &str,
+        profile: Profile,
+        expect: &AnchorExpectation,
+        anchor_sig: &[u8; 64],
+    ) -> PakeResult<String> {
+        let sig = Signature::from_bytes(anchor_sig);
+        let bytes = anchor_canonical_bytes(&expect.server_id, user, ke2_b64, &expect.bind_token);
+        expect
+            .identity_pub
+            .verify(&bytes, &sig)
+            .map_err(|e| format!("anchor: server identity signature rejected: {e}"))?;
+        login_finish_profile(state, pw, user, ke2_b64, profile)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::*;
+        use super::*;
+        use rand::rngs::OsRng;
+
+        // 正向：注册→登录（anchor 验签）往返
+        #[test]
+        fn anchored_login_roundtrip() {
+            let mut rng = OsRng;
+            let setup = server_setup_load(&server_setup_new(&mut rng)).unwrap();
+            let (cstate, m1) = reg_start(&mut rng, "bob", "bob").unwrap();
+            let m2 = server_reg_start(&setup, &m1, "bob").unwrap();
+            let record =
+                server_reg_canonical(&reg_finish(&mut rng, cstate, "bob", "bob", &m2).unwrap()).unwrap();
+            let rec = server_record_from_b64(&record).unwrap();
+
+            // 服务端身份（隧道层 ServerIdentity 的 identity 密钥）
+            let srv_sk = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+            let server_id: [u8; 16] = rand::random();
+            let bind_token: [u8; 16] = rand::random();
+
+            let (lstate, ke1) = login_start(&mut rng, "bob", "bob").unwrap();
+            let (ke2, pending) =
+                server_login_start(&mut rng, &setup, Some(&rec), &ke1, "bob").unwrap();
+            let sig = anchor_sign(&srv_sk, &server_id, "bob", &ke2, &bind_token);
+            let ke3 = login_finish_anchored(
+                lstate,
+                "bob",
+                "bob",
+                &ke2,
+                Profile::default(),
+                &AnchorExpectation {
+                    server_id,
+                    identity_pub: srv_sk.verifying_key(),
+                    bind_token,
+                },
+                &sig.to_bytes(),
+            )
+            .unwrap();
+            server_login_finish(&pending, &ke3).unwrap();
+        }
+
+        // 负向：anchor 签名来自攻击者密钥（伪服务器）⇒ login_finish_anchored 拒绝（ke3 不产生）
+        #[test]
+        fn anchored_login_rejects_forged_anchor() {
+            let mut rng = OsRng;
+            let setup = server_setup_load(&server_setup_new(&mut rng)).unwrap();
+            let (cstate, m1) = reg_start(&mut rng, "carol", "carol").unwrap();
+            let m2 = server_reg_start(&setup, &m1, "carol").unwrap();
+            let record =
+                server_reg_canonical(&reg_finish(&mut rng, cstate, "carol", "carol", &m2).unwrap())
+                    .unwrap();
+            let rec = server_record_from_b64(&record).unwrap();
+
+            let srv_sk = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+            let attacker = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+            let server_id: [u8; 16] = rand::random();
+            let bind_token: [u8; 16] = rand::random();
+
+            let (lstate, ke1) = login_start(&mut rng, "carol", "carol").unwrap();
+            let (ke2, _) =
+                server_login_start(&mut rng, &setup, Some(&rec), &ke1, "carol").unwrap();
+            let expect = AnchorExpectation {
+                server_id,
+                identity_pub: srv_sk.verifying_key(),
+                bind_token,
+            };
+            // 攻击者密钥签的 anchor（伪服务器）⇒ 拒
+            let forged = anchor_sign(&attacker, &server_id, "carol", &ke2, &bind_token);
+            assert!(
+                login_finish_anchored(
+                    lstate,
+                    "carol",
+                    "carol",
+                    &ke2,
+                    Profile::default(),
+                    &expect,
+                    &forged.to_bytes()
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+#[cfg(feature = "anchor")]
+pub use anchor::{
+    anchor_canonical_bytes, anchor_sign, login_finish_anchored, AnchorExpectation, ANCHOR_LABEL,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

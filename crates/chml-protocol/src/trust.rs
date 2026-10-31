@@ -186,6 +186,24 @@ impl ClusterDirectory {
         out.extend_from_slice(&self.root_sig.to_bytes());
     }
 
+    /// 序列化（dir_pull 下发线格式，§3.8/§3.11；`[ver][cluster][dir_version][n]{entries}
+    /// [root_sig]`）。与 `InviteFile::to_bytes` 内嵌目录段同构。
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(17 + self.servers.len() * 1300);
+        self.encode(&mut v);
+        v
+    }
+
+    /// 反序列化（结构级；根验签走 [`ClusterDirectory::verify`]）。
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, TrustError> {
+        let mut rd = Rd::new(bytes);
+        let dir = Self::decode(&mut rd)?;
+        if !rd.done() {
+            return Err(TrustError::Encoding("trailing bytes"));
+        }
+        Ok(dir)
+    }
+
     fn decode(rd: &mut Rd<'_>) -> Result<Self, TrustError> {
         let ver = rd.u8()?;
         if ver != DIRECTORY_VERSION {
@@ -593,6 +611,13 @@ mod tests {
         let (root, cid) = fixture();
         let mut dir = ClusterDirectory::issue(&root, cid, 3, vec![entry(1), entry(2)]);
         assert!(dir.verify(&root.verifying_key()), "合法目录通过");
+        // to_bytes/from_bytes 往返（dir_pull 线格式，§3.11）
+        let back = ClusterDirectory::from_bytes(&dir.to_bytes()).expect("dir roundtrip");
+        assert_eq!(back.dir_version, dir.dir_version);
+        assert!(back.verify(&root.verifying_key()));
+        let mut trailing = dir.to_bytes();
+        trailing.push(0);
+        assert!(ClusterDirectory::from_bytes(&trailing).is_err(), "尾随字节 ⇒ 拒");
         // 条目被篡改（换 relay_endpoint）⇒ 验签失败
         dir.servers[0].relay_endpoint = "evil.example:9".into();
         assert!(!dir.verify(&root.verifying_key()), "条目被篡改 ⇒ 拒");
