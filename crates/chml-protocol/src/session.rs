@@ -36,6 +36,13 @@
 //! 重置；旧接收密钥保留至新密钥首条记录到达（TCP 序下 in-flight 旧记录的宽限路径）；
 //! (2^64−2^13−1 包, 180s) 硬拒绝即清零密钥断链。时钟可注入（[`SessionClock`]）。
 //!
+//! rekey 切换点（竞态修复注记，blocking 复核后定型）：INIT 处理（seal RESP + 切换）在
+//! **写泵**（唯一密封点：密封序=上线序=计数器序）；RESP 应用（切换）在**读泵同步执行**——
+//! 否则读泵会在 RESP 应用前抢先读入新纪元记录，旧钥解新钥被误判伪造并静默丢弃，且丢弃
+//! K 条后隐式计数器永久错位（单次命中即隧道死亡）。另设失步保险丝：连续
+//! [`AUTH_FAIL_STREAK`] 条认证失败 ⇒ 显式 Protocol 断链（fail-loud，不做静默丢数据的
+//! 半死状态）。
+//!
 //! # 心跳（§1.3.3d「keepalive = yamux ping 10s」的实现注记，如实声明）
 //!
 //! yamux 0.14.1 公开 API 不暴露 ping 发起（本次源码核实），10s 心跳由本层加密
@@ -86,6 +93,8 @@ pub const KEEPALIVE: Duration = Duration::from_secs(10);
 pub const FORGE_LIMIT: u32 = 100;
 /// REKEY_INIT 未获 RESP 的重试间隔（wireguard-go RekeyTimeout 节奏，crypto-2026 §6）。
 const REKEY_RETRY: Duration = Duration::from_secs(5);
+/// 失步保险丝阈值：连续认证失败达此数（且无一条成功插入）判 Protocol 断链。
+const AUTH_FAIL_STREAK: u64 = 16;
 /// 会话定时器节拍（真实时间；阈值判定用注入时钟）。
 const TIMER_TICK: Duration = Duration::from_millis(50);
 
@@ -1189,6 +1198,10 @@ struct Inner {
     pending: Option<PendingRekey>,
     forge_attempts: u64,
     replay_rejected: u64,
+    /// 连续认证失败计数（成功即清零）：失步保险丝——仅在 rekey 窗口内武装（见
+    /// open_record），连续 ≥AUTH_FAIL_STREAK 条且无一条成功 ⇒ 密钥失步/实现错误，
+    /// 显式断链（fail-loud）优于静默丢数据或半死隧道。
+    auth_fail_streak: u64,
     received: u64,
     rekeys: u64,
     last_inbound: tokio::time::Instant,
@@ -1227,6 +1240,7 @@ impl Core {
                 pending: None,
                 forge_attempts: 0,
                 replay_rejected: 0,
+                auth_fail_streak: 0,
                 received: 0,
                 rekeys: 0,
                 last_inbound: now,
@@ -1300,6 +1314,7 @@ impl Core {
             inner.last_recv_ct = Some(Sha256::digest(body).into());
             inner.recv.counter += 1;
             inner.received += 1;
+            inner.auth_fail_streak = 0;
             // 新密钥首条记录 ⇒ 对端已切换，TCP 序下不再有旧密钥在途记录。
             inner.retained_recv = None;
             return Ok(pt);
@@ -1308,10 +1323,23 @@ impl Core {
             if let Some(pt) = ret.cipher.open(ret.counter, &aad, body) {
                 ret.counter += 1;
                 inner.received += 1;
+                inner.auth_fail_streak = 0;
                 return Ok(pt);
             }
         }
         inner.forge_attempts += 1;
+        inner.auth_fail_streak += 1;
+        // 失步保险丝仅在 rekey 窗口（有 pending INIT 或 retained 旧钥未收尾）内武装：
+        // 窗口内的连续失败 = 密钥失步/实现错误 ⇒ 显式 Protocol 断链（fail-loud）；
+        // 窗口外的连续失败 = 伪造洪泛，语义归 forge_limit（P0-2：100 次断链）管。
+        if inner.auth_fail_streak >= AUTH_FAIL_STREAK
+            && (inner.pending.is_some() || inner.retained_recv.is_some())
+        {
+            let reason = CloseReason::Protocol;
+            inner.closed = Some(reason);
+            let _ = self.closed_tx.send(true);
+            return Err(SessionError::Closed(reason));
+        }
         if inner.last_recv_ct == Some(Sha256::digest(body).into()) {
             inner.replay_rejected += 1; // 字节级重复 = 重放向量（同时计入伪造）
         }
@@ -1498,10 +1526,16 @@ impl Core {
 // ============================================================================
 
 /// 读泵→写泵的控制转发（唯一串行点 = 写泵，保计数器顺序 = 实际上线顺序）。
+/// 读泵→写泵的控制转发。
+///
+/// 密封纪律（本批修复的竞态注记）：**INIT 的处理（seal RESP + 切换）留在写泵**——写泵是
+/// 唯一密封点，保证「密封序 = 上线序 = 计数器序」；**RESP 的切换（handle_rekey_resp）在
+/// 读泵同步执行**——若经通道异步转发，读泵会在写泵应用 RESP 前抢先读到新纪元记录，
+/// 旧钥解新钥 ⇒ 误判伪造并静默丢弃，且丢弃 K 条后计数器永久错位（一次命中即隧道死亡，
+/// 独立复核实测单次 rekey 丢 128KiB+ 计 18 次伪造）。
 enum CtrlCmd {
     Pong,
     PeerInit(Vec<u8>),
-    PeerResp(Vec<u8>),
 }
 
 async fn write_pump<W>(
@@ -1556,9 +1590,6 @@ async fn write_pump<W>(
                             Ok(None) => {}
                             Err(_) => break,
                         }
-                    }
-                    Some(CtrlCmd::PeerResp(p)) => {
-                        if core.handle_rekey_resp(&p).is_err() { break; }
                     }
                     None => ctrl_done = true,
                 }
@@ -1626,14 +1657,32 @@ async fn read_pump<R>(
                     }
                 }
                 RT_PING => {
+                    // PONG 周期性重发，通道满丢弃无害。
                     let _ = ctrl_tx.try_send(CtrlCmd::Pong);
                 }
                 RT_PONG => {}
                 RT_REKEY_INIT => {
-                    let _ = ctrl_tx.try_send(CtrlCmd::PeerInit(payload));
+                    // INIT 必达（RESP 由写泵密封，若丢则对端 5s 重试期间本端已切换、
+                    // 重复 INIT 被陈旧判定忽略 ⇒ 对端只能等 180s 硬拒绝）。通道满时等待
+                    // 写泵消费（closed 守卫防挂）；极端双向 socket 饱和下退化为死链检测
+                    // 断链（fail-loud），不会静默丢数据。
+                    let sent = tokio::select! {
+                        biased;
+                        _ = closed.changed() => None,
+                        res = ctrl_tx.send(CtrlCmd::PeerInit(payload)) => Some(res),
+                    };
+                    if sent.map(|r| r.is_err()).unwrap_or(true) {
+                        core.kill(CloseReason::SessionClosed);
+                        break;
+                    }
                 }
                 RT_REKEY_RESP => {
-                    let _ = ctrl_tx.try_send(CtrlCmd::PeerResp(payload));
+                    // 同步应用切换（不转发）：见 CtrlCmd 文档的密封纪律注记——
+                    // 抢在切换前读入的新纪元记录必须能立刻用新钥解开。
+                    if core.handle_rekey_resp(&payload).is_err() {
+                        core.kill(CloseReason::Protocol);
+                        break;
+                    }
                 }
                 _ => {
                     core.kill(CloseReason::Protocol);

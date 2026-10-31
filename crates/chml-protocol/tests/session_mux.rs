@@ -17,7 +17,7 @@ use chml_protocol::session::{
     fingerprint_ed25519, initiate, initiate_tofu, respond, AeadChoice, AeadPreference, ClusterId,
     CloseReason, DeviceDirectory, DeviceId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, LookupVerdict,
     ManualClock, ServerIdentity, ServerId, ServerPin, SessionError, Tunnel, TunnelConfig,
-    RT_DATA, RT_I0, RT_I1, RT_R1,
+    RT_DATA, RT_I0, RT_I1, RT_R1, RT_REKEY_RESP,
 };
 use chml_protocol::{ed25519_dalek, rand};
 
@@ -1003,4 +1003,212 @@ async fn device_directory_boxfuture_runtime_check() {
             LookupVerdict::NotFound | LookupVerdict::Revoked { .. } | LookupVerdict::Active(_)
         ));
     }
+}
+
+// ============================================================================
+// rekey 切换竞态回归向量（blocking 复核修复）
+// ============================================================================
+
+/// 帧感知批到达代理（复核实验的确定性复现形态）：s→c 逐帧转发，但 REKEY_RESP 帧与其后
+/// 3 帧合并为**一次** write 到达（TCP 无帧边界，Nagle/内核缓冲合并合法且常见）；
+/// c→s 透明。
+async fn batch_resp_proxy(client_side: DuplexStream, server_side: DuplexStream) {
+    let (mut c_rd, mut c_wr) = tokio::io::split(client_side);
+    let (mut s_rd, mut s_wr) = tokio::io::split(server_side);
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut c_rd, &mut s_wr).await;
+    });
+    tokio::spawn(async move {
+        let mut batched = false;
+        loop {
+            let mut hdr = [0u8; 5];
+            if s_rd.read_exact(&mut hdr).await.is_err() {
+                return;
+            }
+            let len = u32::from_le_bytes(hdr[..4].try_into().expect("4B")) as usize;
+            let mut body = vec![0u8; len - 1];
+            if s_rd.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            if !batched && hdr[4] == RT_REKEY_RESP {
+                // RESP + 后续 3 帧拼成一个缓冲一次写出（同批到达）
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&hdr);
+                buf.extend_from_slice(&body);
+                for _ in 0..3 {
+                    let mut h2 = [0u8; 5];
+                    if s_rd.read_exact(&mut h2).await.is_err() {
+                        break;
+                    }
+                    let l2 = u32::from_le_bytes(h2[..4].try_into().expect("4B")) as usize;
+                    let mut b2 = vec![0u8; l2 - 1];
+                    if s_rd.read_exact(&mut b2).await.is_err() {
+                        break;
+                    }
+                    buf.extend_from_slice(&h2);
+                    buf.extend_from_slice(&b2);
+                }
+                let _ = c_wr.write_all(&buf).await;
+                let _ = c_wr.flush().await;
+                batched = true;
+                continue;
+            }
+            let _ = c_wr.write_all(&hdr).await;
+            let _ = c_wr.write_all(&body).await;
+            let _ = c_wr.flush().await;
+        }
+    });
+}
+
+/// 双向数据泵：`total` 个 chunk（前 4B = LE 序号）。
+async fn bulk_send(mut s: chml_protocol::mux::Stream, total: usize, chunk: usize) {
+    for i in 0..total {
+        let mut b = vec![(i % 251) as u8; chunk];
+        b[..4].copy_from_slice(&(i as u32).to_le_bytes());
+        s.write_all(&b).await.expect("bulk send");
+    }
+}
+
+/// 收全 `total` 个 chunk：返回（收到字节数, 序号全覆盖）。
+async fn bulk_recv(mut s: chml_protocol::mux::Stream, total: usize, chunk: usize) -> (usize, bool) {
+    let mut seen = vec![false; total];
+    let mut bytes = 0usize;
+    for _ in 0..total {
+        let mut b = vec![0u8; chunk];
+        if s.read_exact(&mut b).await.is_err() {
+            break;
+        }
+        bytes += chunk;
+        let seq = u32::from_le_bytes(b[..4].try_into().expect("4B")) as usize;
+        if seq < total {
+            seen[seq] = true;
+        }
+    }
+    (bytes, seen.iter().all(|&x| x))
+}
+
+const BULK_CHUNKS: usize = 24;
+const BULK_CHUNK_LEN: usize = 16 * 1024;
+
+#[tokio::test]
+async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
+    // 复核实验的确定性复现：REKEY_RESP 与新纪元记录同批到达。修复前：读泵在写泵应用
+    // RESP 前抢先读入新纪元记录 ⇒ 旧钥解新钥 ⇒ 误判伪造 + 静默丢数据 + 计数器错位。
+    // 修复后（RESP 应用在读泵同步执行）：零伪造、零丢失、双向数据完整。
+    let fix = fixture();
+    let device = DeviceStaticKeys::generate();
+    let mut dir = InMemoryDirectory::new();
+    register(&mut dir, &device);
+
+    let clock = std::sync::Arc::new(ManualClock::new());
+    let clock_for_cfg = clock.clone();
+    let mk_cfg = move || TunnelConfig {
+        clock: clock_for_cfg.clone(),
+        keepalive: Duration::from_secs(3600), // 隔离死链判定（注入时钟一次前拨 121s）
+        ..TunnelConfig::default()
+    };
+
+    let (client_io, proxy_c) = duplex_pair();
+    let (proxy_s, server_io) = duplex_pair();
+    batch_resp_proxy(proxy_c, proxy_s).await;
+
+    let pin = pin_of(&fix);
+    let server = fix.server;
+    let s_cfg = mk_cfg();
+    let srv = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(30), respond(server_io, &server, dir, s_cfg))
+            .await
+            .expect("respond timeout")
+            .expect("respond")
+    });
+    let c_cfg = mk_cfg();
+    let cli = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(30), initiate(client_io, &device, &pin, c_cfg))
+            .await
+            .expect("initiate timeout")
+            .expect("initiate")
+    });
+    let client = cli.await.expect("cli");
+    let server = srv.await.expect("srv");
+
+    // 双向流：bulk 首块即携 yamux SYN（SYN 惰性），accept 与发送并发
+    let cs = client.open_stream(Prio::Normal).await.expect("c stream");
+    let ss2 = server.open_stream(Prio::Normal).await.expect("s stream2");
+
+    // 双向大流量写入（后台），中途触发 rekey
+    let w1 = tokio::spawn(bulk_send(cs, BULK_CHUNKS, BULK_CHUNK_LEN));
+    let w2 = tokio::spawn(bulk_send(ss2, BULK_CHUNKS, BULK_CHUNK_LEN));
+    let ss = tokio::time::timeout(Duration::from_secs(10), server.accept_stream()).await.expect("t").expect("s stream");
+    let cs2 = tokio::time::timeout(Duration::from_secs(10), client.accept_stream()).await.expect("t2").expect("c stream2");
+    tokio::time::sleep(Duration::from_millis(300)).await; // 流量进行中
+    clock.advance(Duration::from_secs(121)); // 触发 rekey（RESP 批到达竞态窗口）
+    let (r1_bytes, r1_full) = tokio::time::timeout(
+        Duration::from_secs(30),
+        bulk_recv(ss, BULK_CHUNKS, BULK_CHUNK_LEN),
+    ).await.expect("recv c→s timeout");
+    let (r2_bytes, r2_full) = tokio::time::timeout(
+        Duration::from_secs(30),
+        bulk_recv(cs2, BULK_CHUNKS, BULK_CHUNK_LEN),
+    ).await.expect("recv s→c timeout");
+    w1.await.expect("w1");
+    w2.await.expect("w2");
+
+    // rekey 完成 + 竞态断言：零伪造、零重放误判、双向零丢失
+    wait_until("双侧 epoch → 1", || client.stats().epoch == 1 && server.stats().epoch == 1).await;
+    let cst = client.stats();
+    let sst = server.stats();
+    assert_eq!(cst.forge_attempts, 0, "客户端零伪造（RESP 批到达不得误判）");
+    assert_eq!(sst.forge_attempts, 0, "服务端零伪造");
+    assert_eq!(cst.replay_rejected, 0);
+    assert_eq!(sst.replay_rejected, 0);
+    assert!(cst.closed.is_none() && sst.closed.is_none(), "会话存活");
+    assert_eq!(r1_bytes, BULK_CHUNKS * BULK_CHUNK_LEN, "c→s 全量到达（无静默丢弃）");
+    assert_eq!(r2_bytes, BULK_CHUNKS * BULK_CHUNK_LEN, "s→c 全量到达");
+    assert!(r1_full && r2_full, "序号全覆盖（无乱序/丢失）");
+
+    client.shutdown().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn rekey_under_bidirectional_bulk_traffic() {
+    // 补测试缺口：原 rekey 向量只验证 client→server 单向；本向量双向大流量下 rekey，
+    // 断言双向全量到达 + 零伪造 + 双侧纪元推进。
+    let clock = std::sync::Arc::new(ManualClock::new());
+    let cfg_clock = clock.clone();
+    let mk_cfg = move || TunnelConfig {
+        clock: cfg_clock.clone(),
+        keepalive: Duration::from_secs(3600),
+        ..TunnelConfig::default()
+    };
+    let (client, server) = session_pair_cfg(mk_cfg(), mk_cfg()).await;
+
+    let cs = client.open_stream(Prio::Normal).await.expect("c stream");
+    let ss2 = server.open_stream(Prio::Normal).await.expect("s stream2");
+    let w1 = tokio::spawn(bulk_send(cs, BULK_CHUNKS, BULK_CHUNK_LEN));
+    let w2 = tokio::spawn(bulk_send(ss2, BULK_CHUNKS, BULK_CHUNK_LEN));
+    let ss = tokio::time::timeout(Duration::from_secs(10), server.accept_stream()).await.expect("t").expect("s stream");
+    let cs2 = tokio::time::timeout(Duration::from_secs(10), client.accept_stream()).await.expect("t2").expect("c stream2");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    clock.advance(Duration::from_secs(121));
+    let (r1_bytes, r1_full) = tokio::time::timeout(
+        Duration::from_secs(30),
+        bulk_recv(ss, BULK_CHUNKS, BULK_CHUNK_LEN),
+    ).await.expect("recv c→s timeout");
+    let (r2_bytes, r2_full) = tokio::time::timeout(
+        Duration::from_secs(30),
+        bulk_recv(cs2, BULK_CHUNKS, BULK_CHUNK_LEN),
+    ).await.expect("recv s→c timeout");
+    w1.await.expect("w1");
+    w2.await.expect("w2");
+
+    wait_until("双侧 epoch → 1", || client.stats().epoch == 1 && server.stats().epoch == 1).await;
+    assert_eq!(client.stats().forge_attempts, 0, "双向流量下 rekey 零伪造");
+    assert_eq!(server.stats().forge_attempts, 0);
+    assert_eq!(r1_bytes, BULK_CHUNKS * BULK_CHUNK_LEN, "c→s 全量到达");
+    assert_eq!(r2_bytes, BULK_CHUNKS * BULK_CHUNK_LEN, "s→c 全量到达");
+    assert!(r1_full && r2_full, "序号全覆盖");
+
+    client.shutdown().await;
+    server.shutdown().await;
 }
