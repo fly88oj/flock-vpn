@@ -143,6 +143,17 @@ impl HybridKeypair {
             bytes,
         }
     }
+
+    /// 静态 X25519 私钥引用。session 握手的 split 模式（§1.3.3c：X25519(e,s_srv) 与
+    /// ML-KEM ct 分列）需要单独取 X25519 份额做 DH，故开放只读访问。
+    pub fn x25519_secret(&self) -> &StaticSecret {
+        &self.x25519
+    }
+
+    /// ML-KEM-768 解封装钥引用（同上，split 模式直取）。
+    pub fn ml_kem_decapsulation(&self) -> &DecapsulationKey<MlKem768> {
+        &self.ml_kem
+    }
 }
 
 impl fmt::Debug for HybridKeypair {
@@ -186,6 +197,16 @@ impl HybridPubkey {
     pub fn to_bytes(&self) -> [u8; HYBRID_PUB_LEN] {
         self.bytes
     }
+
+    /// X25519 公钥部分（1216B 的前 32B 对应物）。session 握手 split 模式用（§1.3.3c）。
+    pub fn x25519_public(&self) -> &PublicKey {
+        &self.x25519
+    }
+
+    /// ML-KEM-768 封装公钥部分。session 握手对服务器静态 ML-KEM 公钥封装 1088B ct 用。
+    pub fn ml_kem_encapsulation(&self) -> &EncapsulationKey<MlKem768> {
+        &self.ml_kem
+    }
 }
 
 impl fmt::Debug for HybridPubkey {
@@ -223,6 +244,13 @@ impl fmt::Debug for HybridCt {
 /// 公钥指纹：SHA-256(1216B 规范化公钥)。钉扎/展示用（§3.8 展示格式 = 8 组 hex）。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Fingerprint([u8; 32]);
+
+impl Fingerprint {
+    /// 由既有 32B 摘要构造（session 侧对集群根/身份 Ed25519 公钥的指纹复用同一展示格式）。
+    pub fn from_digest(bytes: [u8; 32]) -> Self {
+        Fingerprint(bytes)
+    }
+}
 
 impl Fingerprint {
     /// 原始 32B。
@@ -303,9 +331,9 @@ fn combine(x_ss: &[u8], ml_ss: &[u8]) -> SealedShared {
 /// rand 0.9 → rand_core 0.10 私有桥（ml-kem / x25519-dalek 3.0 的 RNG 代际）。
 /// 目标侧要求不可失败（rc010 CryptoRng ⇒ Error=Infallible），故内层熵源故障直接 panic
 /// （同 rand_core `UnwrapErr` 适配器语义）。
-struct RngBridge<'a, R: rand::TryRngCore + ?Sized>(&'a mut R);
+pub(crate) struct RngBridge<'a, R: rand::TryRngCore + ?Sized>(&'a mut R);
 
-fn bridge<R: rand::TryRngCore + ?Sized>(rng: &mut R) -> RngBridge<'_, R> {
+pub(crate) fn bridge<R: rand::TryRngCore + ?Sized>(rng: &mut R) -> RngBridge<'_, R> {
     RngBridge(rng)
 }
 
