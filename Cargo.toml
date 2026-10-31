@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/chml-protocol"]
+members = ["crates/chml-protocol", "crates/chml-frpc"]
 
 # 布局与成员规划见 docs/design.md §1.1：
-# crates/chml-frpc、chml-sync 与 app/chmlvpn-server、chmlvpn-client 按里程碑（§7）陆续挂入。
+# crates/chml-sync 与 app/chmlvpn-server、chmlvpn-client 按里程碑（§7）陆续挂入。
 
 [workspace.package]
 version = "0.1.0"
@@ -39,6 +39,8 @@ chacha20poly1305 = "0.11.0"
 aes-gcm-siv = "0.12.1"
 tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "macros"] }
 futures = "0.3"
+# chml-frpc（§3.9/M2）：原版 frpc TOML 只读解析 + admin basic auth 编码。
+toml = "0.9"
 
 # 性能归因参考 showroom workspace 的 [profile.test] opt-level=1（docs/research/showroom-analysis §3：
 # 8MiB aes-gcm 在 -O0 0.61s vs -O1 0.013s，46×）。
