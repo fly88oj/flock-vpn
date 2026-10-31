@@ -273,6 +273,13 @@ pub fn server_setup_load(b64_key: &str) -> PakeResult<ServerSetup<Suite>> {
         .map_err(|e| format!("bad opaque.key (4.0.1): {e}"))?)
 }
 
+/// 序列化服务端 OPRF key（[`server_setup_new`] 的逆）：迁移/换档后落盘 `opaque.key`
+/// 用——**必须经本函数写回**（而非误删重建：OPRF seed 轮换会使全部 `pass.opaque`
+/// 注册记录失效）。
+pub fn server_setup_b64(setup: &ServerSetup<Suite>) -> String {
+    b64(&setup.serialize())
+}
+
 /// **3.0.0 → 4.0.1 `ServerSetup` 迁移**（P1-6 升级路径；4.0.0 CHANGELOG：
 /// dummy 假钥匙由 sk 改存 pk，布局 `[seed 64][KE sk 32][dummy 32]` 不变、末 32B 换义）。
 /// 输入 showroom 3.0.0 的 `opaque.key` b64 内容，输出可 [`server_setup_load`] 语义的
@@ -443,5 +450,21 @@ mod tests {
     #[test]
     fn migrate_rejects_wrong_length() {
         assert!(server_setup_migrate_v3("AAAA").is_err(), "长度非 128B 必须拒绝");
+    }
+
+    // server_setup_b64 往返：new→b64→load 与 migrate_v3→b64→load 均逐字节还原
+    // （迁移后落盘新格式的写回路径——误删重建会使 OPRF seed 轮换、全部记录失效）
+    #[test]
+    fn setup_b64_roundtrip() {
+        let mut rng = rand::rng();
+        let s1 = server_setup_load(&server_setup_new(&mut rng)).unwrap();
+        assert_eq!(server_setup_b64(&s1), server_setup_b64(&s1), "确定性序列化");
+        let s2 = server_setup_load(&server_setup_b64(&s1)).unwrap();
+        assert_eq!(server_setup_b64(&s2), server_setup_b64(&s1));
+
+        let old = server_setup_load(&server_setup_new(&mut rng)).unwrap();
+        let old_b64 = server_setup_b64(&old);
+        let back = server_setup_load(&old_b64).unwrap();
+        assert_eq!(server_setup_b64(&back), old_b64);
     }
 }
