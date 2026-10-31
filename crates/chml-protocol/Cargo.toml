@@ -23,7 +23,10 @@ hex = { workspace = true }
 rsa = { workspace = true, optional = true }
 opaque-ke = { workspace = true }
 argon2 = { workspace = true }
-zstd = { workspace = true }
+# zstd 档 optional（feature `zstd`，默认开）：zstd-sys 含 C 源，交叉 wasm32 需 clang；
+# 无 C 工具链环境（如 rust:1-bookworm 容器）可关 default-features 编译核心协议面
+# （lz4_flex 纯 Rust 恒可用）。showroom 的 wasm 依赖声明 default-features=false 即此形态。
+zstd = { workspace = true, optional = true }
 lz4_flex = { workspace = true }
 # session/mux 批次（§1.3.3c/§1.3.3d / §3.5/§3.6）
 yamux = { workspace = true }
@@ -55,7 +58,10 @@ name = "aead"
 harness = false
 
 [features]
-default = []
+# 默认开 zstd 档（ChmlVPN 全量行为不变）；default-features=false 的引用方（showroom wasm）
+# 显式关闭后 compress 模块仅 lz4 纯 Rust 档、wasm32 构建零 C 依赖。
+default = ["zstd"]
+zstd = ["dep:zstd"]
 # —— feature 划分按 docs/design.md §1.3.1 ——
 # 默认（无具名 feature）＝全 VPN 档：sig / kem（混合 KEM）/ envelope v2 / pake / compress /
 # session / mux。trust 模块按后续里程碑批次加入默认档。

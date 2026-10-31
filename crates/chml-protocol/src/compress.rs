@@ -28,7 +28,7 @@ pub const PASSTHROUGH_MIN: usize = 128;
 /// 帧头长度。
 pub const FRAME_HEADER_LEN: usize = 13;
 
-/// 帧错误三态：格式非法 / 尾填充非零 / 解压失败（含长度不符）。
+/// 帧错误：格式非法 / 尾填充非零 / 解压失败（含长度不符）/ 裁剪构建缺能力。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompressError {
     /// 帧头截断/长度越界/保留位非零。
@@ -37,6 +37,8 @@ pub enum CompressError {
     BadPadding,
     /// 解压失败或 orig_len 不符。
     DecompressFailed,
+    /// 裁剪构建缺所需能力（如关闭 `zstd` feature 后解到算法 id 0 的 zstd 帧）。
+    MissingFeature(&'static str),
 }
 
 impl fmt::Display for CompressError {
@@ -45,6 +47,7 @@ impl fmt::Display for CompressError {
             CompressError::MalformedFrame(m) => write!(f, "compress frame: {m}"),
             CompressError::BadPadding => f.write_str("compress frame: non-zero padding bytes"),
             CompressError::DecompressFailed => f.write_str("compress frame: decompress failed"),
+            CompressError::MissingFeature(m) => write!(f, "compress frame: {m}"),
         }
     }
 }
@@ -76,12 +79,22 @@ pub enum PadPolicy {
 }
 
 /// 压缩算法（lz4_flex 0.14 = CPU 受限端备选，compression-2026 §0）。
+///
+/// `zstd` feature（默认开）关闭时 [`Algorithm::Zstd`] 不存在、默认档为 [`Algorithm::Lz4`]，
+/// 且 [`decompress_frame`] 遇算法 id 0（zstd）的帧返回 [`CompressError::MissingFeature`]——
+/// 用于无 C 工具链目标（wasm32 交叉需 clang 编 zstd-sys）的裁剪构建。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Algorithm {
-    /// zstd 0.14.3（默认）。
+    /// zstd（默认档；`zstd` feature 专属）。
+    #[cfg(feature = "zstd")]
     #[default]
     Zstd,
-    /// lz4 块压缩（无 zstd 硬件加速/CPU 受限场景）。
+    /// lz4 块压缩（无 zstd 硬件加速/CPU 受限场景；无 `zstd` feature 时的默认档）。
+    #[cfg(not(feature = "zstd"))]
+    #[default]
+    Lz4,
+    /// lz4 块压缩（`zstd` feature 开启时的备选档）。
+    #[cfg(feature = "zstd")]
     Lz4,
 }
 
@@ -109,6 +122,7 @@ impl CompressPolicy {
     }
 }
 
+#[cfg(feature = "zstd")]
 fn zstd_level(mode: Mode) -> i32 {
     match mode {
         Mode::Archive => 19,
@@ -119,6 +133,7 @@ fn zstd_level(mode: Mode) -> i32 {
 fn flags(compressed: bool, alg: Algorithm) -> u8 {
     let c = u8::from(compressed);
     let a = match alg {
+        #[cfg(feature = "zstd")]
         Algorithm::Zstd => 0u8,
         Algorithm::Lz4 => 1u8,
     };
@@ -139,6 +154,7 @@ pub fn compress_frame(policy: &CompressPolicy, plain: &[u8]) -> Vec<u8> {
         compressed = false;
     } else {
         let candidate = match policy.alg {
+            #[cfg(feature = "zstd")]
             Algorithm::Zstd => zstd::bulk::compress(plain, zstd_level(policy.mode))
                 .expect("zstd compress: 输入长度上限内恒成功"),
             Algorithm::Lz4 => lz4_flex::block::compress(plain),
@@ -180,11 +196,19 @@ pub fn decompress_frame(frame: &[u8]) -> Result<Vec<u8>, CompressError> {
         return Err(CompressError::MalformedFrame("reserved flag bits set"));
     }
     let compressed = fl & 1 != 0;
-    let alg = match (fl >> 1) & 0b11 {
-        0 => Algorithm::Zstd,
-        1 => Algorithm::Lz4,
-        _ => return Err(CompressError::MalformedFrame("unknown algorithm id")),
-    };
+    let alg_id = (fl >> 1) & 0b11;
+    if alg_id > 1 {
+        return Err(CompressError::MalformedFrame("unknown algorithm id"));
+    }
+    #[cfg(not(feature = "zstd"))]
+    if alg_id == 0 {
+        // 线上格式位保留（0=zstd）；裁剪构建无 zstd 时显式报缺，不误报格式错。
+        return Err(CompressError::MissingFeature(
+            "algorithm zstd requires the `zstd` feature (this is a trimmed build)",
+        ));
+    }
+    #[allow(unused_variables)]
+    let alg = alg_id;
     let _dict_id = u32::from_le_bytes(frame[1..5].try_into().expect("13B header"));
     let orig_len = u32::from_le_bytes(frame[5..9].try_into().expect("13B header")) as usize;
     let payload_len = u32::from_le_bytes(frame[9..13].try_into().expect("13B header")) as usize;
@@ -202,10 +226,12 @@ pub fn decompress_frame(frame: &[u8]) -> Result<Vec<u8>, CompressError> {
 
     let out = if compressed {
         match alg {
-            Algorithm::Zstd => zstd::bulk::decompress(payload, orig_len)
+            #[cfg(feature = "zstd")]
+            0 => zstd::bulk::decompress(payload, orig_len)
                 .map_err(|_| CompressError::DecompressFailed)?,
-            Algorithm::Lz4 => lz4_flex::block::decompress(payload, orig_len)
+            1 => lz4_flex::block::decompress(payload, orig_len)
                 .map_err(|_| CompressError::DecompressFailed)?,
+            _ => unreachable!("alg id 已在上文验证 ≤1"),
         }
     } else {
         payload.to_vec()
@@ -228,6 +254,14 @@ mod tests {
 
     fn policy(mode: Mode) -> CompressPolicy {
         CompressPolicy { mode, ..CompressPolicy::default() }
+    }
+
+    /// 参与循环的算法集（`zstd` feature 关闭时仅 lz4——裁剪构建仍全量跑 lz4 路径）。
+    fn algs() -> Vec<Algorithm> {
+        #[cfg(feature = "zstd")]
+        return vec![Algorithm::Zstd, Algorithm::Lz4];
+        #[cfg(not(feature = "zstd"))]
+        return vec![Algorithm::Lz4];
     }
 
     // M1 守门：<128B 直通
@@ -255,7 +289,7 @@ mod tests {
                 (x >> 24) as u8
             })
             .collect();
-        for alg in [Algorithm::Zstd, Algorithm::Lz4] {
+        for alg in algs() {
             let p = CompressPolicy { mode: Mode::Bulk, alg, ..CompressPolicy::default() };
             let frame = compress_frame(&p, &plain);
             assert_eq!(frame[0] & 1, 0, "alg={alg:?}: 试压不缩必须回退明文");
@@ -268,7 +302,7 @@ mod tests {
     fn compress_roundtrip_all_modes() {
         let plain = lorem(64 * 1024);
         for mode in [Mode::Interactive, Mode::Bulk, Mode::Archive] {
-            for alg in [Algorithm::Zstd, Algorithm::Lz4] {
+            for alg in algs() {
                 let p = CompressPolicy { mode, alg, ..CompressPolicy::default() };
                 let frame = compress_frame(&p, &plain);
                 assert_eq!(frame[0] & 1, 1, "mode={mode:?} alg={alg:?}: 可压缩输入应压缩");
@@ -292,7 +326,7 @@ mod tests {
             padding: PadPolicy::Multiple16,
             ..CompressPolicy::default()
         }, &plain);
-        assert_eq!(frame[0], 0);
+        assert_eq!(frame[0], flags(false, Algorithm::default()), "Off 档不压缩（算法位随默认档）");
         assert_eq!(frame.len(), FRAME_HEADER_LEN + plain.len(), "Off 档不填充");
         assert_eq!(decompress_frame(&frame).unwrap(), plain);
     }
@@ -347,11 +381,20 @@ mod tests {
             Err(CompressError::MalformedFrame("reserved flag bits set"))
         );
 
-        // 载荷翻转（解压失败或长度不符）
-        let mut t2 = frame.clone();
-        let last = t2.len() - 1;
-        t2[last] ^= 0x01;
-        assert!(matches!(decompress_frame(&t2), Err(CompressError::DecompressFailed)));
+        // 载荷翻转：zstd 帧有 xxhash 校验必拒（lz4 块压缩无内建校验，完整性由外层信封/
+        // SR-SIG1 承担——算法能力差异，非缺陷掩盖）；裁剪构建的等价负向量见下方 orig_len 篡改
+        #[cfg(feature = "zstd")]
+        {
+            let mut t2 = frame.clone();
+            let last = t2.len() - 1;
+            t2[last] ^= 0x01;
+            assert!(matches!(decompress_frame(&t2), Err(CompressError::DecompressFailed)));
+        }
+        // orig_len 篡改（任何算法/裁剪形态都稳定失败：解压产物长度不符帧头声明）
+        let mut t2b = frame.clone();
+        let orig = u32::from_le_bytes(t2b[5..9].try_into().unwrap());
+        t2b[5..9].copy_from_slice(&(orig + 1).to_le_bytes());
+        assert!(matches!(decompress_frame(&t2b), Err(CompressError::DecompressFailed)));
 
         // 填充区写非零
         let p = CompressPolicy { mode: Mode::Interactive, padding: PadPolicy::Multiple16, ..CompressPolicy::default() };
