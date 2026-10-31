@@ -138,6 +138,46 @@ pub struct PacketChannel {
 /// 单包长度上限（帧头 u16）。
 pub const MAX_PACKET: usize = u16::MAX as usize;
 
+/// 发一个包帧（`[u16 LE len][pkt]`；与 [`PacketChannel::send`] 同一线上格式）。
+///
+/// 独立函数形态供「读/写分离 + 专职任务」的装配使用——select 循环内直接 await
+/// [`PacketChannel::recv`] **不具备取消安全**（帧化是两次 read_exact：半途 future
+/// 被丢弃 ⇒ 已消费的帧头/帧体字节丢失，帧流永久失步）。写侧无此问题：写完整帧
+/// 在分支体内 await 至完成。
+pub async fn send_packet<W>(w: &mut W, pkt: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    use futures::AsyncWriteExt as _;
+    if pkt.len() > MAX_PACKET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mux: packet exceeds u16 frame limit (65535B)",
+        ));
+    }
+    let mut frame = Vec::with_capacity(2 + pkt.len());
+    frame.extend_from_slice(&(pkt.len() as u16).to_le_bytes());
+    frame.extend_from_slice(pkt);
+    w.write_all(&frame).await
+}
+
+/// 收一个包帧（对端 FIN 且无残包 ⇒ `UnexpectedEof`）。
+///
+/// 取消安全注意：本函数内部仍是两次 read_exact——**只在专职读任务里循环使用**
+/// （任务不被 select 取消，半途状态安全保存在自身的执行栈上）。
+pub async fn recv_packet<R>(r: &mut R) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    use futures::AsyncReadExt as _;
+    let mut hdr = [0u8; 2];
+    r.read_exact(&mut hdr).await?;
+    let len = u16::from_le_bytes(hdr) as usize;
+    let mut pkt = vec![0u8; len];
+    r.read_exact(&mut pkt).await?;
+    Ok(pkt)
+}
+
 impl PacketChannel {
     /// 装配（出站 `Tunnel::open_packet_channel` 与接受侧 `accept_stream` 配套共用；
     /// ponytail：合并原 new/from_stream 双构造同体）。
@@ -145,28 +185,20 @@ impl PacketChannel {
         PacketChannel { stream }
     }
 
+    /// 消费为底层流（chunked 注入等测试路径用）。
+    pub fn into_stream(self) -> Stream {
+        self.stream
+    }
+
+
     /// 发一个 IP 包：`[u16 len][pkt]`。
     pub async fn send(&mut self, pkt: &[u8]) -> io::Result<()> {
-        if pkt.len() > MAX_PACKET {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "mux: packet exceeds u16 frame limit (65535B)",
-            ));
-        }
-        let mut frame = Vec::with_capacity(2 + pkt.len());
-        frame.extend_from_slice(&(pkt.len() as u16).to_le_bytes());
-        frame.extend_from_slice(pkt);
-        self.stream.write_all(&frame).await
+        send_packet(&mut self.stream, pkt).await
     }
 
     /// 收一个 IP 包。对端 FIN 且无残包 ⇒ `UnexpectedEof`。
     pub async fn recv(&mut self) -> io::Result<Vec<u8>> {
-        let mut hdr = [0u8; 2];
-        self.stream.read_exact(&mut hdr).await?;
-        let len = u16::from_le_bytes(hdr) as usize;
-        let mut pkt = vec![0u8; len];
-        self.stream.read_exact(&mut pkt).await?;
-        Ok(pkt)
+        recv_packet(&mut self.stream).await
     }
 
     /// 单向结束（透传 [`Stream::finish`] 的 yamux FIN 语义）。

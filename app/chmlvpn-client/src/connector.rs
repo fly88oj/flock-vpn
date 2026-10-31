@@ -383,13 +383,13 @@ pub async fn supervise(
                     }
                 };
                 match tunnel.open_packet_channel().await {
-                    Ok(mut ch) => {
+                    Ok(ch) => {
                         backoff.reset();
                         if let Some(server) = tunnel.peer_server_id() {
                             events(ConnEvent::Connected { endpoint: endpoint.clone(), server });
                         }
                         let mut sess = tun.session();
-                        let bridge_err = dataplane::bridge(&mut sess, &mut ch).await.err();
+                        let bridge_err = dataplane::bridge(&mut sess, ch).await.err();
                         if let Some(e) = &bridge_err {
                             eprintln!("chmlvpn-client: dataplane ended: {e}");
                         }
