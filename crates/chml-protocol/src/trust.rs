@@ -31,10 +31,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 // 会话层已定义的接入材料类型（同一凭证两用：服务器互认 §4 / 客户端接入材料，§1.3.3f）
+// 与共享解析游标 Rd（ponytail：消除与 session 逐一同构的复刻）
 pub use crate::session::{
     fingerprint_ed25519, sign_server_entry, verify_server_entry, ClusterId, ServerEntry, ServerId,
     ServerPin,
 };
+use crate::session::{Rd, RdErr};
 
 /// 邀请文件版本（v3；v1/v2 拒收）。
 pub const INVITE_VERSION: u8 = 3;
@@ -92,6 +94,11 @@ impl std::fmt::Display for TrustError {
     }
 }
 impl std::error::Error for TrustError {}
+impl From<RdErr> for TrustError {
+    fn from(e: RdErr) -> Self {
+        TrustError::Encoding(e.0)
+    }
+}
 impl From<io::Error> for TrustError {
     fn from(e: io::Error) -> Self {
         TrustError::Io(e)
@@ -313,7 +320,7 @@ impl InviteFile {
         let cluster_root_pub = VerifyingKey::from_bytes(&rd.arr32()?)
             .map_err(|_| TrustError::Encoding("root pubkey"))?;
         let expiry_unix = rd.u64()?;
-        let invite_id = rd.arr16_id()?;
+        let invite_id = rd.arr16()?;
         let sig_arr = rd.arr64()?;
         let root_sig = Signature::from_bytes(&sig_arr);
         if !rd.done() {
@@ -557,55 +564,6 @@ impl std::fmt::Display for TrustTofuError {
     }
 }
 impl std::error::Error for TrustTofuError {}
-
-// ============================================================================
-// 解码游标
-// ============================================================================
-
-struct Rd<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Rd<'a> {
-    fn new(b: &'a [u8]) -> Self {
-        Rd { b, pos: 0 }
-    }
-    fn take(&mut self, n: usize) -> Result<&'a [u8], TrustError> {
-        if self.pos + n > self.b.len() {
-            return Err(TrustError::Encoding("truncated"));
-        }
-        let s = &self.b[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
-    }
-    fn u8(&mut self) -> Result<u8, TrustError> {
-        Ok(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Result<u16, TrustError> {
-        let b: [u8; 2] = self.take(2)?.try_into().expect("2B");
-        Ok(u16::from_le_bytes(b))
-    }
-    fn u64(&mut self) -> Result<u64, TrustError> {
-        let b: [u8; 8] = self.take(8)?.try_into().expect("8B");
-        Ok(u64::from_le_bytes(b))
-    }
-    fn arr16(&mut self) -> Result<[u8; 16], TrustError> {
-        self.take(16)?.try_into().map_err(|_| TrustError::Encoding("16B"))
-    }
-    fn arr32(&mut self) -> Result<[u8; 32], TrustError> {
-        self.take(32)?.try_into().map_err(|_| TrustError::Encoding("32B"))
-    }
-    fn arr64(&mut self) -> Result<[u8; 64], TrustError> {
-        self.take(64)?.try_into().map_err(|_| TrustError::Encoding("64B"))
-    }
-    fn arr16_id(&mut self) -> Result<[u8; 16], TrustError> {
-        self.arr16()
-    }
-    fn done(&self) -> bool {
-        self.pos == self.b.len()
-    }
-}
 
 // ============================================================================
 // 单元测试

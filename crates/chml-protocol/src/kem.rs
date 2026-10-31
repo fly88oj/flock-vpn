@@ -11,7 +11,7 @@
 //! HKDF 参数（本库钉死，双方一致即逐字节确定）：salt=None（HKDF 零填充），
 //! info=`chml-protocol/hybrid-kem/x25519+ml-kem-768/v1`，OKM=32B。
 //!
-//! RNG 面：公开函数接受 rand 0.9 的 [`CryptoRngCore`]（= `TryCryptoRng`，OsRng 直接可传）；
+//! RNG 面：公开函数接受 rand 0.9 的 `TryCryptoRng`（OsRng / StdRng 直接可传）；
 //! ml-kem / x25519-dalek 3.0 内部走 rand_core 0.10 代际，由私有 [`RngBridge`] 桥接，调用方无感。
 
 use core::convert::Infallible;
@@ -44,14 +44,6 @@ pub const HYBRID_SK_LEN: usize = X25519_PUB_LEN + 64;
 
 /// HKDF info 标签：域分离（换算法/换组合规则必须换标签）。
 const HKDF_INFO: &[u8] = b"chml-protocol/hybrid-kem/x25519+ml-kem-768/v1";
-
-/// 对外 RNG 面：rand 0.9 的 `TryCryptoRng`（OsRng / StdRng / ThreadRng 等均实现；
-/// 不可失败 `CryptoRng` 由 blanket impl 自动满足）。
-///
-/// 熵源故障（OS 随机数系统不可用，实际不可发生事件）在库内 panic——
-/// 与 ml-kem / x25519-dalek 内建 getrandom 路径同语义。
-pub trait CryptoRngCore: rand::TryCryptoRng {}
-impl<T: rand::TryCryptoRng + ?Sized> CryptoRngCore for T {}
 
 /// KEM 错误：公钥/密文反序列化或校验失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +98,7 @@ pub struct HybridKeypair {
 
 impl HybridKeypair {
     /// 生成新混合密钥对（随机性全部来自 `rng`）。
-    pub fn generate(rng: &mut impl CryptoRngCore) -> Self {
+    pub fn generate(rng: &mut impl rand::TryCryptoRng) -> Self {
         let x = StaticSecret::random_from_rng(&mut bridge(rng));
         let dk = MlKem768::generate_keypair_from_rng(&mut bridge(rng)).0;
         HybridKeypair { x25519: x, ml_kem: dk }
@@ -282,7 +274,7 @@ impl fmt::Debug for Fingerprint {
 /// 封装：对 `pk` 生成一次性共享密钥与混合密文（随机性全部来自 `rng`）。
 ///
 /// 一次性信封/握手共享的正确打开方式：每信封/每握手调用一次，`SealedShared` 用后即弃。
-pub fn encapsulate(pk: &HybridPubkey, rng: &mut impl CryptoRngCore) -> (SealedShared, HybridCt) {
+pub fn encapsulate(pk: &HybridPubkey, rng: &mut impl rand::TryCryptoRng) -> (SealedShared, HybridCt) {
     let eph = EphemeralSecret::random_from_rng(&mut bridge(rng));
     let eph_pub = PublicKey::from(&eph);
     let (ml_ct, ml_ss) = pk.ml_kem.encapsulate_with_rng(&mut bridge(rng));

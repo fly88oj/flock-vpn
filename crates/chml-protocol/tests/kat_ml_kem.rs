@@ -25,7 +25,6 @@ use chml_protocol::ml_kem::{
     ml_kem_768::MlKem768, Decapsulate, DecapsulationKey, EncapsulationKey, Key, KeyExport,
 };
 use chml_protocol::ml_kem::ExpandedKeyEncoding;
-use rand::rngs::OsRng;
 
 /// keyGen：seed(d‖z) → ek 逐字节复现官方向量。
 #[test]
@@ -89,18 +88,6 @@ fn hybrid_sizes_match_kat() {
     let mut hybrid = [0u8; 1216];
     hybrid[32..].copy_from_slice(&ek_arr);
     kem::HybridPubkey::from_bytes(&hybrid).expect("官方 ek 必须通过 FIPS 203 校验");
-    // 混合封装/解封装往返（用官方向量 ek 作为接收方公钥的 ML-KEM 份）
-    let (sk, _) = roundtrip_with_ek(&ek_arr);
-    let _ = sk;
-}
-
-/// 用官方 ek 的持有方做一次完整混合封装往返（X25519 侧为本库生成）。
-fn roundtrip_with_ek(_official_ek: &[u8; 1184]) -> (kem::HybridKeypair, ()) {
-    // 说明：官方向量没有配套 X25519 静态私钥（ACVP 只覆盖 ML-KEM 本体），
-    // 混合往返在此用本库密钥对验证——见 src/kem.rs 单测；此处仅确认官方 ek 可进混合布局。
-    let sk = kem::HybridKeypair::generate(&mut OsRng);
-    let (ss, ct) = kem::encapsulate(&sk.public(), &mut OsRng);
-    let ss2 = kem::decapsulate(&sk, &ct).expect("decapsulate");
-    assert_eq!(ss.as_bytes(), ss2.as_bytes());
-    (sk, ())
+    // 混合封装/解封装往返由 src/kem.rs 单测 roundtrip_and_sizes 覆盖（官方向量无配套
+    // X25519 私钥，ACVP 只覆盖 ML-KEM 本体）——此处仅守「官方 ek 可进混合布局」。
 }

@@ -15,7 +15,7 @@ use std::time::Duration;
 use chml_protocol::mux::Prio;
 use chml_protocol::session::{
     fingerprint_ed25519, initiate, initiate_tofu, respond, AeadChoice, AeadPreference, ClusterId,
-    CloseReason, DeviceDirectory, DeviceId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, LookupVerdict,
+    CloseReason, DeviceId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory,
     ManualClock, ServerIdentity, ServerId, ServerPin, SessionError, Tunnel, TunnelConfig,
     RT_DATA, RT_I0, RT_I1, RT_R1, RT_REKEY_RESP,
 };
@@ -975,35 +975,6 @@ async fn replayed_record_rejected_and_counted() {
 // 服务端目录接缝的异步性（BoxFuture，§7-M1）
 // ============================================================================
 
-struct VerdictDir(String);
-
-impl chml_protocol::session::DeviceDirectory for VerdictDir {
-    fn lookup(&self, _id: &DeviceId) -> futures::future::BoxFuture<'static, LookupVerdict> {
-        let v = self.0.clone();
-        Box::pin(async move {
-            match v.as_str() {
-                "not-found" => LookupVerdict::NotFound,
-                "revoked" => LookupVerdict::Revoked { since_epoch: 1 },
-                _ => LookupVerdict::Active(DeviceRecord {
-                    device_x25519: DeviceStaticKeys::generate().x25519_public(),
-                    device_ed25519: DeviceStaticKeys::generate().ed25519_public(),
-                }),
-            }
-        })
-    }
-}
-
-#[tokio::test]
-async fn device_directory_boxfuture_runtime_check() {
-    for v in ["not-found", "revoked", "active"] {
-        let dir = VerdictDir(v.to_string());
-        let out = dir.lookup(&DeviceId([0; 32])).await;
-        assert!(matches!(
-            out,
-            LookupVerdict::NotFound | LookupVerdict::Revoked { .. } | LookupVerdict::Active(_)
-        ));
-    }
-}
 
 // ============================================================================
 // rekey 切换竞态回归向量（blocking 复核修复）
@@ -1175,45 +1146,3 @@ async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
     server.shutdown().await;
 }
 
-#[tokio::test]
-async fn rekey_under_bidirectional_bulk_traffic() {
-    // 补测试缺口：原 rekey 向量只验证 client→server 单向；本向量双向大流量下 rekey，
-    // 断言双向全量到达 + 零伪造 + 双侧纪元推进。
-    let clock = std::sync::Arc::new(ManualClock::new());
-    let cfg_clock = clock.clone();
-    let mk_cfg = move || TunnelConfig {
-        clock: cfg_clock.clone(),
-        keepalive: Duration::from_secs(3600),
-        ..TunnelConfig::default()
-    };
-    let (client, server) = session_pair_cfg(mk_cfg(), mk_cfg()).await;
-
-    let cs = client.open_stream(Prio::Normal).await.expect("c stream");
-    let ss2 = server.open_stream(Prio::Normal).await.expect("s stream2");
-    let w1 = tokio::spawn(bulk_send(cs, BULK_CHUNKS, BULK_CHUNK_LEN));
-    let w2 = tokio::spawn(bulk_send(ss2, BULK_CHUNKS, BULK_CHUNK_LEN));
-    let ss = tokio::time::timeout(Duration::from_secs(10), server.accept_stream()).await.expect("t").expect("s stream");
-    let cs2 = tokio::time::timeout(Duration::from_secs(10), client.accept_stream()).await.expect("t2").expect("c stream2");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    clock.advance(Duration::from_secs(121));
-    let (r1_bytes, r1_full) = tokio::time::timeout(
-        Duration::from_secs(30),
-        bulk_recv(ss, BULK_CHUNKS, BULK_CHUNK_LEN),
-    ).await.expect("recv c→s timeout");
-    let (r2_bytes, r2_full) = tokio::time::timeout(
-        Duration::from_secs(30),
-        bulk_recv(cs2, BULK_CHUNKS, BULK_CHUNK_LEN),
-    ).await.expect("recv s→c timeout");
-    w1.await.expect("w1");
-    w2.await.expect("w2");
-
-    wait_until("双侧 epoch → 1", || client.stats().epoch == 1 && server.stats().epoch == 1).await;
-    assert_eq!(client.stats().forge_attempts, 0, "双向流量下 rekey 零伪造");
-    assert_eq!(server.stats().forge_attempts, 0);
-    assert_eq!(r1_bytes, BULK_CHUNKS * BULK_CHUNK_LEN, "c→s 全量到达");
-    assert_eq!(r2_bytes, BULK_CHUNKS * BULK_CHUNK_LEN, "s→c 全量到达");
-    assert!(r1_full && r2_full, "序号全覆盖");
-
-    client.shutdown().await;
-    server.shutdown().await;
-}

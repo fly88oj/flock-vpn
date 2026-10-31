@@ -47,9 +47,8 @@ getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
 [dev-dependencies]
 serde_json = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-# bench（§7-M1）：criterion 0.8 + aes-gcm（与库锁定同版本，仅基准用途）
+# bench（§7-M1）：criterion 0.8（aes-gcm 复用正式依赖）
 criterion = "0.8"
-aes-gcm = { workspace = true }
 
 [[bench]]
 name = "aead"

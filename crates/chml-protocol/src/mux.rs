@@ -130,11 +130,8 @@ pub struct PacketChannel {
 pub const MAX_PACKET: usize = u16::MAX as usize;
 
 impl PacketChannel {
-    pub(crate) fn new(stream: Stream) -> Self {
-        PacketChannel { stream }
-    }
-
-    /// 由既有流装配（`Tunnel::accept_stream` 的对端配套：接受侧同样拿到 PacketChannel）。
+    /// 装配（出站 `Tunnel::open_packet_channel` 与接受侧 `accept_stream` 配套共用；
+    /// ponytail：合并原 new/from_stream 双构造同体）。
     pub fn from_stream(stream: Stream) -> Self {
         PacketChannel { stream }
     }

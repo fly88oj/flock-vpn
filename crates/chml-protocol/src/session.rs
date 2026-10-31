@@ -917,40 +917,58 @@ async fn recv_frame<S: AsyncRead + Unpin>(io: &mut S) -> Result<(u8, Vec<u8>), S
 }
 
 /// 解析游标。
-struct Rd<'a> {
+/// 解码越界/长度错误（Rd 游标共用错误；session/trust 各自 From 转换，调用点 `?` 直通）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RdErr(pub &'static str);
+
+impl From<RdErr> for SessionError {
+    fn from(e: RdErr) -> Self {
+        SessionError::Protocol(e.0)
+    }
+}
+
+/// 解析游标（session/trust 共用；ponytail：消除 trust 侧逐一同构的复刻）。
+pub(crate) struct Rd<'a> {
     b: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Rd<'a> {
-    fn new(b: &'a [u8]) -> Self {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
         Rd { b, pos: 0 }
     }
-    fn take(&mut self, n: usize) -> Result<&'a [u8], SessionError> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], RdErr> {
         if self.pos + n > self.b.len() {
-            return Err(SessionError::Protocol("truncated message"));
+            return Err(RdErr("truncated message"));
         }
         let s = &self.b[self.pos..self.pos + n];
         self.pos += n;
         Ok(s)
     }
-    fn u8(&mut self) -> Result<u8, SessionError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, RdErr> {
         Ok(self.take(1)?[0])
     }
-    fn u64(&mut self) -> Result<u64, SessionError> {
+    pub(crate) fn u16(&mut self) -> Result<u16, RdErr> {
+        let b: [u8; 2] = self.take(2)?.try_into().expect("2B");
+        Ok(u16::from_le_bytes(b))
+    }
+    pub(crate) fn u64(&mut self) -> Result<u64, RdErr> {
         let b: [u8; 8] = self.take(8)?.try_into().expect("8B");
         Ok(u64::from_le_bytes(b))
     }
-    fn arr32(&mut self) -> Result<[u8; 32], SessionError> {
-        self.take(32)?.try_into().map_err(|_| SessionError::Protocol("32B"))
+    pub(crate) fn arr32(&mut self) -> Result<[u8; 32], RdErr> {
+        self.take(32)?.try_into().map_err(|_| RdErr("32B"))
     }
-    fn arr16(&mut self) -> Result<[u8; 16], SessionError> {
-        self.take(16)?.try_into().map_err(|_| SessionError::Protocol("16B"))
+    pub(crate) fn arr16(&mut self) -> Result<[u8; 16], RdErr> {
+        self.take(16)?.try_into().map_err(|_| RdErr("16B"))
     }
-    fn rest(&mut self) -> &'a [u8] {
+    pub(crate) fn arr64(&mut self) -> Result<[u8; 64], RdErr> {
+        self.take(64)?.try_into().map_err(|_| RdErr("64B"))
+    }
+    pub(crate) fn rest(&mut self) -> &'a [u8] {
         &self.b[self.pos..]
     }
-    fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.pos == self.b.len()
     }
 }
@@ -1705,9 +1723,8 @@ enum MuxCmd {
     Shutdown,
 }
 
-enum DriverEv {
-    Done,
-}
+
+
 
 async fn mux_driver(
     mut conn: yamux::Connection<MuxIo>,
@@ -1720,7 +1737,7 @@ async fn mux_driver(
     let mut pending_inbound: Option<yamux::Stream> = None;
     let mut shutting = false;
     loop {
-        let ev = std::future::poll_fn(|cx| {
+        let done = std::future::poll_fn(|cx| {
             loop {
                 match cmd_rx.poll_next_unpin(cx) {
                     Poll::Ready(Some(MuxCmd::Open { prio, resp })) => {
@@ -1731,13 +1748,13 @@ async fn mux_driver(
                         }
                     }
                     Poll::Ready(Some(MuxCmd::Shutdown)) => shutting = true,
-                    Poll::Ready(None) => return Poll::Ready(DriverEv::Done),
+                    Poll::Ready(None) => return Poll::Ready(true),
                     Poll::Pending => break,
                 }
             }
             if shutting {
                 return match conn.poll_close(cx) {
-                    Poll::Ready(_) => Poll::Ready(DriverEv::Done),
+                    Poll::Ready(_) => Poll::Ready(true),
                     Poll::Pending => Poll::Pending,
                 };
             }
@@ -1759,7 +1776,7 @@ async fn mux_driver(
                     match conn.poll_next_inbound(cx) {
                         Poll::Ready(Some(Ok(s))) => pending_inbound = Some(s),
                         Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                            return Poll::Ready(DriverEv::Done)
+                            return Poll::Ready(true)
                         }
                         Poll::Pending => break,
                     }
@@ -1775,14 +1792,14 @@ async fn mux_driver(
                         break; // 入站通道满：背压，等消费者取走再被唤醒
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        return Poll::Ready(DriverEv::Done)
+                        return Poll::Ready(true)
                     }
                 }
             }
             Poll::Pending
         })
         .await;
-        if matches!(ev, DriverEv::Done) {
+        if done {
             break;
         }
     }
@@ -1814,7 +1831,7 @@ impl Tunnel {
     /// 打开 TUN 包通道（`[u16 len][ip packet]` 帧化，VPN-14）。
     pub async fn open_packet_channel(&self) -> io::Result<PacketChannel> {
         let s = self.open_stream(Prio::Normal).await?;
-        Ok(PacketChannel::new(s))
+        Ok(PacketChannel::from_stream(s))
     }
 
     /// 接受一条对端打开的逻辑流（`None` = 复用器终止）。

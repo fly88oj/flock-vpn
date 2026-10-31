@@ -35,7 +35,7 @@ use opaque_ke::{
 };
 use sha2_compat::Sha512; // opaque-ke 4.0.1 的 digest 0.10 代际
 
-use crate::kem::CryptoRngCore;
+use rand::TryCryptoRng as CryptoRngCore;
 
 /// rwd 盐 = b"showroom-opaque-v1" + user（showroom-common opaque.rs:53 原值；常数盐合法：
 /// 盲化已提供保护，硬化只为抬高离线字典代价；user 进盐使同密码不同账号派生不同 rwd）。
@@ -55,13 +55,6 @@ pub const SERVER_ID: &[u8] = b"showroom-server";
 
 /// 密码硬化的输出长度（OPAQUE 盲化输入宽度）。
 pub const RWD_LEN: usize = 32;
-
-/// 供下游（showroomctl/chmlvpn-server）类型标注的服务端句柄别名。
-pub mod server_types {
-    pub use super::Suite;
-    pub type Setup = opaque_ke::ServerSetup<Suite>;
-    pub type Record = opaque_ke::ServerRegistration<Suite>;
-}
 
 /// argon2id 参数 profile（§1.3.3h：版本化升级不破老记录；profile id 进注册记录）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

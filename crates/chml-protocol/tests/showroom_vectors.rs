@@ -48,6 +48,12 @@ fn showroom_sig_vector_byte_exact() {
         sig::verify_with_hash(SIG_AUTH, &vk, "POST", "/_api/publish?project=demo", SIG_BODY_SHA, SIG_TS + 301),
         Err(sig::AuthError::Stale)
     );
+    // 篡改 body 哈希 ⇒ 拒（原 showroom_interop 的独有断言，合并于此）
+    assert_eq!(
+        sig::verify_with_hash(SIG_AUTH, &vk, "POST", "/_api/publish?project=demo",
+            "0000000000000000000000000000000000000000000000000000000000000000", SIG_TS),
+        Err(sig::AuthError::BadSignature)
+    );
 }
 
 // ———— 信封 v1（showroom seal 产物 → 本 crate open_v1_legacy 解开；legacy feature）————
