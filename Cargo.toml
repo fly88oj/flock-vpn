@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/chml-protocol"]
+
+# 布局与成员规划见 docs/design.md §1.1：
+# crates/chml-frpc、chml-sync 与 app/chmlvpn-server、chmlvpn-client 按里程碑（§7）陆续挂入。
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://example.invalid/chmlvpn"
+
+[workspace.dependencies]
+# 依赖代际统一按 docs/design.md §1.3.2（P1-6）：
+# aes-gcm 0.11.1 / ed25519-dalek 3.0.0 / rand 0.9 新代际；ml-kem 0.3.3 + x25519-dalek 3.0.0（§1.3.3a）。
+aes-gcm = "0.11.1"
+ed25519-dalek = "3.0.0"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+ml-kem = "0.3.3"
+sha2 = "0.11.1"
+hkdf = "0.13.0"
+rand = "0.9"
+rand_core = "0.10"
+base64 = "0.22"
+hex = "0.4"
+rsa = "0.9.10"
+
+# 性能归因参考 showroom workspace 的 [profile.test] opt-level=1（docs/research/showroom-analysis §3：
+# 8MiB aes-gcm 在 -O0 0.61s vs -O1 0.013s，46×）。
+[profile.test]
+opt-level = 1
