@@ -8,7 +8,7 @@
 //! 设备会话（[`LiveSessions::kill`]）；「票据 epoch < 当前 epoch 即拒」兜住跨连接重放。
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chml_protocol::ed25519_dalek::{Signer, SigningKey};
 use chml_protocol::kem::HybridKeypair;
@@ -23,7 +23,8 @@ use tokio::task::JoinHandle;
 
 use crate::config::{ListenerMode, ServerConfig};
 use crate::control::{serve_control, CtrlGuard};
-use crate::netstate::{DirAdapter, StateStore};
+use crate::dataplane::PeerRouter;
+use crate::netstate::{DirAdapter, NetState as _, StateStore};
 use crate::ticket::TicketIssuer;
 
 /// META 键（集群身份材料 + 票据根种子；bootstrap 一次写入）。
@@ -104,6 +105,20 @@ pub struct ServerCore {
     pub oprf: chml_protocol::opaque_ke::ServerSetup<Suite>,
     pub guard: CtrlGuard,
     pub sessions: LiveSessions,
+    /// M3 数据面路由器（run() 装配 tun 后注入；None = 控制流-only——宿主测试路径）。
+    router: RwLock<Option<Arc<PeerRouter>>>,
+}
+
+impl ServerCore {
+    /// 当前数据面路由器（未装配 ⇒ None）。
+    pub fn router(&self) -> Option<Arc<PeerRouter>> {
+        self.router.read().expect("router lock poisoned").clone()
+    }
+
+    /// 装配数据面（tun + 路由；失败在 [`PeerRouter::open`] 内降级并记日志）。
+    pub fn set_router(&self, router: Arc<PeerRouter>) {
+        *self.router.write().expect("router lock poisoned") = Some(router);
+    }
 }
 
 impl ServerCore {
@@ -216,6 +231,7 @@ impl ServerCore {
             oprf,
             guard: CtrlGuard::new(TicketIssuer::from_seed(ticket_seed)),
             sessions: LiveSessions::default(),
+            router: RwLock::new(None),
         };
         Ok((Arc::new(core), created))
     }
@@ -258,9 +274,11 @@ impl ServerCore {
         Ok(inv.to_bytes())
     }
 
-    /// 单条入连：E2E 握手（respond）→ 会话登记（可被吊销信号杀）→ 控制流。
+    /// 单条入连：E2E 握手（respond）→ 会话登记（可被吊销信号杀）→ 流分派。
     ///
-    /// 控制流 = 首条被接受的 yamux 流（客户端 initiate 后立即 `open_stream(Prio::Control)`）。
+    /// 流分派（M3）：**首条**被接受的 yamux 流 = 控制流（M2 语义不变，客户端
+    /// initiate 后先 `open_stream(Prio::Control)`——排序契约见 chmlvpn-client
+    /// connector）；余流 = 数据面包通道（[`PeerRouter::serve_stream`]）。
     pub async fn serve_conn(self: Arc<Self>, io: TcpStream) {
         let dir = DirAdapter(self.store.clone());
         let tunnel = match respond(io, &self.identity, dir, TunnelConfig::default()).await {
@@ -274,6 +292,8 @@ impl ServerCore {
             return;
         };
         let mut kill = self.sessions.register(device.0);
+        // 该会话设备的注册 VIP（数据面源校验/路由键；查不到 ⇒ 仅控制流）。
+        let device_vip = self.store.device_row(&device).map(|r| r.vip);
         let mut handlers = Vec::new();
         loop {
             tokio::select! {
@@ -281,11 +301,36 @@ impl ServerCore {
                 _ = kill.changed() => break,
                 stream = tunnel.accept_stream() => match stream {
                     Some(s) => {
-                        let core = self.clone();
-                        handlers.push(tokio::spawn(async move {
-                            let mut s = s;
-                            let _ = serve_control(&core, device, &mut s).await;
-                        }));
+                        // 流分派（M3）：按 yamux 流 ID 而非到达序——客户端首条流（id=1）
+                        // = 控制流（M2 语义）；id≥3 = 数据面包通道。按 ID 分派对 yamux
+                        // 惰性 SYN 免疫：被静默持有的控制流（M3 客户端不发控制业务）
+                        // 不物化时，首个物化的数据流不会被误派给控制流处理器。
+                        if s.id() == 1 {
+                            let core = self.clone();
+                            handlers.push(tokio::spawn(async move {
+                                let mut s = s;
+                                let _ = serve_control(&core, device, &mut s).await;
+                            }));
+                        } else {
+                            let router = self.router();
+                            let has_router = router.is_some();
+                            match (router, device_vip) {
+                                (Some(router), Some(vip)) => {
+                                    handlers.push(tokio::spawn(async move {
+                                        router.serve_stream(vip, s).await;
+                                    }));
+                                }
+                                // 无数据面（宿主/无 NET_ADMIN）或注册表缺行：拆流
+                                //（客户端数据面观察通道 EOF → 退避重连，控制流不受影响）。
+                                _ => {
+                                    eprintln!(
+                                        "chmlvpn-server: 数据面流被拆（router={has_router} vip={}）",
+                                        device_vip.is_some()
+                                    );
+                                    drop(s)
+                                }
+                            }
+                        }
                     }
                     None => break,
                 },
@@ -294,6 +339,12 @@ impl ServerCore {
         for h in handlers {
             h.abort();
         }
+        // 会话终止原因（A9 服务端侧：静默死链 ⇒ "dead-link" 可 grep）。
+        let reason = tunnel.stats().closed;
+        eprintln!(
+            "chmlvpn-server: session ended device={device} reason={}",
+            reason.map(|r| r.to_string()).unwrap_or_else(|| "none(io/fin)".into())
+        );
         tunnel.shutdown().await;
         self.sessions.deregister(device.0);
     }
@@ -330,7 +381,7 @@ impl RunningListener {
     }
 }
 
-/// 按模式起服（装配期分派；admin 端点随之启动）。
+/// 按模式起服（装配期分派；admin 端点随之启动；M3 起附带数据面装配）。
 ///
 /// `serve_listener` 为无限循环——`run` 返回的 JoinHandle 正常不结束；abort 即停 accept。
 pub async fn run(
@@ -344,6 +395,9 @@ pub async fn run(
     ),
     String,
 > {
+    // M3 数据面（§2.2 服务端自身也是 peer）：tun + 路由；失败在 PeerRouter::open
+    // 内降级控制流-only 并记日志（宿主测试路径即此形态）。
+    core.set_router(PeerRouter::open(&core.cfg.tun_name).await);
     // admin loopback 端点（CLI 子命令的进程内单写者入口）。
     let admin = crate::admin::serve(core.clone(), core.cfg.admin_bind)
         .await

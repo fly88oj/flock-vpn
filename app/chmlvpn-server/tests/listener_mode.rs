@@ -22,6 +22,7 @@ fn cfg_for(mode: &str, state_dir: &std::path::Path) -> ServerConfig {
         dir_version: 1,
         ticket_ttl_secs: 60,
         admin_bind: "127.0.0.1:0".parse().unwrap(),
+        tun_name: "tun0".into(),
         frp: Some(chmlvpn_server::config::FrpSection {
             original_toml: "serverAddr = \"frps\"\nserverPort = 7000\n".into(),
             frpc_bin: state_dir.join("fake-frpc"),

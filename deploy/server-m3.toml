@@ -1,0 +1,42 @@
+# server.toml —— Frp 模式（m3.yml 内的 server 容器；docs/design.md §7-M3）。
+#
+# 与 server-frp.toml（M2）的唯一差异：advertise/extra 端点为**容器网络视角**
+#（frps:27500 / frps:27501——M3 客户端与 frps 同网；M2 客户端在宿主 ⇒ 127.0.0.1 映射口）。
+# 数据面（M3）：tun_name 生效——服务端自身也是 peer（VIP 100.64.0.1，§2.2）。
+
+state_dir = "/var/lib/chmlvpn"
+mode = "frp"
+bind = "0.0.0.0:9443"
+admin_bind = "127.0.0.1:9444"
+
+advertise_endpoint = "frps:27500"
+extra_endpoints = ["frps:27501"]
+dir_version = 1
+
+# 票据 TTL：缺省 60（§2.2 硬顶）；部署调小以便过期路径验收（M2 语义沿用）。
+ticket_ttl_secs = 6
+
+# M3 数据面接口名（服务端 tun；VIP 固定 100.64.0.1——netstate 分配从 .2 起）。
+tun_name = "tun0"
+
+[frp]
+frpc_bin = "/usr/local/bin/frpc"
+# 原版 frpc TOML（v0.71.1 方言）内嵌注册：两条 tcp proxy = 主端点 + 第二暴露口。
+original_toml = """
+serverAddr = "frps"
+serverPort = 7000
+
+[[proxies]]
+name = "chml-main"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 9443
+remotePort = 27500
+
+[[proxies]]
+name = "chml-alt"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 9443
+remotePort = 27501
+"""

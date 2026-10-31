@@ -1578,8 +1578,9 @@ async fn write_pump<W>(
                 Ok(f) => f,
                 Err(_) => break, // 会话终止/硬拒绝
             };
-            if w.write_all(&frame).await.is_err() {
+            if let Err(e) = w.write_all(&frame).await {
                 core.kill(CloseReason::Io);
+                eprintln!("session: write(data) failed: {e}");
                 break;
             }
         }
@@ -1588,8 +1589,9 @@ async fn write_pump<W>(
             _ = closed.changed() => break,
             _ = tick.tick() => {
                 for frame in core.timer_tick() {
-                    if w.write_all(&frame).await.is_err() {
+                    if let Err(e) = w.write_all(&frame).await {
                         core.kill(CloseReason::Io);
+                        eprintln!("session: write(timer) failed: {e}");
                         break;
                     }
                 }
@@ -1599,12 +1601,22 @@ async fn write_pump<W>(
                 match cmd {
                     Some(CtrlCmd::Pong) => {
                         if let Ok(f) = core.seal_frame(RT_PONG, b"") {
-                            if w.write_all(&f).await.is_err() { core.kill(CloseReason::Io); break; }
+                            if let Err(e) = w.write_all(&f).await {
+                                core.kill(CloseReason::Io);
+                                eprintln!("session: write(pong) failed: {e}");
+                                break;
+                            }
                         } else { break; }
                     }
                     Some(CtrlCmd::PeerInit(p)) => {
                         match core.handle_rekey_init(&p) {
-                            Ok(Some(f)) => { if w.write_all(&f).await.is_err() { core.kill(CloseReason::Io); break; } }
+                            Ok(Some(f)) => {
+                                if let Err(e) = w.write_all(&f).await {
+                                    core.kill(CloseReason::Io);
+                                    eprintln!("session: write(rekey-resp) failed: {e}");
+                                    break;
+                                }
+                            }
                             Ok(None) => {}
                             Err(_) => break,
                         }
@@ -1775,9 +1787,11 @@ async fn mux_driver(
                 if pending_inbound.is_none() {
                     match conn.poll_next_inbound(cx) {
                         Poll::Ready(Some(Ok(s))) => pending_inbound = Some(s),
-                        Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                        Poll::Ready(Some(Err(e))) => {
+                            eprintln!("session: mux inbound error: {e}");
                             return Poll::Ready(true)
                         }
+                        Poll::Ready(None) => return Poll::Ready(true),
                         Poll::Pending => break,
                     }
                 }

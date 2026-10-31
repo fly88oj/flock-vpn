@@ -61,6 +61,9 @@ pub struct ServerConfig {
     /// admin loopback 端点（邀请签发/兑换/注册表管理的进程内单写者入口；CLI 子命令走它）。
     #[serde(default = "default_admin_bind")]
     pub admin_bind: SocketAddr,
+    /// TUN 接口名（M3 数据面，§2.2/§3.12；缺省 "tun0"）。
+    #[serde(default = "default_tun_name")]
+    pub tun_name: String,
     /// 仅 mode = "frp" 时读取。
     pub frp: Option<FrpSection>,
 }
@@ -90,6 +93,9 @@ fn default_ticket_ttl() -> u64 {
 }
 fn default_admin_bind() -> SocketAddr {
     "127.0.0.1:9444".parse().expect("const addr")
+}
+fn default_tun_name() -> String {
+    "tun0".into()
 }
 fn default_frpc_bin() -> PathBuf {
     PathBuf::from("/usr/local/bin/frpc")

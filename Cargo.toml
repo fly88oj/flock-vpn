@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/chml-protocol", "crates/chml-frpc", "app/chmlvpn-server"]
+members = ["crates/chml-protocol", "crates/chml-frpc", "app/chmlvpn-server", "app/chmlvpn-client"]
 
 # 布局与成员规划见 docs/design.md §1.1：
-# crates/chml-sync 与 chmlvpn-client 按里程碑（§7）陆续挂入。
+# crates/chml-sync 按里程碑（§7）陆续挂入。
 
 [workspace.package]
 version = "0.1.0"
@@ -46,6 +46,11 @@ postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 # 单服 NetState 适配器（§3.11/M2：redb 单机版，接口与 M4 chml-sync 对齐，§3.10）。
 redb = "3"
+# chmlvpn-client（§2.3/§3.12/M3）：tun 适配（tun-rs——vpn-mesh §1.2 选型；设计文档写
+# 「2.8.16」，crates.io 当前 max_stable=2.8.14（2026-10-26 发布），以实际存在的版本钉）。
+tun-rs = { version = "2.8.14", default-features = false }
+# Linux 路由/地址配置（§2.3：/16 池指向 TUN + rp_filter=1；vpn-mesh §1.2/S10）。
+rtnetlink = "0.23.0"
 
 # 性能归因参考 showroom workspace 的 [profile.test] opt-level=1（docs/research/showroom-analysis §3：
 # 8MiB aes-gcm 在 -O0 0.61s vs -O1 0.013s，46×）。

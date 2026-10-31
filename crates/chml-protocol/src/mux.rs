@@ -52,6 +52,15 @@ impl Stream {
         Stream { inner, prio }
     }
 
+    /// 流 ID（yamux：客户端打开的流为奇数、服务器打开为偶数；客户端**首条流 = 1**）。
+    ///
+    /// 供装配层做流分派（§3.12：首流 = 控制流）——按 ID 分派对 yamux 的惰性 SYN
+    /// （流在首帧数据前不物化）免疫：被静默持有的控制流（id=1）即使从未物化，
+    /// 后续物化的数据流（id≥3）也能被正确识别为数据面。
+    pub fn id(&self) -> u32 {
+        self.inner.id().val()
+    }
+
     /// 取回内部 yamux 流（inbound 暂存回退路径用，库外无意义）。
     pub(crate) fn into_inner(self) -> yamux::Stream {
         self.inner

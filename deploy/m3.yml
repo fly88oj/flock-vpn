@@ -1,0 +1,75 @@
+# m3.yml —— M3 客户端数据面（docs/design.md §7-M3：m2 拓扑 + client 容器）。
+#
+#   docker compose -f deploy/m3.yml up -d --build
+#   bash deploy/m3_assert.sh          # A2/A3/A4/A9 单服版
+#
+# 拓扑（m2.yml 的 frp 中转变体加真客户端；网络 m3net = 「模拟不可信公网」）：
+#   frps（原版 v0.71.1；用户口 27500/27501 容器网内可达，不映射宿主）
+#     └─ server（Frp 模式 + M3 数据面：tun0 VIP 100.64.0.1；--cap-add NET_ADMIN
+#                --device /dev/net/tun，§6.1 实测可行的 WSL2 后端 tun 直通）
+#   client（chmlvpn-client；tun0 VIP = device-add 分配值；同 NET_ADMIN/tun 直通）
+#
+# 原版 frp 二进制经命名构建上下文直取 .tmp/frp_0.71.1_linux_amd64/（同 m2.yml）。
+# 编排（gen-keys → device-add → invite → vip → ready → restart）由 m3_assert.sh 驱动。
+
+name: chmlvpn-m3
+
+services:
+  frps:
+    build:
+      context: build            # 仅 Dockerfile.frps + frps.toml（committed）
+      dockerfile: Dockerfile.frps
+      additional_contexts:
+        bins: ../.tmp/frp_0.71.1_linux_amd64
+    image: chmlvpn/frps:0.71.1
+    networks: [m3net]
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ..               # workspace 根（源码；.dockerignore 裁剪 target/.tmp）
+      dockerfile: deploy/Dockerfile.server
+      additional_contexts:
+        frpbin: ../.tmp/frp_0.71.1_linux_amd64
+      args:
+        server_conf: server-m3.toml   # 容器网络视角端点（frps:27500/27501）
+    image: chmlvpn/server:m3
+    depends_on: [frps]
+    # M3 数据面：服务端自身也是 peer（tun + 路由，§2.2）。
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    # rp_filter=1（§2.3，innernet 建议）：无特权容器 /proc/sys 只读——namespaced
+    # sysctl 由运行时设置（default ⇒ 新建 tun0 继承 1；代码内 /proc 写兜底宿主路径）。
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    networks: [m3net]
+    volumes:
+      - server-state:/var/lib/chmlvpn
+    restart: unless-stopped
+
+  client:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.client
+    image: chmlvpn/client:m3
+    depends_on: [server]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    networks: [m3net]
+    volumes:
+      - client-state:/var/lib/chmlvpn
+    restart: unless-stopped
+
+networks:
+  m3net:
+    name: chmlvpn-m3net
+
+volumes:
+  server-state: {}
+  client-state: {}

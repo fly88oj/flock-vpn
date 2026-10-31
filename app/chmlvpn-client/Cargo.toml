@@ -1,0 +1,29 @@
+[package]
+name = "chmlvpn-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ChmlVPN 客户端装配（docs/design.md §2.3/§3.12/§7-M3）：tun 适配（TunDevice 接缝）+ 接入器退避/端点轮询 + IP 包 ↔ PacketChannel 数据面 + 路由配置"
+
+[dependencies]
+chml-protocol = { path = "../../crates/chml-protocol", features = ["anchor"] }
+futures = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+# 接入器主循环（多线程 rt + 定时退避）。
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+
+# tun-rs 平台适配器（§2.3）：Linux/Windows/macOS 三平台原生路径；Android/iOS 走 fd 注入
+# 接缝（vpn-mesh §1.1——两平台无 native 等价 API），不装配 tun-rs 构建路径。
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
+tun-rs = { workspace = true }
+
+# 路由配置（§2.3：rtnetlink /16 池指向 TUN + rp_filter=1）仅 Linux。
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

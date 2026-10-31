@@ -1,0 +1,15 @@
+# client.toml —— chmlvpn-client 镜像缺省配置（docs/design.md §3.12/§7-M3）。
+#
+# 身份三件套（device.keys/pins.bin/directory.bin）与 vip 由部署编排写入 state_dir
+#（deploy/m3_assert.sh：gen-keys → 服务端 device-add → invite → vip）。
+
+state_dir = "/var/lib/chmlvpn"
+
+# 本端 VIP：留空 = 读 state_dir/vip 文件（编排写入 device-add 分配值）。
+# vip = "100.64.0.11"
+
+tun_name = "tun0"
+mtu = 1280
+
+# 端点覆盖（调试/断言钉死）；缺省 = 根签目录全部端点轮询（§2.3 端点轮询切换）。
+# endpoints = ["frps:27500", "frps:27501"]

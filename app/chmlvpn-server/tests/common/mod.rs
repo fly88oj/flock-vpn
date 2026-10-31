@@ -330,6 +330,7 @@ impl TestServer {
             dir_version: 1,
             ticket_ttl_secs,
             admin_bind: "127.0.0.1:0".parse().unwrap(),
+            tun_name: "tun0".into(),
             frp: None,
         };
         let (core, created) = ServerCore::open_or_init(cfg).expect("core");

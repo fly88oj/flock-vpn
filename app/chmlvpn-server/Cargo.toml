@@ -9,6 +9,9 @@ description = "ChmlVPN 服务端装配（单服形态）：TCP :9443 E2E 会话 
 [dependencies]
 chml-protocol = { path = "../../crates/chml-protocol", features = ["anchor"] }
 chml-frpc = { path = "../../crates/chml-frpc" }
+# M3 数据面（§2.2 服务端自身也是 peer / §3.11「对上挂 tun 适配器」）：复用客户端 crate 的
+# TunDevice/route/TunIo 接缝（§3.12 接缝落位客户端 crate，本 crate 是其第二个消费者）。
+chmlvpn-client = { path = "../chmlvpn-client" }
 # 控制流消息编码（§2.2：yamux stream0 postcard）与 server.toml 反序列化。
 postcard = { workspace = true }
 serde = { workspace = true }
