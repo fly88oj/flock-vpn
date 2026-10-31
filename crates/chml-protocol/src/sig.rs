@@ -478,7 +478,7 @@ mod tests {
 
         let mut p = KeyProfile::new();
         let kid = p.insert_ed25519(k.0.verifying_key());
-        assert_eq!(p.get(&kid).map(|k| k.clone()), Some(ProfileKey::Ed25519(k.0.verifying_key())));
+        assert_eq!(p.get(&kid).cloned(), Some(ProfileKey::Ed25519(k.0.verifying_key())));
         p.verify_dispatch(&kid, msg, &sig).expect("登记钥匙验签通过");
         assert_eq!(p.verify_dispatch("00000000", msg, &sig), Err(DispatchError::UnknownKid));
 
