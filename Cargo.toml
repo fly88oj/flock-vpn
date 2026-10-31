@@ -19,12 +19,18 @@ ed25519-dalek = "3.0.0"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 ml-kem = "0.3.3"
 sha2 = "0.11.1"
+# opaque-ke 4.0.1 走 digest 0.10 代际（TripleDh 的 H）；与 sha2 0.11 并存（改名隔离）
+sha2_compat = { package = "sha2", version = "0.10" }
 hkdf = "0.13.0"
 rand = "0.9"
 rand_core = "0.10"
 base64 = "0.22"
 hex = "0.4"
 rsa = "0.9.10"
+opaque-ke = { version = "4.0.1", default-features = false, features = ["ristretto255"] }
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+zstd = "0.14.3"
+lz4_flex = "0.14"
 
 # 性能归因参考 showroom workspace 的 [profile.test] opt-level=1（docs/research/showroom-analysis §3：
 # 8MiB aes-gcm 在 -O0 0.61s vs -O1 0.013s，46×）。

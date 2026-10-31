@@ -4,7 +4,9 @@
 //!
 //! - [`kem`]：X25519 + ML-KEM-768 混合 KEM（§1.3.3a / §3.1，P0-1、P0-7）；
 //! - [`envelope`]：文件信封 v2（§1.3.3b / §3.2，P0-3；`legacy` feature 下 v1 只读兼容）；
-//! - [`sig`]：SR-SIG1 兼容五函数 + `KeyProfile` kid 分派（§1.3.2 / §1.3.3g / §3.3，P2-12）。
+//! - [`sig`]：SR-SIG1 兼容五函数 + `KeyProfile` kid 分派（§1.3.2 / §1.3.3g / §3.3，P2-12）；
+//! - [`pake`]：OPAQUE（RFC 9807 / opaque-ke 4.0.1）+ rwd profile（§1.3.3h / §3.4，P2-11）；
+//! - [`compress`]：压缩档位与帧格式（§1.3.3e / §3.7，P0-4/P1-7）。
 //!
 //! feature 矩阵（§1.3.1）：默认 = 全 VPN 档；`legacy` / `anchor` / `pq-sign` / `wasm` 默认关
 //! （`anchor` / `pq-sign` / `wasm` 本批次仅占位，见各 feature 注释）。
@@ -17,8 +19,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod compress;
 pub mod envelope;
 pub mod kem;
+pub mod pake;
 pub mod sig;
 
 // 兼容常量（§1.3.2 工具/常量面；showroom-common lib.rs:51-55 原值）
@@ -33,6 +37,6 @@ pub use sig::{nonce_hex, sha256_hex, sha256_hex_stream};
 pub use sig::SIG_WINDOW_SECS;
 
 /// 版本收口再导出（§1.2）。
-pub use {ed25519_dalek, ml_kem, rand, x25519_dalek};
+pub use {ed25519_dalek, ml_kem, opaque_ke, rand, x25519_dalek};
 #[cfg(feature = "legacy")]
 pub use rsa;
