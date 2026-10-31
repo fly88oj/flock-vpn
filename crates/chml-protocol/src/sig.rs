@@ -74,21 +74,38 @@ impl UserKey {
         self.0.to_bytes()
     }
 
+    /// 读取裸 32B seed 文件（[`UserKey::save_seed`] 写出的格式；showroom `id_ed25519`）。
+    pub fn from_seed_file(path: &std::path::Path) -> crate::compat::Result<Self> {
+        let seed = std::fs::read(path)?;
+        let seed: [u8; KEY_LEN] = seed.as_slice().try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "seed file must be exactly 32 bytes")
+        })?;
+        Ok(UserKey(SigningKey::from_bytes(&seed)))
+    }
+
+    /// 写裸 32B seed（0600；unix 平台专属——wasm32 无文件系统语义）。
+    #[cfg(unix)]
+    pub fn save_seed(&self, path: &std::path::Path) -> crate::compat::Result<()> {
+        crate::compat::write_private(path, &self.0.to_bytes())?;
+        Ok(())
+    }
+
     /// `"ed25519:<base64(pubkey)>"`（base64 无 padding；showroom 逐字节同格式）。
     pub fn pub_string(&self) -> String {
         format!("ed25519:{}", STANDARD_NO_PAD.encode(self.0.verifying_key().as_bytes()))
     }
 
     /// 解析 `"ed25519:<base64(pubkey)>"`（showroom 同格式）。
-    pub fn from_pub_string(s: &str) -> Result<VerifyingKey, SigError> {
+    /// 错误类型 = `Box<dyn Error>`（§1.3.2 兼容面签名不变：showroom 原返回
+    /// `Result<VerifyingKey>` 即 `Result<_, Box<dyn Error>>`）。
+    pub fn from_pub_string(s: &str) -> crate::compat::Result<VerifyingKey> {
         let raw = STANDARD_NO_PAD
-            .decode(s.strip_prefix("ed25519:").ok_or(SigError::Format("missing ed25519: prefix"))?)
-            .map_err(|_| SigError::Format("invalid base64 public key"))?;
+            .decode(s.strip_prefix("ed25519:").ok_or("missing ed25519: prefix")?)?;
         let raw: [u8; KEY_LEN] = raw
             .as_slice()
             .try_into()
-            .map_err(|_| SigError::Format("public key must be exactly 32 bytes"))?;
-        VerifyingKey::from_bytes(&raw).map_err(|_| SigError::Format("invalid ed25519 public key"))
+            .map_err(|_| "public key must be exactly 32 bytes")?;
+        Ok(VerifyingKey::from_bytes(&raw)?)
     }
 }
 
@@ -170,23 +187,6 @@ impl fmt::Display for AuthError {
 }
 
 impl std::error::Error for AuthError {}
-
-/// 解析/种子/公钥串类错误（兼容面 `Result<T>` 的具体化）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SigError {
-    /// 格式非法（附原因）。
-    Format(&'static str),
-}
-
-impl fmt::Display for SigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SigError::Format(msg) => write!(f, "sig: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for SigError {}
 
 /// 验证 SR-SIG1：格式解析 → ±300s 时间窗 → 依次尝试登记公钥（user 可多把，任一命中即过）。
 pub fn verify(
@@ -499,4 +499,26 @@ mod tests {
 
     // 10. 跨生态固定向量（showroom-common ed25519-dalek 2.2 生成，RFC 8032 确定性签名
     //     ⇒ 本 crate 3.0 下必须逐字节复现）：tests/sig_showroom_vector.rs 集成测试覆盖。
+
+    // 11. seed 文件 save/from 往返 + 0600（unix 文件接缝；showroom lib.rs:607-619 平移）
+    #[cfg(unix)]
+    #[test]
+    fn user_key_seed_file_roundtrip() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let k = UserKey::generate();
+        let dir = std::env::temp_dir().join(format!("chml-sig-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("id_ed25519");
+        k.save_seed(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        let k2 = UserKey::from_seed_file(&p).unwrap();
+        assert_eq!(k2.to_seed(), k.to_seed());
+        assert_eq!(k2.pub_string(), k.pub_string());
+        // 非 32B seed 文件 → Err
+        std::fs::write(&p, b"short").unwrap();
+        assert!(UserKey::from_seed_file(&p).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -11,7 +11,9 @@
 //!   记录层计数器 nonce AEAD、抗重放、双阈值 rekey、伪造断链（§1.3.3c / §3.5，P0-2/P1-8/P1-10）；
 //! - [`mux`]：yamux 0.14.1 复用 + 显式 FIN + PacketChannel（§1.3.3d / §3.6，P1-9/VPN-14）；
 //! - [`trust`]：首登信任锚——PinStore（集群根级钉扎）、ClusterDirectory（根签目录，端点与
-//!   条目同签、dir_version 递增）、InviteFile v3（§1.3.3f / §3.8，P0-5）。
+//!   条目同签、dir_version 递增）、InviteFile v3（§1.3.3f / §3.8，P0-5）；
+//! - [`compat`]：showroom 兼容工具面（§1.3.2「工具」清单——`Result` 别名 / `write_private`
+//!   0600 落盘 / `names` 名字校验；showroom 迁移为薄再导出的接缝）。
 //!
 //! feature 矩阵（§1.3.1）：默认 = 全 VPN 档；`legacy` / `anchor` / `pq-sign` / `wasm` 默认关
 //! （`anchor` / `pq-sign` / `wasm` 本批次仅占位，见各 feature 注释）。
@@ -26,6 +28,7 @@
 // 其余目标维持 forbid(unsafe_code)（showroom-common lib.rs:4-5 同款豁免）。
 #![cfg_attr(not(all(feature = "wasm", target_arch = "wasm32")), forbid(unsafe_code))]
 
+pub mod compat;
 pub mod compress;
 pub mod envelope;
 pub mod kem;
@@ -56,6 +59,6 @@ pub use sig::{nonce_hex, sha256_hex, sha256_hex_stream};
 pub use sig::SIG_WINDOW_SECS;
 
 /// 版本收口再导出（§1.2）。
-pub use {ed25519_dalek, ml_kem, opaque_ke, rand, x25519_dalek};
+pub use {aes_gcm, ed25519_dalek, ml_kem, opaque_ke, rand, x25519_dalek};
 #[cfg(feature = "legacy")]
 pub use rsa;
