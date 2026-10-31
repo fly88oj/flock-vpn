@@ -18,6 +18,20 @@
 # Git Bash（MSYS）路径改写坑：/dev/net/tun、/etc/chmlvpn/... 等以 / 开头的参数会被
 # 改写成 Windows 路径（设计附录 B-2 首次踩坑记录）——本脚本内部 export
 # MSYS_NO_PATHCONV=1，调用方无需任何前置设置。
+#
+# WSL bash 兜底（Windows 下 `bash` 解析到 C:\Windows\System32\bash.exe 的 WSL 垫片时）：
+# 垫片经默认发行版起 /bin/bash——若默认发行版是 docker-desktop（无 /bin/bash）则本脚本
+# 根本起不来（execvpe(/bin/bash) failed）；若是完整发行版（如 Ubuntu）则起得来但无
+# MSYS 语义（pwd -W 缺席、docker.exe 收到 /mnt/... 不识别）。两形态统一转投 Windows 侧
+# Git Bash 执行——脚本主体（MSYS_NO_PATHCONV + pwd -W 双侧路径形态）即在该形态验证。
+if grep -qi microsoft /proc/version 2>/dev/null && [ -d /mnt/c ]; then
+    _gb="/mnt/c/Program Files/Git/bin/bash.exe"
+    if [ -x "$_gb" ]; then
+        _self="${BASH_SOURCE[0]:-$0}"
+        case "$_self" in /*) ;; *) _self="$(pwd)/$_self" ;; esac
+        exec "$_gb" "$(wslpath -m "$_self")" "$@"
+    fi
+fi
 
 export MSYS_NO_PATHCONV=1
 

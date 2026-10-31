@@ -272,10 +272,16 @@ impl AsyncWrite for MuxIo {
                 this.send_fut = None;
                 Poll::Ready(Ok(this.send_len))
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "mux: record writer gone",
-            ))),
+            Poll::Ready(Err(_)) => {
+                // 完成的 future 必须清出 send_fut：yamux 在写错误后会重试 poll_write，
+                // 复轮询已完成 future 会以「async fn resumed after completion」panic
+                //（实测杀掉 mux 驱动任务、扰乱会话拆除时序——A9 死链检测被拖延）。
+                this.send_fut = None;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "mux: record writer gone",
+                )))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -297,5 +303,34 @@ mod tests {
     #[test]
     fn prio_values() {
         assert_ne!(Prio::Control, Prio::Normal);
+    }
+
+    /// 回归（A9 排障实测）：写泵消失（会话拆除 ⇒ data_rx drop）后 send 立即 Err；
+    /// yamux 在写错误后会重试 poll_write——已完成 future 必须已清出 `send_fut`，
+    /// 否则复轮询以「async fn resumed after completion」panic（杀 mux 驱动任务，
+    /// 拖延死链拆除时序）。
+    #[test]
+    fn muxio_write_err_then_repoll_returns_err_without_panic() {
+        use futures::task::noop_waker;
+        use std::task::Context;
+
+        let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (_plain_hold, plain_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        drop(data_rx); // 写泵消失（通道无接收者 ⇒ send 立即 Err）
+
+        let mut io = MuxIo::new(plain_rx, data_tx);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let first = std::pin::Pin::new(&mut io).poll_write(&mut cx, b"payload");
+        match first {
+            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
+            other => panic!("期望 Ready(Err(BrokenPipe))，得 {other:?}"),
+        }
+        // 复轮询（yamux 写重试形态）：不得 panic，且再次给出 BrokenPipe。
+        let second = std::pin::Pin::new(&mut io).poll_write(&mut cx, b"payload");
+        match second {
+            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
+            other => panic!("复轮询期望 Ready(Err(BrokenPipe))，得 {other:?}"),
+        }
     }
 }
