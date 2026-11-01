@@ -331,7 +331,9 @@ pub async fn dial(pin: &ServerPin, device: &DeviceStaticKeys, cfg: TunnelConfig)
 }
 
 /// 守护循环事件（日志/断言面：A9 的「检测进入重连」由 [`ConnEvent::SessionEnded`] 携
-/// `dead-link` 原因 + 下一跳时间构成可 grep 的记录）。
+/// `dead-link` 原因 + 下一跳时间构成可 grep 的记录；A10 的 rekey 无感由 supervise 内
+/// 纪元观察任务直接打 `chmlvpn-client: rekey epoch=N` 日志——`events` 回调非 Send 进
+/// 不了 spawn，纪元行不占事件枚举）。
 #[derive(Debug)]
 pub enum ConnEvent {
     /// 正在尝试某端点（attempt 从 1 起）。
@@ -388,12 +390,29 @@ pub async fn supervise(
                         if let Some(server) = tunnel.peer_server_id() {
                             events(ConnEvent::Connected { endpoint: endpoint.clone(), server });
                         }
+                        // rekey 观测（A10）：订阅纪元 watch，每次推进上报（对数据面无感——
+                        // bridge 与本任务并行）。
+                        let mut epoch_rx = tunnel.epoch_watch();
+                        let ep_for_rekey = endpoint.clone();
+                        let rekey_watcher = tokio::spawn(async move {
+                            loop {
+                                if epoch_rx.changed().await.is_err() {
+                                    return;
+                                }
+                                // 回调侧只打日志——事件序由 watch 保序。
+                                eprintln!(
+                                    "chmlvpn-client: rekey epoch={} endpoint={ep_for_rekey}",
+                                    *epoch_rx.borrow_and_update()
+                                );
+                            }
+                        });
                         let mut sess = tun.session();
                         let bridge_err = dataplane::bridge(&mut sess, ch).await.err();
                         if let Some(e) = &bridge_err {
                             eprintln!("chmlvpn-client: dataplane ended: {e}");
                         }
                         drop(sess);
+                        rekey_watcher.abort();
                         let reason = tunnel.stats().closed;
                         drop(control); // 控制流随会话结束（显式：先于 shutdown 的 FIN 次序）
                         events(ConnEvent::SessionEnded { endpoint: endpoint.clone(), reason });

@@ -25,6 +25,10 @@ use crate::proto::NodeId;
 pub const LEASE_TTL: Duration = Duration::from_secs(30);
 /// 反熵周期（§3.10：5s）。
 pub const ANTI_ENTROPY: Duration = Duration::from_secs(5);
+/// 本地会话租约续期周期（TTL/3——**长寿命会话必须周期重发布**：publish 只在建连时
+/// 触发一次，无续期则 30s 后全网「忘记」仍在线的设备（M5 e2e 实测暴露——A1 的
+/// 90s 字节透传把 A2 推过 TTL 窗，跨服转发全体退化为 NOT_HERE）。
+pub const LEASE_REFRESH: Duration = Duration::from_secs(10);
 
 /// gossip 线消息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +165,12 @@ impl LeaseTable {
         fanout.locate(device).await
     }
 
+    /// 非过期租约条数（诊断/断言面：gossip 传播是否工作）。
+    pub fn live_len(&self) -> usize {
+        let st = self.st.lock().expect("lease table");
+        st.iter().filter(|(_, l)| l.expires_at > Instant::now()).count()
+    }
+
     /// 全表摘要（反熵消息体）。
     pub fn anti_entropy_msg(&self) -> GossipMsg {
         let st = self.st.lock().expect("lease table");
@@ -226,6 +236,16 @@ mod tests {
             term_ms: 1,
         });
         assert_eq!(t1.observe(&[7; 32]).unwrap().holder, 2, "旧者不覆盖");
+    }
+
+    /// 续期周期守门：LEASE_REFRESH 必须显著短于 TTL（两次续期窗内不过期——
+    /// M5 e2e 暴露的「长寿命会话租约蒸发」回归面）。
+    #[test]
+    fn refresh_period_is_well_within_ttl() {
+        assert!(
+            LEASE_REFRESH + LEASE_REFRESH < LEASE_TTL,
+            "两个续期周期必须都在 TTL 内（缺一轮续期仍存活——10s 续期 × 30s TTL）"
+        );
     }
 
     #[test]

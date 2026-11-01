@@ -27,8 +27,10 @@ pub(crate) mod arr64 {
 /// Raft 节点 ID（openraft NodeId = u64）。
 pub type NodeId = u64;
 
-/// VIP 池：`100.64.0.0/10`（RFC 6598，§2.1）；`.1` 保留给服务器自身，分配从 `.2` 起。
-pub const VIP_FIRST: u32 = u32::from_be_bytes([100, 64, 0, 2]);
+/// VIP 池：`100.64.0.0/10`（RFC 6598，§2.1）。`100.64.0.1`–`100.64.0.10` 保留给服务器
+/// 自身（多主形态每台服务器各一个 tun VIP——§6.2 拓扑：server-a/b/c = .1/.2/.3），
+/// 设备分配从 `.11` 起（§6.2 客户端 VIP 100.64.0.11/.12/.13）。
+pub const VIP_FIRST: u32 = u32::from_be_bytes([100, 64, 0, 11]);
 /// 池末（/10 段最后一个可用地址）。
 pub const VIP_LAST: u32 = u32::from_be_bytes([100, 127, 255, 254]);
 

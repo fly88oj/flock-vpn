@@ -91,6 +91,10 @@ pub struct ForwardStats {
     /// hop 耗尽的二次转发（防环：丢 + 计数）。
     pub hop_dropped: u64,
     pub delivered_local: u64,
+    /// 交付本机内核（dst = 本服务器自身 VIP——服务器也是 peer，§2.2）。
+    pub delivered_kernel: u64,
+    /// 本机内核发出（route_outbound：回程/本机协议栈流量进 mesh）。
+    pub outbound_kernel: u64,
     pub forwarded: u64,
     pub not_here: u64,
     /// NOT_HERE 后经一次性 location_query 重定向成功。
@@ -123,6 +127,10 @@ pub struct ForwardPlane {
     transport: Mutex<Option<Arc<dyn ForwardTransport>>>,
     fanout: Mutex<Option<Arc<dyn LocateFanout>>>,
     sessions: Mutex<HashMap<[u8; 32], Arc<dyn PacketSink>>>,
+    /// 本机内核接缝（服务器自身 VIP 的本机投递 + 回程路由，§2.2「服务端自身也是
+    /// peer」）：`(自身 VIP, tun 写泵 sink)`——dst = 自身 VIP 的包进内核（ICMP 应答/
+    /// iperf 绑定面）；内核读出的包经 [`ForwardPlane::route_outbound`] 回 mesh。
+    local_peer: Mutex<Option<(Ipv4Addr, Arc<dyn PacketSink>)>>,
     stats: ForwardStatsAtomic,
 }
 
@@ -132,6 +140,8 @@ struct ForwardStatsAtomic {
     src_mismatch_rejected: AtomicU64,
     hop_dropped: AtomicU64,
     delivered_local: AtomicU64,
+    delivered_kernel: AtomicU64,
+    outbound_kernel: AtomicU64,
     forwarded: AtomicU64,
     not_here: AtomicU64,
     locate_redirected: AtomicU64,
@@ -148,6 +158,7 @@ impl ForwardPlane {
             transport: Mutex::new(None),
             fanout: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
+            local_peer: Mutex::new(None),
             stats: ForwardStatsAtomic::default(),
         })
     }
@@ -161,6 +172,16 @@ impl ForwardPlane {
     /// 本机节点号。
     pub fn me(&self) -> NodeId {
         self.me
+    }
+
+    /// 本地在册会话设备集（租约续期循环用——长寿命会话的租约重发布，lease.rs）。
+    pub fn local_devices(&self) -> Vec<[u8; 32]> {
+        self.sessions
+            .lock()
+            .expect("fwd sessions")
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// 挂载/卸载本地设备会话（登录建立/断链拆除）。
@@ -182,12 +203,52 @@ impl ForwardPlane {
             src_mismatch_rejected: self.stats.src_mismatch_rejected.load(Ordering::Relaxed),
             hop_dropped: self.stats.hop_dropped.load(Ordering::Relaxed),
             delivered_local: self.stats.delivered_local.load(Ordering::Relaxed),
+            delivered_kernel: self.stats.delivered_kernel.load(Ordering::Relaxed),
+            outbound_kernel: self.stats.outbound_kernel.load(Ordering::Relaxed),
             forwarded: self.stats.forwarded.load(Ordering::Relaxed),
             not_here: self.stats.not_here.load(Ordering::Relaxed),
             locate_redirected: self.stats.locate_redirected.load(Ordering::Relaxed),
             icmp_unreachable: self.stats.icmp_unreachable.load(Ordering::Relaxed),
             dropped: self.stats.dropped.load(Ordering::Relaxed),
         }
+    }
+
+    /// 挂载本机内核（服务器自身 peer 面）：`vip` = 本机 tun VIP；`sink` = tun 写泵
+    /// （dst = 自身 VIP 的包注入内核）。装配层另起读泵消费 [`Self::route_outbound`]。
+    pub fn set_local_peer(&self, vip: Ipv4Addr, sink: Arc<dyn PacketSink>) {
+        *self.local_peer.lock().expect("fwd local peer") = Some((vip, sink));
+    }
+
+    /// 本机内核发出的包（ICMP 回程/本机协议栈流量）路由进 mesh：跳过第 0 步源绑定
+    /// 校验（本机内核可信源 = 自身 VIP），按目标 VIP 走与 [`Self::ingest`] 相同的
+    /// 判定序（本机会话投递 / ForwardEnvelope 跨服 / 一次性重定向 / 丢+ICMP——对端
+    /// 设备不在本机时尽力语义，源为本机 ⇒ 无处送 ICMP，纯丢）。
+    pub async fn route_outbound(&self, pkt: &[u8]) {
+        self.stats.outbound_kernel.fetch_add(1, Ordering::Relaxed);
+        let Some(dst_vip) = ipv4_dst(pkt) else {
+            self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        // dst = 自身 VIP：本机到本机（罕见；直接丢弃避免回环）。
+        {
+            let local = self.local_peer.lock().expect("fwd local peer").clone();
+            if let Some((vip, _)) = local {
+                if dst_vip == vip {
+                    self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+        let dst_dev = match self.sm.device_by_vip(&dst_vip.octets()) {
+            Some(d) => d,
+            None => {
+                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        // 源占位 [0;32]：非任何注册设备 ⇒ 失败路径（drop_with_icmp）找不到源会话，
+        // 自然纯丢（内核出向的尽力语义）。
+        let _ = self.deliver_or_forward_fwd(&[0u8; 32], dst_dev, pkt).await;
     }
 
     /// 设备注册 VIP（源绑定校验数据源 = NetState 强一致注册表）。
@@ -213,15 +274,42 @@ impl ForwardPlane {
             self.stats.src_violations.fetch_add(1, Ordering::Relaxed);
             return IngestResult::SrcViolation;
         }
-        // 1. 目标 VIP → 设备归属。
+        // 1. 目标 VIP。
         let Some(dst_vip) = ipv4_dst(pkt) else {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             return IngestResult::Dropped;
         };
+        // 1a. dst = 本服务器自身 VIP ⇒ 注入本机内核（服务器也是 peer，§2.2——A2/A4
+        // 的 ping/iperf 本服路径）。
+        {
+            let local = self.local_peer.lock().expect("fwd local peer").clone();
+            if let Some((vip, kernel)) = local {
+                if dst_vip == vip {
+                    if kernel.deliver(pkt).is_ok() {
+                        self.stats.delivered_kernel.fetch_add(1, Ordering::Relaxed);
+                        return IngestResult::DeliveredLocal;
+                    }
+                    self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    return IngestResult::Dropped;
+                }
+            }
+        }
+        // 1b. 目标 VIP → 设备归属。
         let Some(dst_dev) = self.sm.device_by_vip(&dst_vip.octets()) else {
             // 未注册目标：丢 + 尽力 ICMP。
             return self.drop_with_icmp(device, pkt);
         };
+        self.deliver_or_forward_fwd(device, dst_dev, pkt).await
+    }
+
+    /// 判定序 2→4（本机投递 / 跨服 ForwardEnvelope / NOT_HERE→重定向 / 丢+ICMP）。
+    /// 入向（ingest）与内核出向（route_outbound——src 无会话绑定，不送 ICMP）共用。
+    async fn deliver_or_forward_fwd(
+        &self,
+        src_dev: &[u8; 32],
+        dst_dev: [u8; 32],
+        pkt: &[u8],
+    ) -> IngestResult {
         // 2. 归属本机 ⇒ 直接投递。
         if let Some(sink) = self
             .sessions
@@ -240,7 +328,7 @@ impl ForwardPlane {
             Some(lease) if lease.holder != self.me => {
                 let env = ForwardEnvelope {
                     ver: FORWARD_VER,
-                    src_dev: *device,
+                    src_dev: *src_dev,
                     dst_dev,
                     origin_server: self.me,
                     hop: 1,
@@ -255,7 +343,7 @@ impl ForwardPlane {
                     Ok(ForwardOutcome::NotHere) => {
                         // 4. 一次性 location_query 重定向；仍失败 ⇒ 丢 + ICMP。
                         self.stats.not_here.fetch_add(1, Ordering::Relaxed);
-                        self.redirect_once(device, dst_dev, pkt).await
+                        self.redirect_once(src_dev, dst_dev, pkt).await
                     }
                     Ok(ForwardOutcome::Rejected(_)) | Err(_) => {
                         self.stats.forwarded.fetch_add(1, Ordering::Relaxed);
@@ -267,7 +355,7 @@ impl ForwardPlane {
             // 租约说本机但会话不在（刚断链）或无租约：一次性询问后丢。
             _ => {
                 self.stats.not_here.fetch_add(1, Ordering::Relaxed);
-                return self.redirect_once(device, dst_dev, pkt).await;
+                self.redirect_once(src_dev, dst_dev, pkt).await
             }
         }
     }

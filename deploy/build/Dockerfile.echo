@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1
+# echo —— A1 字节透传 harness 的回显端点（docs/design.md §6.3 A1：经中转 echo 回
+# 1MiB 随机 + 全 256 字节值，sha256 一致——frp-compat T1/T2 的 e2e 复刻面）。
+# socat TCP-LISTEN fork + EXEC:cat = 全双工字节回显（无框定/无改写）。
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends socat \
+ && rm -rf /var/lib/apt/lists/*
+EXPOSE 9001
+ENTRYPOINT ["socat", "TCP-LISTEN:9001,reuseaddr,fork", "EXEC:cat"]

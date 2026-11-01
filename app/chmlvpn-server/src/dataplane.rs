@@ -124,12 +124,14 @@ impl PeerRouter {
     /// 打开 tun + 路由并装配路由器；任一步失败记日志并降级控制流-only
     /// （M2 宿主测试/无 NET_ADMIN 部署路径）。async：路由配置走 rtnetlink/tokio。
     ///
+    /// `vip` = 本机 tun VIP（单服缺省 [`SERVER_VIP`]；多主形态每台各配，§6.2）。
+    ///
     /// 非 Linux 平台不装配真设备（Windows wintun 运行路径按 §7-M3 留待 M5 真机手工
     /// 验证——宿主 `cargo test` 不得触碰宿主驱动；macOS 未验证同 §7-M3）。
-    pub async fn open(tun_name: &str) -> Arc<Self> {
+    pub async fn open(tun_name: &str, vip: Ipv4Addr) -> Arc<Self> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = tun_name;
+            let _ = (tun_name, vip);
             eprintln!(
                 "chmlvpn-server: 数据面仅 Linux 装配（Windows 真机 M5 手工清单/macOS 未验证）——控制流-only 模式"
             );
@@ -137,38 +139,10 @@ impl PeerRouter {
         }
         #[cfg(target_os = "linux")]
         {
-            let spec = TunSpec {
-                name: tun_name.into(),
-                mtu: chmlvpn_client::tun::MTU,
-            };
-            let opened = match TunIo::open(&spec) {
-                Ok(tun) => {
-                    let ifname = tun.name().to_string();
-                    match route::apply(&RoutePlan::new(&ifname, SERVER_VIP)).await {
-                        Ok(()) => Ok(tun),
-                        Err(e) => {
-                            eprintln!("chmlvpn-server: 路由配置失败（控制流-only 模式）: {e}");
-                            Err(())
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "chmlvpn-server: tun 打开失败（控制流-only 模式；容器需 --cap-add NET_ADMIN --device /dev/net/tun）: {e}"
-                    );
-                    Err(())
-                }
-            };
-            match opened {
+            match open_tun_with_route(tun_name, vip).await {
                 Ok(tun) => {
                     let mut sess = tun.session();
                     let kernel_tx = sess.tx.clone();
-                    eprintln!(
-                        "chmlvpn-server: dataplane up: tun {} vip {SERVER_VIP} route {}/{} + rp_filter=1",
-                        tun.name(),
-                        route::VIP_POOL.0,
-                        route::VIP_POOL.1
-                    );
                     PeerRouter {
                         tun: Some(Arc::new(tun)),
                         sessions: SessionIndex::new(),
@@ -181,6 +155,34 @@ impl PeerRouter {
                     sessions: SessionIndex::new(),
                     kernel_tx: None,
                 }),
+            }
+        }
+    }
+
+    /// 多主形态的 tun 装配（§2.2「服务端自身也是 peer」+ §6.2 M5 批次）：开 tun + 路由
+    /// 后**不**起单服内核路由任务——会话面由 chml-sync 转发面承担
+    /// （[`crate::sync::wire_local_peer`]：dst=自身 VIP 注入内核；内核回程读泵 →
+    /// `SyncNode::route_outbound`）。
+    ///
+    /// 返回 `(tun 句柄, 会话)`；失败 ⇒ None（控制流-only 降级，同单服语义）。
+    pub async fn open_tun_session(
+        tun_name: &str,
+        vip: Ipv4Addr,
+    ) -> Option<(Arc<TunIo>, chmlvpn_client::tun::TunSession)> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (tun_name, vip);
+            eprintln!("chmlvpn-server: 数据面仅 Linux 装配——多主形态控制流-only 模式");
+            None
+        }
+        #[cfg(target_os = "linux")]
+        {
+            match open_tun_with_route(tun_name, vip).await {
+                Ok(tun) => {
+                    let sess = tun.session();
+                    Some((Arc::new(tun), sess))
+                }
+                Err(()) => None,
             }
         }
     }
@@ -317,6 +319,42 @@ enum Step {
     InBytes(usize),
     InErr,
     InEof,
+}
+
+/// Linux：开 tun + 配路由（`100.64.0.0/16 → tun + 本机 VIP + rp_filter=1`）。
+/// 失败记日志并返回 Err（调用方降级控制流-only）。
+#[cfg(target_os = "linux")]
+async fn open_tun_with_route(tun_name: &str, vip: Ipv4Addr) -> Result<TunIo, ()> {
+    let spec = TunSpec {
+        name: tun_name.into(),
+        mtu: chmlvpn_client::tun::MTU,
+    };
+    match TunIo::open(&spec) {
+        Ok(tun) => {
+            let ifname = tun.name().to_string();
+            match route::apply(&RoutePlan::new(&ifname, vip)).await {
+                Ok(()) => {
+                    eprintln!(
+                        "chmlvpn-server: dataplane up: tun {} vip {vip} route {}/{} + rp_filter=1",
+                        tun.name(),
+                        route::VIP_POOL.0,
+                        route::VIP_POOL.1
+                    );
+                    Ok(tun)
+                }
+                Err(e) => {
+                    eprintln!("chmlvpn-server: 路由配置失败（控制流-only 模式）: {e}");
+                    Err(())
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "chmlvpn-server: tun 打开失败（控制流-only 模式；容器需 --cap-add NET_ADMIN --device /dev/net/tun）: {e}"
+            );
+            Err(())
+        }
+    }
 }
 
 // ============================================================================

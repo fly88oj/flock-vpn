@@ -192,7 +192,7 @@ async fn write_any_read_any_linearizable_within_2s() {
     assert_eq!(
         row.vip,
         chml_sync::VIP_FIRST.to_be_bytes(),
-        "首 VIP = 100.64.0.2"
+        "首 VIP = 100.64.0.11（.1–.10 保留给服务器，§6.2）"
     );
 
     // 吊销记录同样 ≤2s 线性一致可见。

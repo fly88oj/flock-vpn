@@ -93,6 +93,14 @@ impl LiveSessions {
             .map(|v| v.iter().filter(|tx| !tx.is_closed()).count())
             .unwrap_or(0)
     }
+
+    /// 在线设备数（M5 断言面：admin stats 的 sessions_online）。
+    pub fn device_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("live sessions poisoned")
+            .len()
+    }
 }
 
 /// 多主 apply/租约钩子（§2.2 吊销传播界 + vpn-mesh §5.2 租约冲突）。
@@ -506,18 +514,23 @@ impl ServerCore {
                 },
             }
         }
+        // 优雅收尾（顺序关键——**不得 abort 数据面任务**）：先拆隧道（流全关 ⇒
+        // serve_stream/serve_stream_sync 自然退出并 detach——abort 会跳过 detach，
+        // forward.sessions 残留死会话；租约续期循环会把残留项当在线设备反复重发布，
+        // 与新持有者打「租约战」互踢活会话——M5 e2e 实测风暴根因）。
+        let close_reason = tunnel.stats().closed;
+        tunnel.shutdown().await;
         for h in handlers {
-            h.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
         }
         // 会话终止原因（A9 服务端侧：静默死链 ⇒ "dead-link" 可 grep）。
-        let reason = tunnel.stats().closed;
+        let reason = close_reason;
         eprintln!(
             "chmlvpn-server: session ended device={device} reason={}",
             reason
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "none(io/fin)".into())
         );
-        tunnel.shutdown().await;
         self.sessions.deregister(device.0);
     }
 
@@ -569,7 +582,11 @@ pub async fn run(
 > {
     // M3 数据面（§2.2 服务端自身也是 peer）：tun + 路由；失败在 PeerRouter::open
     // 内降级控制流-only 并记日志（宿主测试路径即此形态）。
-    core.set_router(PeerRouter::open(&core.cfg.tun_name).await);
+    // 多主形态（sync::run_raft）已按自身 peer 面装配 tun（router 预置）⇒ 此处跳过，
+    // 避免二次开同名设备。
+    if core.router().is_none() {
+        core.set_router(PeerRouter::open(&core.cfg.tun_name, core.cfg.vip).await);
+    }
     // admin loopback 端点（CLI 子命令的进程内单写者入口）。
     let admin = crate::admin::serve(core.clone(), core.cfg.admin_bind)
         .await

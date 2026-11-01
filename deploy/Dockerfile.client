@@ -13,13 +13,16 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/chml-protocol/Cargo.toml crates/chml-protocol/
 COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
+COPY crates/chml-sync/Cargo.toml crates/chml-sync/
 COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
 COPY app/chmlvpn-client/Cargo.toml app/chmlvpn-client/
 RUN mkdir -p crates/chml-protocol/src crates/chml-protocol/benches \
-             crates/chml-frpc/src app/chmlvpn-server/src app/chmlvpn-client/src \
+             crates/chml-frpc/src crates/chml-sync/src \
+             app/chmlvpn-server/src app/chmlvpn-client/src \
  && echo 'pub fn _stub() {}' > crates/chml-protocol/src/lib.rs \
  && echo 'fn main() {}' > crates/chml-protocol/benches/aead.rs \
  && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/chml-sync/src/lib.rs \
  && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
  && echo 'fn main() {}' > app/chmlvpn-server/src/main.rs \
  && echo 'pub fn _stub() {}' > app/chmlvpn-client/src/lib.rs \
@@ -35,8 +38,12 @@ RUN touch crates/chml-protocol/src/lib.rs app/chmlvpn-client/src/lib.rs \
  && cargo build --release --locked -p chmlvpn-client
 
 FROM debian:bookworm-slim
+# 工具面：iproute2/iputils-ping/iperf3/procps（A2/A3/A4 断言与诊断）；
+# netcat-openbsd/tcpdump/iptables/hping3：M5 断言（A1 字节透传 nc echo、A11 压缩
+# 默认关的 iptables 字节计数对照、A14 伪造源的 hping3 + tcpdump 收包面）。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends iproute2 iputils-ping iperf3 procps \
+      netcat-openbsd tcpdump iptables hping3 \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/chmlvpn-client /usr/local/bin/chmlvpn-client
 RUN mkdir -p /var/lib/chmlvpn

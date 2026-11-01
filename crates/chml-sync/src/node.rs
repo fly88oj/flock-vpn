@@ -191,8 +191,14 @@ impl SyncNodeBuilder {
             ic_serve_ic.serve_loop(target).await;
         });
 
-        // 反熵循环（5s 全表摘要 fan-out）。
+        // 反熵循环（5s 全表摘要 fan-out）+ 本地会话租约续期（TTL/3 重发布）。
         tokio::spawn(anti_entropy_loop(ic.clone(), lease.clone()));
+        tokio::spawn(lease_refresh_loop(
+            ic.clone(),
+            lease.clone(),
+            forward.clone(),
+            self.node_id,
+        ));
 
         // 成员初始化（同配置多节点并发 initialize 安全——openraft 契约）。
         if !self.members.is_empty() {
@@ -223,6 +229,48 @@ impl SyncNodeBuilder {
         let reader = Arc::new(NodeReader(inner.clone()));
         let dir = SyncDirectory::new(reader, inner.lag.clone(), inner.sm.epoch_watch());
         Ok(SyncNode { inner, dir })
+    }
+}
+
+/// 本地会话租约续期：每 [`LEASE_REFRESH`]（TTL/3）把仍在本机在线的设备重新
+/// publish + 广播（publish 建连时只发一次——无此循环则 30s 后租约全网蒸发）。
+async fn lease_refresh_loop(
+    ic: Arc<Interconnect>,
+    lease: Arc<LeaseTable>,
+    forward: Arc<crate::forward::ForwardPlane>,
+    me: NodeId,
+) {
+    let mut tick = tokio::time::interval(crate::lease::LEASE_REFRESH);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        for device in forward.local_devices() {
+            let _ = lease.publish(&device);
+            broadcast_publish(&ic, me, device);
+        }
+    }
+}
+
+/// 单条租约事件广播（publish/续期共用）。
+fn broadcast_publish(ic: &Arc<Interconnect>, me: NodeId, device: [u8; 32]) {
+    let msg = crate::lease::GossipMsg::Publish {
+        device,
+        holder: me,
+        term_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    for peer in ic.node_ids() {
+        if peer != me {
+            let ic = ic.clone();
+            let m = msg.clone();
+            tokio::spawn(async move {
+                let _ = ic
+                    .call(peer, WireRpc::Gossip(m), Duration::from_secs(2))
+                    .await;
+            });
+        }
     }
 }
 
@@ -501,28 +549,10 @@ impl SyncNode {
         issuer.verify(t, device, self.inner.sm.epoch(), now_unix)
     }
 
-    /// 发布本机设备租约（gossip 事件广播 ≤1s + 反熵兜底）。
+    /// 发布本机设备租约（gossip 事件广播 ≤1s + 反熵兜底 + TTL/3 续期循环）。
     pub async fn publish_lease(&self, device: &[u8; 32]) -> Option<NodeId> {
         let prev = self.inner.lease.publish(device);
-        let msg = crate::lease::GossipMsg::Publish {
-            device: *device,
-            holder: self.inner.id,
-            term_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-        };
-        for peer in self.inner.ic.node_ids() {
-            if peer != self.inner.id {
-                let ic = self.inner.ic.clone();
-                let m = msg.clone();
-                tokio::spawn(async move {
-                    let _ = ic
-                        .call(peer, WireRpc::Gossip(m), Duration::from_secs(2))
-                        .await;
-                });
-            }
-        }
+        broadcast_publish(&self.inner.ic, self.inner.id, *device);
         prev
     }
 
@@ -539,6 +569,11 @@ impl SyncNode {
     /// 应答侧握手拒绝计数（无凭证/伪造凭证在握手层被拒——admission 断言面）。
     pub fn rejected_handshakes(&self) -> u64 {
         self.inner.ic.rejected_handshakes()
+    }
+
+    /// 互连诊断计数（拨号 ok/err，RPC ok/err——M5 排障面）。
+    pub fn interconnect_diag(&self) -> (u64, u64, u64, u64) {
+        self.inner.ic.diag()
     }
 
     // ------------------------------------------------------------------
@@ -664,6 +699,21 @@ impl SyncNode {
         pkt: &[u8],
     ) -> crate::forward::IngestResult {
         self.inner.forward.ingest(device, pkt).await
+    }
+
+    /// 挂载本机内核（服务器自身 peer 面，§2.2）：`vip` = 本机 tun VIP，`sink` = tun
+    /// 写泵。dst = 自身 VIP 的入向包注入内核（A2 ping / A4 iperf 本服路径）。
+    pub fn set_local_peer(
+        &self,
+        vip: std::net::Ipv4Addr,
+        sink: Arc<dyn crate::forward::PacketSink>,
+    ) {
+        self.inner.forward.set_local_peer(vip, sink);
+    }
+
+    /// 本机内核出向（tun 读泵产出：ICMP 回程/本机协议栈流量）路由进 mesh。
+    pub async fn route_outbound(&self, pkt: &[u8]) {
+        self.inner.forward.route_outbound(pkt).await
     }
 
     /// 一次性位置询问（本地租约域优先；fan-out ≤3 台互连服务器）。

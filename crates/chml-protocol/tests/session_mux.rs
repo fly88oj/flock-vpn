@@ -1146,3 +1146,88 @@ async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
     server.shutdown().await;
 }
 
+
+// ============================================================================
+// M5 A8：单隧道 100 并发 yamux 流持续 60s 无错（R11——单隧道多会话复用的承载上限）
+// ============================================================================
+
+/// 100 条并发 yamux 流在同一条会话隧道上持续收发（缺省 60s；`A8_SECS` 可调便于本地
+/// 快跑，M5 断言按缺省 60s 执行）。通过标准：全部流建立、每条流双向字节数严格一致、
+/// 隧道无错不断（epoch/rekey 不影响数据面）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hundred_streams_sixty_seconds_sustained() {
+    let secs: u64 = std::env::var("A8_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let streams: usize = 100;
+    let chunk: usize = 4096;
+    // 每流每秒发一轮（100 流 × 4KiB/s = ~400KiB/s 总量——持续而不过载）。
+    let rounds_target = secs as usize;
+
+    let (client, server) = session_pair().await;
+
+    // 服务端：收 100 条流（accept 循环），每条流回显收到的每个 chunk。
+    let srv = tokio::spawn(async move {
+        let mut seen = 0usize;
+        let mut echoers = Vec::new();
+        while let Some(s) = server.accept_stream().await {
+            seen += 1;
+            echoers.push(tokio::spawn(async move {
+                let mut s = s;
+                let mut buf = vec![0u8; chunk];
+                // 回显泵：读到即回写；读错/写错 = 流结束（对端 FIN/会话拆）。
+                while s.read_exact(&mut buf).await.is_ok() && s.write_all(&buf).await.is_ok() {}
+            }));
+            if seen == streams {
+                break;
+            }
+        }
+        assert_eq!(seen, streams, "服务端应收到全部 {streams} 条流");
+        for e in echoers {
+            let _ = e.await;
+        }
+    });
+
+    // 客户端：100 条流并发，每条按秒级节奏发 chunk、收回显、校验序号连续。
+    let mut drivers = Vec::new();
+    for i in 0..streams {
+        let stream = client.open_stream(Prio::Normal).await.expect("open stream");
+        drivers.push(tokio::spawn(async move {
+            let mut s = stream;
+            let mut sent_seq: u32 = 0;
+            let mut recv_seq: u32 = 0;
+            for round in 0..rounds_target {
+                let mut b = vec![i as u8 % 251; chunk];
+                b[..4].copy_from_slice(&sent_seq.to_le_bytes());
+                s.write_all(&b).await.expect("write");
+                let mut r = vec![0u8; chunk];
+                s.read_exact(&mut r).await.expect("echo read");
+                assert_eq!(u32::from_le_bytes(r[..4].try_into().unwrap()), recv_seq);
+                sent_seq += 1;
+                recv_seq += 1;
+                if round + 1 < rounds_target {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+            (sent_seq as usize * chunk, recv_seq == sent_seq)
+        }));
+    }
+    let mut total_bytes = 0usize;
+    for d in drivers {
+        let (n, ok) = d.await.expect("driver");
+        assert!(ok, "回显序号必须连续");
+        total_bytes += n;
+    }
+    // 结束：拆会话（服务端 echo 任务随会话结束退出）。
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(10), srv).await;
+
+    // 通过面：100 流 × {secs}s × 4KiB 双向全部完成、隧道未因错误断开。
+    assert_eq!(
+        total_bytes,
+        streams * rounds_target * chunk,
+        "总发送字节精确匹配（无丢失/无重复）"
+    );
+    eprintln!("A8: {streams} streams × {secs}s × {chunk}B 双向 = {total_bytes}B OK");
+}

@@ -210,6 +210,11 @@ pub struct Interconnect {
     pub rpc_timeout: Duration,
     /// 应答侧握手拒绝计数（无凭证/坏握手——对发起端表现为不透明的连接终止）。
     rejected_handshakes: AtomicU64,
+    /// 互连诊断计数（M5 排障面：拨号/RPC 成败）。
+    pub(crate) diag_dial_ok: AtomicU64,
+    pub(crate) diag_dial_err: AtomicU64,
+    pub(crate) diag_rpc_ok: AtomicU64,
+    pub(crate) diag_rpc_err: AtomicU64,
 }
 
 impl Interconnect {
@@ -248,6 +253,10 @@ impl Interconnect {
             session_cfg: session::TunnelConfig::default(),
             rpc_timeout: Duration::from_secs(5),
             rejected_handshakes: AtomicU64::new(0),
+            diag_dial_ok: AtomicU64::new(0),
+            diag_dial_err: AtomicU64::new(0),
+            diag_rpc_ok: AtomicU64::new(0),
+            diag_rpc_err: AtomicU64::new(0),
         })
     }
 
@@ -292,7 +301,17 @@ impl Interconnect {
 
     async fn connect_pipe(&self, peer: NodeId) -> io::Result<Arc<Pipe>> {
         let entry = self.peer_entry(peer)?;
-        let io = self.fabric.dial(&entry.server_id).await?;
+        let io = match self.fabric.dial(&entry.server_id).await {
+            Ok(io) => {
+                self.diag_dial_ok.fetch_add(1, Ordering::Relaxed);
+                io
+            }
+            Err(e) => {
+                self.diag_dial_err.fetch_add(1, Ordering::Relaxed);
+                eprintln!("interconnect: dial node {peer} failed: {e}");
+                return Err(e);
+            }
+        };
         let pin = ServerPin {
             cluster_id: self.cluster_id,
             cluster_root_pub: self.root_pub,
@@ -309,19 +328,24 @@ impl Interconnect {
     }
 
     /// 到对端开一条 RPC 流（缓存会话优先；失效重建一次）。
+    ///
+    /// **锁纪律（M5 e2e 实测教训）**：全局 pipes 锁不得跨任何网络 await——对端宕机时
+    /// 其拨号（DNS NXDOMAIN 可达秒级）+ 握手会阻塞**所有**对端的 RPC（含 Raft 心跳），
+    /// 500ms 心跳/1.5s 选举超时下即触发选举抖动（A7 窗口实测）。此处在锁外完成
+    /// 开流/拨号/握手，回锁只做查插（竞态双连无害——后写者胜）。
     async fn open_stream(&self, peer: NodeId) -> io::Result<MuxStream> {
-        let mut pipes = self.pipes.lock().await;
-        if let Some(pipe) = pipes.get(&peer).cloned() {
+        let cached = self.pipes.lock().await.get(&peer).cloned();
+        if let Some(pipe) = cached {
             match pipe.open_stream().await {
                 Ok(s) => return Ok(s),
                 Err(_) => {
-                    pipes.remove(&peer);
+                    self.pipes.lock().await.remove(&peer);
                 }
             }
         }
         let pipe = self.connect_pipe(peer).await?;
         let s = pipe.open_stream().await?;
-        pipes.insert(peer, pipe);
+        self.pipes.lock().await.insert(peer, pipe.clone());
         Ok(s)
     }
 
@@ -363,17 +387,34 @@ impl Interconnect {
                 .map_err(|e| io::Error::other(format!("decode: {e}")))
         };
         match tokio::time::timeout(timeout, fut).await {
-            Ok(Ok(resp)) => Ok(resp),
+            Ok(Ok(resp)) => {
+                self.diag_rpc_ok.fetch_add(1, Ordering::Relaxed);
+                Ok(resp)
+            }
             Ok(Err(e)) => {
                 // 流级 IO 错误：会话可能半死——逐出，下一条 RPC 重握手。
+                self.diag_rpc_err.fetch_add(1, Ordering::Relaxed);
+                eprintln!("interconnect: rpc to {peer} io-error: {e}");
                 self.evict(peer).await;
                 Err(WireCallError::Io(e))
             }
             Err(_) => {
+                self.diag_rpc_err.fetch_add(1, Ordering::Relaxed);
+                eprintln!("interconnect: rpc to {peer} timed out ({timeout:?})");
                 self.evict(peer).await;
                 Err(WireCallError::TimedOut)
             }
         }
+    }
+
+    /// 互连诊断计数（M5 排障面）。
+    pub fn diag(&self) -> (u64, u64, u64, u64) {
+        (
+            self.diag_dial_ok.load(Ordering::Relaxed),
+            self.diag_dial_err.load(Ordering::Relaxed),
+            self.diag_rpc_ok.load(Ordering::Relaxed),
+            self.diag_rpc_err.load(Ordering::Relaxed),
+        )
     }
 
     /// 应答侧主循环：收入连 → 服务器-服务器 profile 应答（无凭证即拒）→ 逐流分发。

@@ -1,0 +1,305 @@
+# e2e.yml —— M5 全拓扑（docs/design.md §6.2/§6.3：三网隔离 + Direct/Frp 混布 + 3 voter）。
+#
+#   docker compose -f deploy/e2e.yml up -d --build
+#   bash deploy/e2e_assert.sh          # A1–A16（§6.3）
+#
+# 三网隔离（§6.2：单网段会让「模拟不可信公网」名不副实）：
+#   chmlpub 172.28.0.0/24  bridge —— 模拟不可信公网：frps-a/b、frpc-a/b 边车、
+#                            client-1/2/3、Direct 形态的 server-c（172.28.0.22）；
+#                            密文流经它。172.28.0.20/.21 **故意不分配**——A13 的
+#                            「server-a/b 直连不可达」目标地址。
+#   srvmesh 172.29.0.0/24  internal —— 只挂三台 server（Raft/gossip/FRWD 互连不出公网；
+#                            网络别名 raft-1/2/3 = TcpFabric 拨号表）。
+#   link-a/b 各 /30        frpc 边车 ↔ 对应 server（边车把 server:9443 经中转暴露）。
+#
+# 编排（e2e_assert.sh 驱动，幂等）：
+#   up 时 operator（一次性）init-cluster --voters 3 --endpoints …（已有 root.seed 即跳过）
+#   → 三台 enroll（捆绑自 /mat 卷）→ server 侧 cluster-bootstrap（根签 Bootstrap+SetOprf）
+#   → device-add/cluster-invite → 客户端 gen-keys/invite/vip/ready → restart client。
+# server 容器在捆绑/集群就绪前**等待**（sync.rs 等待语义），`up -d` 一次全起不崩循环。
+
+name: chmlvpn-e2e
+
+x-e2e-server: &e2e-server
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.server
+    additional_contexts:
+      frpbin: ../.tmp/frp_0.71.1_linux_amd64
+    args:
+      server_features: multi-primary   # §6.2 M5：NetBackend::Sync/Raft 装配档
+  cap_add: [NET_ADMIN]
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    net.ipv4.conf.all.rp_filter: "1"
+    net.ipv4.conf.default.rp_filter: "1"
+  volumes:
+    - cluster-mat:/mat:ro              # init-cluster 产物（enroll 输入；root.seed 只在运维侧）
+  restart: unless-stopped
+
+services:
+  # —— 中转（原版 frps v0.71.1 定版；用户口 23000/23100、23001/23101 由 frpc proxy 注册）——
+  frps-a:
+    build:
+      context: build
+      dockerfile: Dockerfile.frps
+      additional_contexts:
+        bins: ../.tmp/frp_0.71.1_linux_amd64
+    image: chmlvpn/frps:0.71.1
+    networks:
+      chmlpub:
+        ipv4_address: 172.28.0.2
+    restart: unless-stopped
+
+  frps-b:
+    build:
+      context: build
+      dockerfile: Dockerfile.frps
+      additional_contexts:
+        bins: ../.tmp/frp_0.71.1_linux_amd64
+    image: chmlvpn/frps:0.71.1
+    networks:
+      chmlpub:
+        ipv4_address: 172.28.0.3
+    restart: unless-stopped
+
+  # —— frpc 边车（server-a/b 的中转注册；A1 echo 面同链路）——
+  frpc-a:
+    build:
+      context: build
+      dockerfile: Dockerfile.frpc
+      additional_contexts:
+        bins: ../.tmp/frp_0.71.1_linux_amd64
+    image: chmlvpn/frpc:0.71.1
+    command: ["-c", "/etc/frpc/frpc.toml"]
+    volumes:
+      - ./build/frpc-a.toml:/etc/frpc/frpc.toml:ro
+    depends_on: [frps-a]
+    networks:
+      chmlpub:
+        ipv4_address: 172.28.0.4
+      link-a: {}
+    restart: unless-stopped
+
+  frpc-b:
+    build:
+      context: build
+      dockerfile: Dockerfile.frpc
+      additional_contexts:
+        bins: ../.tmp/frp_0.71.1_linux_amd64
+    image: chmlvpn/frpc:0.71.1
+    command: ["-c", "/etc/frpc/frpc.toml"]
+    volumes:
+      - ./build/frpc-b.toml:/etc/frpc/frpc.toml:ro
+    depends_on: [frps-b]
+    networks:
+      chmlpub:
+        ipv4_address: 172.28.0.5
+      link-b: {}
+    restart: unless-stopped
+
+  # —— A1 字节透传 echo 端点（link 网内；经中转暴露成 23100/23101）——
+  echo-a:
+    build:
+      context: build
+      dockerfile: Dockerfile.echo
+    image: chmlvpn/echo:e2e
+    networks: [link-a]
+    restart: unless-stopped
+
+  echo-b:
+    build:
+      context: build
+      dockerfile: Dockerfile.echo
+    image: chmlvpn/echo:e2e
+    networks: [link-b]
+    restart: unless-stopped
+
+  # —— 三台 server（3 voter 仲裁，§4；Direct/Frp 混布，§6.2）——
+  server-a:
+    <<: *e2e-server
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+      additional_contexts:
+        frpbin: ../.tmp/frp_0.71.1_linux_amd64
+      args:
+        server_features: multi-primary
+        server_conf: server-e2e-a.toml
+    image: chmlvpn/server:e2e-a
+    depends_on: [frpc-a]
+    volumes:
+      - cluster-mat:/mat:ro
+      - server-a-state:/var/lib/chmlvpn
+    networks:
+      link-a: {}
+      srvmesh:
+        aliases: [raft-1]
+
+  server-b:
+    <<: *e2e-server
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+      additional_contexts:
+        frpbin: ../.tmp/frp_0.71.1_linux_amd64
+      args:
+        server_features: multi-primary
+        server_conf: server-e2e-b.toml
+    image: chmlvpn/server:e2e-b
+    depends_on: [frpc-b]
+    volumes:
+      - cluster-mat:/mat:ro
+      - server-b-state:/var/lib/chmlvpn
+    networks:
+      link-b: {}
+      srvmesh:
+        aliases: [raft-2]
+
+  server-c:
+    # Direct 形态（硬约束守门样板，§0/§2.1）：直挂 chmlpub，无 frpc 边车、无 frp 进程
+    # （A16 的 pgrep 面）；镜像与 a/b 同源（build 无 [frp] 段即零 frp 装配）。
+    <<: *e2e-server
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+      additional_contexts:
+        frpbin: ../.tmp/frp_0.71.1_linux_amd64
+      args:
+        server_features: multi-primary
+        server_conf: server-e2e-c.toml
+    image: chmlvpn/server:e2e-c
+    volumes:
+      - cluster-mat:/mat:ro
+      - server-c-state:/var/lib/chmlvpn
+    networks:
+      chmlpub:
+        ipv4_address: 172.28.0.22
+      srvmesh:
+        aliases: [raft-3]
+
+  # —— 一次性运维容器：init-cluster（幂等——root.seed 已在即跳过）——
+  operator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+      additional_contexts:
+        frpbin: ../.tmp/frp_0.71.1_linux_amd64
+      args:
+        server_features: multi-primary
+        server_conf: server-e2e-a.toml
+    image: chmlvpn/server:e2e-a
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ -f /mat/root.seed ]; then
+          echo "operator: cluster material already present (skip init-cluster)"
+        else
+          chmlvpn-server --config /etc/chmlvpn/server.toml init-cluster \
+            --voters 3 --out /mat \
+            --endpoints "frps-a:23000,frps-b:23001,172.28.0.22:9443"
+        fi
+    volumes:
+      - cluster-mat:/mat
+    networks:
+      chmlpub:
+        ipv4_address: 172.28.0.6
+    restart: "no"
+
+  # —— 客户端 ×3（接入映射钉死，§6.2：client-1→frps-a、client-2→frps-b、client-3→直连）——
+  client-1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.client
+    image: chmlvpn/client:e2e
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    volumes:
+      - ./client-e2e-1.toml:/etc/chmlvpn/client.toml:ro
+      - client-1-state:/var/lib/chmlvpn
+    networks:
+      chmlpub:
+        ipv4_address: 172.28.0.10
+    restart: unless-stopped
+
+  client-2:
+    image: chmlvpn/client:e2e
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.client
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    volumes:
+      - ./client-e2e-2.toml:/etc/chmlvpn/client.toml   # rw：A15 迁移需在容器内改写端点序
+      - client-2-state:/var/lib/chmlvpn
+    networks:
+      chmlpub:
+        ipv4_address: 172.28.0.11
+    restart: unless-stopped
+
+  client-3:
+    image: chmlvpn/client:e2e
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.client
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    volumes:
+      - ./client-e2e-3.toml:/etc/chmlvpn/client.toml:ro
+      - client-3-state:/var/lib/chmlvpn
+    networks:
+      chmlpub:
+        ipv4_address: 172.28.0.12
+    restart: unless-stopped
+
+networks:
+  chmlpub:
+    name: chmlvpn-e2e-chmlpub
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+  srvmesh:
+    name: chmlvpn-e2e-srvmesh
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+  link-a:
+    # 设计 §6.2 写 /30；Docker bridge 需网关 + 广播各占一位，/30 仅剩 2 可用地址
+    # 撑不起「网关 + 边车 + server」三元——取最小可用的 /29（隔离语义不变）。
+    name: chmlvpn-e2e-link-a
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/29
+  link-b:
+    name: chmlvpn-e2e-link-b
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.8/29
+
+volumes:
+  cluster-mat: {}
+  server-a-state: {}
+  server-b-state: {}
+  server-c-state: {}
+  client-1-state: {}
+  client-2-state: {}
+  client-3-state: {}

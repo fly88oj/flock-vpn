@@ -145,7 +145,12 @@ impl RaftLogStorage<SyncConfig> for RedbLogStore {
         let txn = self.db.begin_read().map_err(storage_err)?;
         let kv = txn.open_table(KV).map_err(storage_err)?;
         match kv.get("vote").map_err(storage_err)? {
-            Some(v) => Ok(postcard::from_bytes(v.value()).map_err(storage_err)?),
+            // 写侧（save_vote）序列化的是裸 Vote——读侧必须同型解码。此前读侧按
+            // 返回位置的 Option<Vote> 推断，首字节被当作 Option 判别式 ⇒ 选举后
+            // 任意重启必炸（M5 A7 的 stop/start 实测暴露；tests/store_reopen 回归）。
+            Some(v) => Ok(Some(
+                postcard::from_bytes::<Vote<u64>>(v.value()).map_err(storage_err)?,
+            )),
             None => Ok(None),
         }
     }

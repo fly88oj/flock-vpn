@@ -327,6 +327,7 @@ impl TestServer {
             ticket_ttl_secs,
             admin_bind: "127.0.0.1:0".parse().unwrap(),
             tun_name: "tun0".into(),
+            vip: "100.64.0.1".parse().unwrap(),
             frp: None,
             sync: None,
         };

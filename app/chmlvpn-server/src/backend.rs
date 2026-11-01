@@ -348,6 +348,21 @@ impl NetBackend {
             },
         }
     }
+
+    /// 原样写透传（feature `multi-primary`；admin SignedWrite → 运维侧根签操作：
+    /// Bootstrap/SetOprf/RecordInvite——签名验证全部在 Raft 状态机内）。
+    #[cfg(feature = "multi-primary")]
+    pub async fn write_sync(
+        &self,
+        req: sync_proto::SyncRequest,
+    ) -> Result<sync_proto::SyncResponse, NetError> {
+        match self {
+            NetBackend::Sync(s) => s.write(req).await,
+            NetBackend::Single(_) => Err(NetError::InvalidState(
+                "单服形态无 SignedWrite（管理操作走 invite/redeem/device-add/revoke）".into(),
+            )),
+        }
+    }
 }
 
 // ============================================================================

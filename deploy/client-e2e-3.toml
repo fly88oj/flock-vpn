@@ -1,0 +1,9 @@
+# client.toml —— e2e client-3（docs/design.md §6.2 M5：钉死 Direct 直连 172.28.0.22:9443）。
+# VIP 100.64.0.13（§6.2）。A16 的 Direct 形态客户端。
+
+state_dir = "/var/lib/chmlvpn"
+
+tun_name = "tun0"
+mtu = 1280
+
+endpoints = ["172.28.0.22:9443", "frps-a:23000", "frps-b:23001"]

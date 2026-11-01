@@ -25,7 +25,7 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 futures = { workspace = true }
 # 每入连一会话任务 + accept 循环 + admin loopback 端点：workspace tokio 之上加多线程 rt。
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 
 [features]
 default = []

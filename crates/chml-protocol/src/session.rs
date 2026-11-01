@@ -1234,6 +1234,8 @@ pub(crate) struct Core {
     cfg: TunnelConfig,
     inner: StdMutex<Inner>,
     closed_tx: watch::Sender<bool>,
+    /// 密钥纪元观测（rekey apply 时推进；M5 A10 的 epoch 递增观测面）。
+    epoch_tx: watch::Sender<u64>,
 }
 
 impl Core {
@@ -1244,6 +1246,7 @@ impl Core {
             Role::Server => (tk.s2c, tk.c2s),
         };
         let (closed_tx, _) = watch::channel(false);
+        let (epoch_tx, _) = watch::channel(0u64);
         Arc::new(Core {
             cfg,
             inner: StdMutex::new(Inner {
@@ -1268,7 +1271,13 @@ impl Core {
                 peer_server: None,
             }),
             closed_tx,
+            epoch_tx,
         })
+    }
+
+    /// 订阅密钥纪元变化（初始 0；每次 rekey apply 推进 +1）。
+    pub(crate) fn subscribe_epoch(&self) -> watch::Receiver<u64> {
+        self.epoch_tx.subscribe()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1459,7 +1468,7 @@ impl Core {
         // RESP 必须用旧发送密钥封装（对端收到 RESP 才切换）。
         let frame = Core::seal_locked(&self.cfg, &mut inner, RT_REKEY_RESP, &resp)?;
         // 切换：本端为该次 rekey 的响应方。
-        Core::switch_locked(&mut inner, &ss, epoch, eph_bytes, ct.to_bytes(), false, self.cfg.clock.now());
+        self.switch_locked(&mut inner, &ss, epoch, eph_bytes, ct.to_bytes(), false, self.cfg.clock.now());
         Ok(Some(frame))
     }
 
@@ -1476,7 +1485,7 @@ impl Core {
                 let ct = kem::HybridCt::from_bytes(&ct_bytes);
                 if let Some(ss) = kem::decapsulate(&p.eph, &ct) {
                     let eph_pub = p.eph.public().to_bytes();
-                    Core::switch_locked(&mut inner, &ss, epoch, eph_pub, ct_bytes, true, self.cfg.clock.now());
+                    self.switch_locked(&mut inner, &ss, epoch, eph_pub, ct_bytes, true, self.cfg.clock.now());
                 }
             }
         }
@@ -1484,7 +1493,9 @@ impl Core {
     }
 
     /// 切换到新纪元密钥。`we_are_initiator` = 本端是否为该次 rekey 的 INIT 发起方。
+    #[allow(clippy::too_many_arguments)]
     fn switch_locked(
+        &self,
         inner: &mut Inner,
         ss: &kem::SealedShared,
         epoch: u64,
@@ -1522,6 +1533,7 @@ impl Core {
         inner.epoch_start = now;
         inner.rekeys += 1;
         inner.pending = None;
+        let _ = self.epoch_tx.send(inner.epoch); // 纪元观测面（A10）
     }
 
     fn stats(&self) -> SessionStats {
@@ -1858,6 +1870,11 @@ impl Tunnel {
         self.core.stats()
     }
 
+    /// 订阅密钥纪元（每次 rekey apply 推进；客户端装配层的 A10 观测面）。
+    pub fn epoch_watch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.core.subscribe_epoch()
+    }
+
     /// 对端设备标识（服务端侧；客户端侧为 `None`）。
     pub fn peer_device_id(&self) -> Option<DeviceId> {
         self.core.lock().peer_device
@@ -2175,10 +2192,15 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (t, payload) = recv_frame(&mut io).await?;
+    // 握手形态观测面（M5 断言 A5/A16 的「I0 不得出现」grep 面）：TOFU 引导路径
+    // 显式留痕；钉扎 1-RTT（RT_I1 直达）在会话建立时打印。
+    let mut via_tofu = false;
     let i1 = match t {
         RT_I1 => payload,
         RT_I0 => {
             // TOFU 首连：R0 出示入群凭证链 + 集群根公钥，随后等 I1
+            eprintln!("session: TOFU bootstrap (I0) received -- 2-RTT path");
+            via_tofu = true;
             let mut r = Rd::new(&payload);
             let ver = r.u8()?;
             if ver != PROTOCOL_VERSION {
@@ -2324,6 +2346,10 @@ where
 
     let core = Core::new(cfg, Role::Server, chosen, &tk);
     core.lock().peer_device = Some(device_id);
+    eprintln!(
+        "session: server handshake ok device={device_id} form={}",
+        if via_tofu { "tofu-2rtt(I0)" } else { "pinned-1rtt(I1)" }
+    );
     Ok(spawn_session(io, core, false))
 }
 

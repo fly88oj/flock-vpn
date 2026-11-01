@@ -18,6 +18,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/chml-protocol/Cargo.toml crates/chml-protocol/
 COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
+COPY crates/chml-sync/Cargo.toml crates/chml-sync/
 COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
 # chmlvpn-server 依赖 chmlvpn-client（M3 数据面：TunDevice/route 接缝复用，§2.2/§3.12）。
 COPY app/chmlvpn-client/Cargo.toml app/chmlvpn-client/
@@ -25,10 +26,12 @@ COPY app/chmlvpn-client/Cargo.toml app/chmlvpn-client/
 # stub benches/aead.rs：chml-protocol manifest 声明 [[bench]]，cargo 解析 manifest
 # 需该文件存在（依赖层不编译 bench 本体）。
 RUN mkdir -p crates/chml-protocol/src crates/chml-protocol/benches \
-             crates/chml-frpc/src app/chmlvpn-server/src app/chmlvpn-client/src \
+             crates/chml-frpc/src crates/chml-sync/src \
+             app/chmlvpn-server/src app/chmlvpn-client/src \
  && echo 'pub fn _stub() {}' > crates/chml-protocol/src/lib.rs \
  && echo 'fn main() {}' > crates/chml-protocol/benches/aead.rs \
  && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/chml-sync/src/lib.rs \
  && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
  && echo 'fn main() {}' > app/chmlvpn-server/src/main.rs \
  && echo 'pub fn _stub() {}' > app/chmlvpn-client/src/lib.rs \
@@ -36,24 +39,29 @@ RUN mkdir -p crates/chml-protocol/src crates/chml-protocol/benches \
  && cargo build --release --locked -p chmlvpn-server \
  && rm -rf target/release/deps/chmlvpn_server* target/release/deps/chmlvpn_server_lib* \
           target/release/deps/chmlvpn_client* target/release/deps/chml_protocol* \
-          target/release/deps/chml_frpc* \
+          target/release/deps/chml_frpc* target/release/deps/chml_sync* \
  && rm -f target/release/chmlvpn-server target/release/chmlvpn-client
 
 # —— 源码层 ——
+# server_features：构建档（e2e 多主拓扑传 "multi-primary"——§6.2 M5；缺省空 = 单服）。
+ARG server_features=""
 COPY crates/chml-protocol/src crates/chml-protocol/src
 COPY crates/chml-frpc/src crates/chml-frpc/src
+COPY crates/chml-sync/src crates/chml-sync/src
 COPY app/chmlvpn-client/src app/chmlvpn-client/src
 COPY app/chmlvpn-server/src app/chmlvpn-server/src
 RUN touch crates/chml-protocol/src/lib.rs crates/chml-frpc/src/lib.rs \
+      crates/chml-sync/src/lib.rs \
       app/chmlvpn-client/src/lib.rs app/chmlvpn-client/src/main.rs \
       app/chmlvpn-server/src/lib.rs app/chmlvpn-server/src/main.rs \
- && cargo build --release --locked -p chmlvpn-server
+ && cargo build --release --locked -p chmlvpn-server --features "${server_features}"
 
 FROM debian:bookworm-slim
 # procps：§7-M2 的 Direct 形态断言（容器内 pgrep -f frp 无进程）需要 pgrep；
-# iproute2/iperf3：M3 数据面断言（A3 ip link / A4 iperf3 服务端）。
+# iproute2/iperf3：M3 数据面断言（A3 ip link / A4 iperf3 服务端）；
+# netcat-openbsd：M5 A11 压缩默认关的隧道内 nc 吞吐对照面。
 RUN apt-get update \
- && apt-get install -y --no-install-recommends procps iproute2 iperf3 \
+ && apt-get install -y --no-install-recommends procps iproute2 iperf3 netcat-openbsd \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/chmlvpn-server /usr/local/bin/chmlvpn-server
 # 原版 frpc v0.71.1 定版二进制（命名 context `frpbin` ← .tmp；主 context 无需携带）

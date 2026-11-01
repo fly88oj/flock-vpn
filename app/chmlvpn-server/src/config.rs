@@ -64,6 +64,11 @@ pub struct ServerConfig {
     /// TUN 接口名（M3 数据面，§2.2/§3.12；缺省 "tun0"）。
     #[serde(default = "default_tun_name")]
     pub tun_name: String,
+    /// 本机 tun VIP（§2.2 服务端自身也是 peer；缺省 100.64.0.1。多主形态每台服务器
+    /// 各配一个——§6.2：server-a/b/c = .1/.2/.3；设备 VIP 由 Raft 从 .11 起分配，
+    /// 与服务器段不撞）。
+    #[serde(default = "default_vip")]
+    pub vip: std::net::Ipv4Addr,
     /// 仅 mode = "frp" 时读取。
     pub frp: Option<FrpSection>,
     /// 多主同步（§2.2/§3.11 M4 批次；缺省 None = 单服形态——m2/m2-direct 部署不变）。
@@ -78,7 +83,14 @@ pub struct SyncSection {
     #[serde(default = "default_sync_mode")]
     pub mode: String,
     /// raft 形态：节点捆绑文件（init-cluster 产物；根公钥 + 入群凭证 + 根签目录）。
+    /// 缺省 = state_dir/bundle.bin（`enroll` 子命令落点）。
     pub bundle: Option<PathBuf>,
+    /// raft 形态：服务器互连织物监听地址（§6.2 srvmesh 内联网；缺省 0.0.0.0:9500）。
+    #[serde(default = "default_raft_bind")]
+    pub raft_bind: SocketAddr,
+    /// raft 形态：对端拨号表 `"节点号=host:port"`（§6.2 srvmesh；例 "1=raft-1:9500"）。
+    #[serde(default)]
+    pub raft_peers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,8 +125,14 @@ fn default_tun_name() -> String {
 fn default_frpc_bin() -> PathBuf {
     PathBuf::from("/usr/local/bin/frpc")
 }
+fn default_vip() -> std::net::Ipv4Addr {
+    crate::dataplane::SERVER_VIP
+}
 fn default_sync_mode() -> String {
     "single".into()
+}
+fn default_raft_bind() -> SocketAddr {
+    "0.0.0.0:9500".parse().expect("const addr")
 }
 
 impl ServerConfig {

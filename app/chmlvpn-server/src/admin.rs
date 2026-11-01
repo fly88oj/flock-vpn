@@ -58,6 +58,12 @@ pub enum AdminRequest {
     },
     /// 吊销设备（推进 epoch + 杀本地会话）。
     Revoke { device: [u8; 32] },
+    /// 运行状态快照（M5 断言面：epoch/leader/转发计数/在线会话——`stats` 子命令）。
+    Stats,
+    /// 多主写透传（feature `multi-primary`）：根签管理操作（Bootstrap/SetOprf/
+    /// RecordInvite——签名验证在 Raft 状态机内，admin 只透传）。
+    #[cfg(feature = "multi-primary")]
+    SignedWrite { req: chml_sync::proto::SyncRequest },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,6 +72,10 @@ pub enum AdminResponse {
     Redeemed { device_id: [u8; 32], vip: [u8; 4] },
     DeviceAdded { device_id: [u8; 32], vip: [u8; 4] },
     Revoked { epoch: u64 },
+    /// Stats 的行式键值（`key=value` 每行一对；脚本 grep 面）。
+    StatsText { lines: Vec<String> },
+    /// SignedWrite 的回执（Debug 文本形态——`Ok`/`Error(..)` 的可读化）。
+    WriteReceipt { text: String },
     Err { msg: String },
 }
 
@@ -172,7 +182,64 @@ async fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
                 Err(e) => AdminResponse::Err { msg: e.to_string() },
             }
         }
+        AdminRequest::Stats => AdminResponse::StatsText {
+            lines: stats_lines(core).await,
+        },
+        #[cfg(feature = "multi-primary")]
+        AdminRequest::SignedWrite { req } => {
+            use crate::netstate::NetError;
+            match core.net.write_sync(req).await {
+                Ok(resp) => AdminResponse::WriteReceipt { text: format!("{resp:?}") },
+                Err(NetError::InvalidState(m)) if m.starts_with("sync:") => {
+                    // SyncError 串（NoLeader/ForwardToLeader 等）——保留原文。
+                    AdminResponse::Err { msg: m }
+                }
+                Err(e) => AdminResponse::Err { msg: e.to_string() },
+            }
+        }
     }
+}
+
+/// 运行状态快照（M5 断言的观测面：A6 epoch 前进 / A7 leader 仲裁 / A14 FRWD 与源
+/// VIP 违例计数 / A15 locate 重定向计数）。
+async fn stats_lines(core: &ServerCore) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("epoch={}", core.net.epoch().await));
+    lines.push(format!("sessions_online={}", core.sessions.device_count()));
+    lines.push(format!(
+        "tun_vip={}",
+        core.cfg.vip
+    ));
+    #[cfg(feature = "multi-primary")]
+    if let Some(node) = &core.sync {
+        lines.push(format!("node_id={}", node.id()));
+        let leader = node.current_leader().await.map(|l| l.to_string()).unwrap_or_default();
+        lines.push(format!("leader={leader}"));
+        lines.push(format!("breaker_open={}", node.breaker_open()));
+        let f = node.forward().stats();
+        lines.push(format!("fwd_forwarded={}", f.forwarded));
+        lines.push(format!("fwd_delivered_local={}", f.delivered_local));
+        lines.push(format!("fwd_delivered_kernel={}", f.delivered_kernel));
+        lines.push(format!("fwd_outbound_kernel={}", f.outbound_kernel));
+        lines.push(format!("fwd_not_here={}", f.not_here));
+        lines.push(format!("fwd_locate_redirected={}", f.locate_redirected));
+        lines.push(format!("fwd_dropped={}", f.dropped));
+        lines.push(format!("fwd_icmp_unreachable={}", f.icmp_unreachable));
+        lines.push(format!("fwd_src_violations={}", f.src_violations));
+        lines.push(format!(
+            "fwd_src_mismatch_rejected={}",
+            f.src_mismatch_rejected
+        ));
+        lines.push(format!("fwd_hop_dropped={}", f.hop_dropped));
+        lines.push(format!("lease_entries={}", node.lease().live_len()));
+        let (d_ok, d_err, r_ok, r_err) = node.interconnect_diag();
+        lines.push(format!("ic_dial_ok={d_ok} ic_dial_err={d_err} ic_rpc_ok={r_ok} ic_rpc_err={r_err}"));
+        let d = node.dir().stats();
+        lines.push(format!("dir_cache_hits={}", d.cache_hits));
+        lines.push(format!("dir_linearizable_reads={}", d.linearizable_reads));
+        lines.push(format!("rejected_handshakes={}", node.rejected_handshakes()));
+    }
+    lines
 }
 
 /// admin 客户端（CLI 子命令用；一请求一连接）。

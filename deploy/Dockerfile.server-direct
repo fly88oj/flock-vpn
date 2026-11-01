@@ -16,14 +16,17 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/chml-protocol/Cargo.toml crates/chml-protocol/
 COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
+COPY crates/chml-sync/Cargo.toml crates/chml-sync/
 COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
 # chmlvpn-server 依赖 chmlvpn-client（M3 数据面接缝复用，§2.2/§3.12）。
 COPY app/chmlvpn-client/Cargo.toml app/chmlvpn-client/
 RUN mkdir -p crates/chml-protocol/src crates/chml-protocol/benches \
-             crates/chml-frpc/src app/chmlvpn-server/src app/chmlvpn-client/src \
+             crates/chml-frpc/src crates/chml-sync/src \
+             app/chmlvpn-server/src app/chmlvpn-client/src \
  && echo 'pub fn _stub() {}' > crates/chml-protocol/src/lib.rs \
  && echo 'fn main() {}' > crates/chml-protocol/benches/aead.rs \
  && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/chml-sync/src/lib.rs \
  && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
  && echo 'fn main() {}' > app/chmlvpn-server/src/main.rs \
  && echo 'pub fn _stub() {}' > app/chmlvpn-client/src/lib.rs \
@@ -31,13 +34,15 @@ RUN mkdir -p crates/chml-protocol/src crates/chml-protocol/benches \
  && cargo build --release --locked -p chmlvpn-server \
  && rm -rf target/release/deps/chmlvpn_server* target/release/deps/chmlvpn_server_lib* \
           target/release/deps/chmlvpn_client* target/release/deps/chml_protocol* \
-          target/release/deps/chml_frpc* \
+          target/release/deps/chml_frpc* target/release/deps/chml_sync* \
  && rm -f target/release/chmlvpn-server
 COPY crates/chml-protocol/src crates/chml-protocol/src
 COPY crates/chml-frpc/src crates/chml-frpc/src
+COPY crates/chml-sync/src crates/chml-sync/src
 COPY app/chmlvpn-client/src app/chmlvpn-client/src
 COPY app/chmlvpn-server/src app/chmlvpn-server/src
 RUN touch crates/chml-protocol/src/lib.rs crates/chml-frpc/src/lib.rs \
+      crates/chml-sync/src/lib.rs \
       app/chmlvpn-client/src/lib.rs app/chmlvpn-client/src/main.rs \
       app/chmlvpn-server/src/lib.rs app/chmlvpn-server/src/main.rs \
  && cargo build --release --locked -p chmlvpn-server

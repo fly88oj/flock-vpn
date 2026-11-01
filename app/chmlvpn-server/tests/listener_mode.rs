@@ -24,6 +24,7 @@ fn cfg_for(mode: &str, state_dir: &std::path::Path) -> ServerConfig {
         admin_bind: "127.0.0.1:0".parse().unwrap(),
         sync: None,
         tun_name: "tun0".into(),
+        vip: "100.64.0.1".parse().unwrap(),
         frp: Some(chmlvpn_server::config::FrpSection {
             original_toml: "serverAddr = \"frps\"\nserverPort = 7000\n".into(),
             frpc_bin: state_dir.join("fake-frpc"),

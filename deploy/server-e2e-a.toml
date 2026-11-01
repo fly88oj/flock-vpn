@@ -1,0 +1,32 @@
+# server.toml —— e2e server-a（docs/design.md §6.2 M5：Frp 接入形态 + 多主 voter 1）。
+#
+# server-a/b 的进程内 listener 为本地监听（bind 9443，仅 link-a 可达）；frpc 注册由
+# **独立边车容器 frpc-a** 承担（§6.2「测试拓扑用独立边车容器只是组网需要——同一
+# Supervisor 代码两种部署」；进程内 Supervisor 形态由 m2/m3 部署覆盖）。接入端点
+# = frps-a:23000（客户端可见）。
+# 多主（§4）：3 voter 经 srvmesh 服务器-服务器 profile 互连（TCP 织物 :9500，网络
+# 别名 raft-1/2/3）；tun VIP 100.64.0.1（§6.2；设备 VIP 由 Raft 从 .11 分配）。
+
+state_dir = "/var/lib/chmlvpn"
+mode = "direct"
+bind = "0.0.0.0:9443"
+admin_bind = "127.0.0.1:9444"
+
+advertise_endpoint = "frps-a:23000"
+extra_endpoints = []
+dir_version = 1
+
+ticket_ttl_secs = 60
+
+tun_name = "tun0"
+vip = "100.64.0.1"
+
+[sync]
+mode = "raft"
+bundle = "/var/lib/chmlvpn/bundle.bin"
+raft_bind = "0.0.0.0:9500"
+raft_peers = [
+    "1=raft-1:9500",
+    "2=raft-2:9500",
+    "3=raft-3:9500",
+]

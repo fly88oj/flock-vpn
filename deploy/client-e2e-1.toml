@@ -1,0 +1,12 @@
+# client.toml —— e2e client-1（docs/design.md §6.2 M5：钉死 frps-a:23000 接入）。
+#
+# `endpoints` 覆盖 = 断言语义（§6.2「接入映射钉死」）：首位 = 本客户端指定接入端点；
+# 其后保留根签目录全端点序（A5 故障切换轮询面——目录内其余端点按序可达）。
+# VIP 100.64.0.11（Raft 分配首个，§6.2）。
+
+state_dir = "/var/lib/chmlvpn"
+
+tun_name = "tun0"
+mtu = 1280
+
+endpoints = ["frps-a:23000", "frps-b:23001", "172.28.0.22:9443"]

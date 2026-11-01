@@ -25,8 +25,10 @@
 //! - [`node`]：[`node::SyncNode`] 装配（写转发 leader、任意节点线性一致读、learner
 //!   准入/add_voter/rewrap 管理面）。
 //!
-//! 未含（后续批次）：服务器进程装配（app/chmlvpn-server 接入 chml-sync 替换单服
-//! NetState 的批次）、TCP/中转 Fabric、控制流 dir_pull 客户端侧消息协议。
+//! - [`tcp`]：生产织物（直接 TCP 监听/拨号；§6.2 M5 批次接入——此前仅内存织物）。
+//!
+//! 未含（后续批次）：经中转 Fabric（srvmesh 不可直达时的服务器互连）、控制流
+//! dir_pull 客户端侧消息协议。
 #![forbid(unsafe_code)]
 
 pub mod dir;
@@ -40,6 +42,7 @@ pub mod proto;
 pub mod sm;
 pub mod state;
 pub mod store;
+pub mod tcp;
 pub mod ticket;
 pub mod wire;
 
@@ -61,6 +64,7 @@ pub use proto::{
 };
 pub use sm::{LagInjector, RedbStateMachine, SmCore};
 pub use store::RedbLogStore;
+pub use tcp::TcpFabric;
 pub use wire::{Fabric, Interconnect, LagMonitor, PeerIo};
 
 /// openraft 类型配置（NodeId=u64 / BasicNode / 标准 Entry / Cursor 快照）。

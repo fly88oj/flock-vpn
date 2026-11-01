@@ -18,7 +18,9 @@
 //!   复用 `chmlvpn-client` 的 TunDevice/route 接缝，§2.2/§3.12）；
 //! - [`backend`]：NetBackend——单服（redb）与多主（chml-sync Raft）的统一异步写读门面
 //!   （feature `multi-primary`；§2.2/§3.11 M4 装配批次）；
-//! - [`bundle`]：init-cluster/enroll 的节点捆绑文件（根公钥 + 入群凭证 + 根签目录）。
+//! - [`bundle`]：init-cluster/enroll 的节点捆绑文件（根公钥 + 入群凭证 + 根签目录）；
+//! - [`sync`]：多主运行装配（TCP 织物 + SyncNode + 服务器自身 peer 面；feature
+//!   `multi-primary`，§6.2 M5 批次）。
 
 #![forbid(unsafe_code)]
 
@@ -31,4 +33,6 @@ pub mod dataplane;
 pub mod frp;
 pub mod netstate;
 pub mod server;
+#[cfg(feature = "multi-primary")]
+pub mod sync;
 pub mod ticket;

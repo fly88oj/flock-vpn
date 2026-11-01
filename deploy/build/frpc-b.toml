@@ -1,0 +1,18 @@
+# frpc-b —— server-b 的中转注册（docs/design.md §6.2 M5）。
+# 用户口 23001（server-b 接入端点）+ echo 23101（A1 第二条中转）。
+serverAddr = "frps-b"
+serverPort = 7000
+
+[[proxies]]
+name = "chml-b-main"
+type = "tcp"
+localIP = "server-b"
+localPort = 9443
+remotePort = 23001
+
+[[proxies]]
+name = "chml-b-echo"
+type = "tcp"
+localIP = "echo-b"
+localPort = 9001
+remotePort = 23101

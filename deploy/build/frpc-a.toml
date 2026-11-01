@@ -1,0 +1,20 @@
+# frpc-a —— server-a 的中转注册（docs/design.md §6.2 M5）。
+# proxy chml-a-main：server-a:9443 → frps-a 用户口 23000（chmlvpn 接入端点）。
+# proxy chml-a-echo：echo-a:9001 → frps-a 23100（A1 字节透传 harness 的 echo 面经
+# 同一中转链路——R1/R2 复刻）。
+serverAddr = "frps-a"
+serverPort = 7000
+
+[[proxies]]
+name = "chml-a-main"
+type = "tcp"
+localIP = "server-a"
+localPort = 9443
+remotePort = 23000
+
+[[proxies]]
+name = "chml-a-echo"
+type = "tcp"
+localIP = "echo-a"
+localPort = 9001
+remotePort = 23100
