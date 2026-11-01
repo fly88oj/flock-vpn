@@ -1,9 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/chml-protocol", "crates/chml-frpc", "app/chmlvpn-server", "app/chmlvpn-client"]
+members = ["crates/chml-protocol", "crates/chml-frpc", "crates/chml-sync", "app/chmlvpn-server", "app/chmlvpn-client"]
 
-# 布局与成员规划见 docs/design.md §1.1：
-# crates/chml-sync 按里程碑（§7）陆续挂入。
+# 布局与成员规划见 docs/design.md §1.1。
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,30 @@
+[package]
+name = "chml-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ChmlVPN 多主多活同步：openraft 复制状态机 + redb 存储 + 服务器-服务器 profile E2E 传输（docs/design.md §3.10/§4，VPN-15）"
+
+[dependencies]
+chml-protocol = { path = "../chml-protocol" }
+openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
+redb = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+# 集成测试启用 test-util（内存织物/RTT 注入）：dev-dependency 不污染对外默认档。
+chml-sync = { path = ".", features = ["test-util"] }
+
+[features]
+default = []
+# 内存互连织物 + RTT/故障注入（tests/cluster 用；不入生产默认档）。
+test-util = []

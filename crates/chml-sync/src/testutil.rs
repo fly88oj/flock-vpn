@@ -1,0 +1,150 @@
+//! 测试支撑（`--features test-util`；不入默认构建）。
+//!
+//! - [`MemoryFabric`]：进程内互连织物——`dial` 造 duplex 对投递到对端 accept 队列
+//!   （模拟 TCP 拨号；节点 kill = accept 队列拆除 + dial 拒绝）；
+//! - 双向延迟桥：两对 duplex 之间每方向 sleep `delay` ⇒ RTT = 2×delay（§7-M4 注入
+//!   100ms 校准）；
+//! - [`MemoryFabric::cut`]：单节点故障注入（kill leader 用例）。
+
+use std::collections::BTreeMap;
+use std::io;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chml_protocol::session::ServerId;
+use futures::future::BoxFuture;
+use futures::FutureExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::sync::mpsc;
+
+use crate::wire::{Fabric, PeerIo};
+
+/// 双向延迟桥：`x ↔ y` 每方向 sleep `delay` 再转发（字节级线路传播延迟模型）。
+async fn delayed_bridge(x: DuplexStream, y: DuplexStream, delay: Duration) {
+    let (mut xr, mut xw) = tokio::io::split(x);
+    let (mut yr, mut yw) = tokio::io::split(y);
+    let x2y = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match xr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    tokio::time::sleep(delay).await;
+                    if yw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    let _ = yw.flush().await;
+                }
+            }
+        }
+    });
+    let y2x = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match yr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    tokio::time::sleep(delay).await;
+                    if xw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    let _ = xw.flush().await;
+                }
+            }
+        }
+    });
+    let _ = tokio::join!(x2y, y2x);
+}
+
+/// 节点接入槽（公开可见性承载 FabricRegistry 类型别名）。
+pub struct NodeSlot {
+    tx: mpsc::Sender<PeerIo>,
+    alive: bool,
+}
+
+/// 节点注册表（全部节点共享）。
+pub type FabricRegistry = Arc<Mutex<BTreeMap<[u8; 16], NodeSlot>>>;
+
+/// 进程内互连织物（每节点一个实例）。
+pub struct MemoryFabric {
+    me: ServerId,
+    reg: FabricRegistry,
+    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PeerIo>>>,
+    delay: Duration,
+    buf: usize,
+}
+
+impl MemoryFabric {
+    /// 空注册表。
+    pub fn registry() -> FabricRegistry {
+        Arc::new(Mutex::new(BTreeMap::new()))
+    }
+
+    /// 建节点织物并注册。`delay` = 单向传播延迟（RTT = 2×delay）；`buf` = duplex 缓冲。
+    pub fn new(me: ServerId, reg: &FabricRegistry, delay: Duration, buf: usize) -> Arc<Self> {
+        let (tx, rx) = mpsc::channel::<PeerIo>(64);
+        reg.lock().expect("fabric reg").insert(me.0, NodeSlot { tx, alive: true });
+        Arc::new(MemoryFabric { me, reg: reg.clone(), rx: Arc::new(tokio::sync::Mutex::new(rx)), delay, buf })
+    }
+
+    /// 节点下线（dial 拒绝；在途 accept 队列保留至耗尽——kill leader 用例）。
+    pub fn cut(reg: &FabricRegistry, id: &ServerId) {
+        if let Some(slot) = reg.lock().expect("fabric reg").get_mut(&id.0) {
+            slot.alive = false;
+        }
+    }
+
+    /// 节点恢复。
+    pub fn uncut(reg: &FabricRegistry, id: &ServerId) {
+        if let Some(slot) = reg.lock().expect("fabric reg").get_mut(&id.0) {
+            slot.alive = true;
+        }
+    }
+
+    /// 本机身份。
+    pub fn id(&self) -> &ServerId {
+        &self.me
+    }
+}
+
+impl Fabric for MemoryFabric {
+    fn dial(&self, target: &ServerId) -> BoxFuture<'static, io::Result<PeerIo>> {
+        let reg = self.reg.clone();
+        let target = *target;
+        let delay = self.delay;
+        let buf = self.buf;
+        async move {
+            let tx = {
+                let mut reg = reg.lock().expect("fabric reg");
+                let slot = reg
+                    .get_mut(&target.0)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionRefused, "no such node"))?;
+                if !slot.alive {
+                    return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "node down"));
+                }
+                slot.tx.clone()
+            };
+            // 双 duplex + 延迟桥：dialer 持 d1a、acceptor 得 d2a，桥接 d1b↔d2b。
+            let (dial_io, d1b) = tokio::io::duplex(buf);
+            let (acc_io, d2b) = tokio::io::duplex(buf);
+            tx.send(Box::new(acc_io) as PeerIo).await.map_err(|_| {
+                io::Error::new(io::ErrorKind::ConnectionRefused, "accept queue gone")
+            })?;
+            tokio::spawn(delayed_bridge(d1b, d2b, delay));
+            Ok(Box::new(dial_io) as PeerIo)
+        }
+        .boxed()
+    }
+
+    fn accept(&self) -> BoxFuture<'static, io::Result<PeerIo>> {
+        let rx = self.rx.clone();
+        async move {
+            // tokio Mutex：guard 可跨 await（单 serve_loop 消费者，无争用）。
+            let mut rx = rx.lock().await;
+            rx.recv().await.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::ConnectionAborted, "fabric closed")
+            })
+        }
+        .boxed()
+    }
+}
