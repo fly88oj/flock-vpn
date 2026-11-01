@@ -538,11 +538,14 @@ a8() {
     log "A8 单隧道多会话：100 并发 yamux 流持续 60s 无错（单测入口：session_mux ignored 档）"
     local out
     out="$(cd "$REPO" && cargo test -p chml-protocol --test session_mux hundred_streams -- --ignored --nocapture 2>&1)"
-    printf '%s\n' "$out" | grep -E 'A8:|test result' | sed 's/^/    /'
-    if printf '%s\n' "$out" | grep -q 'test result: ok'; then
-        record PASS A8 "100 流 × 60s × 4KiB 双向无错（hundred_streams_sixty_seconds_sustained ok）"
+    printf '%s\n' "$out" | grep -E 'A8:|test hundred|test result' | sed 's/^/    /'
+    # 判据必须是**真执行**：具名测试 ok + "N passed" 且 N≥1——空跑（0 passed，如
+    # --ignored 配无 ignore 标记的历史缺陷）绝不得记 PASS。
+    if printf '%s\n' "$out" | grep -q 'test hundred_streams_sixty_seconds_sustained ... ok' \
+        && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
+        record PASS A8 "100 流 × 60s × 4KiB 双向无错（hundred_streams_sixty_seconds_sustained 真执行 ok）"
     else
-        record FAIL A8 "单测失败（见上）"
+        record FAIL A8 "单测未执行或失败（判据：具名 ok + ≥1 passed；见上）"
     fi
 }
 
@@ -660,7 +663,8 @@ a11() {
     if case "$bytes0" in ''|0) false;; esac && case "$bytesR" in ''|0) false;; esac; then
         awk -v a="$bytes0" -v b="$bytesR" 'BEGIN{d=a-b; if (d<0) d=-d; exit !(d <= 0.05*(a+b)/2)}' && ok_wire=1
     fi
-    printf '%s\n' "$unit" | grep -q 'test result: ok' && ok_unit=1
+    # ≥1 passed：空跑不得记 PASS（同 A8 判据纪律）。
+    printf '%s\n' "$unit" | grep -qE 'test result: ok\. [1-9][0-9]* passed' && ok_unit=1
 
     if [ "$ok_wire" = 1 ] && [ "$ok_unit" = 1 ]; then
         record PASS A11 "中转字节量 zeros=${bytes0}B ≈ random=${bytesR}B（差 <5% ⇒ 压缩未启用）；compress 单测（默认关/非膨胀回退）全绿"
@@ -901,6 +905,23 @@ a16
 # ============================================================================
 # 结果落盘 deploy/e2e-results.md
 # ============================================================================
+FOOTNOTES=$(cat <<'FN'
+
+脚注（如实记录）：
+1. client-2 终值 VIP 高于 .12：A6/A7-A6 两次吊销各消耗一个设备身份（吊销终态、IP 不复用），
+   脚本以「新设备身份 re-enroll」复活通道；A15 迁移断言按当时 VIP 执行。
+2. A15 的 locate 重定向计数若未动：迁移恢复（实测 1s）由租约事件推送（≤1s）在陈旧窗生效前
+   完成——NOT_HERE→location_query 路径未被触发时如实记录；该路径由 chml-sync tests/forward
+   单测覆盖。
+3. A8/A11/A12 为设计指定的单测复跑入口（A8：session_mux #[ignore] 档 100 流×60s，以 --ignored
+   真执行——判据要求具名测试 ok 且 ≥1 passed，空跑不得记 PASS；A11：compress 档；A12：replay/forge）。
+4. 实测暴露并修复的三处产品缺陷：redb vote 编解码不对称（tests/store_reopen 回归）；长寿命
+   会话租约蒸发（lease_refresh_loop TTL/3 续期）；互连全局锁跨网络 await + 无拨号预算（锁外
+   拨号 + TcpFabric 3s 预算）。
+5. link-a/b 网段为 /29：Docker bridge 需网关+广播各占一位，/30 撑不起「网关 + 边车 + server」
+   三元（隔离语义不变）。
+FN
+)
 {
     printf '# M5 e2e 实测结果（docs/design.md §6.3 A1–A16）\n\n'
     printf -- '- 执行：%s 起；主机 = Windows + Docker Desktop 29.8.2（WSL2）；脚本 deploy/e2e_assert.sh\n' "$START_TS"
@@ -911,6 +932,7 @@ a16
     printf '| 结果 | 断言 | 说明 |\n|---|---|---|\n'
     for l in "${SUMMARY[@]}"; do printf '| %s |\n' "$l"; done
     printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
+    printf '%s' "$FOOTNOTES"
 } > "$RESULTS"
 
 printf '\n== 汇总（已写 %s）==\n' "$RESULTS"

@@ -1154,6 +1154,7 @@ async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
 /// 100 条并发 yamux 流在同一条会话隧道上持续收发（缺省 60s；`A8_SECS` 可调便于本地
 /// 快跑，M5 断言按缺省 60s 执行）。通过标准：全部流建立、每条流双向字节数严格一致、
 /// 隧道无错不断（epoch/rekey 不影响数据面）。
+#[ignore = "M5 A8 断言入口（60s 持续档不进缺省套件）：deploy/e2e_assert.sh 以 --ignored 运行"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hundred_streams_sixty_seconds_sustained() {
     let secs: u64 = std::env::var("A8_SECS")
