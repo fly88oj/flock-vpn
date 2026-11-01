@@ -23,7 +23,7 @@
 #   A11 压缩默认关       隧道内 4MiB 全零 vs 随机的中转字节量差 <5%（若开压缩，全零侧
 #                        应显著缩小）；非膨胀回退 = compress 单测复跑
 #   A12 抗重放           会话层重复/回退计数记录被拒且计入伪造限额（单测入口复跑）
-#   A13 无直连回退       client-1 对 172.28.0.20/21:9443（server-a/b 的 chmlpub 位）直连必败
+#   A13 无直连回退       client-1 对 172.28.0.20/21:9443（server-a/b 的 flockpub 位）直连必败
 #   A14 跨服面+源校验    server-a FRWD 计数非零；断 srvmesh 后互 ping 断/本服 ping 仍通；
 #                        hping3 伪造 src=client-2 VIP ⇒ server-a 违例计数递增、client-2 收不到
 #   A15 租约陈旧容错     client-2 迁移到 frps-a 端点重启 ⇒ 丢包 ≤35s 恢复（NOT_HERE→
@@ -66,8 +66,8 @@ HERE="$(cd "$_src" && pwd -W 2>/dev/null || echo "$_src")"
 REPO="$(cd "$HERE/.." && pwd)"
 COMPOSE_FILE="$HERE/e2e.yml"
 RESULTS="$HERE/e2e-results.md"
-NET_PUB="chmlvpn-e2e-chmlpub"
-NET_MESH="chmlvpn-e2e-srvmesh"
+NET_PUB="flock-e2e-flockpub"
+NET_MESH="flock-e2e-srvmesh"
 
 VIP_A="100.64.0.1"    # server-a（Frp 形态，tun VIP）
 VIP_B="100.64.0.2"    # server-b（Frp 形态）
@@ -99,7 +99,7 @@ ec() { compose exec -T "client-$1" "${@:2}"; }          # exec client-N
 es_() { compose exec -T "server-$1" "${@:2}"; }         # exec server-N
 
 # —— 观测面助手 ——
-stat_of() { es_ "$1" chmlvpn-server --config /etc/chmlvpn/server.toml stats 2>/dev/null; }
+stat_of() { es_ "$1" flock-server --config /etc/flock/server.toml stats 2>/dev/null; }
 conn_count() { compose logs "client-$1" 2>/dev/null | grep -c '已连接'; }
 last_ep() { compose logs "client-$1" 2>/dev/null | grep '已连接' | tail -1 | grep -o '已连接 [^（ ]*' | sed 's/已连接 //'; }
 # wait_new_conn <n> <ep|-> <timeout-s> [baseline]：等一条**新**「已连接」（count 超基线）
@@ -151,16 +151,16 @@ bootstrap() {
     # 迁移形态（首位 frps-a）。复位为钉死端点 frps-b（§6.2 映射）并重启三客户端
     # （幂等：进程按配置重载；client-1/3 的 ro 挂载写失败即原样）。
     ec 2 sh -c "printf '%s
-' 'state_dir = \"/var/lib/chmlvpn\"' '' 'tun_name = \"tun0\"' 'mtu = 1280' '' 'endpoints = [\"frps-b:23001\", \"frps-a:23000\", \"172.28.0.22:9443\"]' > /etc/chmlvpn/client.toml" || true
+' 'state_dir = \"/var/lib/flock\"' '' 'tun_name = \"tun0\"' 'mtu = 1280' '' 'endpoints = [\"frps-b:23001\", \"frps-a:23000\", \"172.28.0.22:9443\"]' > /etc/flock/client.toml" || true
     compose restart client-1 client-2 client-3 >/dev/null 2>&1 || true
 
     log "bootstrap 1: 三台 enroll（/mat 捆绑 → state_dir/bundle.bin）"
     local i=0
     for s in a b c; do
-        if es_ "$s" sh -c 'test -f /var/lib/chmlvpn/bundle.bin'; then
+        if es_ "$s" sh -c 'test -f /var/lib/flock/bundle.bin'; then
             echo "server-$s: 已 enroll（幂等跳过）"
         else
-            es_ "$s" chmlvpn-server --config /etc/chmlvpn/server.toml \
+            es_ "$s" flock-server --config /etc/flock/server.toml \
                 enroll --bundle "/mat/node-$i.bundle" || return 1
         fi
         i=$((i+1))
@@ -168,7 +168,7 @@ bootstrap() {
 
     log "bootstrap 2: cluster-bootstrap（根签 Bootstrap+SetOprf；经 server-a，幂等）"
     t=$((SECONDS + 240))
-    until es_ a chmlvpn-server --config /etc/chmlvpn/server.toml \
+    until es_ a flock-server --config /etc/flock/server.toml \
             cluster-bootstrap --root-seed /mat/root.seed 2>&1 | tee /tmp/e2e-boot.txt | grep -q 'cluster-bootstrap ok\|幂等'; do
         if [ $SECONDS -ge $t ]; then
             echo "cluster-bootstrap 240s 未成功"; cat /tmp/e2e-boot.txt
@@ -183,7 +183,7 @@ bootstrap() {
     while [ -z "$ok" ]; do
         ok=1
         for s in a b c; do
-            es_ "$s" chmlvpn-server --config /etc/chmlvpn/server.toml stats 2>/dev/null | grep -q '^epoch=' || ok=""
+            es_ "$s" flock-server --config /etc/flock/server.toml stats 2>/dev/null | grep -q '^epoch=' || ok=""
         done
         [ -n "$ok" ] && break
         if [ $SECONDS -ge $t ]; then echo "三台 stats 未齐（180s）"; return 1; fi
@@ -198,31 +198,31 @@ bootstrap() {
 
     # —— 客户端设备注册 + 邀请（幂等：ready 标记）——
     for n in 1 2 3; do
-        if ec "$n" sh -c 'test -f /var/lib/chmlvpn/ready'; then
+        if ec "$n" sh -c 'test -f /var/lib/flock/ready'; then
             echo "client-$n: 已就绪（幂等跳过）"
             continue
         fi
         log "bootstrap 5: client-$n gen-keys → device-add（server-a admin，Raft 提交）"
         local keys dx de out vip inv
-        keys="$(ec "$n" chmlvpn-client --config /etc/chmlvpn/client.toml gen-keys)" || return 1
+        keys="$(ec "$n" flock-client --config /etc/flock/client.toml gen-keys)" || return 1
         dx="$(printf '%s\n' "$keys" | sed -n 's/^device-x=//p')"
         de="$(printf '%s\n' "$keys" | sed -n 's/^device-ed=//p')"
         [ -n "$dx" ] && [ -n "$de" ] || { echo "client-$n gen-keys 输出异常"; return 1; }
-        out="$(es_ a chmlvpn-server --config /etc/chmlvpn/server.toml \
+        out="$(es_ a flock-server --config /etc/flock/server.toml \
             device-add --user "e2eclient$n" --device-x "$dx" --device-ed "$de" 2>&1)" \
             || { echo "client-$n device-add 失败：$out"; return 1; }
         vip="$(printf '%s\n' "$out" | sed -n 's/^vip=//p' | tr -d '\r')"
         case "$vip" in 100.64.*) ;; *) echo "client-$n VIP 异常：$out"; return 1;; esac
 
         log "bootstrap 6: cluster-invite（根签 v3）→ client-$n ingest + vip + ready"
-        inv="$(es_ a chmlvpn-server --config /etc/chmlvpn/server.toml \
+        inv="$(es_ a flock-server --config /etc/flock/server.toml \
             cluster-invite --root-seed /mat/root.seed --bundle /mat/node-0.bundle --ttl-secs 86400 | tail -1)" \
             || { echo "cluster-invite 失败"; return 1; }
-        printf '%s' "$inv" | ec "$n" sh -c 'cat > /var/lib/chmlvpn/invite.b64' || return 1
-        ec "$n" chmlvpn-client --config /etc/chmlvpn/client.toml \
-            invite /var/lib/chmlvpn/invite.b64 || return 1
-        printf '%s' "$vip" | ec "$n" sh -c 'cat > /var/lib/chmlvpn/vip' || return 1
-        ec "$n" sh -c 'touch /var/lib/chmlvpn/ready' || return 1
+        printf '%s' "$inv" | ec "$n" sh -c 'cat > /var/lib/flock/invite.b64' || return 1
+        ec "$n" flock-client --config /etc/flock/client.toml \
+            invite /var/lib/flock/invite.b64 || return 1
+        printf '%s' "$vip" | ec "$n" sh -c 'cat > /var/lib/flock/vip' || return 1
+        ec "$n" sh -c 'touch /var/lib/flock/ready' || return 1
         eval "VIP_C$n=\"\$vip\""
         compose restart "client-$n" >/dev/null 2>&1 || return 1
     done
@@ -240,9 +240,9 @@ bootstrap() {
     done
 
     # 幂等重跑路径：VIP 回填。
-    [ -n "$VIP_C1" ] || VIP_C1="$(ec 1 sh -c 'cat /var/lib/chmlvpn/vip' 2>/dev/null | tr -d '\r')"
-    [ -n "$VIP_C2" ] || VIP_C2="$(ec 2 sh -c 'cat /var/lib/chmlvpn/vip' 2>/dev/null | tr -d '\r')"
-    [ -n "$VIP_C3" ] || VIP_C3="$(ec 3 sh -c 'cat /var/lib/chmlvpn/vip' 2>/dev/null | tr -d '\r')"
+    [ -n "$VIP_C1" ] || VIP_C1="$(ec 1 sh -c 'cat /var/lib/flock/vip' 2>/dev/null | tr -d '\r')"
+    [ -n "$VIP_C2" ] || VIP_C2="$(ec 2 sh -c 'cat /var/lib/flock/vip' 2>/dev/null | tr -d '\r')"
+    [ -n "$VIP_C3" ] || VIP_C3="$(ec 3 sh -c 'cat /var/lib/flock/vip' 2>/dev/null | tr -d '\r')"
     echo "VIP: client-1=$VIP_C1 client-2=$VIP_C2 client-3=$VIP_C3"
     log "bootstrap 完成"
 }
@@ -365,7 +365,7 @@ a5() {
 
     local ping_ok="" vip_now tofu_lines i0_ok=no
     wait_ping 1 "$VIP_B" 15 && ping_ok=1
-    vip_now="$(ec 1 sh -c 'cat /var/lib/chmlvpn/vip' 2>/dev/null | tr -d '\r')"
+    vip_now="$(ec 1 sh -c 'cat /var/lib/flock/vip' 2>/dev/null | tr -d '\r')"
     tofu_lines="$(compose logs server-b 2>/dev/null | grep -c 'TOFU bootstrap (I0)')"
     [ "$tofu_lines" = "0" ] && i0_ok=yes
 
@@ -400,7 +400,7 @@ a6() { # a6 <tag> <via> <client-n> <on>
     local tag="$1" via="$2" cn="$3" on="$4"
     log "$tag 多主吊销：经 server-$via revoke client-$cn（会话在 server-$on）≤${A6_DEADLINE}s"
     local dev_id
-    dev_id="$(ec "$cn" chmlvpn-client --config /etc/chmlvpn/client.toml gen-keys | sed -n 's/^device-id=//p')"
+    dev_id="$(ec "$cn" flock-client --config /etc/flock/client.toml gen-keys | sed -n 's/^device-id=//p')"
     [ -n "$dev_id" ] || { record FAIL "$tag" "取 client-$cn device-id 失败"; return; }
 
     local online_before epoch_before conn_base
@@ -410,7 +410,7 @@ a6() { # a6 <tag> <via> <client-n> <on>
     [ -n "$epoch_before" ] || { record FAIL "$tag" "stats 未就绪"; return; }
 
     local t0=$SECONDS out
-    out="$(es_ "$via" chmlvpn-server --config /etc/chmlvpn/server.toml revoke --device "$dev_id" 2>&1)" \
+    out="$(es_ "$via" flock-server --config /etc/flock/server.toml revoke --device "$dev_id" 2>&1)" \
         || { record FAIL "$tag" "revoke 提交失败：$out"; return; }
 
     local killed=0 adv=0 dt=999
@@ -441,21 +441,21 @@ a6() { # a6 <tag> <via> <client-n> <on>
 re_enroll_client() { # re_enroll_client <n> <first-endpoint>
     local n="$1" first="$2"
     log "re-enroll client-$n（吊销终态后以新设备身份注册；新 VIP 由 Raft 分配，IP 不复用）"
-    ec "$n" sh -c 'rm -f /var/lib/chmlvpn/ready /var/lib/chmlvpn/vip /var/lib/chmlvpn/device.keys /var/lib/chmlvpn/pins.bin /var/lib/chmlvpn/directory.bin' || return 1
+    ec "$n" sh -c 'rm -f /var/lib/flock/ready /var/lib/flock/vip /var/lib/flock/device.keys /var/lib/flock/pins.bin /var/lib/flock/directory.bin' || return 1
     local keys dx de out vip inv
-    keys="$(ec "$n" chmlvpn-client --config /etc/chmlvpn/client.toml gen-keys)" || return 1
+    keys="$(ec "$n" flock-client --config /etc/flock/client.toml gen-keys)" || return 1
     dx="$(printf '%s\n' "$keys" | sed -n 's/^device-x=//p')"
     de="$(printf '%s\n' "$keys" | sed -n 's/^device-ed=//p')"
     # 注册/签发固定走 server-b（a7 停 server-a 期间仍存活；Raft 任意节点等价）。
-    out="$(es_ b chmlvpn-server --config /etc/chmlvpn/server.toml \
+    out="$(es_ b flock-server --config /etc/flock/server.toml \
         device-add --user "e2eclient$n-r" --device-x "$dx" --device-ed "$de" 2>&1)" || return 1
     vip="$(printf '%s\n' "$out" | sed -n 's/^vip=//p' | tr -d '\r')"
-    inv="$(es_ b chmlvpn-server --config /etc/chmlvpn/server.toml \
+    inv="$(es_ b flock-server --config /etc/flock/server.toml \
         cluster-invite --root-seed /mat/root.seed --bundle /mat/node-1.bundle --ttl-secs 86400 | tail -1)" || return 1
-    printf '%s' "$inv" | ec "$n" sh -c 'cat > /var/lib/chmlvpn/invite.b64'
-    ec "$n" chmlvpn-client --config /etc/chmlvpn/client.toml invite /var/lib/chmlvpn/invite.b64 || return 1
-    printf '%s' "$vip" | ec "$n" sh -c 'cat > /var/lib/chmlvpn/vip'
-    ec "$n" sh -c 'touch /var/lib/chmlvpn/ready'
+    printf '%s' "$inv" | ec "$n" sh -c 'cat > /var/lib/flock/invite.b64'
+    ec "$n" flock-client --config /etc/flock/client.toml invite /var/lib/flock/invite.b64 || return 1
+    printf '%s' "$vip" | ec "$n" sh -c 'cat > /var/lib/flock/vip'
+    ec "$n" sh -c 'touch /var/lib/flock/ready'
     eval "VIP_C$n=\"\$vip\""
     local cbase; cbase="$(conn_count "$n")"
     compose restart "client-$n" >/dev/null 2>&1
@@ -550,11 +550,11 @@ a8() {
 }
 
 # ============================================================================
-# A9：静默死链双侧 ≤30s 检测（client-3 disconnect chmlpub）
+# A9：静默死链双侧 ≤30s 检测（client-3 disconnect flockpub）
 # ============================================================================
 
 a9() {
-    log "A9 静默死链：disconnect client-3（chmlpub）⇒ 双侧 ≤${A9_DEADLINE}s 检测并重连"
+    log "A9 静默死链：disconnect client-3（flockpub）⇒ 双侧 ≤${A9_DEADLINE}s 检测并重连"
     local cid
     cid="$(compose ps -q client-3)"
     [ -n "$cid" ] || { record FAIL A9 "client-3 容器 id 为空"; return; }
@@ -694,7 +694,7 @@ a12() {
 }
 
 # ============================================================================
-# A13：无直连回退（server-a/b 不挂 chmlpub ⇒ 其位址必败）
+# A13：无直连回退（server-a/b 不挂 flockpub ⇒ 其位址必败）
 # ============================================================================
 
 a13() {
@@ -710,7 +710,7 @@ a13() {
         fi
     done
     if [ $bad -eq 0 ]; then
-        record PASS A13 "172.28.0.20/.21:9443 均不可达（Frp 形态两台不挂 chmlpub——拓扑有效性）"
+        record PASS A13 "172.28.0.20/.21:9443 均不可达（Frp 形态两台不挂 flockpub——拓扑有效性）"
     else
         record FAIL A13 "$bad 个地址可直连（经中转语义已被绕过）"
     fi
@@ -780,7 +780,7 @@ a14() {
 # ============================================================================
 
 write_client2_endpoints() {
-    ec 2 sh -c "printf '%s\n' 'state_dir = \"/var/lib/chmlvpn\"' '' 'tun_name = \"tun0\"' 'mtu = 1280' '' 'endpoints = [\"$1\", \"frps-b:23001\", \"172.28.0.22:9443\"]' > /etc/chmlvpn/client.toml" \
+    ec 2 sh -c "printf '%s\n' 'state_dir = \"/var/lib/flock\"' '' 'tun_name = \"tun0\"' 'mtu = 1280' '' 'endpoints = [\"$1\", \"frps-b:23001\", \"172.28.0.22:9443\"]' > /etc/flock/client.toml" \
         && printf '    client-2 endpoints 首位 = %s\n' "$1"
 }
 
@@ -812,7 +812,7 @@ a15() {
         if [ "${redir_after:-0}" -gt "${base_redir:-0}" ] 2>/dev/null; then
             redir_note="locate 重定向计数 ${base_redir:-0}→${redir_after:-0}（NOT_HERE→location_query 路径被走到）"
         else
-            redir_note="locate 重定向计数未动（租约事件推送 ≤1s 先于陈旧窗生效；redirect 路径由 chml-sync forward 单测覆盖）"
+            redir_note="locate 重定向计数未动（租约事件推送 ≤1s 先于陈旧窗生效；redirect 路径由 flock-sync forward 单测覆盖）"
         fi
         record PASS A15 "迁移后 ${dt}s（≤${A15_DEADLINE}s）client-1→client-2 ping 恢复；${redir_note}"
     else
@@ -849,7 +849,7 @@ a16() {
     frpc_containers="$(docker ps --filter name=frpc --format '{{.Names}}' | sort | tr '\n' ' ')"
     printf '    server-c frp 进程: %s；frpc 容器: %s\n' "${frp_procs:-（无）}" "$frpc_containers"
     [ -z "$frp_procs" ] || rc=1
-    [ "$frpc_containers" = "chmlvpn-e2e-frpc-a-1 chmlvpn-e2e-frpc-b-1 " ] || rc=1
+    [ "$frpc_containers" = "flock-e2e-frpc-a-1 flock-e2e-frpc-b-1 " ] || rc=1
 
     if [ $rc -eq 0 ]; then
         record PASS A16 "直连会话（无 I0，端点 $EP_C）；ping $VIP_C 与 c1/c2↔c3 互 ping 0 丢包（Direct↔Frp 跨服同构）；server-c 无 frp 进程、无边车"
@@ -911,7 +911,7 @@ FOOTNOTES=$(cat <<'FN'
 1. client-2 终值 VIP 高于 .12：A6/A7-A6 两次吊销各消耗一个设备身份（吊销终态、IP 不复用），
    脚本以「新设备身份 re-enroll」复活通道；A15 迁移断言按当时 VIP 执行。
 2. A15 的 locate 重定向计数若未动：迁移恢复（实测 1s）由租约事件推送（≤1s）在陈旧窗生效前
-   完成——NOT_HERE→location_query 路径未被触发时如实记录；该路径由 chml-sync tests/forward
+   完成——NOT_HERE→location_query 路径未被触发时如实记录；该路径由 flock-sync tests/forward
    单测覆盖。
 3. A8/A11/A12 为设计指定的单测复跑入口（A8：session_mux #[ignore] 档 100 流×60s，以 --ignored
    真执行——判据要求具名测试 ok 且 ≥1 passed，空跑不得记 PASS；A11：compress 档；A12：replay/forge）。
@@ -925,7 +925,7 @@ FN
 {
     printf '# M5 e2e 实测结果（docs/design.md §6.3 A1–A16）\n\n'
     printf -- '- 执行：%s 起；主机 = Windows + Docker Desktop 29.8.2（WSL2）；脚本 deploy/e2e_assert.sh\n' "$START_TS"
-    printf -- '- 拓扑：deploy/e2e.yml——三网隔离（chmlpub 172.28.0.0/24 / srvmesh 172.29.0.0/24 / link-a·b 各 /29）；'
+    printf -- '- 拓扑：deploy/e2e.yml——三网隔离（flockpub 172.28.0.0/24 / srvmesh 172.29.0.0/24 / link-a·b 各 /29）；'
     printf -- 'frps-a/b = 原版 frp 0.71.1 + frpc-a/b 边车；server-a/b/c = 3 voter（Frp/Frp/Direct 混布，srvmesh 服务器-服务器 profile 互连）；client-1/2/3 钉死 frps-a:23000 / frps-b:23001 / 172.28.0.22:9443\n'
     printf -- '- VIP：server a/b/c = %s/%s/%s；client 1/2/3 = %s/%s/%s（Raft 分配，从 .11 起）\n\n' \
         "$VIP_A" "$VIP_B" "$VIP_C" "${VIP_C1:-?}" "${VIP_C2:-?}" "${VIP_C3:-?}"

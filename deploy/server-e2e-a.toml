@@ -7,7 +7,7 @@
 # 多主（§4）：3 voter 经 srvmesh 服务器-服务器 profile 互连（TCP 织物 :9500，网络
 # 别名 raft-1/2/3）；tun VIP 100.64.0.1（§6.2；设备 VIP 由 Raft 从 .11 分配）。
 
-state_dir = "/var/lib/chmlvpn"
+state_dir = "/var/lib/flock"
 mode = "direct"
 bind = "0.0.0.0:9443"
 admin_bind = "127.0.0.1:9444"
@@ -23,7 +23,7 @@ vip = "100.64.0.1"
 
 [sync]
 mode = "raft"
-bundle = "/var/lib/chmlvpn/bundle.bin"
+bundle = "/var/lib/flock/bundle.bin"
 raft_bind = "0.0.0.0:9500"
 raft_peers = [
     "1=raft-1:9500",

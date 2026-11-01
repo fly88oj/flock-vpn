@@ -4,7 +4,7 @@
 # 其后保留根签目录全端点序（A5 故障切换轮询面——目录内其余端点按序可达）。
 # VIP 100.64.0.11（Raft 分配首个，§6.2）。
 
-state_dir = "/var/lib/chmlvpn"
+state_dir = "/var/lib/flock"
 
 tun_name = "tun0"
 mtu = 1280

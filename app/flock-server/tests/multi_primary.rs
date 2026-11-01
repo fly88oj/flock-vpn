@@ -1,6 +1,6 @@
 //! 多主装配集成测试（docs/design.md §2.2/§3.11 M4 批次；feature `multi-primary`）。
 //!
-//! 进程内 3 节点内存集群（`chml_sync::testutil::MemoryFabric`，RTT 2×5ms）：
+//! 进程内 3 节点内存集群（`flock_sync::testutil::MemoryFabric`，RTT 2×5ms）：
 //!
 //! 1. **全链控制面**：redeem（Raft 提交）→ 1-RTT 首连（**两级读目录**：respond 注入
 //!    `SyncNode::device_directory`）→ OPAQUE 登录（anchor + **Raft 内共享 OPRF**）→
@@ -24,22 +24,22 @@ use flock_protocol::session::{
 use flock_protocol::sig::UserKey;
 use flock_protocol::trust::{InviteFile, PinStore, PinVerdict};
 use flock_protocol::{ed25519_dalek, rand};
-use chml_sync::hooks::HookRecorder;
-use chml_sync::proto::{NodeId, SyncRequest};
-use chml_sync::testutil::MemoryFabric;
-use chml_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
-use chmlvpn_server::config::ServerConfig;
-use chmlvpn_server::netstate::RedeemRequest;
-use chmlvpn_server::server::ServerCore;
-use chmlvpn_server::ticket::TicketWire;
+use flock_sync::hooks::HookRecorder;
+use flock_sync::proto::{NodeId, SyncRequest};
+use flock_sync::testutil::MemoryFabric;
+use flock_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
+use flock_server::config::ServerConfig;
+use flock_server::netstate::RedeemRequest;
+use flock_server::server::ServerCore;
+use flock_server::ticket::TicketWire;
 
-/// RTT = 2×5ms（内存织物；§7-M4 的 100ms 校准档属 chml-sync 自身测试）。
+/// RTT = 2×5ms（内存织物；§7-M4 的 100ms 校准档属 flock-sync 自身测试）。
 const FABRIC_DELAY: Duration = Duration::from_millis(5);
 /// A6 时序预算（§2.2：健康集群吊销传播 ≤5s）。
 const A6_BUDGET: Duration = Duration::from_secs(5);
 
 fn sid(n: NodeId) -> ServerId {
-    chml_sync::wire::sid_of(n)
+    flock_sync::wire::sid_of(n)
 }
 
 // ============================================================================
@@ -110,20 +110,20 @@ async fn build_cluster() -> Node3 {
         .await
         .expect("bootstrap");
     assert!(
-        matches!(boot, chml_sync::proto::SyncResponse::Ok),
+        matches!(boot, flock_sync::proto::SyncResponse::Ok),
         "bootstrap: {boot:?}"
     );
     let oprf_b64 = server_setup_new(&mut rand::rngs::OsRng);
-    let oprf_op = chml_sync::proto::AdminOp::Rewrap {
+    let oprf_op = flock_sync::proto::AdminOp::Rewrap {
         server_id: 0,
         wrapped: oprf_b64.as_bytes().to_vec(),
     };
     let _ = oprf_op; // （SetOprf 走独立构造，非 AdminOp——见下）
-    let set_oprf = SyncRequest::SetOprf(chml_sync::proto::RootSigned {
+    let set_oprf = SyncRequest::SetOprf(flock_sync::proto::RootSigned {
         op: oprf_b64.clone(),
         sig: {
             use ed25519_dalek::Signer as _;
-            let mut canon = b"chml-sync/set-oprf/v1".to_vec();
+            let mut canon = b"flock-sync/set-oprf/v1".to_vec();
             canon.extend_from_slice(&(oprf_b64.len() as u32).to_le_bytes());
             canon.extend_from_slice(oprf_b64.as_bytes());
             root.sign(&canon).to_bytes()
@@ -131,7 +131,7 @@ async fn build_cluster() -> Node3 {
     });
     let resp = leader.write(set_oprf).await.expect("set oprf");
     assert!(
-        matches!(resp, chml_sync::proto::SyncResponse::Ok),
+        matches!(resp, flock_sync::proto::SyncResponse::Ok),
         "set_oprf: {resp:?}"
     );
 
@@ -224,7 +224,7 @@ async fn connect(device: &DeviceStaticKeys, pin: &ServerPin) -> Tunnel {
 mod cli {
     use super::*;
     use flock_protocol::sig as sr_sig;
-    use chmlvpn_server::control::{recv_ctrl_msg, send_ctrl_msg, CtrlRequest, CtrlResponse};
+    use flock_server::control::{recv_ctrl_msg, send_ctrl_msg, CtrlRequest, CtrlResponse};
 
     pub struct Ctrl {
         pub tunnel: Tunnel,
@@ -290,12 +290,12 @@ mod cli {
             else {
                 return Err(format!("login begin shape: {resp:?}"));
             };
-            let ke3 = chmlvpn_server::control::client_login_finish_anchored(
+            let ke3 = flock_server::control::client_login_finish_anchored(
                 state,
                 pw,
                 user,
                 &ke2_b64,
-                chmlvpn_server::control::AnchorLoginExpectation {
+                flock_server::control::AnchorLoginExpectation {
                     server_id: pin.entry.server_id.0,
                     identity_pub: pin.entry.identity_pub,
                     bind_token,
@@ -321,14 +321,14 @@ mod cli {
             sr: &UserKey,
         ) -> CtrlResponse {
             use ed25519_dalek::Signer as _;
-            let device = chmlvpn_server::control::DevicePubs {
+            let device = flock_server::control::DevicePubs {
                 x25519: dev.x25519_public().to_bytes(),
                 ed25519: *dev.ed25519_public().as_bytes(),
             };
             let sr_pub = *sr_sig::UserKey::from_pub_string(&sr.pub_string())
                 .unwrap()
                 .as_bytes();
-            let canon = chmlvpn_server::control::keybind_canonical(
+            let canon = flock_server::control::keybind_canonical(
                 cluster_id,
                 user,
                 &bind_token,
@@ -359,15 +359,15 @@ mod cli {
     }
 
     /// SR-SIG1 授权头（§1.3.2 七字段）。
-    fn sr_auth(user: &str, key: &UserKey) -> chmlvpn_server::control::SrAuth {
+    fn sr_auth(user: &str, key: &UserKey) -> flock_server::control::SrAuth {
         let now = flock_protocol::trust::now_unix() as i64;
         let nonce = sr_sig::nonce_hex();
-        chmlvpn_server::control::SrAuth {
+        flock_server::control::SrAuth {
             header: sr_sig::sign_prehashed(
                 user,
                 key,
-                chmlvpn_server::control::CTRL_METHOD,
-                chmlvpn_server::control::PATH_TICKET_RENEW,
+                flock_server::control::CTRL_METHOD,
+                flock_server::control::PATH_TICKET_RENEW,
                 &sr_sig::sha256_hex(b""),
                 now,
                 &nonce,
@@ -473,7 +473,7 @@ async fn three_node_cluster_forward_and_revocation() {
     assert!(
         matches!(
             out_b,
-            Err(chmlvpn_server::netstate::RedeemError::AlreadyUsed)
+            Err(flock_server::netstate::RedeemError::AlreadyUsed)
         ),
         "同 invite_id 二次兑换拒（Raft 状态机内查重）：{out_b:?}"
     );
@@ -524,7 +524,7 @@ async fn three_node_cluster_forward_and_revocation() {
     assert!(
         matches!(
             ca.set_password("mp-a", "pw").await,
-            chmlvpn_server::control::CtrlResponse::Ok
+            flock_server::control::CtrlResponse::Ok
         ),
         "口令设置（SetPassword 复制；共享 OPRF）"
     );
@@ -550,7 +550,7 @@ async fn three_node_cluster_forward_and_revocation() {
         )
         .await
     {
-        chmlvpn_server::control::CtrlResponse::KeyBound { .. } => {}
+        flock_server::control::CtrlResponse::KeyBound { .. } => {}
         other => panic!("key bind: {other:?}"),
     }
     // SR-SIG1 状态变更（Sync 票据 + nonce 记账；在 server-1 上验证）。
@@ -558,7 +558,7 @@ async fn three_node_cluster_forward_and_revocation() {
         .ticket_renew(Some(ticket_a.clone()), "mp-a", &sr_key)
         .await
     {
-        chmlvpn_server::control::CtrlResponse::TicketRenewed { ticket } => {
+        flock_server::control::CtrlResponse::TicketRenewed { ticket } => {
             assert!(
                 matches!(ticket, TicketWire::Sync(_)),
                 "换发票据仍为 Raft 根"

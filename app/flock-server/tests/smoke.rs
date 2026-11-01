@@ -4,16 +4,16 @@
 //!
 //! ```text
 //! docker compose -f deploy/m2.yml        up -d --build   # 先起 frp 中转变体（需 prepare）
-//! cargo test -p chmlvpn-server --test smoke -- --ignored relay
+//! cargo test -p flock-server --test smoke -- --ignored relay
 //!
 //! docker compose -f deploy/m2-direct.yml up -d --build   # 直连变体（零 frp，免 prepare）
-//! cargo test -p chmlvpn-server --test smoke -- --ignored direct
+//! cargo test -p flock-server --test smoke -- --ignored direct
 //! ```
 //!
 //! 断言集与 in-process `tests/control_flow.rs` 完全同源（同一 CtrlClient 驱动），差异仅在：
 //! 端点 = 宿主映射口；管理面 = 容器内 CLI（`docker compose exec`）而非进程内调用。
 //!
-//! 环境变量：`CHML_SMOKE_HOST`（默认 127.0.0.1；远程 docker host 时改指）。
+//! 环境变量：`FLOCK_SMOKE_HOST`（默认 127.0.0.1；远程 docker host 时改指）。
 //!
 //! TOFU 残余风险声明（§3.8，不可静默）：TOFU 不防首登在线 MITM；组织场景走邀请强路径。
 
@@ -27,7 +27,7 @@ use flock_protocol::session::{
 use flock_protocol::sig as sr_sig;
 use flock_protocol::sig::UserKey;
 use flock_protocol::trust::{confirm_tofu_and_pin, InviteFile, PinStore, PinVerdict};
-use chmlvpn_server::control::{client_login_finish_anchored, CtrlError, CtrlResponse, DeviceOp};
+use flock_server::control::{client_login_finish_anchored, CtrlError, CtrlResponse, DeviceOp};
 use common::{connect, pin_from_invite, pin_with_root, CtrlClient};
 
 const DEPLOY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
@@ -48,7 +48,7 @@ impl Profile {
 
     /// 宿主侧端点（目录内条目 = 同一映射口；端点 #2 = 第二暴露口，§7-M2 换端点模拟）。
     fn endpoints(self) -> (String, String) {
-        let host = std::env::var("CHML_SMOKE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        let host = std::env::var("FLOCK_SMOKE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
         match self {
             Profile::Relay => (format!("{host}:27500"), format!("{host}:27501")),
             Profile::Direct => (format!("{host}:9443"), format!("{host}:9444")),
@@ -106,9 +106,9 @@ fn compose_exec_status(profile: Profile, args: &[&str]) -> (bool, String) {
 
 fn cli(profile: Profile, sub: &[&str]) -> String {
     let mut args = vec![
-        "/usr/local/bin/chmlvpn-server",
+        "/usr/local/bin/flock-server",
         "--config",
-        "/etc/chmlvpn/server.toml",
+        "/etc/flock/server.toml",
     ];
     args.extend_from_slice(sub);
     compose_exec(profile, &args)
@@ -238,7 +238,7 @@ async fn smoke_full_chain(profile: Profile) {
         let mut rng = rand::rngs::OsRng;
         let (state, ke1) = login_start(&mut rng, "pw", &user).unwrap();
         match a
-            .req(chmlvpn_server::control::CtrlRequest::LoginBegin {
+            .req(flock_server::control::CtrlRequest::LoginBegin {
                 user: user.clone(),
                 ke1_b64: ke1,
             })
@@ -258,7 +258,7 @@ async fn smoke_full_chain(profile: Profile) {
                         "pw",
                         &user,
                         &ke2_b64,
-                        chmlvpn_server::control::AnchorLoginExpectation {
+                        flock_server::control::AnchorLoginExpectation {
                             server_id: pin.entry.server_id.0,
                             identity_pub: pin.entry.identity_pub,
                             bind_token,
@@ -336,7 +336,7 @@ async fn smoke_full_chain(profile: Profile) {
     );
     // (2) 坏票据 + 全新 nonce ⇒ 拒；同 nonce 好票据 ⇒ 过（顺序契约的端到端实证）。
     let mut bad = ticket_a.clone();
-    if let chmlvpn_server::ticket::TicketWire::Local(t) = &mut bad {
+    if let flock_server::ticket::TicketWire::Local(t) = &mut bad {
         t.exp += 100;
     }
     let n = sr_sig::nonce_hex();
@@ -447,9 +447,9 @@ fn common_b64d(s: &str) -> Vec<u8> {
 
 fn cli_status(profile: Profile, sub: &[&str]) -> (bool, String) {
     let mut args = vec![
-        "/usr/local/bin/chmlvpn-server",
+        "/usr/local/bin/flock-server",
         "--config",
-        "/etc/chmlvpn/server.toml",
+        "/etc/flock/server.toml",
     ];
     args.extend_from_slice(sub);
     compose_exec_status(profile, &args)

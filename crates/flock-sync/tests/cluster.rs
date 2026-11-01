@@ -21,20 +21,20 @@ use flock_protocol::trust::ClusterDirectory;
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
-use chml_sync::hooks::HookRecorder;
-use chml_sync::proto::{
+use flock_sync::hooks::HookRecorder;
+use flock_sync::proto::{
     AdminAck, NodeId, ReadQuery, ReadView, ServerKeyEntry, StateError, SyncRequest, SyncResponse,
     VerdictW,
 };
-use chml_sync::testutil::{FabricRegistry, MemoryFabric};
-use chml_sync::ticket::TicketError;
-use chml_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
+use flock_sync::testutil::{FabricRegistry, MemoryFabric};
+use flock_sync::ticket::TicketError;
+use flock_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
 
 /// 每方向 50ms ⇒ RTT 100ms。
 const RTT_HALF: Duration = Duration::from_millis(50);
 const NODES: [u64; 3] = [1, 2, 3];
 
-/// NodeId ↔ ServerId（与 chml_sync::wire::sid_of 同映射）。
+/// NodeId ↔ ServerId（与 flock_sync::wire::sid_of 同映射）。
 fn sid(n: NodeId) -> ServerId {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&n.to_be_bytes());
@@ -191,7 +191,7 @@ async fn write_any_read_any_linearizable_within_2s() {
     );
     assert_eq!(
         row.vip,
-        chml_sync::VIP_FIRST.to_be_bytes(),
+        flock_sync::VIP_FIRST.to_be_bytes(),
         "首 VIP = 100.64.0.11（.1–.10 保留给服务器，§6.2）"
     );
 

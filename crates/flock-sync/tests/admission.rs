@@ -14,13 +14,13 @@ use std::time::{Duration, Instant};
 
 use flock_protocol::session::{DeviceStaticKeys, ServerEntry, ServerPin, TunnelConfig};
 use flock_protocol::trust::ClusterDirectory;
-use chml_sync::wire::Fabric;
+use flock_sync::wire::Fabric;
 use common::{bootstrap, sid, TestCluster};
 
-use chml_sync::proto::{
+use flock_sync::proto::{
     AdminAck, NodeId, ReadQuery, ReadView, ServerKeyEntry, StateError, SyncRequest, SyncResponse,
 };
-use chml_sync::ticket::TicketIssuer;
+use flock_sync::ticket::TicketIssuer;
 
 const NODES: [u64; 3] = [1, 2, 3];
 
@@ -37,7 +37,7 @@ async fn rogue_handshake(
     claimed_entry: ServerEntry,
 ) -> Result<flock_protocol::session::Tunnel, flock_protocol::session::SessionError> {
     let fabric =
-        chml_sync::testutil::MemoryFabric::new(sid(0xABCD), &c.reg, common::RTT_HALF, 1024 * 1024);
+        flock_sync::testutil::MemoryFabric::new(sid(0xABCD), &c.reg, common::RTT_HALF, 1024 * 1024);
     let io = fabric.dial(&sid(target)).await.expect("dial");
     let rogue = DeviceStaticKeys::generate();
     let pin = ServerPin {

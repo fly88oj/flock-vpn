@@ -1,4 +1,4 @@
-state_dir = "/var/lib/chmlvpn"
+state_dir = "/var/lib/flock"
 
 tun_name = "tun0"
 mtu = 1280

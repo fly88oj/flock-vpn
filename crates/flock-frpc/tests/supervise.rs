@@ -19,10 +19,10 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use chml_frpc::config::{parse_ini, AdminCommon};
-use chml_frpc::probe::ProbeResult;
-use chml_frpc::supervisor::{HealthPolicy, RestartPolicy, SupervisorConfig};
-use chml_frpc::{
+use flock_frpc::config::{parse_ini, AdminCommon};
+use flock_frpc::probe::ProbeResult;
+use flock_frpc::supervisor::{HealthPolicy, RestartPolicy, SupervisorConfig};
+use flock_frpc::{
     ChmlFrpMode, FrpcBinaries, FrpcBinary, ManagedRelay, RelayFlavor, RelayPhase, RelaySpec,
     StopReason, Supervisor, CHMLFRP_PINNED_VERSION, ORIGINAL_PINNED_VERSION,
 };
@@ -44,7 +44,7 @@ const STUB_LIFETIME_MS: u64 = 20;
 
 fn test_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "chml-frpc-test-{tag}-{}",
+        "flock-frpc-test-{tag}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

@@ -15,7 +15,7 @@ use flock_protocol::session::DeviceId;
 use serde::{Deserialize, Serialize};
 
 /// 票据签名域分离标签。
-pub const TICKET_LABEL: &[u8] = b"chmlvpn-server/ticket/v1";
+pub const TICKET_LABEL: &[u8] = b"flock-server/ticket/v1";
 /// 票据 TTL 默认 60s（§2.2「票据 TTL 60s 硬顶」；部署可调小以便过期路径验收）。
 pub const TICKET_TTL_SECS: u64 = 60;
 
@@ -187,7 +187,7 @@ impl TicketIssuer {
 /// 控制流承载的会话票据（对客户端不透明 blob：登录取回、状态变更请求回呈）。
 ///
 /// - [`TicketWire::Local`]：单服形态——票据根 = 本地状态库种子（[`SignedTicket`]）；
-/// - [`TicketWire::Sync`]：多主形态——票据根在 Raft 状态内（`chml_sync::ticket::Ticket`
+/// - [`TicketWire::Sync`]：多主形态——票据根在 Raft 状态内（`flock_sync::ticket::Ticket`
 ///   线格式；任何服务器都验得了——SR-SIG1 跨服重放面的闭合前提，§2.2）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TicketWire {
@@ -209,7 +209,7 @@ pub enum TicketAuthority {
     Local(Box<TicketIssuer>),
     /// 多主：密钥根在 Raft（Bootstrap 落库；签发/校验经 SyncNode——不依赖 leader）。
     #[cfg(feature = "multi-primary")]
-    Sync(std::sync::Arc<chml_sync::SyncNode>),
+    Sync(std::sync::Arc<flock_sync::SyncNode>),
 }
 
 impl TicketAuthority {
@@ -243,7 +243,7 @@ impl TicketAuthority {
         }
     }
 
-    /// 校验序（Local：签名→TTL→epoch→设备态；Sync：chml-sync 同语义 + 本机 epoch）。
+    /// 校验序（Local：签名→TTL→epoch→设备态；Sync：flock-sync 同语义 + 本机 epoch）。
     #[allow(clippy::too_many_arguments)]
     pub fn verify(
         &self,
@@ -269,19 +269,19 @@ impl TicketAuthority {
             #[cfg(feature = "multi-primary")]
             TicketWire::Sync(bytes) => {
                 let t =
-                    chml_sync::ticket::Ticket::from_bytes(bytes).ok_or(TicketReason::Malformed)?;
+                    flock_sync::ticket::Ticket::from_bytes(bytes).ok_or(TicketReason::Malformed)?;
                 let node = match self {
                     TicketAuthority::Sync(n) => n,
                     TicketAuthority::Local(_) => return Err(TicketReason::BadSignature),
                 };
                 node.verify_ticket(&t, &session_device.0, now)
                     .map_err(|e| match e {
-                        chml_sync::ticket::TicketError::BadSignature => TicketReason::BadSignature,
-                        chml_sync::ticket::TicketError::Expired { .. } => TicketReason::Expired,
-                        chml_sync::ticket::TicketError::StaleEpoch { .. } => {
+                        flock_sync::ticket::TicketError::BadSignature => TicketReason::BadSignature,
+                        flock_sync::ticket::TicketError::Expired { .. } => TicketReason::Expired,
+                        flock_sync::ticket::TicketError::StaleEpoch { .. } => {
                             TicketReason::StaleEpoch
                         }
-                        chml_sync::ticket::TicketError::WrongDevice => TicketReason::DeviceMismatch,
+                        flock_sync::ticket::TicketError::WrongDevice => TicketReason::DeviceMismatch,
                     })?;
                 // 设备态（吊销/禁用 ⇒ 拒）——与 Local 序第 4 步对齐。
                 match lookup(session_device) {

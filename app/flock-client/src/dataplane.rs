@@ -24,7 +24,7 @@ use crate::tun::TunSession;
 
 /// 读块大小（≤ 单帧上限；帧在持久缓冲内重组，读块无需整帧）。
 ///
-/// pub：服务器侧 dataplane（`chmlvpn-server`，§2.2「服务端自身也是 peer」）共用
+/// pub：服务器侧 dataplane（`flock-server`，§2.2「服务端自身也是 peer」）共用
 /// 同一取消安全帧化形态。
 pub const READ_CHUNK: usize = 4096;
 

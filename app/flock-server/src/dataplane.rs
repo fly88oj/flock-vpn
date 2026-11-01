@@ -9,14 +9,14 @@
 //!    失配 ⇒ 丢包 + 计数（rp_filter 只作用于内核入向，用户态流必须应用层过滤）；
 //! 2. 经 tun 写泵注入内核（dst = 服务器 VIP 的包由本机协议栈应答——A2 ping 路径）；
 //! 3. 内核回程（tun 读泵）按目标 VIP 路由到对应会话的包通道（单服形态的租约表对应物；
-//!    跨服 ForwardEnvelope 转发面属 M4 `chml-sync`，§2.2 第 3 步）。
+//!    跨服 ForwardEnvelope 转发面属 M4 `flock-sync`，§2.2 第 3 步）。
 //!
 //! 无 tun 环境（宿主单测、无 NET_ADMIN 的部署）：[`PeerRouter::open`] 记日志并降级
 //! 「控制流-only」——包通道优雅 FIN，客户端观察通道 EOF（M2 行为保持）。
 //!
 //! # 取消安全与会话登记（关键不变量）
 //!
-//! - 入站帧化同客户端契约（见 `chmlvpn_client::dataplane` 模块文档）：select! 内
+//! - 入站帧化同客户端契约（见 `flock_client::dataplane` 模块文档）：select! 内
 //!   直接 await 帧化 recv 会丢帧——本侧以 `poll_fn` + 单次 `poll_read` + 持久
 //!   [`FrameBuf`] 驱动；
 //! - 同 VIP 重注册（设备重连，§2.4 漫游模型）：[`SessionIndex`] 以**代际**守卫——
@@ -29,15 +29,15 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use flock_protocol::mux::{send_packet, PacketChannel, Stream};
-use chmlvpn_client::dataplane::{FrameBuf, READ_CHUNK};
+use flock_client::dataplane::{FrameBuf, READ_CHUNK};
 use futures::io::AsyncRead as _;
 use tokio::sync::mpsc;
 
 #[cfg(target_os = "linux")]
-use chmlvpn_client::route::{self, RoutePlan};
-use chmlvpn_client::tun::TunIo;
+use flock_client::route::{self, RoutePlan};
+use flock_client::tun::TunIo;
 #[cfg(target_os = "linux")]
-use chmlvpn_client::tun::TunSpec;
+use flock_client::tun::TunSpec;
 
 /// 服务器自身 VIP（§2.2「服务端自身也是 peer，VIP 100.64.0.1」；netstate 分配从 .2 起）。
 pub const SERVER_VIP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
@@ -133,7 +133,7 @@ impl PeerRouter {
         {
             let _ = (tun_name, vip);
             eprintln!(
-                "chmlvpn-server: 数据面仅 Linux 装配（Windows 真机 M5 手工清单/macOS 未验证）——控制流-only 模式"
+                "flock-server: 数据面仅 Linux 装配（Windows 真机 M5 手工清单/macOS 未验证）——控制流-only 模式"
             );
             Self::none()
         }
@@ -160,7 +160,7 @@ impl PeerRouter {
     }
 
     /// 多主形态的 tun 装配（§2.2「服务端自身也是 peer」+ §6.2 M5 批次）：开 tun + 路由
-    /// 后**不**起单服内核路由任务——会话面由 chml-sync 转发面承担
+    /// 后**不**起单服内核路由任务——会话面由 flock-sync 转发面承担
     /// （[`crate::sync::wire_local_peer`]：dst=自身 VIP 注入内核；内核回程读泵 →
     /// `SyncNode::route_outbound`）。
     ///
@@ -168,11 +168,11 @@ impl PeerRouter {
     pub async fn open_tun_session(
         tun_name: &str,
         vip: Ipv4Addr,
-    ) -> Option<(Arc<TunIo>, chmlvpn_client::tun::TunSession)> {
+    ) -> Option<(Arc<TunIo>, flock_client::tun::TunSession)> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (tun_name, vip);
-            eprintln!("chmlvpn-server: 数据面仅 Linux 装配——多主形态控制流-only 模式");
+            eprintln!("flock-server: 数据面仅 Linux 装配——多主形态控制流-only 模式");
             None
         }
         #[cfg(target_os = "linux")]
@@ -192,7 +192,7 @@ impl PeerRouter {
     #[cfg(target_os = "linux")]
     fn with_kernel_router_task(
         self: PeerRouter,
-        mut sess: chmlvpn_client::tun::TunSession,
+        mut sess: flock_client::tun::TunSession,
     ) -> Arc<Self> {
         let arc = Arc::new(self);
         let router = arc.clone();
@@ -327,7 +327,7 @@ enum Step {
 async fn open_tun_with_route(tun_name: &str, vip: Ipv4Addr) -> Result<TunIo, ()> {
     let spec = TunSpec {
         name: tun_name.into(),
-        mtu: chmlvpn_client::tun::MTU,
+        mtu: flock_client::tun::MTU,
     };
     match TunIo::open(&spec) {
         Ok(tun) => {
@@ -335,7 +335,7 @@ async fn open_tun_with_route(tun_name: &str, vip: Ipv4Addr) -> Result<TunIo, ()>
             match route::apply(&RoutePlan::new(&ifname, vip)).await {
                 Ok(()) => {
                     eprintln!(
-                        "chmlvpn-server: dataplane up: tun {} vip {vip} route {}/{} + rp_filter=1",
+                        "flock-server: dataplane up: tun {} vip {vip} route {}/{} + rp_filter=1",
                         tun.name(),
                         route::VIP_POOL.0,
                         route::VIP_POOL.1
@@ -343,14 +343,14 @@ async fn open_tun_with_route(tun_name: &str, vip: Ipv4Addr) -> Result<TunIo, ()>
                     Ok(tun)
                 }
                 Err(e) => {
-                    eprintln!("chmlvpn-server: 路由配置失败（控制流-only 模式）: {e}");
+                    eprintln!("flock-server: 路由配置失败（控制流-only 模式）: {e}");
                     Err(())
                 }
             }
         }
         Err(e) => {
             eprintln!(
-                "chmlvpn-server: tun 打开失败（控制流-only 模式；容器需 --cap-add NET_ADMIN --device /dev/net/tun）: {e}"
+                "flock-server: tun 打开失败（控制流-only 模式；容器需 --cap-add NET_ADMIN --device /dev/net/tun）: {e}"
             );
             Err(())
         }
@@ -366,7 +366,7 @@ async fn open_tun_with_route(tun_name: &str, vip: Ipv4Addr) -> Result<TunIo, ()>
 struct ChannelSink(mpsc::Sender<Vec<u8>>);
 
 #[cfg(feature = "multi-primary")]
-impl chml_sync::PacketSink for ChannelSink {
+impl flock_sync::PacketSink for ChannelSink {
     fn deliver(&self, pkt: &[u8]) -> std::io::Result<()> {
         self.0.try_send(pkt.to_vec()).map_err(|e| {
             std::io::Error::new(
@@ -379,14 +379,14 @@ impl chml_sync::PacketSink for ChannelSink {
 
 /// 多主形态的会话包通道服务（与 [`PeerRouter::serve_stream`] 同构的取消安全结构）。
 ///
-/// - 入站：帧化读出 → [`chml_sync::SyncNode::ingest_packet`]（内部完成 §2.2 判定序：
+/// - 入站：帧化读出 → [`flock_sync::SyncNode::ingest_packet`]（内部完成 §2.2 判定序：
 ///   **第 0 步源 VIP 绑定校验** → 租约定位 → 本机投递 / ForwardEnvelope 跨服转发 /
 ///   NOT_HERE → 一次性 location_query → 仍失败丢包+尽力 ICMP）；
 /// - 出站：ForwardPlane 本机投递（sink → out_rx）→ 整帧下发；
 /// - 生命周期：attach/detach_session（租约域登记）+ 代际语义由 ForwardPlane 的
 ///   sessions 表承担（同设备新流覆盖旧 sink）。
 #[cfg(feature = "multi-primary")]
-pub async fn serve_stream_sync(node: Arc<chml_sync::SyncNode>, device: [u8; 32], stream: Stream) {
+pub async fn serve_stream_sync(node: Arc<flock_sync::SyncNode>, device: [u8; 32], stream: Stream) {
     let mut stream = stream;
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(1024);
     node.attach_session(device, Arc::new(ChannelSink(out_tx)));

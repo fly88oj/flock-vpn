@@ -1,4 +1,4 @@
-//! client.toml（docs/design.md §3.12：`chmlvpn-client --config client.toml`）。
+//! client.toml（docs/design.md §3.12：`flock-client --config client.toml`）。
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;

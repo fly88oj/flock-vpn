@@ -4,7 +4,7 @@
 #（frps:27500 / frps:27501——M3 客户端与 frps 同网；M2 客户端在宿主 ⇒ 127.0.0.1 映射口）。
 # 数据面（M3）：tun_name 生效——服务端自身也是 peer（VIP 100.64.0.1，§2.2）。
 
-state_dir = "/var/lib/chmlvpn"
+state_dir = "/var/lib/flock"
 mode = "frp"
 bind = "0.0.0.0:9443"
 admin_bind = "127.0.0.1:9444"
@@ -27,14 +27,14 @@ serverAddr = "frps"
 serverPort = 7000
 
 [[proxies]]
-name = "chml-main"
+name = "flock-main"
 type = "tcp"
 localIP = "127.0.0.1"
 localPort = 9443
 remotePort = 27500
 
 [[proxies]]
-name = "chml-alt"
+name = "flock-alt"
 type = "tcp"
 localIP = "127.0.0.1"
 localPort = 9443

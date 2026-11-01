@@ -20,15 +20,15 @@ use flock_protocol::session::{initiate, DeviceStaticKeys, ServerPin, Tunnel, Tun
 use flock_protocol::sig as sr_sig;
 use flock_protocol::sig::{self, UserKey};
 use flock_protocol::trust::{ClusterDirectory, InviteFile};
-use chmlvpn_server::config::ServerConfig;
-use chmlvpn_server::control::{
+use flock_server::config::ServerConfig;
+use flock_server::control::{
     client_login_finish_anchored, keybind_canonical, recv_ctrl_msg, send_ctrl_msg, CtrlRequest,
     CtrlResponse, DeviceOp, DevicePubs, SrAuth, CTRL_METHOD, CTRL_PROTO_VERSION, PATH_DEVICE_OP,
     PATH_REDEEM_INVITE, PATH_TICKET_RENEW,
 };
-use chmlvpn_server::netstate::RedeemRequest;
-use chmlvpn_server::server::ServerCore;
-use chmlvpn_server::ticket::TicketWire;
+use flock_server::netstate::RedeemRequest;
+use flock_server::server::ServerCore;
+use flock_server::ticket::TicketWire;
 
 pub fn b64(bytes: &[u8]) -> String {
     use base64::Engine as _;
@@ -123,7 +123,7 @@ impl CtrlClient {
             pw,
             user,
             &ke2,
-            chmlvpn_server::control::AnchorLoginExpectation {
+            flock_server::control::AnchorLoginExpectation {
                 server_id: pin.entry.server_id.0,
                 identity_pub: pin.entry.identity_pub,
                 bind_token,

@@ -5,15 +5,15 @@
 #   1. 客户端 `gen-keys`（生成/复用设备密钥并打印公钥）；
 #   2. 服务端 `device-add`（注册设备 + 分 VIP）与 `invite`（签发 v3 邀请）；
 #   3. 客户端 `invite <file>`（钉扎根公钥 + 存根签目录）+ 写 vip 文件；
-#   4. `touch /var/lib/chmlvpn/ready` 后 `docker compose restart client`
+#   4. `touch /var/lib/flock/ready` 后 `docker compose restart client`
 #      ⇒ 本入口 exec 客户端主进程（日志进 `docker compose logs client`，A9 grep 面）。
 set -e
-STATE=/var/lib/chmlvpn
+STATE=/var/lib/flock
 
 if [ -f "$STATE/ready" ]; then
-    echo "chmlvpn-client: state ready; starting (config /etc/chmlvpn/client.toml)"
-    exec chmlvpn-client --config /etc/chmlvpn/client.toml
+    echo "flock-client: state ready; starting (config /etc/flock/client.toml)"
+    exec flock-client --config /etc/flock/client.toml
 fi
 
-echo "chmlvpn-client: awaiting bootstrap (run deploy/m3_assert.sh)..."
+echo "flock-client: awaiting bootstrap (run deploy/m3_assert.sh)..."
 exec sleep infinity

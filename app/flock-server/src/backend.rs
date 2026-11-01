@@ -24,13 +24,13 @@ use crate::netstate::{
 };
 
 #[cfg(feature = "multi-primary")]
-use chml_sync::proto as sync_proto;
+use flock_sync::proto as sync_proto;
 
 /// 形态分派的统一后端。
 pub enum NetBackend {
     /// 单服：本地状态库（M2 形态；m2-direct.yml 等部署）。
     Single(std::sync::Arc<StateStore>),
-    /// 多主：chml-sync Raft 状态机（feature `multi-primary`）。
+    /// 多主：flock-sync Raft 状态机（feature `multi-primary`）。
     #[cfg(feature = "multi-primary")]
     Sync(std::sync::Arc<SyncNetState>),
 }
@@ -61,7 +61,7 @@ impl NetBackend {
             #[cfg(feature = "multi-primary")]
             NetBackend::Sync(s) => match s
                 .node
-                .read_linearizable(chml_sync::proto::ReadQuery::DeviceRow(id.0))
+                .read_linearizable(flock_sync::proto::ReadQuery::DeviceRow(id.0))
                 .await
             {
                 Ok(sync_proto::ReadView::Device(Some(row))) => Some(row.into()),
@@ -78,7 +78,7 @@ impl NetBackend {
             NetBackend::Sync(s) => {
                 match s
                     .node
-                    .read_linearizable(chml_sync::proto::ReadQuery::DevicesOf(owner.to_string()))
+                    .read_linearizable(flock_sync::proto::ReadQuery::DevicesOf(owner.to_string()))
                     .await
                 {
                     Ok(sync_proto::ReadView::Devices(rows)) => rows
@@ -267,7 +267,7 @@ impl NetBackend {
             #[cfg(feature = "multi-primary")]
             NetBackend::Sync(s) => match s
                 .node
-                .read_linearizable(chml_sync::proto::ReadQuery::User(user.to_string()))
+                .read_linearizable(flock_sync::proto::ReadQuery::User(user.to_string()))
                 .await
             {
                 Ok(sync_proto::ReadView::User(Some(row))) => {
@@ -308,7 +308,7 @@ impl NetBackend {
             #[cfg(feature = "multi-primary")]
             NetBackend::Sync(s) => match s
                 .node
-                .read_linearizable(chml_sync::proto::ReadQuery::User(user.to_string()))
+                .read_linearizable(flock_sync::proto::ReadQuery::User(user.to_string()))
                 .await
             {
                 Ok(sync_proto::ReadView::User(Some(row))) => row
@@ -376,17 +376,17 @@ pub use adapter::SyncNetState;
 mod adapter {
     use std::sync::Arc;
 
-    use chml_sync::proto::{SyncError, SyncRequest, SyncResponse};
+    use flock_sync::proto::{SyncError, SyncRequest, SyncResponse};
 
     use crate::netstate::NetError;
 
     /// SyncNode 的 NetBackend 适配体（写转发 leader / 线性一致读经节点门面）。
     pub struct SyncNetState {
-        pub node: Arc<chml_sync::SyncNode>,
+        pub node: Arc<flock_sync::SyncNode>,
     }
 
     impl SyncNetState {
-        pub fn new(node: Arc<chml_sync::SyncNode>) -> Arc<Self> {
+        pub fn new(node: Arc<flock_sync::SyncNode>) -> Arc<Self> {
             Arc::new(SyncNetState { node })
         }
 
@@ -401,11 +401,11 @@ mod adapter {
     }
 }
 
-// —— 行类型转换（chml-sync 行 → 服务器 netstate 行；语义同构，§3.10 接口对齐）——
+// —— 行类型转换（flock-sync 行 → 服务器 netstate 行；语义同构，§3.10 接口对齐）——
 #[cfg(feature = "multi-primary")]
 mod conv {
     use crate::netstate::{DeviceRow, DeviceStatus};
-    use chml_sync::proto;
+    use flock_sync::proto;
 
     impl From<proto::DeviceRow> for DeviceRow {
         fn from(r: proto::DeviceRow) -> Self {
@@ -428,8 +428,8 @@ mod conv {
 // —— StateError → 服务器错误面映射 ——
 
 #[cfg(feature = "multi-primary")]
-fn net_err(e: &chml_sync::proto::StateError) -> NetError {
-    use chml_sync::proto::StateError;
+fn net_err(e: &flock_sync::proto::StateError) -> NetError {
+    use flock_sync::proto::StateError;
     match e {
         StateError::DeviceExists => NetError::InvalidState("device already registered".into()),
         StateError::DeviceNotFound => NetError::NotFound,
@@ -453,9 +453,9 @@ fn redeem_io(e: NetError) -> crate::netstate::RedeemError {
 }
 
 #[cfg(feature = "multi-primary")]
-fn redeem_err(e: &chml_sync::proto::StateError) -> crate::netstate::RedeemError {
+fn redeem_err(e: &flock_sync::proto::StateError) -> crate::netstate::RedeemError {
     use crate::netstate::RedeemError;
-    use chml_sync::proto::StateError;
+    use flock_sync::proto::StateError;
     match e {
         StateError::AlreadyUsed => RedeemError::AlreadyUsed,
         StateError::InviteRevoked => RedeemError::InviteRevoked,

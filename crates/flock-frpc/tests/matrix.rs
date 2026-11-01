@@ -13,8 +13,8 @@ mod common;
 
 use std::path::PathBuf;
 
-use chml_frpc::supervisor::SupervisorConfig;
-use chml_frpc::{
+use flock_frpc::supervisor::SupervisorConfig;
+use flock_frpc::{
     check_version_matrix, ChmlFrpMode, FrpcBinaries, FrpcBinary, FrpcError, RelayFlavor,
     RelayPhase, RelaySpec, StopReason, Supervisor, CHMLFRP_PINNED_VERSION, ORIGINAL_PINNED_VERSION,
 };
@@ -51,7 +51,7 @@ fn original_spec() -> RelaySpec {
 
 fn temp_run_base(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "chml-frpc-test-matrix-{tag}-{}",
+        "flock-frpc-test-matrix-{tag}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

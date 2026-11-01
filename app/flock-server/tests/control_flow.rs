@@ -21,7 +21,7 @@ use flock_protocol::session::{
 use flock_protocol::sig as sr_sig;
 use flock_protocol::sig::UserKey;
 use flock_protocol::trust::{confirm_tofu_and_pin, InviteFile, PinStore, PinVerdict};
-use chmlvpn_server::control::{client_login_finish_anchored, CtrlError, CtrlResponse, DeviceOp};
+use flock_server::control::{client_login_finish_anchored, CtrlError, CtrlResponse, DeviceOp};
 use common::{connect, pin_from_invite, pin_with_root, CtrlClient, TestServer};
 
 fn now() -> i64 {
@@ -81,7 +81,7 @@ async fn full_chain_invite_login_keybind_srsig1_revoke() {
         let mut rng = rand::rngs::OsRng;
         let (state, ke1) = login_start(&mut rng, "pw-123", "alice").unwrap();
         match a
-            .req(chmlvpn_server::control::CtrlRequest::LoginBegin {
+            .req(flock_server::control::CtrlRequest::LoginBegin {
                 user: "alice".into(),
                 ke1_b64: ke1,
             })
@@ -101,7 +101,7 @@ async fn full_chain_invite_login_keybind_srsig1_revoke() {
                         "pw-123",
                         "alice",
                         &ke2_b64,
-                        chmlvpn_server::control::AnchorLoginExpectation {
+                        flock_server::control::AnchorLoginExpectation {
                             server_id: pin.entry.server_id.0,
                             identity_pub: pin.entry.identity_pub,
                             bind_token,
@@ -122,7 +122,7 @@ async fn full_chain_invite_login_keybind_srsig1_revoke() {
         .await
         .expect("login");
     match &ticket_a {
-        chmlvpn_server::ticket::TicketWire::Local(t) => {
+        flock_server::ticket::TicketWire::Local(t) => {
             assert_eq!(t.user, "alice");
             assert_eq!(t.device, dev_id(&dev_a).to_vec(), "票据绑定会话设备");
         }
@@ -194,7 +194,7 @@ async fn full_chain_invite_login_keybind_srsig1_revoke() {
     // (b) 契约顺序：坏票据 + 全新 nonce ⇒ TicketBad；同 nonce 持有效票据 ⇒ 过（未入账证明）。
     // 篡改覆盖字段 ⇒ 签名失效（TicketWire::Local 的 exp 进 canonical 字节）。
     let mut bad_ticket = ticket_a.clone();
-    if let chmlvpn_server::ticket::TicketWire::Local(t) = &mut bad_ticket {
+    if let flock_server::ticket::TicketWire::Local(t) = &mut bad_ticket {
         t.exp += 100;
     }
     let n3 = sr_sig::nonce_hex();
@@ -301,7 +301,7 @@ async fn full_chain_invite_login_keybind_srsig1_revoke() {
         let mut a2 = a;
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            a2.req(chmlvpn_server::control::CtrlRequest::DirPull { since_version: 0 }),
+            a2.req(flock_server::control::CtrlRequest::DirPull { since_version: 0 }),
         )
         .await;
         assert!(r.is_err() || r.unwrap().is_err(), "吊销后 A 的会话被拆");

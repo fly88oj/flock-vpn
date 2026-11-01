@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# chmlvpn-server —— Frp 模式镜像（docs/design.md §7-M2：m2.yml 的 server 服务）。
+# flock-server —— Frp 模式镜像（docs/design.md §7-M2：m2.yml 的 server 服务）。
 #
 # 依赖层缓存：先只拷 manifest + stub 源构建依赖层，再拷真实源重编——源码改动不重拉依赖。
 # frpc 二进制经命名构建上下文 `frpbin` 直取 .tmp/frp_0.71.1_linux_amd64/
@@ -17,44 +17,44 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/flock-protocol/Cargo.toml crates/flock-protocol/
-COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
-COPY crates/chml-sync/Cargo.toml crates/chml-sync/
-COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
-# chmlvpn-server 依赖 chmlvpn-client（M3 数据面：TunDevice/route 接缝复用，§2.2/§3.12）。
-COPY app/chmlvpn-client/Cargo.toml app/chmlvpn-client/
+COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
+COPY crates/flock-sync/Cargo.toml crates/flock-sync/
+COPY app/flock-server/Cargo.toml app/flock-server/
+# flock-server 依赖 flock-client（M3 数据面：TunDevice/route 接缝复用，§2.2/§3.12）。
+COPY app/flock-client/Cargo.toml app/flock-client/
 # —— 依赖层（stub 源）——
 # stub benches/aead.rs：flock-protocol manifest 声明 [[bench]]，cargo 解析 manifest
 # 需该文件存在（依赖层不编译 bench 本体）。
 RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
-             crates/chml-frpc/src crates/chml-sync/src \
-             app/chmlvpn-server/src app/chmlvpn-client/src \
+             crates/flock-frpc/src crates/flock-sync/src \
+             app/flock-server/src app/flock-client/src \
  && echo 'pub fn _stub() {}' > crates/flock-protocol/src/lib.rs \
  && echo 'fn main() {}' > crates/flock-protocol/benches/aead.rs \
- && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
- && echo 'pub fn _stub() {}' > crates/chml-sync/src/lib.rs \
- && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
- && echo 'fn main() {}' > app/chmlvpn-server/src/main.rs \
- && echo 'pub fn _stub() {}' > app/chmlvpn-client/src/lib.rs \
- && echo 'fn main() {}' > app/chmlvpn-client/src/main.rs \
- && cargo build --release --locked -p chmlvpn-server \
- && rm -rf target/release/deps/chmlvpn_server* target/release/deps/chmlvpn_server_lib* \
-          target/release/deps/chmlvpn_client* target/release/deps/flock_protocol* \
-          target/release/deps/chml_frpc* target/release/deps/chml_sync* \
- && rm -f target/release/chmlvpn-server target/release/chmlvpn-client
+ && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/flock-sync/src/lib.rs \
+ && echo 'pub fn _stub() {}' > app/flock-server/src/lib.rs \
+ && echo 'fn main() {}' > app/flock-server/src/main.rs \
+ && echo 'pub fn _stub() {}' > app/flock-client/src/lib.rs \
+ && echo 'fn main() {}' > app/flock-client/src/main.rs \
+ && cargo build --release --locked -p flock-server \
+ && rm -rf target/release/deps/flock_server* target/release/deps/flock_server_lib* \
+          target/release/deps/flock_client* target/release/deps/flock_protocol* \
+          target/release/deps/flock_frpc* target/release/deps/flock_sync* \
+ && rm -f target/release/flock-server target/release/flock-client
 
 # —— 源码层 ——
 # server_features：构建档（e2e 多主拓扑传 "multi-primary"——§6.2 M5；缺省空 = 单服）。
 ARG server_features=""
 COPY crates/flock-protocol/src crates/flock-protocol/src
-COPY crates/chml-frpc/src crates/chml-frpc/src
-COPY crates/chml-sync/src crates/chml-sync/src
-COPY app/chmlvpn-client/src app/chmlvpn-client/src
-COPY app/chmlvpn-server/src app/chmlvpn-server/src
-RUN touch crates/flock-protocol/src/lib.rs crates/chml-frpc/src/lib.rs \
-      crates/chml-sync/src/lib.rs \
-      app/chmlvpn-client/src/lib.rs app/chmlvpn-client/src/main.rs \
-      app/chmlvpn-server/src/lib.rs app/chmlvpn-server/src/main.rs \
- && cargo build --release --locked -p chmlvpn-server --features "${server_features}"
+COPY crates/flock-frpc/src crates/flock-frpc/src
+COPY crates/flock-sync/src crates/flock-sync/src
+COPY app/flock-client/src app/flock-client/src
+COPY app/flock-server/src app/flock-server/src
+RUN touch crates/flock-protocol/src/lib.rs crates/flock-frpc/src/lib.rs \
+      crates/flock-sync/src/lib.rs \
+      app/flock-client/src/lib.rs app/flock-client/src/main.rs \
+      app/flock-server/src/lib.rs app/flock-server/src/main.rs \
+ && cargo build --release --locked -p flock-server --features "${server_features}"
 
 FROM debian:bookworm-slim
 # procps：§7-M2 的 Direct 形态断言（容器内 pgrep -f frp 无进程）需要 pgrep；
@@ -63,13 +63,13 @@ FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends procps iproute2 iperf3 netcat-openbsd \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/target/release/chmlvpn-server /usr/local/bin/chmlvpn-server
+COPY --from=builder /src/target/release/flock-server /usr/local/bin/flock-server
 # 原版 frpc v0.71.1 定版二进制（命名 context `frpbin` ← .tmp；主 context 无需携带）
 COPY --from=frpbin frpc /usr/local/bin/frpc
-RUN chmod +x /usr/local/bin/frpc && mkdir -p /var/lib/chmlvpn
+RUN chmod +x /usr/local/bin/frpc && mkdir -p /var/lib/flock
 # server.toml 可经构建参数替换（m3.yml 传 server-m3.toml：容器网络视角端点）；
 # 缺省 = server-frp.toml（M2 宿主视角，行为不变）。
 ARG server_conf=server-frp.toml
-COPY deploy/${server_conf} /etc/chmlvpn/server.toml
-ENTRYPOINT ["/usr/local/bin/chmlvpn-server"]
-CMD ["--config", "/etc/chmlvpn/server.toml"]
+COPY deploy/${server_conf} /etc/flock/server.toml
+ENTRYPOINT ["/usr/local/bin/flock-server"]
+CMD ["--config", "/etc/flock/server.toml"]

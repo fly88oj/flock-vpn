@@ -15,7 +15,7 @@
 #
 # 汇总：末尾逐项 PASS/FAIL；任一 FAIL ⇒ 退出码非零。
 #
-# Git Bash（MSYS）路径改写坑：/dev/net/tun、/etc/chmlvpn/... 等以 / 开头的参数会被
+# Git Bash（MSYS）路径改写坑：/dev/net/tun、/etc/flock/... 等以 / 开头的参数会被
 # 改写成 Windows 路径（设计附录 B-2 首次踩坑记录）——本脚本内部 export
 # MSYS_NO_PATHCONV=1，调用方无需任何前置设置。
 #
@@ -43,7 +43,7 @@ _src="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # 不存在则回落 POSIX 路径，docker on Linux 本就接受）。
 HERE="$(cd "$_src" && pwd -W 2>/dev/null || echo "$_src")"
 COMPOSE_FILE="$HERE/m3.yml"
-NETWORK="chmlvpn-m3net"
+NETWORK="flock-m3net"
 SERVER_VIP="100.64.0.1"
 MTU_EXPECT=1280
 A4_MIN_MBPS=100
@@ -83,14 +83,14 @@ bootstrap() {
     exec_server sh -c 'ip link show tun0' >/dev/null 2>&1 \
         || { echo "server tun0 未创建（dataplane down）"; compose logs --tail 40 server; return 1; }
 
-    if exec_client sh -c 'test -f /var/lib/chmlvpn/ready' 2>/dev/null; then
+    if exec_client sh -c 'test -f /var/lib/flock/ready' 2>/dev/null; then
         log "bootstrap: 已就绪（幂等跳过）"
         return 0
     fi
 
     log "bootstrap: gen-keys（客户端）"
     local keys
-    keys="$(exec_client chmlvpn-client --config /etc/chmlvpn/client.toml gen-keys)" || return 1
+    keys="$(exec_client flock-client --config /etc/flock/client.toml gen-keys)" || return 1
     local dev_x dev_ed
     dev_x="$(printf '%s\n' "$keys" | sed -n 's/^device-x=//p')"
     dev_ed="$(printf '%s\n' "$keys" | sed -n 's/^device-ed=//p')"
@@ -98,7 +98,7 @@ bootstrap() {
 
     log "bootstrap: 服务端 device-add（预注册设备 + 分 VIP）"
     local out
-    out="$(exec_server chmlvpn-server --config /etc/chmlvpn/server.toml \
+    out="$(exec_server flock-server --config /etc/flock/server.toml \
         device-add --user m3client --device-x "$dev_x" --device-ed "$dev_ed" 2>&1)" \
         || { echo "device-add 失败：$out"; return 1; }
     local vip
@@ -110,19 +110,19 @@ bootstrap() {
 
     log "bootstrap: 服务端 invite（v3 邀请）"
     local invite_b64
-    invite_b64="$(exec_server chmlvpn-server --config /etc/chmlvpn/server.toml \
+    invite_b64="$(exec_server flock-server --config /etc/flock/server.toml \
         invite --ttl-secs 86400)" || return 1
-    printf '%s' "$invite_b64" | exec_client sh -c 'cat > /var/lib/chmlvpn/invite.b64' || return 1
+    printf '%s' "$invite_b64" | exec_client sh -c 'cat > /var/lib/flock/invite.b64' || return 1
 
     log "bootstrap: 客户端 ingest invite（钉扎根公钥 + 存目录）"
-    exec_client chmlvpn-client --config /etc/chmlvpn/client.toml \
-        invite /var/lib/chmlvpn/invite.b64 || return 1
+    exec_client flock-client --config /etc/flock/client.toml \
+        invite /var/lib/flock/invite.b64 || return 1
 
     log "bootstrap: 写入 vip=$vip"
-    printf '%s' "$vip" | exec_client sh -c 'cat > /var/lib/chmlvpn/vip' || return 1
+    printf '%s' "$vip" | exec_client sh -c 'cat > /var/lib/flock/vip' || return 1
 
     log "bootstrap: ready + restart client（主进程接管）"
-    exec_client sh -c 'touch /var/lib/chmlvpn/ready' || return 1
+    exec_client sh -c 'touch /var/lib/flock/ready' || return 1
     compose restart client >/dev/null 2>&1 || return 1
 
     # 等客户端握手成功（tun0 出现 = 客户端主进程已跑到数据面装配）。

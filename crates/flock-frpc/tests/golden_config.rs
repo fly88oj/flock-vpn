@@ -10,10 +10,10 @@
 //!   （面板/发行包 v0.51.2 INI 方言；磁盘形态 CRLF 系 Windows 侧解包所致，对比按行尾归一）；
 //! - `original.frpc.toml` ← `.tmp/frp_0.71.1_linux_amd64/frpc.toml`（v0.71.1 TOML 方言）。
 
-use chml_frpc::config::{
+use flock_frpc::config::{
     augment_chmlfrp_admin, parse_ini, ChmlFrpIniConfig, OriginalTomlConfig, WebServerSection,
 };
-use chml_frpc::AdminCommon;
+use flock_frpc::AdminCommon;
 
 const GOLDEN_INI: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -125,7 +125,7 @@ fn original_toml_generator_full_form_roundtrip() {
     let table: toml::Table = rendered.parse().unwrap();
     assert_eq!(table["auth"]["token"].as_str(), Some("secret-token"));
     assert_eq!(table["webServer"]["port"].as_integer(), Some(7400));
-    let targets = chml_frpc::config::original_probe_targets(&table);
+    let targets = flock_frpc::config::original_probe_targets(&table);
     assert_eq!(targets.admin.as_ref().unwrap().addr.port(), 7400);
     assert_eq!(
         targets.local_tunnel,

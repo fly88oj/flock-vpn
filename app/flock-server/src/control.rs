@@ -49,7 +49,7 @@ pub const PATH_TICKET_RENEW: &str = "/ticket-renew";
 pub const PATH_REDEEM_INVITE: &str = "/redeem-invite";
 pub const PATH_DEVICE_OP: &str = "/device-op";
 /// key-bind 设备签名域分离标签（公钥经登录态登记，受服务端身份签名覆盖的 bind_token 佐证）。
-pub const KEYBIND_LABEL: &[u8] = b"chmlvpn-server/control/key-bind/v1";
+pub const KEYBIND_LABEL: &[u8] = b"flock-server/control/key-bind/v1";
 
 /// 单条控制消息上限（防御性；远小于记录层 1MiB 上限）。
 pub const MAX_CTRL_MSG: usize = 256 * 1024;
@@ -266,7 +266,7 @@ fn state_err(e: NetError) -> CtrlResponse {
         NetError::IpExhausted => CtrlError::IpExhausted,
         NetError::Internal(_) => CtrlError::Internal,
     };
-    eprintln!("chmlvpn-server: netstate: {e}");
+    eprintln!("flock-server: netstate: {e}");
     err(code)
 }
 
@@ -388,7 +388,7 @@ impl CtrlGuard {
             .ticket_principal(net, session_device, ticket, now_unix as u64)
             .await
             .map_err(|r| {
-                eprintln!("chmlvpn-server: ticket rejected: {r}");
+                eprintln!("flock-server: ticket rejected: {r}");
                 CtrlError::TicketBad
             })?;
         // ② SR-SIG1 验签（user 公钥集来自注册表——线性一致）。
@@ -550,7 +550,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             ) {
                 Ok(t) => t,
                 Err(m) => {
-                    eprintln!("chmlvpn-server: ticket issue: {m}");
+                    eprintln!("flock-server: ticket issue: {m}");
                     return err(CtrlError::Internal);
                 }
             };
@@ -573,7 +573,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             {
                 Ok(u) => u,
                 Err(r) => {
-                    eprintln!("chmlvpn-server: key-bind ticket rejected: {r}");
+                    eprintln!("flock-server: key-bind ticket rejected: {r}");
                     return err(CtrlError::TicketBad);
                 }
             };
@@ -642,7 +642,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                     ) {
                         Ok(t) => t,
                         Err(m) => {
-                            eprintln!("chmlvpn-server: ticket issue: {m}");
+                            eprintln!("flock-server: ticket issue: {m}");
                             return err(CtrlError::Internal);
                         }
                     };

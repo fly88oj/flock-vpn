@@ -1,4 +1,4 @@
-//! `chml-sync`：多主多活同步（docs/design.md §3.10/§4 第一部分，VPN-15）。
+//! `flock-sync`：多主多活同步（docs/design.md §3.10/§4 第一部分，VPN-15）。
 //!
 //! 本 crate 落地 §4 择型的核心件——**openraft 0.9.25 复制状态机**（设备注册表/邀请/VIP
 //! 分配/吊销/服务器密钥/票据密钥根，全部强一致），外加为 `tests/cluster` 八项断言服务的
@@ -76,7 +76,7 @@ pub mod raft_types {
     use crate::proto::{SyncRequest, SyncResponse};
 
     openraft::declare_raft_types!(
-        /// chml-sync 的 openraft 类型集。
+        /// flock-sync 的 openraft 类型集。
         pub SyncConfig:
             D = SyncRequest,
             R = SyncResponse,

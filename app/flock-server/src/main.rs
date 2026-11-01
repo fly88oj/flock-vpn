@@ -1,4 +1,4 @@
-//! chmlvpn-server 进程入口（docs/design.md §3.11：`--config server.toml` / `init-cluster`
+//! flock-server 进程入口（docs/design.md §3.11：`--config server.toml` / `init-cluster`
 //! / 运维子命令）。
 //!
 //! 子命令：
@@ -13,12 +13,12 @@
 
 use std::path::PathBuf;
 
-use chmlvpn_server::admin::{client, AdminRequest, AdminResponse};
-use chmlvpn_server::config::ServerConfig;
-use chmlvpn_server::control::DevicePubs;
+use flock_server::admin::{client, AdminRequest, AdminResponse};
+use flock_server::config::ServerConfig;
+use flock_server::control::DevicePubs;
 
 const USAGE: &str = "\
-chmlvpn-server [--config <server.toml>] [<subcommand>]
+flock-server [--config <server.toml>] [<subcommand>]
 
 子命令：
   (run)                          起服（缺省；listener.mode = direct 缺省 / frp；
@@ -46,7 +46,7 @@ fn main() {
     let code = match run_cli() {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("chmlvpn-server: {e}");
+            eprintln!("flock-server: {e}");
             2
         }
     };
@@ -321,7 +321,7 @@ fn run_cli() -> Result<(), String> {
                         Some(s) => s.split(',').map(|e| e.trim().to_string()).collect(),
                         None => (0..n).map(|i| format!("node-{i}:9443")).collect(),
                     };
-                    let m = chmlvpn_server::bundle::ClusterMaterial::generate(n, None, |i| {
+                    let m = flock_server::bundle::ClusterMaterial::generate(n, None, |i| {
                         eps[i].clone()
                     });
                     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
@@ -345,7 +345,7 @@ fn run_cli() -> Result<(), String> {
                     println!("out={out}（root.seed 保密；node-*.bundle 分发各机 + enroll）");
                     return Ok(());
                 }
-                let (core, created) = chmlvpn_server::server::ServerCore::open_or_init(cfg)?;
+                let (core, created) = flock_server::server::ServerCore::open_or_init(cfg)?;
                 if !created {
                     return Err("状态库已初始化（init-cluster 仅首次）".into());
                 }
@@ -355,7 +355,7 @@ fn run_cli() -> Result<(), String> {
             }
             Cmd::Enroll { bundle } => {
                 let bytes = std::fs::read(&bundle).map_err(|e| format!("read {bundle}: {e}"))?;
-                let b = chmlvpn_server::bundle::NodeBundle::from_bytes(&bytes)
+                let b = flock_server::bundle::NodeBundle::from_bytes(&bytes)
                     .ok_or("捆绑文件解码失败")?;
                 let cid = b.verify()?;
                 let ident = b.identity()?;
@@ -393,28 +393,28 @@ fn run_cli() -> Result<(), String> {
                         .unwrap_or_else(|| cfg2.state_dir.join("bundle.bin"));
                     let bytes = std::fs::read(&bundle_path)
                         .map_err(|e| format!("读 {}: {e}", bundle_path.display()))?;
-                    let bundle = chmlvpn_server::bundle::NodeBundle::from_bytes(&bytes)
+                    let bundle = flock_server::bundle::NodeBundle::from_bytes(&bytes)
                         .ok_or("捆绑文件解码失败")?;
                     let cluster_id = bundle.verify()?;
-                    let boot = chml_sync::proto::SyncRequest::bootstrap_signed(
+                    let boot = flock_sync::proto::SyncRequest::bootstrap_signed(
                         &root,
                         cluster_id.0,
                         ticket_root,
                     );
                     // SetOprf：共享 OPRF key（本进程生成；根签后全网可验——§2.4）。
                     let oprf_b64 = flock_protocol::pake::server_setup_new(&mut flock_protocol::rand::rngs::OsRng);
-                    let l_oprf: &[u8] = b"chml-sync/set-oprf/v1";
+                    let l_oprf: &[u8] = b"flock-sync/set-oprf/v1";
                     let mut canon = Vec::with_capacity(l_oprf.len() + 4 + oprf_b64.len());
                     canon.extend_from_slice(l_oprf);
                     canon.extend_from_slice(&(oprf_b64.len() as u32).to_le_bytes());
                     canon.extend_from_slice(oprf_b64.as_bytes());
-                    let set_oprf = chml_sync::proto::SyncRequest::SetOprf(chml_sync::proto::RootSigned {
+                    let set_oprf = flock_sync::proto::SyncRequest::SetOprf(flock_sync::proto::RootSigned {
                         op: oprf_b64,
                         sig: root.sign(&canon).to_bytes(),
                     });
                     // 自验（root_pub 对 canonical 验签——防端点错配直接提交废签名）。
                     let root_pub = root.verifying_key();
-                    if let chml_sync::proto::SyncRequest::SetOprf(rs) = &set_oprf {
+                    if let flock_sync::proto::SyncRequest::SetOprf(rs) = &set_oprf {
                         debug_assert!(root_pub.verify(&canon, &Signature::from_bytes(&rs.sig)).is_ok());
                     }
                     for req in [boot, set_oprf] {
@@ -473,13 +473,13 @@ fn run_cli() -> Result<(), String> {
                     let root = load_root_seed(&root_seed)?;
                     let bytes =
                         std::fs::read(&bundle).map_err(|e| format!("读 {bundle}: {e}"))?;
-                    let b = chmlvpn_server::bundle::NodeBundle::from_bytes(&bytes)
+                    let b = flock_server::bundle::NodeBundle::from_bytes(&bytes)
                         .ok_or("捆绑文件解码失败")?;
                     let cluster_id = b.verify()?;
                     let dir = b.directory()?;
                     let invite_id: [u8; 16] = flock_protocol::rand::random();
                     let expiry = flock_protocol::trust::now_unix() + ttl_secs;
-                    let record = chml_sync::proto::SyncRequest::RecordInvite {
+                    let record = flock_sync::proto::SyncRequest::RecordInvite {
                         invite_id,
                         expiry_unix: expiry,
                     };
@@ -489,7 +489,7 @@ fn run_cli() -> Result<(), String> {
                         Err(_) => {
                             let mut boot_bind = cfg.admin_bind;
                             boot_bind.set_port(cfg.admin_bind.port() + 1);
-                            client(boot_bind, AdminRequest::SignedWrite { req: chml_sync::proto::SyncRequest::RecordInvite { invite_id, expiry_unix: expiry } }).await?
+                            client(boot_bind, AdminRequest::SignedWrite { req: flock_sync::proto::SyncRequest::RecordInvite { invite_id, expiry_unix: expiry } }).await?
                         }
                     };
                     match resp {
@@ -540,7 +540,7 @@ fn run_cli() -> Result<(), String> {
                 } else {
                     // 服务未跑：本进程直写（状态库未初始化时先引导——首次签发的兜底路径）。
                     let (core, created) =
-                        chmlvpn_server::server::ServerCore::open_or_init(cfg.clone())?;
+                        flock_server::server::ServerCore::open_or_init(cfg.clone())?;
                     if created {
                         eprintln!("note: 已引导新状态库（建议改用 init-cluster）");
                     }
@@ -609,13 +609,13 @@ fn run_cli() -> Result<(), String> {
                 if let Some(sync) = &cfg.sync {
                     if sync.mode == "raft" {
                         let (running, task, _admin) =
-                            chmlvpn_server::sync::run_raft(cfg, mode).await?;
+                            flock_server::sync::run_raft(cfg, mode).await?;
                         eprintln!(
-                            "chmlvpn-server: listening on {} (mode: {}, sync: raft)",
+                            "flock-server: listening on {} (mode: {}, sync: raft)",
                             running.local_addr(),
                             match running {
-                                chmlvpn_server::server::RunningListener::Direct { .. } => "direct",
-                                chmlvpn_server::server::RunningListener::Frp { .. } => "frp",
+                                flock_server::server::RunningListener::Direct { .. } => "direct",
+                                flock_server::server::RunningListener::Frp { .. } => "frp",
                             }
                         );
                         return match task.await {
@@ -635,17 +635,17 @@ fn run_cli() -> Result<(), String> {
                         );
                     }
                 }
-                let (core, created) = chmlvpn_server::server::ServerCore::open_or_init(cfg)?;
+                let (core, created) = flock_server::server::ServerCore::open_or_init(cfg)?;
                 if created {
                     eprintln!("note: 状态库未初始化即起服——已引导（生产请先 init-cluster）");
                 }
-                let (running, task, _admin) = chmlvpn_server::server::run(core, mode).await?;
+                let (running, task, _admin) = flock_server::server::run(core, mode).await?;
                 eprintln!(
-                    "chmlvpn-server: listening on {} (mode: {})",
+                    "flock-server: listening on {} (mode: {})",
                     running.local_addr(),
                     match running {
-                        chmlvpn_server::server::RunningListener::Direct { .. } => "direct",
-                        chmlvpn_server::server::RunningListener::Frp { .. } => "frp",
+                        flock_server::server::RunningListener::Direct { .. } => "direct",
+                        flock_server::server::RunningListener::Frp { .. } => "frp",
                     }
                 );
                 match task.await {

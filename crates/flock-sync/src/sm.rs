@@ -31,7 +31,7 @@ use crate::raft_types::SyncConfig;
 use crate::state::NetStateData;
 
 /// SM 侧快照持久化表（与日志存储表分离：redb 并发写事务按表粒度避冲突）。
-pub const SMKV_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("chml_sync_sm");
+pub const SMKV_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("flock_sync_sm");
 
 /// 快照束（wire + 持久化格式）。
 #[derive(Serialize, Deserialize)]
@@ -249,7 +249,7 @@ impl SmCore {
             let meta = SnapshotMeta {
                 last_log_id: d.last_applied,
                 last_membership: d.last_membership.clone(),
-                snapshot_id: format!("chml-sync-{:016x}", rng_u64()),
+                snapshot_id: format!("flock-sync-{:016x}", rng_u64()),
             };
             (
                 SnapBundle {

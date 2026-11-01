@@ -63,7 +63,7 @@ pub enum AdminRequest {
     /// 多主写透传（feature `multi-primary`）：根签管理操作（Bootstrap/SetOprf/
     /// RecordInvite——签名验证在 Raft 状态机内，admin 只透传）。
     #[cfg(feature = "multi-primary")]
-    SignedWrite { req: chml_sync::proto::SyncRequest },
+    SignedWrite { req: flock_sync::proto::SyncRequest },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

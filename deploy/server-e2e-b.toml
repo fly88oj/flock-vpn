@@ -1,7 +1,7 @@
 # server.toml —— e2e server-b（docs/design.md §6.2 M5：Frp 接入形态 + 多主 voter 2）。
 # 同 server-e2e-a（边车 frpc-b → frps-b:23001）；tun VIP 100.64.0.2（§6.2）。
 
-state_dir = "/var/lib/chmlvpn"
+state_dir = "/var/lib/flock"
 mode = "direct"
 bind = "0.0.0.0:9443"
 admin_bind = "127.0.0.1:9444"
@@ -17,7 +17,7 @@ vip = "100.64.0.2"
 
 [sync]
 mode = "raft"
-bundle = "/var/lib/chmlvpn/bundle.bin"
+bundle = "/var/lib/flock/bundle.bin"
 raft_bind = "0.0.0.0:9500"
 raft_peers = [
     "1=raft-1:9500",

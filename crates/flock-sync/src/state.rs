@@ -316,7 +316,7 @@ impl NetStateData {
         let Ok(root_vk) = VerifyingKey::from_bytes(&cluster.root_pub) else {
             return ApplyOutcome::err(StateError::BadRootSignature);
         };
-        let l_oprf: &[u8] = b"chml-sync/set-oprf/v1";
+        let l_oprf: &[u8] = b"flock-sync/set-oprf/v1";
         let mut canon = Vec::with_capacity(l_oprf.len() + 4 + rs.op.len());
         canon.extend_from_slice(l_oprf);
         canon.extend_from_slice(&(rs.op.len() as u32).to_le_bytes());

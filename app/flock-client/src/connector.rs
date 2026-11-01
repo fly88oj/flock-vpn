@@ -142,7 +142,7 @@ impl ClientState {
                 .map_err(|e| ClientError::State(format!("directory.bin 解析: {e}")))?,
             Err(_) => {
                 return Err(ClientError::State(
-                    "无根签目录（先运行 `chmlvpn-client invite <file>` 引导，§1.3.3f）".into(),
+                    "无根签目录（先运行 `flock-client invite <file>` 引导，§1.3.3f）".into(),
                 ))
             }
         };
@@ -332,7 +332,7 @@ pub async fn dial(pin: &ServerPin, device: &DeviceStaticKeys, cfg: TunnelConfig)
 
 /// 守护循环事件（日志/断言面：A9 的「检测进入重连」由 [`ConnEvent::SessionEnded`] 携
 /// `dead-link` 原因 + 下一跳时间构成可 grep 的记录；A10 的 rekey 无感由 supervise 内
-/// 纪元观察任务直接打 `chmlvpn-client: rekey epoch=N` 日志——`events` 回调非 Send 进
+/// 纪元观察任务直接打 `flock-client: rekey epoch=N` 日志——`events` 回调非 Send 进
 /// 不了 spawn，纪元行不占事件枚举）。
 #[derive(Debug)]
 pub enum ConnEvent {
@@ -358,12 +358,12 @@ pub async fn supervise(
     let mut ring = EndpointRing::new(state.endpoints());
     loop {
         let Some(endpoint) = ring.next_endpoint() else {
-            eprintln!("chmlvpn-client: 目录无端点，5s 后重查");
+            eprintln!("flock-client: 目录无端点，5s 后重查");
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         };
         let Some(pin) = state.pin_for(&endpoint) else {
-            eprintln!("chmlvpn-client: 端点 {endpoint} 无接入材料/未钉扎，跳过");
+            eprintln!("flock-client: 端点 {endpoint} 无接入材料/未钉扎，跳过");
             continue;
         };
         let attempt = backoff.attempt + 1;
@@ -379,7 +379,7 @@ pub async fn supervise(
                         events(ConnEvent::SessionEnded { endpoint: endpoint.clone(), reason: tunnel.stats().closed });
                         tunnel.shutdown().await;
                         let d = backoff.next_jitter(rand::random::<f64>());
-                        eprintln!("chmlvpn-client: {d:?} 后重连（控制流开失败）");
+                        eprintln!("flock-client: {d:?} 后重连（控制流开失败）");
                         tokio::time::sleep(d).await;
                         continue;
                     }
@@ -401,7 +401,7 @@ pub async fn supervise(
                                 }
                                 // 回调侧只打日志——事件序由 watch 保序。
                                 eprintln!(
-                                    "chmlvpn-client: rekey epoch={} endpoint={ep_for_rekey}",
+                                    "flock-client: rekey epoch={} endpoint={ep_for_rekey}",
                                     *epoch_rx.borrow_and_update()
                                 );
                             }
@@ -409,7 +409,7 @@ pub async fn supervise(
                         let mut sess = tun.session();
                         let bridge_err = dataplane::bridge(&mut sess, ch).await.err();
                         if let Some(e) = &bridge_err {
-                            eprintln!("chmlvpn-client: dataplane ended: {e}");
+                            eprintln!("flock-client: dataplane ended: {e}");
                         }
                         drop(sess);
                         rekey_watcher.abort();
@@ -419,18 +419,18 @@ pub async fn supervise(
                         tunnel.shutdown().await;
                     }
                     Err(e) => {
-                        eprintln!("chmlvpn-client: 打开包通道失败: {e}");
+                        eprintln!("flock-client: 打开包通道失败: {e}");
                         tunnel.shutdown().await;
                     }
                 }
             }
             Err(e) => {
-                eprintln!("chmlvpn-client: 拨号失败（attempt {attempt}）: {e}");
+                eprintln!("flock-client: 拨号失败（attempt {attempt}）: {e}");
             }
         }
         let d = backoff.next_jitter(rand::random::<f64>());
         eprintln!(
-            "chmlvpn-client: {:?} 后重连（下一端点轮询）",
+            "flock-client: {:?} 后重连（下一端点轮询）",
             d
         );
         tokio::time::sleep(d).await;

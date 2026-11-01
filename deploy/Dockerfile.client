@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# chmlvpn-client —— M3 客户端镜像（docs/design.md §3.12/§7-M3：m3.yml 的 client 服务）。
+# flock-client —— M3 客户端镜像（docs/design.md §3.12/§7-M3：m3.yml 的 client 服务）。
 #
 # 构建模式与 Dockerfile.server 相同（manifest+stub 依赖层缓存；glibc 两侧同钉
 # bookworm）。运行段工具：iproute2/iputils-ping（A2/A3 断言）、iperf3（A4）、
@@ -12,30 +12,30 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/flock-protocol/Cargo.toml crates/flock-protocol/
-COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
-COPY crates/chml-sync/Cargo.toml crates/chml-sync/
-COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
-COPY app/chmlvpn-client/Cargo.toml app/chmlvpn-client/
+COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
+COPY crates/flock-sync/Cargo.toml crates/flock-sync/
+COPY app/flock-server/Cargo.toml app/flock-server/
+COPY app/flock-client/Cargo.toml app/flock-client/
 RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
-             crates/chml-frpc/src crates/chml-sync/src \
-             app/chmlvpn-server/src app/chmlvpn-client/src \
+             crates/flock-frpc/src crates/flock-sync/src \
+             app/flock-server/src app/flock-client/src \
  && echo 'pub fn _stub() {}' > crates/flock-protocol/src/lib.rs \
  && echo 'fn main() {}' > crates/flock-protocol/benches/aead.rs \
- && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
- && echo 'pub fn _stub() {}' > crates/chml-sync/src/lib.rs \
- && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
- && echo 'fn main() {}' > app/chmlvpn-server/src/main.rs \
- && echo 'pub fn _stub() {}' > app/chmlvpn-client/src/lib.rs \
- && echo 'fn main() {}' > app/chmlvpn-client/src/main.rs \
- && cargo build --release --locked -p chmlvpn-client \
- && rm -rf target/release/deps/chmlvpn_client* target/release/deps/flock_protocol* \
- && rm -f target/release/chmlvpn-client
+ && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/flock-sync/src/lib.rs \
+ && echo 'pub fn _stub() {}' > app/flock-server/src/lib.rs \
+ && echo 'fn main() {}' > app/flock-server/src/main.rs \
+ && echo 'pub fn _stub() {}' > app/flock-client/src/lib.rs \
+ && echo 'fn main() {}' > app/flock-client/src/main.rs \
+ && cargo build --release --locked -p flock-client \
+ && rm -rf target/release/deps/flock_client* target/release/deps/flock_protocol* \
+ && rm -f target/release/flock-client
 
 COPY crates/flock-protocol/src crates/flock-protocol/src
-COPY app/chmlvpn-client/src app/chmlvpn-client/src
-RUN touch crates/flock-protocol/src/lib.rs app/chmlvpn-client/src/lib.rs \
-      app/chmlvpn-client/src/main.rs \
- && cargo build --release --locked -p chmlvpn-client
+COPY app/flock-client/src app/flock-client/src
+RUN touch crates/flock-protocol/src/lib.rs app/flock-client/src/lib.rs \
+      app/flock-client/src/main.rs \
+ && cargo build --release --locked -p flock-client
 
 FROM debian:bookworm-slim
 # 工具面：iproute2/iputils-ping/iperf3/procps（A2/A3/A4 断言与诊断）；
@@ -45,9 +45,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends iproute2 iputils-ping iperf3 procps \
       netcat-openbsd tcpdump iptables hping3 \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/target/release/chmlvpn-client /usr/local/bin/chmlvpn-client
-RUN mkdir -p /var/lib/chmlvpn
-COPY deploy/client.toml /etc/chmlvpn/client.toml
+COPY --from=builder /src/target/release/flock-client /usr/local/bin/flock-client
+RUN mkdir -p /var/lib/flock
+COPY deploy/client.toml /etc/flock/client.toml
 COPY deploy/client-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

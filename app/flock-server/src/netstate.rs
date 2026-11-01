@@ -1,6 +1,6 @@
 //! 单服 NetState：注册表/邀请/VIP 分配的强一致本地状态机（docs/design.md §3.11 / §7-M2）。
 //!
-//! **接口与 M4 `chml-sync` 对齐**（§3.10 `NetState::{register_device, revoke, allocate_ip,
+//! **接口与 M4 `flock-sync` 对齐**（§3.10 `NetState::{register_device, revoke, allocate_ip,
 //! redeem_invite, revoke_invite, …}`）：本模块定义 [`NetState`] trait，redb 单机版
 //! [`StateStore`] 为 M2 唯一实现；M4 落地时 openraft 状态机实现同一 trait，装配点零改动。
 //! 语义纪律（§2.1/§1.3.3f，M4 同样成立）：

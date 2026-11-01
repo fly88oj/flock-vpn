@@ -1,11 +1,11 @@
-//! chmlvpn-client 进程入口（docs/design.md §3.12/§7-M3）。
+//! flock-client 进程入口（docs/design.md §3.12/§7-M3）。
 //!
 //! 子命令：
 //! - （缺省 `run`）：起客户端——tun（MTU 1280）+ 路由 + 接入器守护（退避重连）；
 //! - `invite <path>`：载入邀请文件（b64 文本或原始字节）→ 钉扎集群根公钥 + 存根签
 //!   目录（一次性引导，§1.3.3f 强路径）；
 //! - `gen-keys`：生成/复用设备静态密钥并打印公钥（部署编排把公钥交给
-//!   `chmlvpn-server device-add`/`redeem` 预注册）；
+//!   `flock-server device-add`/`redeem` 预注册）；
 //! - `--smoke`：wintun/真机冒烟（§7-M3 Windows 手工清单）——建 tun + 配路由 +
 //!   打印接口状态即退。
 //!
@@ -17,13 +17,13 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use flock_protocol::trust::InviteFile;
-use chmlvpn_client::config::ClientConfig;
-use chmlvpn_client::connector::{self, Backoff, ClientError, ClientState, ConnEvent};
-use chmlvpn_client::route::{self, RoutePlan};
-use chmlvpn_client::tun::{TunIo, TunSpec};
+use flock_client::config::ClientConfig;
+use flock_client::connector::{self, Backoff, ClientError, ClientState, ConnEvent};
+use flock_client::route::{self, RoutePlan};
+use flock_client::tun::{TunIo, TunSpec};
 
 const USAGE: &str = "\
-chmlvpn-client [--config <client.toml>] [<subcommand>]
+flock-client [--config <client.toml>] [<subcommand>]
 
 子命令：
   (run)                  起客户端（缺省）：tun + 路由 + 接入器守护（退避重连）
@@ -36,7 +36,7 @@ fn main() {
     let code = match run_cli() {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("chmlvpn-client: {e}");
+            eprintln!("flock-client: {e}");
             2
         }
     };
@@ -170,10 +170,10 @@ fn run_cli() -> Result<(), String> {
                 let vip = state.resolve_vip(&cfg.state_dir, cfg.vip).map_err(cli_err)?;
                 let spec = TunSpec { name: cfg.tun_name.clone(), mtu: cfg.mtu };
                 let tun = TunIo::open(&spec).map_err(|e| cli_err(ClientError::from(e)))?;
-                eprintln!("chmlvpn-client: tun {} mtu={} vip={vip}", tun.name(), spec.mtu);
+                eprintln!("flock-client: tun {} mtu={} vip={vip}", tun.name(), spec.mtu);
                 route::apply(&RoutePlan::new(&spec.name, vip)).await.map_err(|e| cli_err(ClientError::State(e.to_string())))?;
                 eprintln!(
-                    "chmlvpn-client: route {}/{} → {} + rp_filter=1",
+                    "flock-client: route {}/{} → {} + rp_filter=1",
                     route::VIP_POOL.0,
                     route::VIP_POOL.1,
                     spec.name
@@ -185,20 +185,20 @@ fn run_cli() -> Result<(), String> {
                     override_endpoints(state, &cfg.endpoints)?
                 };
                 eprintln!(
-                    "chmlvpn-client: 守护启动（端点: {}）",
+                    "flock-client: 守护启动（端点: {}）",
                     state.endpoints().join(", ")
                 );
                 connector::supervise(&state, &tun, flock_protocol::session::TunnelConfig::default(), Backoff::default(), |ev| {
                     match ev {
                         ConnEvent::Dialing { endpoint, attempt } => eprintln!(
-                            "chmlvpn-client: 拨号 {endpoint}（attempt {attempt}）"
+                            "flock-client: 拨号 {endpoint}（attempt {attempt}）"
                         ),
                         ConnEvent::Connected { endpoint, server } => eprintln!(
-                            "chmlvpn-client: 已连接 {endpoint}（server={}）",
+                            "flock-client: 已连接 {endpoint}（server={}）",
                             hex::encode(server.0)
                         ),
                         ConnEvent::SessionEnded { endpoint, reason } => eprintln!(
-                            "chmlvpn-client: 会话结束 {endpoint} reason={} → 进入重连",
+                            "flock-client: 会话结束 {endpoint} reason={} → 进入重连",
                             reason.map(|r| r.to_string()).unwrap_or_else(|| "none(io/fin)".into())
                         ),
                     }

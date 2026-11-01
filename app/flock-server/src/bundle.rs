@@ -8,7 +8,7 @@
 //!
 //! `enroll --bundle <file>`：装载并**验证**（目录根验签 + 入群凭证验签 + 一致性比对），
 //! 通过后写入状态目录供 raft 形态起服使用（进程内装配见 tests/multi_primary.rs；
-//! TCP/中转织物随 §6/§7-M5 部署批次接 `chml_sync::wire::Fabric`）。
+//! TCP/中转织物随 §6/§7-M5 部署批次接 `flock_sync::wire::Fabric`）。
 
 use flock_protocol::ed25519_dalek::Signature;
 use flock_protocol::kem::HybridKeypair;
@@ -175,7 +175,7 @@ impl ClusterMaterial {
     }
 }
 
-/// voter i 的确定性 ServerId（前 8B = 大端 i+1——与 chml_sync::node_id_of 同映射，
+/// voter i 的确定性 ServerId（前 8B = 大端 i+1——与 flock_sync::node_id_of 同映射，
 /// openraft NodeId = i+1）。
 pub fn voter_server_id(i: usize) -> [u8; 16] {
     let mut b = [0u8; 16];

@@ -1,6 +1,6 @@
-# chml-frpc
+# flock-frpc
 
-frpc 子进程双栈托管（docs/design.md §3.9 / §5 / §7-M2，★VPN-16）。ChmlVPN 服务端经
+frpc 子进程双栈托管（docs/design.md §3.9 / §5 / §7-M2，★VPN-16）。Flock VPN 服务端经
 FRP 中转暴露监听口，但不把 frp 协议编进自身——两套定版 frpc 二进制作为子进程托管：
 
 - **ChmlFrp 节点** ⇔ `ChmlFrp-0.51.2_251023` 定版 frpc（面板托管）；
@@ -21,7 +21,7 @@ FRP 中转暴露监听口，但不把 frp 协议编进自身——两套定版 f
 
 ## 测试
 
-`cargo test -p chml-frpc --all-features`——含 golden-file（R8/R12：生成物与官方发行包
+`cargo test -p flock-frpc --all-features`——含 golden-file（R8/R12：生成物与官方发行包
 样本逐字节/逐字段一致）、矩阵（R9：4 组合只有对角线过）、守护（假进程桩 3 退→3 拉 +
 退避下界 + 停止语义 + 探测面）。真实 frpc 二进制不进测试（假桩承担），golden 样本逐
 字节复制自 `.tmp/chmlfrpc/.../frpc.ini` 与 `.tmp/frp_0.71.1_linux_amd64/frpc.toml`。

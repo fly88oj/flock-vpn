@@ -4,7 +4,7 @@
 # advertise/extra = 客户端（宿主冒烟测试）视角的端点；extra 即「第二暴露口」——同一服务器
 # 经 frps 的第二个 proxy 暴露，用于 §7-M2「换端点仍 1-RTT」模拟。
 
-state_dir = "/var/lib/chmlvpn"
+state_dir = "/var/lib/flock"
 mode = "frp"
 bind = "0.0.0.0:9443"
 admin_bind = "127.0.0.1:9444"
@@ -24,14 +24,14 @@ serverAddr = "frps"
 serverPort = 7000
 
 [[proxies]]
-name = "chml-main"
+name = "flock-main"
 type = "tcp"
 localIP = "127.0.0.1"
 localPort = 9443
 remotePort = 27500
 
 [[proxies]]
-name = "chml-alt"
+name = "flock-alt"
 type = "tcp"
 localIP = "127.0.0.1"
 localPort = 9443

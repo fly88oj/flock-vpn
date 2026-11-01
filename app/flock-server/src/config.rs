@@ -2,11 +2,11 @@
 //!
 //! **接入层与 frp 解耦（用户硬约束，最高优先级）**：`listener.mode` 二选一——
 //! - `direct`（**缺省**）：直接监听 `bind`，零 frp 逻辑——本模块到运行时的 Direct 代码路径
-//!   不触碰 chml-frpc（不实例化 Supervisor、不生成配置、不启动子进程）；
-//! - `frp`：本地监听 `bind` + `chml-frpc` Supervisor 托管中转（§3.9/§5）。
+//!   不触碰 flock-frpc（不实例化 Supervisor、不生成配置、不启动子进程）；
+//! - `frp`：本地监听 `bind` + `flock-frpc` Supervisor 托管中转（§3.9/§5）。
 //!
 //! 解耦纪律落在类型上：config 层只定义自有类型 [`FrpPlan`]（String/PathBuf/SocketAddr，
-//! 无 chml-frpc 类型）；RelaySpec/FrpcBinaries 的构造全部隔离在 `frp.rs`（仅 Frp 分支引用）。
+//! 无 flock-frpc 类型）；RelaySpec/FrpcBinaries 的构造全部隔离在 `frp.rs`（仅 Frp 分支引用）。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,13 +15,13 @@ use serde::Deserialize;
 
 use crate::ticket::TICKET_TTL_SECS;
 
-/// frp 模式的装配计划（config 层自有类型；chml-frpc 类型不出现在此层）。
+/// frp 模式的装配计划（config 层自有类型；flock-frpc 类型不出现在此层）。
 #[derive(Debug, Clone)]
 pub struct FrpPlan {
     /// 原版 frpc TOML（v0.71.1 方言）**内嵌全文**——server.toml `[frp] original_toml`；
     /// 启动时写出到 state 目录再以 `RelaySpec::Original{toml}` 注册（走真实产品路径）。
     pub original_toml: String,
-    /// 原版 frpc 二进制路径（v0.71.1 定版；R9 矩阵锁在 chml-frpc 内执行）。
+    /// 原版 frpc 二进制路径（v0.71.1 定版；R9 矩阵锁在 flock-frpc 内执行）。
     pub frpc_bin: PathBuf,
     /// Supervisor run 目录基点（托管配置/日志落点）。
     pub run_base: PathBuf,
@@ -32,7 +32,7 @@ pub struct FrpPlan {
 pub enum ListenerMode {
     /// 直接监听（**缺省**）——零 frp 逻辑（§2.1 硬约束）。
     Direct { bind: SocketAddr },
-    /// 本地监听 + chml-frpc 托管中转。
+    /// 本地监听 + flock-frpc 托管中转。
     Frp { bind: SocketAddr, plan: FrpPlan },
 }
 

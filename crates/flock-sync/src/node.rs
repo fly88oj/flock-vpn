@@ -135,7 +135,7 @@ impl SyncNodeBuilder {
         let pinned = self.pinned_root.unwrap_or(self.ident.root_pub);
 
         let cfg = openraft::Config {
-            cluster_name: "chml-sync".into(),
+            cluster_name: "flock-sync".into(),
             heartbeat_interval: self.settings.heartbeat_ms,
             election_timeout_min: self.settings.election_min_ms,
             election_timeout_max: self.settings.election_max_ms,

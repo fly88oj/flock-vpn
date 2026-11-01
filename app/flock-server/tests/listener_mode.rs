@@ -1,16 +1,16 @@
 //! ListenerMode 装配测试（docs/design.md §2.1/§3.11：Direct 缺省零 frp 逻辑；Frp 走
-//! chml-frpc Supervisor 真实产品路径）。
+//! flock-frpc Supervisor 真实产品路径）。
 //!
 //! - `direct_mode_*`：Direct 起服 ⇒ 监听句柄为 `RunningListener::Direct`；状态目录无任何
 //!   frp 配置/托管落点（Supervisor 未实例化的运行时证明——其唯一副作用是 run 目录与
-//!   托管配置副本，见 chml-frpc supervisor.rs）。
+//!   托管配置副本，见 flock-frpc supervisor.rs）。
 //! - `frp_mode_*`：Frp 装配确实接管（内嵌 TOML 落盘 + Supervisor spawn）；frpc 二进制
-//!   缺失/不可执行 ⇒ 启动失败fail-fast（R9 矩阵与 spawn 校验在 chml-frpc 内执行）。
+//!   缺失/不可执行 ⇒ 启动失败fail-fast（R9 矩阵与 spawn 校验在 flock-frpc 内执行）。
 
 mod common;
 
-use chmlvpn_server::config::ServerConfig;
-use chmlvpn_server::server::{self, RunningListener, ServerCore};
+use flock_server::config::ServerConfig;
+use flock_server::server::{self, RunningListener, ServerCore};
 
 fn cfg_for(mode: &str, state_dir: &std::path::Path) -> ServerConfig {
     ServerConfig {
@@ -25,7 +25,7 @@ fn cfg_for(mode: &str, state_dir: &std::path::Path) -> ServerConfig {
         sync: None,
         tun_name: "tun0".into(),
         vip: "100.64.0.1".parse().unwrap(),
-        frp: Some(chmlvpn_server::config::FrpSection {
+        frp: Some(flock_server::config::FrpSection {
             original_toml: "serverAddr = \"frps\"\nserverPort = 7000\n".into(),
             frpc_bin: state_dir.join("fake-frpc"),
             run_base: Some(state_dir.join("frpc-run")),
@@ -65,7 +65,7 @@ async fn direct_mode_starts_without_any_frp_artifact() {
         matches!(running, RunningListener::Direct { .. }),
         "Direct 起服 ⇒ Direct 变体（无 ManagedRelay）"
     );
-    // 运行时证明：无 frp 配置生成、无 Supervisor run 目录（chml-frpc 在本进程零实例化）。
+    // 运行时证明：无 frp 配置生成、无 Supervisor run 目录（flock-frpc 在本进程零实例化）。
     assert!(
         !any_entry(dir.path(), &|n| n.starts_with("frpc") || n.contains("frp")),
         "状态目录不应出现任何 frp 落点"

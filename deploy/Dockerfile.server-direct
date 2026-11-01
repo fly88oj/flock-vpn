@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
-# chmlvpn-server —— Direct 模式镜像（docs/design.md §7-M2：m2-direct.yml 的唯一服务）。
+# flock-server —— Direct 模式镜像（docs/design.md §7-M2：m2-direct.yml 的唯一服务）。
 #
 # 与 Dockerfile.server 的差异即「Direct 形态」的物化：**镜像内没有任何 frp 二进制**
-# （§2.1 硬约束：Direct 代码路径不触碰 chml-frpc；容器内 pgrep -f frp 恒无命中）。
+# （§2.1 硬约束：Direct 代码路径不触碰 flock-frpc；容器内 pgrep -f frp 恒无命中）。
 # 免 prepare 步骤：build context 不需要 deploy/build/。
 
 # 构建段与运行段必须同一 Debian suite（glibc 符号版本兼容）：binary 链接的
@@ -15,44 +15,44 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/flock-protocol/Cargo.toml crates/flock-protocol/
-COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
-COPY crates/chml-sync/Cargo.toml crates/chml-sync/
-COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
-# chmlvpn-server 依赖 chmlvpn-client（M3 数据面接缝复用，§2.2/§3.12）。
-COPY app/chmlvpn-client/Cargo.toml app/chmlvpn-client/
+COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
+COPY crates/flock-sync/Cargo.toml crates/flock-sync/
+COPY app/flock-server/Cargo.toml app/flock-server/
+# flock-server 依赖 flock-client（M3 数据面接缝复用，§2.2/§3.12）。
+COPY app/flock-client/Cargo.toml app/flock-client/
 RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
-             crates/chml-frpc/src crates/chml-sync/src \
-             app/chmlvpn-server/src app/chmlvpn-client/src \
+             crates/flock-frpc/src crates/flock-sync/src \
+             app/flock-server/src app/flock-client/src \
  && echo 'pub fn _stub() {}' > crates/flock-protocol/src/lib.rs \
  && echo 'fn main() {}' > crates/flock-protocol/benches/aead.rs \
- && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
- && echo 'pub fn _stub() {}' > crates/chml-sync/src/lib.rs \
- && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
- && echo 'fn main() {}' > app/chmlvpn-server/src/main.rs \
- && echo 'pub fn _stub() {}' > app/chmlvpn-client/src/lib.rs \
- && echo 'fn main() {}' > app/chmlvpn-client/src/main.rs \
- && cargo build --release --locked -p chmlvpn-server \
- && rm -rf target/release/deps/chmlvpn_server* target/release/deps/chmlvpn_server_lib* \
-          target/release/deps/chmlvpn_client* target/release/deps/flock_protocol* \
-          target/release/deps/chml_frpc* target/release/deps/chml_sync* \
- && rm -f target/release/chmlvpn-server
+ && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/flock-sync/src/lib.rs \
+ && echo 'pub fn _stub() {}' > app/flock-server/src/lib.rs \
+ && echo 'fn main() {}' > app/flock-server/src/main.rs \
+ && echo 'pub fn _stub() {}' > app/flock-client/src/lib.rs \
+ && echo 'fn main() {}' > app/flock-client/src/main.rs \
+ && cargo build --release --locked -p flock-server \
+ && rm -rf target/release/deps/flock_server* target/release/deps/flock_server_lib* \
+          target/release/deps/flock_client* target/release/deps/flock_protocol* \
+          target/release/deps/flock_frpc* target/release/deps/flock_sync* \
+ && rm -f target/release/flock-server
 COPY crates/flock-protocol/src crates/flock-protocol/src
-COPY crates/chml-frpc/src crates/chml-frpc/src
-COPY crates/chml-sync/src crates/chml-sync/src
-COPY app/chmlvpn-client/src app/chmlvpn-client/src
-COPY app/chmlvpn-server/src app/chmlvpn-server/src
-RUN touch crates/flock-protocol/src/lib.rs crates/chml-frpc/src/lib.rs \
-      crates/chml-sync/src/lib.rs \
-      app/chmlvpn-client/src/lib.rs app/chmlvpn-client/src/main.rs \
-      app/chmlvpn-server/src/lib.rs app/chmlvpn-server/src/main.rs \
- && cargo build --release --locked -p chmlvpn-server
+COPY crates/flock-frpc/src crates/flock-frpc/src
+COPY crates/flock-sync/src crates/flock-sync/src
+COPY app/flock-client/src app/flock-client/src
+COPY app/flock-server/src app/flock-server/src
+RUN touch crates/flock-protocol/src/lib.rs crates/flock-frpc/src/lib.rs \
+      crates/flock-sync/src/lib.rs \
+      app/flock-client/src/lib.rs app/flock-client/src/main.rs \
+      app/flock-server/src/lib.rs app/flock-server/src/main.rs \
+ && cargo build --release --locked -p flock-server
 
 FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends procps \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/target/release/chmlvpn-server /usr/local/bin/chmlvpn-server
-RUN mkdir -p /var/lib/chmlvpn
-COPY deploy/server-direct.toml /etc/chmlvpn/server.toml
-ENTRYPOINT ["/usr/local/bin/chmlvpn-server"]
-CMD ["--config", "/etc/chmlvpn/server.toml"]
+COPY --from=builder /src/target/release/flock-server /usr/local/bin/flock-server
+RUN mkdir -p /var/lib/flock
+COPY deploy/server-direct.toml /etc/flock/server.toml
+ENTRYPOINT ["/usr/local/bin/flock-server"]
+CMD ["--config", "/etc/flock/server.toml"]

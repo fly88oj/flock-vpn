@@ -1,9 +1,9 @@
-# client.toml —— chmlvpn-client 镜像缺省配置（docs/design.md §3.12/§7-M3）。
+# client.toml —— flock-client 镜像缺省配置（docs/design.md §3.12/§7-M3）。
 #
 # 身份三件套（device.keys/pins.bin/directory.bin）与 vip 由部署编排写入 state_dir
 #（deploy/m3_assert.sh：gen-keys → 服务端 device-add → invite → vip）。
 
-state_dir = "/var/lib/chmlvpn"
+state_dir = "/var/lib/flock"
 
 # 本端 VIP：留空 = 读 state_dir/vip 文件（编排写入 device-add 分配值）。
 # vip = "100.64.0.11"

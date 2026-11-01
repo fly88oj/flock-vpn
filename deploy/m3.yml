@@ -8,12 +8,12 @@
 #     供 Windows 真机手工清单——§7-M3/§7-M5 宿主 `--smoke`/run 连本地中转）
 #     └─ server（Frp 模式 + M3 数据面：tun0 VIP 100.64.0.1；--cap-add NET_ADMIN
 #                --device /dev/net/tun，§6.1 实测可行的 WSL2 后端 tun 直通）
-#   client（chmlvpn-client；tun0 VIP = device-add 分配值；同 NET_ADMIN/tun 直通）
+#   client（flock-client；tun0 VIP = device-add 分配值；同 NET_ADMIN/tun 直通）
 #
 # 原版 frp 二进制经命名构建上下文直取 .tmp/frp_0.71.1_linux_amd64/（同 m2.yml）。
 # 编排（gen-keys → device-add → invite → vip → ready → restart）由 m3_assert.sh 驱动。
 
-name: chmlvpn-m3
+name: flock-m3
 
 services:
   frps:
@@ -22,7 +22,7 @@ services:
       dockerfile: Dockerfile.frps
       additional_contexts:
         bins: ../.tmp/frp_0.71.1_linux_amd64
-    image: chmlvpn/frps:0.71.1
+    image: flock/frps:0.71.1
     # 宿主映射（仅回环）：Windows 真机清单（§7-M3/§7-M5）宿主 client 经
     # 127.0.0.1:27500/27501 连本地中转；容器网内口不受影响。
     ports:
@@ -39,7 +39,7 @@ services:
         frpbin: ../.tmp/frp_0.71.1_linux_amd64
       args:
         server_conf: server-m3.toml   # 容器网络视角端点（frps:27500/27501）
-    image: chmlvpn/server:m3
+    image: flock/server:m3
     depends_on: [frps]
     # M3 数据面：服务端自身也是 peer（tun + 路由，§2.2）。
     cap_add: [NET_ADMIN]
@@ -52,14 +52,14 @@ services:
       net.ipv4.conf.default.rp_filter: "1"
     networks: [m3net]
     volumes:
-      - server-state:/var/lib/chmlvpn
+      - server-state:/var/lib/flock
     restart: unless-stopped
 
   client:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.client
-    image: chmlvpn/client:m3
+    image: flock/client:m3
     depends_on: [server]
     cap_add: [NET_ADMIN]
     devices:
@@ -69,12 +69,12 @@ services:
       net.ipv4.conf.default.rp_filter: "1"
     networks: [m3net]
     volumes:
-      - client-state:/var/lib/chmlvpn
+      - client-state:/var/lib/flock
     restart: unless-stopped
 
 networks:
   m3net:
-    name: chmlvpn-m3net
+    name: flock-m3net
 
 volumes:
   server-state: {}

@@ -11,12 +11,12 @@
 
 use std::sync::Arc;
 
-use chml_sync::store::RedbLogStore;
-use chml_sync::SyncConfig;
+use flock_sync::store::RedbLogStore;
+use flock_sync::SyncConfig;
 use openraft::storage::RaftLogStorage as _;
 
-const KV: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("chml_sync_kv");
-const LOG: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("chml_sync_log");
+const KV: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("flock_sync_kv");
+const LOG: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("flock_sync_log");
 
 fn lid(idx: u64) -> openraft::LogId<u64> {
     openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), idx)
@@ -45,7 +45,7 @@ async fn store_reopen_recovers_vote_and_log() {
                 (1, openraft::EntryPayload::<SyncConfig>::Blank),
                 (
                     2,
-                    openraft::EntryPayload::Normal(chml_sync::SyncRequest::Revoke {
+                    openraft::EntryPayload::Normal(flock_sync::SyncRequest::Revoke {
                         device: [7; 32],
                     }),
                 ),

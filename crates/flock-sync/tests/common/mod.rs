@@ -8,15 +8,15 @@ use flock_protocol::session::{ClusterId, ServerEntry, ServerId, ServerIdentity};
 use flock_protocol::trust::ClusterDirectory;
 use ed25519_dalek::SigningKey;
 
-use chml_sync::hooks::HookRecorder;
-use chml_sync::proto::{NodeId, ReadQuery, ReadView, SyncRequest, SyncResponse};
-use chml_sync::testutil::{FabricRegistry, MemoryFabric};
-use chml_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
+use flock_sync::hooks::HookRecorder;
+use flock_sync::proto::{NodeId, ReadQuery, ReadView, SyncRequest, SyncResponse};
+use flock_sync::testutil::{FabricRegistry, MemoryFabric};
+use flock_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
 
 /// 每方向 50ms ⇒ RTT 100ms（§7-M4 注入校准）。
 pub const RTT_HALF: Duration = Duration::from_millis(50);
 
-/// NodeId ↔ ServerId（与 chml_sync::wire::sid_of 同映射）。
+/// NodeId ↔ ServerId（与 flock_sync::wire::sid_of 同映射）。
 pub fn sid(n: NodeId) -> ServerId {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&n.to_be_bytes());

@@ -1,12 +1,12 @@
 //! 多主运行装配（feature `multi-primary`；docs/design.md §2.2/§3.11/§6.2 M5 批次）。
 //!
-//! 单服形态见 [`crate::server::run`]；本模块把 §3.10 的 [`chml_sync::SyncNode`] 接到
+//! 单服形态见 [`crate::server::run`]；本模块把 §3.10 的 [`flock_sync::SyncNode`] 接到
 //! **真实进程/容器部署**：
 //!
 //! 1. **入群捆绑**：`state_dir/bundle.bin`（`enroll` 子命令产物；缺失 ⇒ 等待——容器
 //!    编排里 init-cluster → 分发 → enroll 先于起服完成，等待语义让 `compose up`
 //!    一次全起不崩循环）；
-//! 2. **TCP 织物**：[`chml_sync::TcpFabric`] 绑 `sync.raft_bind`（§6.2 srvmesh 内联
+//! 2. **TCP 织物**：[`flock_sync::TcpFabric`] 绑 `sync.raft_bind`（§6.2 srvmesh 内联
 //!    网），对端表来自 `sync.raft_peers`；
 //! 3. **装配**：`SyncNodeBuilder`（voters = 根签目录全体节点）→ `ServerCore::open_sync`
 //!    （等 Bootstrap+SetOprf 在本节点 apply——运维侧 `cluster-bootstrap` 提交，等待
@@ -58,15 +58,15 @@ pub async fn run_raft(
     // 2. TCP 织物（srvmesh 直接互连；对端表 = sync.raft_peers）。
     let mut peers = std::collections::BTreeMap::new();
     for entry in &sync.raft_peers {
-        let (id, addr) = chml_sync::tcp::parse_peer_entry(entry)?;
+        let (id, addr) = flock_sync::tcp::parse_peer_entry(entry)?;
         peers.insert(id, addr);
     }
     let fabric =
-        chml_sync::TcpFabric::bind(sync.raft_bind, peers)
+        flock_sync::TcpFabric::bind(sync.raft_bind, peers)
             .await
             .map_err(|e| format!("raft fabric bind {}: {e}", sync.raft_bind))?;
     eprintln!(
-        "chmlvpn-server: raft fabric listening on {}",
+        "flock-server: raft fabric listening on {}",
         fabric.local_addr().map(|a| a.to_string()).unwrap_or_default()
     );
 
@@ -77,11 +77,11 @@ pub async fn run_raft(
     let voters: Vec<u64> = directory
         .servers
         .iter()
-        .map(|e| chml_sync::node::node_id_of(&e.server_id))
+        .map(|e| flock_sync::node::node_id_of(&e.server_id))
         .collect();
     let node = Arc::new(
-        chml_sync::SyncNodeBuilder::new(
-            chml_sync::SyncSettings::default(),
+        flock_sync::SyncNodeBuilder::new(
+            flock_sync::SyncSettings::default(),
             ident.clone(),
             directory,
             fabric,
@@ -111,7 +111,7 @@ pub async fn run_raft(
             {
                 let _ = tokio::signal::ctrl_c().await;
             }
-            eprintln!("chmlvpn-server: 信号退出——Raft 优雅停机");
+            eprintln!("flock-server: 信号退出——Raft 优雅停机");
             let _ = n.shutdown().await;
             std::process::exit(0);
         });
@@ -124,7 +124,7 @@ pub async fn run_raft(
     serve_bootstrap_ep(node.clone(), boot_bind)
         .await
         .map_err(|e| format!("bootstrap endpoint bind {boot_bind}: {e}"))?;
-    eprintln!("chmlvpn-server: cluster bootstrap endpoint on {boot_bind}（根签提交直达 Raft）");
+    eprintln!("flock-server: cluster bootstrap endpoint on {boot_bind}（根签提交直达 Raft）");
 
     // 5. ServerCore（等 Bootstrap+SetOprf apply；运维侧 cluster-bootstrap 先行/后行皆可）。
     let core = wait_cluster_ready(cfg.clone(), ident, node.clone()).await?;
@@ -148,7 +148,7 @@ fn bootstrap_bind_of(admin: std::net::SocketAddr) -> std::net::SocketAddr {
 /// RecordInvite——签名验证在状态机内）与 `Stats`，直达 `SyncNode::write`。进程生命周期
 /// 常驻（与 admin 并存；CLI `cluster-bootstrap`/`cluster-invite` 在 admin 未起时回退到它）。
 async fn serve_bootstrap_ep(
-    node: Arc<chml_sync::SyncNode>,
+    node: Arc<flock_sync::SyncNode>,
     bind: std::net::SocketAddr,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -166,7 +166,7 @@ async fn serve_bootstrap_ep(
 }
 
 async fn handle_bootstrap_conn(
-    node: &Arc<chml_sync::SyncNode>,
+    node: &Arc<flock_sync::SyncNode>,
     io: &mut tokio::net::TcpStream,
 ) -> std::io::Result<()> {
     // 帧协议与 admin.rs 相同（[u32 LE len][postcard AdminRequest]）。
@@ -218,7 +218,7 @@ async fn wait_bundle(path: &std::path::Path) -> Result<Vec<u8>, String> {
             Ok(b) => return Ok(b),
             Err(_) if std::time::Instant::now() < deadline => {
                 eprintln!(
-                    "chmlvpn-server: 等待入群捆绑 {}（enroll 后自动继续；剩余 {:?}）",
+                    "flock-server: 等待入群捆绑 {}（enroll 后自动继续；剩余 {:?}）",
                     path.display(),
                     deadline.saturating_duration_since(std::time::Instant::now())
                 );
@@ -233,14 +233,14 @@ async fn wait_bundle(path: &std::path::Path) -> Result<Vec<u8>, String> {
 async fn wait_cluster_ready(
     cfg: ServerConfig,
     ident: Arc<ServerIdentity>,
-    node: Arc<chml_sync::SyncNode>,
+    node: Arc<flock_sync::SyncNode>,
 ) -> Result<Arc<ServerCore>, String> {
     let deadline = std::time::Instant::now() + CLUSTER_READY_WAIT;
     loop {
         match ServerCore::open_sync(cfg.clone(), ident.clone(), node.clone()).await {
             Ok(core) => return Ok(core),
             Err(e) if std::time::Instant::now() < deadline => {
-                eprintln!("chmlvpn-server: 集群未就绪（{e}）——2s 后重试");
+                eprintln!("flock-server: 集群未就绪（{e}）——2s 后重试");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             Err(e) => {
@@ -255,7 +255,7 @@ async fn wait_cluster_ready(
 /// - 回程读泵：tun 产出（ICMP 回程/本机协议栈流量）→ `SyncNode::route_outbound`。
 ///
 /// 无 tun（无 NET_ADMIN 部署）⇒ 记日志跳过（控制流-only；转发面设备↔设备不受影响）。
-pub async fn wire_local_peer(core: &Arc<ServerCore>, node: &Arc<chml_sync::SyncNode>) {
+pub async fn wire_local_peer(core: &Arc<ServerCore>, node: &Arc<flock_sync::SyncNode>) {
     let vip = core.cfg.vip;
     match crate::dataplane::PeerRouter::open_tun_session(&core.cfg.tun_name, vip).await {
         Some((tun, sess)) => {
@@ -270,10 +270,10 @@ pub async fn wire_local_peer(core: &Arc<ServerCore>, node: &Arc<chml_sync::SyncN
             });
             // 设备句柄存活持有（接口随句柄存续）。
             std::mem::forget(tun);
-            eprintln!("chmlvpn-server: local peer wired vip={vip}（dst=本机 VIP 入内核 + 回程进 mesh）");
+            eprintln!("flock-server: local peer wired vip={vip}（dst=本机 VIP 入内核 + 回程进 mesh）");
         }
         None => {
-            eprintln!("chmlvpn-server: 无 tun——本机 VIP 投递降级（跨服转发面不受影响）")
+            eprintln!("flock-server: 无 tun——本机 VIP 投递降级（跨服转发面不受影响）")
         }
     }
 }
@@ -281,7 +281,7 @@ pub async fn wire_local_peer(core: &Arc<ServerCore>, node: &Arc<chml_sync::SyncN
 /// tun 写泵 sink（ForwardPlane 本机投递接缝）。
 struct KernelSink(tokio::sync::mpsc::Sender<Vec<u8>>);
 
-impl chml_sync::PacketSink for KernelSink {
+impl flock_sync::PacketSink for KernelSink {
     fn deliver(&self, pkt: &[u8]) -> std::io::Result<()> {
         self.0.try_send(pkt.to_vec()).map_err(|e| {
             std::io::Error::new(

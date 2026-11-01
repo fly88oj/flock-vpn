@@ -20,9 +20,9 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use crate::raft_types::SyncConfig;
 
 /// 日志表：index → entry 字节。
-const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("chml_sync_log");
+const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("flock_sync_log");
 /// KV 表：vote / last_purged。
-const KV: TableDefinition<&str, &[u8]> = TableDefinition::new("chml_sync_kv");
+const KV: TableDefinition<&str, &[u8]> = TableDefinition::new("flock_sync_kv");
 
 /// redb 打开/读写失败 → openraft StorageError。
 fn storage_err(e: impl fmt::Display) -> openraft::StorageError<u64> {

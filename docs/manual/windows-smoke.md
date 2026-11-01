@@ -1,5 +1,7 @@
 # Windows 真机 --smoke 记录（docs/design.md §7-M3 手工清单）
 
+> 2026-11-02 项目更名 ChmlVPN → **Flock VPN**：本文命令示例与输出样例中的二进制名（flock-client/flock-server）、容器/网络名（flock-m3-*）、路径（/etc/flock、/var/lib/flock）已按新命名同步；仓库目录 `E:\Works\ChmlVPN` 本身未改名，指向它的路径保持原样。
+
 - 日期：2026-11-01
 - 真机：Windows 10 Pro 26H2（build 26300，x64），管理员身份 **否**（`net session` → `ADMIN=no`；清单要求如实记录，不提权重跑）
 - Docker：Docker Desktop 29.8.2（`docker info --format '{{.ServerVersion}}'`）
@@ -51,13 +53,13 @@ committed `deploy/m3.yml` 原不映射宿主（注释「用户口 27500/27501 �
 ```
 $ export MSYS_NO_PATHCONV=1
 $ docker compose -f deploy/m3.yml up -d
- Container chmlvpn-m3-frps-1 Recreated / Started（新增 127.0.0.1:27500-27501 映射）
-$ docker compose -f deploy/m3.yml cp .tmp/server-m3-host.toml server:/etc/chmlvpn/server.toml
+ Container flock-m3-frps-1 Recreated / Started（新增 127.0.0.1:27500-27501 映射）
+$ docker compose -f deploy/m3.yml cp .tmp/server-m3-host.toml server:/etc/flock/server.toml
 $ docker compose -f deploy/m3.yml restart server
 $ docker compose -f deploy/m3.yml ps --format '{{.Name}} {{.Status}} {{.Ports}}'
-chmlvpn-m3-frps-1   Up  127.0.0.1:27500-27501->27500-27501/tcp
-chmlvpn-m3-server-1 Up
-chmlvpn-m3-client-1 Up
+flock-m3-frps-1   Up  127.0.0.1:27500-27501->27500-27501/tcp
+flock-m3-server-1 Up
+flock-m3-client-1 Up
 ```
 
 server 就绪（日志）：`dataplane up: tun tun0 vip 100.64.0.1 route 100.64.0.0/16 +
@@ -82,37 +84,37 @@ endpoints = ["127.0.0.1:27500", "127.0.0.1:27501"]
 引导序（与 m3_assert.sh 同序，宿主侧手工）：
 
 ```
-$ cargo run -p chmlvpn-client -- --config .tmp/host-client.toml gen-keys
+$ cargo run -p flock-client -- --config .tmp/host-client.toml gen-keys
 device-id=2b7ddf35560aca5528e53f138393822e7f800333c9735ebeb3517a27052d017b
 device-x=b+PDQoL3xTKMxgxumlunRkKLYWeL+0i9P96tB2tC5Uo
 device-ed=XVFeoYKi5OA/PoDGa60ObX1bTCmJHbn1/Hcq7zg40c4
 
-$ docker compose -f deploy/m3.yml exec -T server chmlvpn-server \
-    --config /etc/chmlvpn/server.toml device-add \
+$ docker compose -f deploy/m3.yml exec -T server flock-server \
+    --config /etc/flock/server.toml device-add \
     --user winhost --device-x "b+PDQoL3…" --device-ed "XVFeoYKi…"
 device_id=5d515ea182a2e4e03f3e80c66bad0e6d7d5b4c29891db9f5fc772aef3838d1ce
 vip=100.64.0.3                       # 容器 client 已占 100.64.0.2，本机分配 .3
 
-$ docker compose -f deploy/m3.yml exec -T server chmlvpn-server \
-    --config /etc/chmlvpn/server.toml invite --ttl-secs 86400 > .tmp/host-invite.b64
+$ docker compose -f deploy/m3.yml exec -T server flock-server \
+    --config /etc/flock/server.toml invite --ttl-secs 86400 > .tmp/host-invite.b64
 $ printf '100.64.0.3' > .tmp/host-client-state/vip
 
-$ cargo run -p chmlvpn-client -- --config .tmp/host-client.toml invite .tmp/host-invite.b64
+$ cargo run -p flock-client -- --config .tmp/host-client.toml invite .tmp/host-invite.b64
 invite ok: cluster=d638c699732c629abeedb52dd1e722fc endpoints=2（已钉扎根公钥 + 存目录）
 ```
 
 `endpoints=2` 即注入的宿主视角目录（127.0.0.1:27500 + 27501）——config 的端点覆盖与
-目录一致（`override_endpoints` 端点↔材料同签校验可过，app/chmlvpn-client/src/main.rs:218-233）。
+目录一致（`override_endpoints` 端点↔材料同签校验可过，app/flock-client/src/main.rs:218-233）。
 
 ## 2. --smoke 实测
 
 按清单命令形态（`--config` 与 `--smoke` 顺序无关，main.rs:58-85 解析）：
 
 ```
-$ cargo run -p chmlvpn-client -- --smoke --config .tmp/host-client.toml
+$ cargo run -p flock-client -- --smoke --config .tmp/host-client.toml
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
-     Running `target\debug\chmlvpn-client.exe --smoke --config .tmp/host-client.toml`
-chmlvpn-client: tun: tun-rs create tun0: 拒绝访问。 (os error 5)
+     Running `target\debug\flock-client.exe --smoke --config .tmp/host-client.toml`
+flock-client: tun: tun-rs create tun0: 拒绝访问。 (os error 5)
 error: process didn't exit successfully: … (exit code: 2)
 ```
 
@@ -173,11 +175,11 @@ $ ping -n 2 -w 2000 100.64.0.1
 100.64.0.1 的 Ping 统计信息: 数据包: 已发送 = 2, 已接收 = 0, 丢失 = 2 (100% 丢失)
 ```
 
-宿主单测（§7-M3「Windows 主机上 `cargo test -p chmlvpn-client`」，含路由 Unsupported
+宿主单测（§7-M3「Windows 主机上 `cargo test -p flock-client`」，含路由 Unsupported
 路径的真实执行）：
 
 ```
-$ cargo test -p chmlvpn-client
+$ cargo test -p flock-client
 test route::tests::non_linux_apply_is_explicit_unsupported ... ok
 test route::tests::plan_defaults_to_100_64_slash16 ... ok
 test route::tests::pool_mask_dotted ... ok
@@ -189,9 +191,9 @@ test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 同一 m3 拓扑的容器 client（VIP 100.64.0.2，经 frps 中转）日志与实测：
 
 ```
-client-1 | chmlvpn-client: tun tun0 mtu=1280 vip=100.64.0.2
-client-1 | chmlvpn-client: route 100.64.0.0/16 → tun0 + rp_filter=1
-client-1 | chmlvpn-client: 已连接 frps:27500（server=f2220c4ee069b62c93554fa5cdf05e09）
+client-1 | flock-client: tun tun0 mtu=1280 vip=100.64.0.2
+client-1 | flock-client: route 100.64.0.0/16 → tun0 + rp_filter=1
+client-1 | flock-client: 已连接 frps:27500（server=f2220c4ee069b62c93554fa5cdf05e09）
 $ docker compose -f deploy/m3.yml exec -T client ip addr show tun0
 3: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1280 …
     inet 100.64.0.2/32 scope global tun0
@@ -206,7 +208,7 @@ $ docker compose -f deploy/m3.yml exec -T client ping -c 3 -W 3 100.64.0.1
 
 受阻根因单一：**当前会话非管理员**。清单要求不提权，故以下留待管理员会话补测：
 
-1. 管理员终端重跑 `cargo run -p chmlvpn-client -- --smoke --config .tmp/host-client.toml`
+1. 管理员终端重跑 `cargo run -p flock-client -- --smoke --config .tmp/host-client.toml`
    ——预期 wintun 适配器创建成功（驱动已在库）→ 打印 `tun: tun0 mtu=1280 vip=100.64.0.3`
    → route 行打印 Windows `Unsupported`（含手工指令，属预期行为而非失败）→ 2s 后拆设备；
    期间另开终端 `netsh interface ipv4 show subinterface` 看 tun0 MTU=1280、
@@ -229,7 +231,7 @@ $ docker compose -f deploy/m3.yml exec -T client ping -c 3 -W 3 100.64.0.1
 $ docker compose -f deploy/m3.yml down -v
 ```
 
-（输出见记录尾；含 server-state/client-state 卷删除与 chmlvpn-m3net 网络删除。）
+（输出见记录尾；含 server-state/client-state 卷删除与 flock-m3net 网络删除。）
 仓库内新增/改动：`deploy/m3.yml`（+7/-1，frps 宿主回环映射）；`.tmp/` 下测试工件
 （host-client-state、host-client.toml、host-invite.b64、server-m3-host.toml、wintun-dl/）
 为 gitignore 范围的一次性物，未入库。

@@ -108,7 +108,7 @@ impl SupervisorConfig {
             bins,
             restart: RestartPolicy::default(),
             health: HealthPolicy::default(),
-            run_base: std::env::temp_dir().join("chml-frpc"),
+            run_base: std::env::temp_dir().join("flock-frpc"),
             verify_version_at_start: false,
         }
     }

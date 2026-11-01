@@ -1,5 +1,5 @@
 //! NetState 写操作集与读查询（docs/design.md §3.10 接口；与 M2 单服 `NetState` trait
-//! 语义对齐——见 app/chmlvpn-server/src/netstate.rs 的纪律注记）。
+//! 语义对齐——见 app/flock-server/src/netstate.rs 的纪律注记）。
 //!
 //! 全部写操作 = [`SyncRequest`]，经 Raft 提交后由 [`crate::state::NetStateData::apply`]
 //! 确定性执行。**admin_op（add_voter/rewrap/revoke_invite）与 server_keys 必须带集群根
@@ -35,11 +35,11 @@ pub const VIP_FIRST: u32 = u32::from_be_bytes([100, 64, 0, 11]);
 pub const VIP_LAST: u32 = u32::from_be_bytes([100, 127, 255, 254]);
 
 /// 管理操作签名域分离标签（canonical 字节前缀）。
-const L_ADMIN: &[u8] = b"chml-sync/admin/v1";
+const L_ADMIN: &[u8] = b"flock-sync/admin/v1";
 /// server_keys 签名域分离标签。
 const L_SERVER_KEYS: &[u8] = b"ch-sync/server-keys/v1";
 /// Bootstrap 自证签名域分离标签。
-const L_BOOTSTRAP: &[u8] = b"chml-sync/bootstrap/v1";
+const L_BOOTSTRAP: &[u8] = b"flock-sync/bootstrap/v1";
 
 // ============================================================================
 // 行类型（与 M2 netstate.rs 同语义；M4 后续批次做服务器装配侧的 trait 收敛）

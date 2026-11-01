@@ -8,7 +8,7 @@ members = ["crates/flock-protocol", "crates/flock-frpc", "crates/flock-sync", "a
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
-repository = "https://example.invalid/chmlvpn"
+repository = "https://example.invalid/flock/flock-vpn"
 
 [workspace.dependencies]
 # 依赖代际统一按 docs/design.md §1.3.2（P1-6）：
@@ -38,14 +38,14 @@ chacha20poly1305 = "0.11.0"
 aes-gcm-siv = "0.12.1"
 tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "macros"] }
 futures = "0.3"
-# chml-frpc（§3.9/M2）：原版 frpc TOML 只读解析 + admin basic auth 编码。
+# flock-frpc（§3.9/M2）：原版 frpc TOML 只读解析 + admin basic auth 编码。
 toml = "0.9"
-# chmlvpn-server（§3.11/M2）：控制流消息（yamux stream0）postcard 编码 + server.toml 反序列化。
+# flock-server（§3.11/M2）：控制流消息（yamux stream0）postcard 编码 + server.toml 反序列化。
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
-# 单服 NetState 适配器（§3.11/M2：redb 单机版，接口与 M4 chml-sync 对齐，§3.10）。
+# 单服 NetState 适配器（§3.11/M2：redb 单机版，接口与 M4 flock-sync 对齐，§3.10）。
 redb = "3"
-# chmlvpn-client（§2.3/§3.12/M3）：tun 适配（tun-rs——vpn-mesh §1.2 选型；设计文档写
+# flock-client（§2.3/§3.12/M3）：tun 适配（tun-rs——vpn-mesh §1.2 选型；设计文档写
 # 「2.8.16」，crates.io 当前 max_stable=2.8.14（2026-10-26 发布），以实际存在的版本钉）。
 tun-rs = { version = "2.8.14", default-features = false }
 # Linux 路由/地址配置（§2.3：/16 池指向 TUN + rp_filter=1；vpn-mesh §1.2/S10）。

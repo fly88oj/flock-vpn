@@ -4,14 +4,14 @@ serverAddr = "frps-b"
 serverPort = 7000
 
 [[proxies]]
-name = "chml-b-main"
+name = "flock-b-main"
 type = "tcp"
 localIP = "server-b"
 localPort = 9443
 remotePort = 23001
 
 [[proxies]]
-name = "chml-b-echo"
+name = "flock-b-echo"
 type = "tcp"
 localIP = "echo-b"
 localPort = 9001

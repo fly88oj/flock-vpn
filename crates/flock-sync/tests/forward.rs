@@ -13,10 +13,10 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chml_sync::forward::{
+use flock_sync::forward::{
     ForwardEnvelope, ForwardOutcome, IngestResult, PacketSink, RejectReason, FORWARD_VER,
 };
-use chml_sync::proto::{NodeId, SyncRequest, SyncResponse};
+use flock_sync::proto::{NodeId, SyncRequest, SyncResponse};
 
 use common::{bootstrap, wait_local_row, TestCluster};
 
@@ -298,7 +298,7 @@ async fn forward_local_delivery_and_redirect_with_hop_guard() {
     let stale_term = now_ms();
     c.nodes[0]
         .lease()
-        .merge_remote(chml_sync::lease::GossipMsg::Publish {
+        .merge_remote(flock_sync::lease::GossipMsg::Publish {
             device: id_c,
             holder: 2,
             term_ms: stale_term + 200,
@@ -408,7 +408,7 @@ async fn unresolved_destination_drops_with_best_effort_icmp() {
     // 陈旧租约指向 node2，但 node2 没有该设备会话且无人认领。
     c.nodes[0]
         .lease()
-        .merge_remote(chml_sync::lease::GossipMsg::Publish {
+        .merge_remote(flock_sync::lease::GossipMsg::Publish {
             device: id_d,
             holder: 2,
             term_ms: now_ms() + 100, // 较新 term 使其胜出本地空表
@@ -482,14 +482,14 @@ async fn lease_domain_semantics_and_locate_fanout() {
     );
     // NetState 设备行不存当前位置：VIP/状态原样（快照视图无 holder 字段可言）。
     let v = c.nodes[0]
-        .read_linearizable(chml_sync::proto::ReadQuery::DeviceRow(id))
+        .read_linearizable(flock_sync::proto::ReadQuery::DeviceRow(id))
         .await
         .expect("read");
-    let chml_sync::proto::ReadView::Device(Some(d)) = v else {
+    let flock_sync::proto::ReadView::Device(Some(d)) = v else {
         panic!()
     };
     assert_eq!(d.vip, row.vip, "静态注册信息不变（NetState 不存位置）");
-    assert_eq!(d.status, chml_sync::proto::DeviceStatus::Active);
+    assert_eq!(d.status, flock_sync::proto::DeviceStatus::Active);
 
     // location_query：本地租约域命中即答（不扇出）。
     let holder = c.nodes[2].location_query(&id).await;
@@ -509,12 +509,12 @@ async fn lease_domain_semantics_and_locate_fanout() {
     // （短路等待 31s 太慢——用表内直改 expires 不可行（私有），改以反熵/事件路径
     // 已覆盖；此处断言 LEASE_TTL 常量与 observe 语义一致。）
     assert_eq!(
-        chml_sync::lease::LEASE_TTL,
+        flock_sync::lease::LEASE_TTL,
         Duration::from_secs(30),
         "租约 TTL 30s（§3.10）"
     );
     assert_eq!(
-        chml_sync::lease::ANTI_ENTROPY,
+        flock_sync::lease::ANTI_ENTROPY,
         Duration::from_secs(5),
         "反熵 5s（§3.10）"
     );

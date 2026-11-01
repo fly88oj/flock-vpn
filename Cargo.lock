@@ -348,69 +348,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flock-frpc"
-version = "0.1.0"
-dependencies = [
- "base64",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "flock-sync"
-version = "0.1.0"
-dependencies = [
- "flock-sync",
- "ed25519-dalek",
- "flock-protocol",
- "futures",
- "openraft",
- "postcard",
- "rand 0.9.5",
- "redb",
- "serde",
- "sha2 0.11.1",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "flock-client"
-version = "0.1.0"
-dependencies = [
- "base64",
- "flock-protocol",
- "futures",
- "hex",
- "rtnetlink",
- "serde",
- "tempfile",
- "tokio",
- "toml",
- "tun-rs",
-]
-
-[[package]]
-name = "flock-server"
-version = "0.1.0"
-dependencies = [
- "base64",
- "flock-frpc",
- "flock-sync",
- "flock-client",
- "flock-protocol",
- "futures",
- "hex",
- "postcard",
- "redb",
- "serde",
- "sha2 0.11.1",
- "tempfile",
- "tokio",
- "toml",
-]
-
-[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -956,6 +893,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
+name = "flock-client"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "flock-protocol",
+ "futures",
+ "hex",
+ "rtnetlink",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tun-rs",
+]
+
+[[package]]
+name = "flock-frpc"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "flock-protocol"
 version = "0.1.0"
 dependencies = [
@@ -984,6 +946,44 @@ dependencies = [
  "x25519-dalek",
  "yamux",
  "zstd",
+]
+
+[[package]]
+name = "flock-server"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "flock-client",
+ "flock-frpc",
+ "flock-protocol",
+ "flock-sync",
+ "futures",
+ "hex",
+ "postcard",
+ "redb",
+ "serde",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "flock-sync"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "flock-protocol",
+ "flock-sync",
+ "futures",
+ "openraft",
+ "postcard",
+ "rand 0.9.5",
+ "redb",
+ "serde",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

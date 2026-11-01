@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 /// 票据 TTL（§2.2：60s 硬顶）。
 pub const TICKET_TTL_SECS: u64 = 60;
 
-const L_TICKET: &[u8] = b"chml-sync/ticket/v1";
-const L_ROOT_DERIVE: &[u8] = b"chml-sync/ticket-root-derive/v1";
+const L_TICKET: &[u8] = b"flock-sync/ticket/v1";
+const L_ROOT_DERIVE: &[u8] = b"flock-sync/ticket-root-derive/v1";
 
 /// 票据校验失败原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

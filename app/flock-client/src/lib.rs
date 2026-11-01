@@ -1,4 +1,4 @@
-//! chmlvpn-client 库面（docs/design.md §2.3 / §3.12 / §7-M3）。
+//! flock-client 库面（docs/design.md §2.3 / §3.12 / §7-M3）。
 //!
 //! 模块：
 //! - [`tun`]：`TunDevice` 接缝（open/read/write/close）+ tun-rs 适配器（cfg 门控）+
@@ -9,7 +9,7 @@
 //!   指数退避 + 端点轮询）；
 //! - [`dataplane`]：IP 包 ↔ `PacketChannel` 桥。
 //!
-//! 服务器（`chmlvpn-server`）以库形式复用 [`tun`]/[`route`]/dataplane 桥
+//! 服务器（`flock-server`）以库形式复用 [`tun`]/[`route`]/dataplane 桥
 //! （§2.2「服务端自身也是 peer」、§3.11「对上挂 tun 适配器」）——`TunDevice` 接缝按
 //! §3.12 落位本 crate，跨 app 复用即此接缝的第二个消费者。
 

@@ -111,14 +111,14 @@ impl LiveSessions {
 #[cfg(feature = "multi-primary")]
 struct ServerSyncHooks {
     sessions: Arc<LiveSessions>,
-    node: Arc<chml_sync::SyncNode>,
+    node: Arc<flock_sync::SyncNode>,
 }
 
 #[cfg(feature = "multi-primary")]
-impl chml_sync::hooks::SyncHooks for ServerSyncHooks {
-    fn on_revocation_applied(&self, ev: chml_sync::hooks::RevocationEvent) {
+impl flock_sync::hooks::SyncHooks for ServerSyncHooks {
+    fn on_revocation_applied(&self, ev: flock_sync::hooks::RevocationEvent) {
         eprintln!(
-            "chmlvpn-server: revocation applied (epoch={}, log={}) killing local sessions",
+            "flock-server: revocation applied (epoch={}, log={}) killing local sessions",
             ev.new_epoch, ev.log_index
         );
         self.sessions.kill(&ev.device);
@@ -126,7 +126,7 @@ impl chml_sync::hooks::SyncHooks for ServerSyncHooks {
     }
     fn on_lease_evicted(&self, device: &[u8; 32]) {
         // 租约冲突新者胜（设备已迁往他机）：旧端踢出（§3.10 LeaseTable）。
-        eprintln!("chmlvpn-server: lease evicted (device moved) killing local session");
+        eprintln!("flock-server: lease evicted (device moved) killing local session");
         self.sessions.kill(device);
     }
 }
@@ -134,7 +134,7 @@ impl chml_sync::hooks::SyncHooks for ServerSyncHooks {
 /// 服务端核心（装配期构建；Arc 共享给 accept/admin 任务）。
 pub struct ServerCore {
     pub cfg: ServerConfig,
-    /// 写读后端（§2.2/§3.11）：Single = 本地 redb（M2 形态）；Sync = chml-sync Raft
+    /// 写读后端（§2.2/§3.11）：Single = 本地 redb（M2 形态）；Sync = flock-sync Raft
     /// （feature `multi-primary`——写转发 leader / 线性一致读 / 两级读目录）。
     pub net: NetBackend,
     /// 集群根密钥签名钥（单服 = 库内根；多主 = **None**——根密钥离线保管，目录/邀请
@@ -150,7 +150,7 @@ pub struct ServerCore {
     pub sessions: Arc<LiveSessions>,
     /// 多主同步节点（feature `multi-primary`；单服 = None）。
     #[cfg(feature = "multi-primary")]
-    pub sync: Option<Arc<chml_sync::SyncNode>>,
+    pub sync: Option<Arc<flock_sync::SyncNode>>,
     /// M3 数据面路由器（run() 装配 tun 后注入；None = 控制流-only——宿主测试路径）。
     router: RwLock<Option<Arc<PeerRouter>>>,
 }
@@ -288,11 +288,11 @@ impl ServerCore {
 
     /// 多主装配（feature `multi-primary`；§2.2/§3.11 M4 批次）。
     ///
-    /// - 目录 = `session::respond` 注入 [`chml_sync::SyncNode::device_directory`]
+    /// - 目录 = `session::respond` 注入 [`flock_sync::SyncNode::device_directory`]
     ///   （两级读：记录缓存 + epoch + apply-lag 熔断降级线性一致读，§4）；
     /// - 票据根 = Raft 状态内（Bootstrap 落库）；
     /// - OPRF key = Raft 内共享（SetOprf 根签登记——跨节点登录，§2.4）；
-    /// - 吊销/租约冲突经 [`chml_sync::hooks::SyncHooks`] 在 apply 现场杀本地会话（§2.2）。
+    /// - 吊销/租约冲突经 [`flock_sync::hooks::SyncHooks`] 在 apply 现场杀本地会话（§2.2）。
     ///
     /// 前置：集群已 Bootstrap（ticket_root + SetOprf 就位）——init-cluster/enroll 流程或
     /// 装配方（tests/multi_primary.rs）完成；等待窗口 15s。
@@ -300,7 +300,7 @@ impl ServerCore {
     pub async fn open_sync(
         cfg: ServerConfig,
         ident: Arc<ServerIdentity>,
-        node: Arc<chml_sync::SyncNode>,
+        node: Arc<flock_sync::SyncNode>,
     ) -> Result<Arc<Self>, String> {
         // 等 Bootstrap + SetOprf 复制到位（本节点 apply 即可见——本地读）。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -415,10 +415,10 @@ impl ServerCore {
     /// 单条入连：E2E 握手（respond）→ 会话登记（可被吊销信号杀）→ 流分派。
     ///
     /// 流分派（M3）：**首条**被接受的 yamux 流 = 控制流（M2 语义不变，客户端
-    /// initiate 后先 `open_stream(Prio::Control)`——排序契约见 chmlvpn-client
+    /// initiate 后先 `open_stream(Prio::Control)`——排序契约见 flock-client
     /// connector）；余流 = 数据面包通道（[`PeerRouter::serve_stream`]）。
     pub async fn serve_conn(self: Arc<Self>, io: TcpStream) {
-        // respond 的目录注入分派：Single = redb 适配器；Sync = chml-sync 两级读
+        // respond 的目录注入分派：Single = redb 适配器；Sync = flock-sync 两级读
         // （缓存 + epoch + apply-lag 熔断降级线性一致读，§4——本批次的接入点）。
         let handshake = match &self.net {
             NetBackend::Single(store) => {
@@ -444,7 +444,7 @@ impl ServerCore {
         let tunnel = match handshake {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("chmlvpn-server: handshake rejected: {e}");
+                eprintln!("flock-server: handshake rejected: {e}");
                 return;
             }
         };
@@ -478,7 +478,7 @@ impl ServerCore {
                                 let _ = serve_control(&core, device, &mut s).await;
                             }));
                         } else {
-                            // 多主：包通道走 chml-sync 转发面（attach_session sink +
+                            // 多主：包通道走 flock-sync 转发面（attach_session sink +
                             // ingest：第 0 步源 VIP 校验 → 租约定位 → 本机投递或
                             // ForwardEnvelope 跨服，§2.2 判定序）。
                             #[cfg(feature = "multi-primary")]
@@ -502,7 +502,7 @@ impl ServerCore {
                                 //（客户端数据面观察通道 EOF → 退避重连，控制流不受影响）。
                                 _ => {
                                     eprintln!(
-                                        "chmlvpn-server: 数据面流被拆（router={has_router} vip={}）",
+                                        "flock-server: 数据面流被拆（router={has_router} vip={}）",
                                         device_vip.is_some()
                                     );
                                     drop(s)
@@ -526,7 +526,7 @@ impl ServerCore {
         // 会话终止原因（A9 服务端侧：静默死链 ⇒ "dead-link" 可 grep）。
         let reason = close_reason;
         eprintln!(
-            "chmlvpn-server: session ended device={device} reason={}",
+            "flock-server: session ended device={device} reason={}",
             reason
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "none(io/fin)".into())
@@ -546,7 +546,7 @@ impl ServerCore {
     }
 }
 
-/// 运行中的监听端点（Direct 分支零 chml-frpc 类型；Frp 分支持托管句柄）。
+/// 运行中的监听端点（Direct 分支零 flock-frpc 类型；Frp 分支持托管句柄）。
 pub enum RunningListener {
     Direct {
         local: SocketAddr,
