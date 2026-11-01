@@ -17,15 +17,21 @@
 //! - [`dir`]：`session::DeviceDirectory` 两级读实现（记录缓存 + epoch + lag 熔断降级
 //!   线性一致读）。
 //! - [`lease`]：gossip 租约表（设备当前位置唯一真相源；冲突 = 新者胜 + 旧端踢出回调）。
+//! - [`forward`]：跨服转发承载（ForwardEnvelope + 源 VIP 绑定校验 + hop=1 防环 +
+//!   NOT_HERE→一次性 location_query + 尽力 ICMP，§2.2）。
+//! - [`directory`]：`Directory::serve(dir_pull)`——根签 ClusterDirectory 下发/安装。
 //! - [`ticket`]：本地短 TTL 票据签发/校验——**票据密钥根在 Raft 内**（§4 第二阶段能力
 //!   直接吸收进首版）。
-//! - [`node`]：[`node::SyncNode`] 装配（写转发 leader、任意节点线性一致读）。
+//! - [`node`]：[`node::SyncNode`] 装配（写转发 leader、任意节点线性一致读、learner
+//!   准入/add_voter/rewrap 管理面）。
 //!
-//! 未含（后续批次，§7-M4 余项）：gossip 反熵完备化、跨服转发承载（ForwardEnvelope）、
-//! learner→快照→add_voter 准入流水的服务器装配（admission 测试组）、TCP/中转 Fabric。
+//! 未含（后续批次）：服务器进程装配（app/chmlvpn-server 接入 chml-sync 替换单服
+//! NetState 的批次）、TCP/中转 Fabric、控制流 dir_pull 客户端侧消息协议。
 #![forbid(unsafe_code)]
 
 pub mod dir;
+pub mod directory;
+pub mod forward;
 pub mod hooks;
 pub mod lease;
 pub mod network;
@@ -41,6 +47,12 @@ pub mod wire;
 #[cfg(feature = "test-util")]
 pub mod testutil;
 
+pub use directory::{DirError, DirPullResp, Directory};
+pub use forward::{
+    ForwardEnvelope, ForwardOutcome, ForwardPlane, ForwardStats, ForwardTransport, IngestResult,
+    PacketSink, FORWARD_VER,
+};
+pub use lease::LocateFanout;
 pub use network::{SyncNetFactory, SyncNetwork};
 pub use node::{SyncNode, SyncNodeBuilder, SyncSettings};
 pub use proto::{

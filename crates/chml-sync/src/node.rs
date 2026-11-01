@@ -9,6 +9,7 @@
 //! - **票据签发**：密钥根来自 Raft 状态（Bootstrap 后可用）。
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,8 +23,10 @@ use openraft::{BasicNode, Raft};
 use redb::Database;
 
 use crate::dir::{DirHandle, LinearizableReader, SyncDirectory};
+use crate::directory::Directory;
+use crate::forward::{ForwardEnvelope, ForwardOutcome, ForwardPlane, ForwardTransport, PacketSink};
 use crate::hooks::SyncHooks;
-use crate::lease::{LeaseTable, ANTI_ENTROPY};
+use crate::lease::{LeaseTable, LocateFanout, ANTI_ENTROPY};
 use crate::proto::{NodeId, ReadQuery, ReadView, SyncError, SyncRequest, SyncResponse};
 use crate::raft_types::SyncConfig;
 use crate::sm::{RedbStateMachine, SmCore};
@@ -158,9 +161,19 @@ impl SyncNodeBuilder {
 
         let lag = LagMonitor::new(self.settings.lag_threshold, sm.applied_counter());
         let lease = LeaseTable::new(self.node_id, self.settings.lease_ttl, sm.shared_hooks());
+        let directory = Arc::new(Directory::new(self.ident.root_pub, &self.directory)
+            .map_err(|e| SyncError::Raft(format!("directory: {e}")))?);
+        let forward = ForwardPlane::new(self.node_id, sm.clone(), lease.clone());
 
         // 互连应答循环（无凭证对端在此层被拒）。
-        let target = RpcTarget { raft: raft.clone(), sm: sm.clone(), lag: lag.clone(), lease: lease.clone() };
+        let target = RpcTarget {
+            raft: raft.clone(),
+            sm: sm.clone(),
+            lag: lag.clone(),
+            lease: lease.clone(),
+            forward: forward.clone(),
+            directory: directory.clone(),
+        };
         tokio::spawn(async move {
             ic_serve_ic.serve_loop(target).await;
         });
@@ -173,13 +186,21 @@ impl SyncNodeBuilder {
             let _ = raft.initialize(self.members.clone()).await;
         }
 
+        // 转发面互连接缝（FRWD 流 + location_query 扇出）。
+        let fwd_transport = Arc::new(IcForwardTransport { ic: ic.clone() });
+        let fwd_fanout = Arc::new(IcLocateFanout { ic: ic.clone(), me: self.node_id });
+        forward.set_transport(fwd_transport, fwd_fanout);
+
         let inner = Arc::new(NodeInner {
             id: self.node_id,
+            entry: self.ident.entry.clone(),
             raft,
             sm,
             lag,
             lease,
             ic,
+            directory,
+            forward,
             settings: self.settings,
             ticket_seq: AtomicU64::new(0),
         });
@@ -212,13 +233,59 @@ pub fn node_id_of(sid: &chml_protocol::session::ServerId) -> NodeId {
 
 pub(crate) struct NodeInner {
     pub id: NodeId,
+    pub entry: chml_protocol::session::ServerEntry,
     pub raft: Raft<SyncConfig>,
     pub sm: Arc<SmCore>,
     pub lag: Arc<LagMonitor>,
     pub lease: Arc<LeaseTable>,
     pub ic: Arc<Interconnect>,
+    pub directory: Arc<Directory>,
+    pub forward: Arc<ForwardPlane>,
     pub settings: SyncSettings,
     ticket_seq: AtomicU64,
+}
+
+/// FRWD 流发送接缝：ForwardEnvelope 经互连 E2E 会话（外层服务器间加密）。
+struct IcForwardTransport {
+    ic: Arc<Interconnect>,
+}
+
+impl ForwardTransport for IcForwardTransport {
+    fn send(&self, peer: NodeId, env: ForwardEnvelope) -> BoxFuture<'static, io::Result<ForwardOutcome>> {
+        let ic = self.ic.clone();
+        Box::pin(async move {
+            match ic.call(peer, WireRpc::Forward(env), Duration::from_secs(3)).await {
+                Ok(WireResp::Forward(r)) => Ok(r),
+                Ok(_) => Err(io::Error::other("forward rpc response mismatch")),
+                Err(e) => Err(io::Error::from(e)),
+            }
+        })
+    }
+}
+
+/// location_query 扇出接缝：问 ≤3 台互连服务器「谁在托管该设备」（一次性，不重试）。
+struct IcLocateFanout {
+    ic: Arc<Interconnect>,
+    me: NodeId,
+}
+
+impl LocateFanout for IcLocateFanout {
+    fn locate(&self, device: &[u8; 32]) -> BoxFuture<'static, Option<NodeId>> {
+        let ic = self.ic.clone();
+        let me = self.me;
+        let device = *device;
+        Box::pin(async move {
+            let peers: Vec<NodeId> = ic.node_ids().into_iter().filter(|p| *p != me).take(3).collect();
+            for peer in peers {
+                if let Ok(WireResp::Locate(Some(holder))) =
+                    ic.call(peer, WireRpc::Locate(device), Duration::from_secs(2)).await
+                {
+                    return Some(holder);
+                }
+            }
+            None
+        })
+    }
 }
 
 /// 目录的线性一致读句柄（`'static` future 要求——克隆内柄）。
@@ -326,7 +393,7 @@ impl SyncNode {
     }
 
     /// DeviceDirectory 接缝句柄（session::respond 注入）。
-    pub fn directory(&self) -> DirHandle {
+    pub fn device_directory(&self) -> DirHandle {
         DirHandle(self.dir.clone())
     }
 
@@ -410,6 +477,127 @@ impl SyncNode {
     /// Raft 句柄（membership 管理/快照触发等装配面）。
     pub fn raft(&self) -> &Raft<SyncConfig> {
         &self.inner.raft
+    }
+
+    /// 本机入群凭证公开部分（ServerEntry——server_keys/rewrap 封装目标等用）。
+    pub fn entry(&self) -> &chml_protocol::session::ServerEntry {
+        &self.inner.entry
+    }
+
+    /// 应答侧握手拒绝计数（无凭证/伪造凭证在握手层被拒——admission 断言面）。
+    pub fn rejected_handshakes(&self) -> u64 {
+        self.inner.ic.rejected_handshakes()
+    }
+
+    // ------------------------------------------------------------------
+    // 集群准入（§4-3：learner → 快照同步 → add_voter 根签 → 提升；§3.10）
+    // ------------------------------------------------------------------
+
+    /// 安装根签新目录（根验签 + 版本回退拒；热更新互连映射——准入新服务器后全网可拨）。
+    pub fn install_directory(&self, dir: &ClusterDirectory) -> Result<(), SyncError> {
+        self.inner
+            .directory
+            .install(dir)
+            .map_err(|e| SyncError::Raft(format!("install directory: {e}")))?;
+        self.inner.ic.update_nodes(self.inner.directory.node_entries());
+        Ok(())
+    }
+
+    /// 目录服务（dir_pull 下发根签 ClusterDirectory，§3.10 `Directory::serve`）。
+    pub fn directory(&self) -> &Arc<Directory> {
+        &self.inner.directory
+    }
+
+    /// 以 learner 加入集群（leader 侧调用；blocking = 等日志/快照追平）。
+    pub async fn add_learner(&self, node_id: NodeId) -> Result<(), SyncError> {
+        self.inner
+            .raft
+            .add_learner(node_id, openraft::BasicNode::new(format!("node-{node_id}")), true)
+            .await
+            .map(|_| ())
+            .map_err(|e| SyncError::Raft(format!("add_learner: {e}")))
+    }
+
+    /// 快照触发 + 日志压实（准入流水用：迫使新 learner 走快照同步路径）。
+    pub async fn snapshot_and_purge(&self) -> Result<u64, SyncError> {
+        let applied = self.inner.sm.applied_index();
+        self.inner
+            .raft
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|e| SyncError::Raft(format!("trigger snapshot: {e}")))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.inner.raft.get_snapshot().await.ok().flatten().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if applied > 0 {
+            self.inner
+                .raft
+                .trigger()
+                .purge_log(applied)
+                .await
+                .map_err(|e| SyncError::Raft(format!("purge: {e}")))?;
+        }
+        Ok(applied)
+    }
+
+    /// add_voter 管理操作（§4-3）：先经 Raft 状态机提交根签 AdminOp::AddVoter（验签后
+    /// 记录 voters + config_version），再执行 openraft 成员提升（joint 共识）。
+    /// 状态机拒绝（无根签名/未引导）⇒ 不提升，原样返回拒绝响应。
+    pub async fn add_voter_signed(
+        &self,
+        root: &ed25519_dalek::SigningKey,
+        node_id: NodeId,
+    ) -> Result<SyncResponse, SyncError> {
+        let resp = self.write(SyncRequest::add_voter_signed(root, node_id)).await?;
+        if matches!(resp, SyncResponse::Error(_)) {
+            return Ok(resp);
+        }
+        // 提升：以状态机记录的 voter 集（含新节点）做 ReplaceAllVoters。
+        let mut voters: std::collections::BTreeSet<NodeId> =
+            self.inner.sm.with_data(|d| d.voters.clone());
+        voters.insert(self.inner.id);
+        voters.insert(node_id);
+        self.inner
+            .raft
+            .change_membership(openraft::ChangeMembers::ReplaceAllVoters(voters), false)
+            .await
+            .map_err(|e| SyncError::Raft(format!("change membership: {e}")))?;
+        Ok(resp)
+    }
+
+    // ------------------------------------------------------------------
+    // 转发面 + 租约（§2.2/§3.10）
+    // ------------------------------------------------------------------
+
+    /// 转发面（本机投递/跨服转发/源 VIP 校验）。
+    pub fn forward(&self) -> &Arc<ForwardPlane> {
+        &self.inner.forward
+    }
+
+    /// 挂载本地设备会话投递 sink（装配层映射 PacketChannel）。
+    pub fn attach_session(&self, device: [u8; 32], sink: Arc<dyn PacketSink>) {
+        self.inner.forward.attach_session(device, sink);
+    }
+
+    /// 卸载本地设备会话。
+    pub fn detach_session(&self, device: &[u8; 32]) {
+        self.inner.forward.detach_session(device);
+    }
+
+    /// 会话入向处理（§2.2 转发判定序；装配层从 PacketChannel 读出后调用）。
+    pub async fn ingest_packet(&self, device: &[u8; 32], pkt: &[u8]) -> crate::forward::IngestResult {
+        self.inner.forward.ingest(device, pkt).await
+    }
+
+    /// 一次性位置询问（本地租约域优先；fan-out ≤3 台互连服务器）。
+    pub async fn location_query(&self, device: &[u8; 32]) -> Option<NodeId> {
+        let fanout = IcLocateFanout { ic: self.inner.ic.clone(), me: self.inner.id };
+        self.inner.lease.location_query(device, &fanout).await
     }
 
     /// SM 核（测试观察面：lag 注入器等）。

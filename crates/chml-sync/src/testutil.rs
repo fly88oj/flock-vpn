@@ -14,46 +14,40 @@ use std::time::Duration;
 use chml_protocol::session::ServerId;
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::DuplexStream;
 use tokio::sync::mpsc;
 
 use crate::wire::{Fabric, PeerIo};
 
-/// 双向延迟桥：`x ↔ y` 每方向 sleep `delay` 再转发（字节级线路传播延迟模型）。
+/// 单向泵：读 `r` → sleep `delay` → 写 `w`（线路传播延迟模型）。
+async fn pump(mut r: tokio::io::ReadHalf<DuplexStream>, mut w: tokio::io::WriteHalf<DuplexStream>, delay: Duration) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tokio::time::sleep(delay).await;
+                if w.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+                let _ = w.flush().await;
+            }
+        }
+    }
+}
+
+/// 双向延迟桥：`x ↔ y` 每方向 sleep `delay` 再转发；**任一侧关闭（EOF）⇒ 双向拆除**
+/// （仿真 TCP 单侧 close 的 FIN 传播——否则对端永远等不到 EOF，坏握手会挂死）。
 async fn delayed_bridge(x: DuplexStream, y: DuplexStream, delay: Duration) {
-    let (mut xr, mut xw) = tokio::io::split(x);
-    let (mut yr, mut yw) = tokio::io::split(y);
-    let x2y = tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match xr.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    tokio::time::sleep(delay).await;
-                    if yw.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                    let _ = yw.flush().await;
-                }
-            }
-        }
-    });
-    let y2x = tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match yr.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    tokio::time::sleep(delay).await;
-                    if xw.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                    let _ = xw.flush().await;
-                }
-            }
-        }
-    });
-    let _ = tokio::join!(x2y, y2x);
+    let (xr, xw) = tokio::io::split(x);
+    let (yr, yw) = tokio::io::split(y);
+    let mut x2y = tokio::spawn(pump(xr, yw, delay));
+    let mut y2x = tokio::spawn(pump(yr, xw, delay));
+    tokio::select! {
+        _ = &mut x2y => { y2x.abort(); }
+        _ = &mut y2x => { x2y.abort(); }
+    }
 }
 
 /// 节点接入槽（公开可见性承载 FabricRegistry 类型别名）。

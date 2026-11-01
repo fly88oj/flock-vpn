@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 use crate::hooks::HookRegistry;
@@ -120,6 +121,16 @@ impl LeaseTable {
         }
     }
 
+    /// 一次性跨服位置询问（§3.10 `location_query`：fan-out ≤3，不缓存不重试——
+    /// 失败即丢包+ICMP，由上层恢复）。本地租约域命中即答（唯一真相源）；
+    /// 否则经 [`LocateFanout`] 问互连服务器「谁在托管该设备」，取首个肯定回答。
+    pub async fn location_query(&self, device: &[u8; 32], fanout: &dyn LocateFanout) -> Option<NodeId> {
+        if let Some(l) = self.observe(device) {
+            return Some(l.holder);
+        }
+        fanout.locate(device).await
+    }
+
     /// 全表摘要（反熵消息体）。
     pub fn anti_entropy_msg(&self) -> GossipMsg {
         let st = self.st.lock().expect("lease table");
@@ -131,6 +142,11 @@ impl LeaseTable {
                 .collect(),
         }
     }
+}
+
+/// 位置询问扇出接缝（node 装配注入 wire 实现：WireRpc::Locate，至多 3 台互连服务器）。
+pub trait LocateFanout: Send + Sync + 'static {
+    fn locate(&self, device: &[u8; 32]) -> BoxFuture<'static, Option<NodeId>>;
 }
 
 fn now_ms() -> u64 {

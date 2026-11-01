@@ -168,6 +168,16 @@ impl SmCore {
         self.with_data(|d| d.ticket_root)
     }
 
+    /// 设备注册 VIP（转发面第 0 步源绑定校验/路由解析用）。
+    pub fn vip_of(&self, device: &[u8; 32]) -> Option<[u8; 4]> {
+        self.with_data(|d| d.devices.get(device).map(|r| r.vip))
+    }
+
+    /// 按 VIP 反查设备（目标归属解析；NetState 只存静态注册信息——不含当前位置）。
+    pub fn device_by_vip(&self, vip: &[u8; 4]) -> Option<[u8; 32]> {
+        self.with_data(|d| d.devices.iter().find(|(_, r)| &r.vip == vip).map(|(id, _)| *id))
+    }
+
     /// 执行一批日志的 apply（核心转移 + 钩子触发 + watch 推进）。
     async fn apply_entries(&self, entries: &[Entry<SyncConfig>]) -> Vec<SyncResponse> {
         self.lag.maybe_delay().await;

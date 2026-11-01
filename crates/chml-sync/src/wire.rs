@@ -143,18 +143,18 @@ impl LagMonitor {
 /// 应答侧目录：只认根签 ClusterDirectory 内的服务器身份（入群凭证认证的对向半边）。
 #[derive(Clone)]
 pub struct PeerDirectory {
-    entries: Arc<BTreeMap<NodeId, ServerEntry>>,
+    entries: Arc<std::sync::RwLock<BTreeMap<NodeId, ServerEntry>>>,
 }
 
 impl PeerDirectory {
-    pub fn new(entries: Arc<BTreeMap<NodeId, ServerEntry>>) -> Self {
+    pub fn new(entries: Arc<std::sync::RwLock<BTreeMap<NodeId, ServerEntry>>>) -> Self {
         PeerDirectory { entries }
     }
 }
 
 impl DeviceDirectory for PeerDirectory {
     fn lookup(&self, id: &DeviceId) -> BoxFuture<'static, LookupVerdict> {
-        for e in self.entries.values() {
+        for e in self.entries.read().expect("peer dir").values() {
             if DeviceId::from_ed25519(&e.identity_pub) == *id {
                 let rec = DeviceRecord {
                     device_x25519: *e.static_hybrid_pub.x25519_public(),
@@ -191,7 +191,7 @@ pub struct Interconnect {
     self_keys: DeviceStaticKeys,
     cluster_id: ClusterId,
     root_pub: VerifyingKey,
-    nodes: Arc<BTreeMap<NodeId, ServerEntry>>,
+    nodes: Arc<std::sync::RwLock<BTreeMap<NodeId, ServerEntry>>>,
     fabric: Arc<dyn Fabric>,
     pipes: tokio::sync::Mutex<BTreeMap<NodeId, Arc<Pipe>>>,
     /// 每对端 RPC 门闩（同一互连会话至多一条在途 RPC——mux 驱动单待开流 +
@@ -200,6 +200,8 @@ pub struct Interconnect {
     session_cfg: session::TunnelConfig,
     /// 会话建立/RPC 预算（缺省 5s）。
     pub rpc_timeout: Duration,
+    /// 应答侧握手拒绝计数（无凭证/坏握手——对发起端表现为不透明的连接终止）。
+    rejected_handshakes: AtomicU64,
 }
 
 impl Interconnect {
@@ -216,6 +218,8 @@ impl Interconnect {
             let nid = u64::from_be_bytes(e.server_id.0[..8].try_into().expect("8B"));
             nodes.insert(nid, e.clone());
         }
+        let nodes: Arc<std::sync::RwLock<BTreeMap<NodeId, ServerEntry>>> =
+            Arc::new(std::sync::RwLock::new(nodes));
         // 发起方「设备」材料 = 本机静态 X25519 + 身份 Ed25519（与入群凭证同源——
         // 应答侧 PeerDirectory 按根签条目的同两把公钥比对）。
         let key_bytes = {
@@ -229,12 +233,13 @@ impl Interconnect {
             cluster_id: directory.cluster_id,
             root_pub: ident.root_pub,
             ident,
-            nodes: Arc::new(nodes),
+            nodes,
             fabric,
             pipes: tokio::sync::Mutex::new(BTreeMap::new()),
             gates: std::sync::Mutex::new(BTreeMap::new()),
             session_cfg: session::TunnelConfig::default(),
             rpc_timeout: Duration::from_secs(5),
+            rejected_handshakes: AtomicU64::new(0),
         })
     }
 
@@ -243,19 +248,29 @@ impl Interconnect {
         &self.root_pub
     }
 
-    /// 目录内全部节点号（gossip fan-out 用）。
+    /// 目录内全部节点号（gossip fan-out / location_query fan-out 用）。
     pub fn node_ids(&self) -> Vec<NodeId> {
-        self.nodes.keys().copied().collect()
+        self.nodes.read().expect("ic nodes").keys().copied().collect()
     }
 
-    fn peer_entry(&self, peer: NodeId) -> io::Result<&ServerEntry> {
-        self.nodes.get(&peer).ok_or_else(|| {
+    /// 热更新互连目录映射（准入新服务器：根签新目录全网 install 后调用）。
+    pub fn update_nodes(&self, entries: BTreeMap<NodeId, ServerEntry>) {
+        *self.nodes.write().expect("ic nodes") = entries;
+    }
+
+    /// 应答侧握手拒绝计数（无凭证/伪造凭证——admission 断言面）。
+    pub fn rejected_handshakes(&self) -> u64 {
+        self.rejected_handshakes.load(Ordering::Relaxed)
+    }
+
+    fn peer_entry(&self, peer: NodeId) -> io::Result<ServerEntry> {
+        self.nodes.read().expect("ic nodes").get(&peer).cloned().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("no directory entry for node {peer}"))
         })
     }
 
     async fn connect_pipe(&self, peer: NodeId) -> io::Result<Arc<Pipe>> {
-        let entry = self.peer_entry(peer)?.clone();
+        let entry = self.peer_entry(peer)?;
         let io = self.fabric.dial(&entry.server_id).await?;
         let pin = ServerPin {
             cluster_id: self.cluster_id,
@@ -348,7 +363,11 @@ impl Interconnect {
                 let dir = PeerDirectory::new(this.nodes.clone());
                 match session::respond(io, &this.ident, dir, this.session_cfg.clone()).await {
                     Ok(tunnel) => this.serve_tunnel(tunnel, target).await,
-                    Err(_) => { /* 无凭证/坏握手 ⇒ 会话拒（§4-2：握手层即拒） */ }
+                    Err(_) => {
+                        // 无凭证/坏握手 ⇒ 会话拒（§4-2：握手层即拒——拿不到快照也进不了
+                        // Raft：分发器只存在于认证会话之内）。
+                        this.rejected_handshakes.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             });
         }
@@ -398,6 +417,12 @@ pub enum WireRpc {
     Write(SyncRequest),
     Read(ReadQuery),
     Gossip(GossipMsg),
+    /// 位置询问（location_query fan-out 的单跳：问「谁在托管该设备」）。
+    Locate([u8; 32]),
+    /// 跨服转发（FRWD 流承载 ForwardEnvelope，§2.2-3）。
+    Forward(crate::forward::ForwardEnvelope),
+    /// dir_pull（客户端经控制流发起；此处为服务器侧 serve 实现，§3.10）。
+    DirPull { since: u64 },
 }
 
 /// 互连 RPC 响应（远端 Raft 致命错误统一折算 `Err(String)` → 调用方按 Unreachable 处理；
@@ -410,6 +435,10 @@ pub enum WireResp {
     Write(Result<crate::proto::SyncResponse, SyncError>),
     Read(Result<ReadView, SyncError>),
     Gossip(bool),
+    /// 持有者节点号（本地租约域命中才答）。
+    Locate(Option<NodeId>),
+    Forward(crate::forward::ForwardOutcome),
+    DirPull(crate::directory::DirPullResp),
 }
 
 /// 互连调用失败。
@@ -440,13 +469,15 @@ impl From<WireCallError> for io::Error {
     }
 }
 
-/// 分发目标（Raft 句柄 + SM 核 + lag 监控 + 租约表）。
+/// 分发目标（Raft 句柄 + SM 核 + lag 监控 + 租约表 + 转发面 + 目录服务）。
 #[derive(Clone)]
 pub struct RpcTarget {
     pub raft: Raft<SyncConfig>,
     pub sm: Arc<SmCore>,
     pub lag: Arc<LagMonitor>,
     pub lease: Arc<LeaseTable>,
+    pub forward: Arc<crate::forward::ForwardPlane>,
+    pub directory: Arc<crate::directory::Directory>,
 }
 
 /// 入站 RPC 分发（应答侧核心）。
@@ -484,6 +515,12 @@ pub async fn dispatch(target: &RpcTarget, rpc: WireRpc) -> WireResp {
             target.lease.merge_remote(m);
             WireResp::Gossip(true)
         }
+        WireRpc::Locate(device) => {
+            // 「设备当前位置唯一真相源 = 租约域」：只按本地租约作答（TTL 内有效）。
+            WireResp::Locate(target.lease.observe(&device).map(|l| l.holder))
+        }
+        WireRpc::Forward(env) => WireResp::Forward(target.forward.receive(env)),
+        WireRpc::DirPull { since } => WireResp::DirPull(target.directory.dir_pull_response(since).into()),
     }
 }
 
