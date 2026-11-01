@@ -348,7 +348,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "chml-frpc"
+name = "flock-frpc"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -357,10 +357,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "chml-sync"
+name = "flock-sync"
 version = "0.1.0"
 dependencies = [
- "chml-sync",
+ "flock-sync",
  "ed25519-dalek",
  "flock-protocol",
  "futures",
@@ -375,7 +375,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "chmlvpn-client"
+name = "flock-client"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -391,13 +391,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "chmlvpn-server"
+name = "flock-server"
 version = "0.1.0"
 dependencies = [
  "base64",
- "chml-frpc",
- "chml-sync",
- "chmlvpn-client",
+ "flock-frpc",
+ "flock-sync",
+ "flock-client",
  "flock-protocol",
  "futures",
  "hex",

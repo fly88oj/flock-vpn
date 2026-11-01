@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/flock-protocol", "crates/chml-frpc", "crates/chml-sync", "app/chmlvpn-server", "app/chmlvpn-client"]
+members = ["crates/flock-protocol", "crates/flock-frpc", "crates/flock-sync", "app/flock-server", "app/flock-client"]
 
 # 布局与成员规划见 docs/design.md §1.1。
 

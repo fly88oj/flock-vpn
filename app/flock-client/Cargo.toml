@@ -1,10 +1,10 @@
 [package]
-name = "chmlvpn-client"
+name = "flock-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ChmlVPN 客户端装配（docs/design.md §2.3/§3.12/§7-M3）：tun 适配（TunDevice 接缝）+ 接入器退避/端点轮询 + IP 包 ↔ PacketChannel 数据面 + 路由配置"
+description = "Flock VPN 客户端装配（docs/design.md §2.3/§3.12/§7-M3）：tun 适配（TunDevice 接缝）+ 接入器退避/端点轮询 + IP 包 ↔ PacketChannel 数据面 + 路由配置"
 
 [dependencies]
 flock-protocol = { path = "../../crates/flock-protocol", features = ["anchor"] }

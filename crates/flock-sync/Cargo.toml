@@ -1,10 +1,10 @@
 [package]
-name = "chml-sync"
+name = "flock-sync"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ChmlVPN 多主多活同步：openraft 复制状态机 + redb 存储 + 服务器-服务器 profile E2E 传输（docs/design.md §3.10/§4，VPN-15）"
+description = "Flock VPN 多主多活同步：openraft 复制状态机 + redb 存储 + 服务器-服务器 profile E2E 传输（docs/design.md §3.10/§4，VPN-15）"
 
 [dependencies]
 flock-protocol = { path = "../flock-protocol" }
@@ -22,7 +22,7 @@ rand = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 # 集成测试启用 test-util（内存织物/RTT 注入）：dev-dependency 不污染对外默认档。
-chml-sync = { path = ".", features = ["test-util"] }
+flock-sync = { path = ".", features = ["test-util"] }
 
 [features]
 default = []
