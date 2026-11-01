@@ -4,8 +4,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chml_protocol::session::{ClusterId, ServerEntry, ServerId, ServerIdentity};
-use chml_protocol::trust::ClusterDirectory;
+use flock_protocol::session::{ClusterId, ServerEntry, ServerId, ServerIdentity};
+use flock_protocol::trust::ClusterDirectory;
 use ed25519_dalek::SigningKey;
 
 use chml_sync::hooks::HookRecorder;

@@ -11,15 +11,15 @@
 
 use std::sync::Arc;
 
-use chml_protocol::ed25519_dalek;
-use chml_protocol::ed25519_dalek::Signer as _;
-use chml_protocol::mux::Prio;
-use chml_protocol::pake::{login_start, reg_finish, reg_start};
-use chml_protocol::rand;
-use chml_protocol::session::{initiate, DeviceStaticKeys, ServerPin, Tunnel, TunnelConfig};
-use chml_protocol::sig as sr_sig;
-use chml_protocol::sig::{self, UserKey};
-use chml_protocol::trust::{ClusterDirectory, InviteFile};
+use flock_protocol::ed25519_dalek;
+use flock_protocol::ed25519_dalek::Signer as _;
+use flock_protocol::mux::Prio;
+use flock_protocol::pake::{login_start, reg_finish, reg_start};
+use flock_protocol::rand;
+use flock_protocol::session::{initiate, DeviceStaticKeys, ServerPin, Tunnel, TunnelConfig};
+use flock_protocol::sig as sr_sig;
+use flock_protocol::sig::{self, UserKey};
+use flock_protocol::trust::{ClusterDirectory, InviteFile};
 use chmlvpn_server::config::ServerConfig;
 use chmlvpn_server::control::{
     client_login_finish_anchored, keybind_canonical, recv_ctrl_msg, send_ctrl_msg, CtrlRequest,
@@ -38,7 +38,7 @@ pub fn b64(bytes: &[u8]) -> String {
 /// 已连上隧道的控制流客户端。
 pub struct CtrlClient {
     pub tunnel: Tunnel,
-    stream: chml_protocol::mux::Stream,
+    stream: flock_protocol::mux::Stream,
 }
 
 impl CtrlClient {
@@ -376,7 +376,7 @@ impl TestServer {
                 device_ed25519: *device.ed25519_public().as_bytes(),
                 expected_root_pub: *self.core.identity.root_pub.as_bytes(),
                 expected_cluster_id: self.core.identity.cluster_id.0,
-                now_unix: chml_protocol::trust::now_unix(),
+                now_unix: flock_protocol::trust::now_unix(),
             })
             .await
             .expect("redeem")

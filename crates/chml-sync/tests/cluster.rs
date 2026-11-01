@@ -16,8 +16,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chml_protocol::session::{ClusterId, DeviceId, LookupVerdict, ServerId, ServerIdentity};
-use chml_protocol::trust::ClusterDirectory;
+use flock_protocol::session::{ClusterId, DeviceId, LookupVerdict, ServerId, ServerIdentity};
+use flock_protocol::trust::ClusterDirectory;
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
@@ -456,7 +456,7 @@ async fn server_keys_rewrap_roundtrip() {
     // OPRF 类秘密 → envelope v2 封装到节点 2 的混合公钥 → 根签 rewrap 提交。
     let secret = b"opaque-oprf-key-material-32-bytes!!!";
     let mut wrapped = Vec::new();
-    chml_protocol::envelope::seal_v2(&target_entry.static_hybrid_pub, &secret[..], &mut wrapped)
+    flock_protocol::envelope::seal_v2(&target_entry.static_hybrid_pub, &secret[..], &mut wrapped)
         .expect("seal");
     let resp = must_write(
         &cluster.nodes[writer],
@@ -486,7 +486,7 @@ async fn server_keys_rewrap_roundtrip() {
     };
     assert_eq!(got, wrapped, "封装副本原样落库");
     let mut opened = Vec::new();
-    chml_protocol::envelope::open_v2(&cluster.idents[1].static_hybrid, &got[..], &mut opened)
+    flock_protocol::envelope::open_v2(&cluster.idents[1].static_hybrid, &got[..], &mut opened)
         .expect("open");
     assert_eq!(opened, secret, "rewrap 往返：目标服务器开封得到原秘密");
 }

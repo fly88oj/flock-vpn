@@ -10,11 +10,11 @@
 //! 通过后写入状态目录供 raft 形态起服使用（进程内装配见 tests/multi_primary.rs；
 //! TCP/中转织物随 §6/§7-M5 部署批次接 `chml_sync::wire::Fabric`）。
 
-use chml_protocol::ed25519_dalek::Signature;
-use chml_protocol::kem::HybridKeypair;
-use chml_protocol::rand;
-use chml_protocol::session::{verify_server_entry, ServerEntry, ServerId, ServerIdentity};
-use chml_protocol::trust::ClusterDirectory;
+use flock_protocol::ed25519_dalek::Signature;
+use flock_protocol::kem::HybridKeypair;
+use flock_protocol::rand;
+use flock_protocol::session::{verify_server_entry, ServerEntry, ServerId, ServerIdentity};
+use flock_protocol::trust::ClusterDirectory;
 use serde::{Deserialize, Serialize};
 
 /// 节点捆绑文件（postcard 线/盘格式）。
@@ -49,7 +49,7 @@ impl NodeBundle {
 
     /// 还原 [`ServerIdentity`]（entry_sig 重签比对在 [`NodeBundle::verify`]）。
     pub fn identity(&self) -> Result<ServerIdentity, String> {
-        let identity = chml_protocol::ed25519_dalek::SigningKey::from_bytes(&self.identity_seed);
+        let identity = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&self.identity_seed);
         let hybrid_sk: [u8; 96] = self
             .hybrid_sk
             .clone()
@@ -63,7 +63,7 @@ impl NodeBundle {
             static_hybrid_pub: static_hybrid.public(),
         };
         Ok(ServerIdentity {
-            cluster_id: chml_protocol::session::ClusterId(self.cluster_id),
+            cluster_id: flock_protocol::session::ClusterId(self.cluster_id),
             server_id: ServerId(self.server_id),
             identity,
             static_hybrid,
@@ -81,7 +81,7 @@ impl NodeBundle {
 
     /// 完整验证：根公钥可构 + 根签目录验签 + 入群凭证（entry_sig）验签 + 一致性比对
     /// （目录含本端点条目、集群标识一致——防拼接「他集群目录 + 本凭证」）。
-    pub fn verify(&self) -> Result<chml_protocol::session::ClusterId, String> {
+    pub fn verify(&self) -> Result<flock_protocol::session::ClusterId, String> {
         let root = root_vk(&self.root_pub)?;
         let dir =
             ClusterDirectory::from_bytes(&self.directory).map_err(|e| format!("目录解码: {e}"))?;
@@ -109,16 +109,16 @@ impl NodeBundle {
     }
 }
 
-fn root_vk(pub32: &[u8; 32]) -> Result<chml_protocol::ed25519_dalek::VerifyingKey, String> {
-    chml_protocol::ed25519_dalek::VerifyingKey::from_bytes(pub32)
+fn root_vk(pub32: &[u8; 32]) -> Result<flock_protocol::ed25519_dalek::VerifyingKey, String> {
+    flock_protocol::ed25519_dalek::VerifyingKey::from_bytes(pub32)
         .map_err(|_| "根公钥编码非法".to_string())
 }
 
 /// init-cluster 集群材料（内存形态；`bundle()` 逐 voter 取走）。
 pub struct ClusterMaterial {
     /// 集群根密钥（**仅运维侧持有**；写盘时 0600 语义由调用方负责，bundle 不含签名钥）。
-    pub root: chml_protocol::ed25519_dalek::SigningKey,
-    pub cluster_id: chml_protocol::session::ClusterId,
+    pub root: flock_protocol::ed25519_dalek::SigningKey,
+    pub cluster_id: flock_protocol::session::ClusterId,
     idents: Vec<ServerIdentity>,
     directory: ClusterDirectory,
 }
@@ -127,13 +127,13 @@ impl ClusterMaterial {
     /// 生成 N voter 的集群材料（根密钥 + 各 voter 身份 + 根签目录，§4-1）。
     pub fn generate(
         voters: usize,
-        cluster_id: Option<chml_protocol::session::ClusterId>,
+        cluster_id: Option<flock_protocol::session::ClusterId>,
         endpoint_of: impl Fn(usize) -> String,
     ) -> Self {
         let root =
-            chml_protocol::ed25519_dalek::SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+            flock_protocol::ed25519_dalek::SigningKey::from_bytes(&rand::random::<[u8; 32]>());
         let cluster_id =
-            cluster_id.unwrap_or_else(|| chml_protocol::session::ClusterId(rand::random()));
+            cluster_id.unwrap_or_else(|| flock_protocol::session::ClusterId(rand::random()));
         let idents: Vec<ServerIdentity> = (0..voters)
             .map(|i| {
                 ServerIdentity::enroll(

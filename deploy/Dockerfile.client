@@ -11,16 +11,16 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates/chml-protocol/Cargo.toml crates/chml-protocol/
+COPY crates/flock-protocol/Cargo.toml crates/flock-protocol/
 COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
 COPY crates/chml-sync/Cargo.toml crates/chml-sync/
 COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
 COPY app/chmlvpn-client/Cargo.toml app/chmlvpn-client/
-RUN mkdir -p crates/chml-protocol/src crates/chml-protocol/benches \
+RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
              crates/chml-frpc/src crates/chml-sync/src \
              app/chmlvpn-server/src app/chmlvpn-client/src \
- && echo 'pub fn _stub() {}' > crates/chml-protocol/src/lib.rs \
- && echo 'fn main() {}' > crates/chml-protocol/benches/aead.rs \
+ && echo 'pub fn _stub() {}' > crates/flock-protocol/src/lib.rs \
+ && echo 'fn main() {}' > crates/flock-protocol/benches/aead.rs \
  && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/chml-sync/src/lib.rs \
  && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
@@ -28,12 +28,12 @@ RUN mkdir -p crates/chml-protocol/src crates/chml-protocol/benches \
  && echo 'pub fn _stub() {}' > app/chmlvpn-client/src/lib.rs \
  && echo 'fn main() {}' > app/chmlvpn-client/src/main.rs \
  && cargo build --release --locked -p chmlvpn-client \
- && rm -rf target/release/deps/chmlvpn_client* target/release/deps/chml_protocol* \
+ && rm -rf target/release/deps/chmlvpn_client* target/release/deps/flock_protocol* \
  && rm -f target/release/chmlvpn-client
 
-COPY crates/chml-protocol/src crates/chml-protocol/src
+COPY crates/flock-protocol/src crates/flock-protocol/src
 COPY app/chmlvpn-client/src app/chmlvpn-client/src
-RUN touch crates/chml-protocol/src/lib.rs app/chmlvpn-client/src/lib.rs \
+RUN touch crates/flock-protocol/src/lib.rs app/chmlvpn-client/src/lib.rs \
       app/chmlvpn-client/src/main.rs \
  && cargo build --release --locked -p chmlvpn-client
 

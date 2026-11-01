@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use chml_protocol::session::ServerIdentity;
+use flock_protocol::session::ServerIdentity;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 

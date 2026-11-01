@@ -7,7 +7,7 @@ repository.workspace = true
 description = "ChmlVPN 客户端装配（docs/design.md §2.3/§3.12/§7-M3）：tun 适配（TunDevice 接缝）+ 接入器退避/端点轮询 + IP 包 ↔ PacketChannel 数据面 + 路由配置"
 
 [dependencies]
-chml-protocol = { path = "../../crates/chml-protocol", features = ["anchor"] }
+flock-protocol = { path = "../../crates/flock-protocol", features = ["anchor"] }
 futures = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }

@@ -144,7 +144,7 @@ async fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
                     device_ed25519: device.ed25519,
                     expected_root_pub: *core.identity.root_pub.as_bytes(),
                     expected_cluster_id: core.identity.cluster_id.0,
-                    now_unix: chml_protocol::trust::now_unix(),
+                    now_unix: flock_protocol::trust::now_unix(),
                 })
                 .await
             {
@@ -161,8 +161,8 @@ async fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
                 .await
             {
                 Ok(row) => AdminResponse::DeviceAdded {
-                    device_id: chml_protocol::session::DeviceId(
-                        *chml_protocol::ed25519_dalek::VerifyingKey::from_bytes(&device.ed25519)
+                    device_id: flock_protocol::session::DeviceId(
+                        *flock_protocol::ed25519_dalek::VerifyingKey::from_bytes(&device.ed25519)
                             .expect("32B ed25519")
                             .as_bytes(),
                     )
@@ -173,7 +173,7 @@ async fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
             }
         }
         AdminRequest::Revoke { device } => {
-            let id = chml_protocol::session::DeviceId(device);
+            let id = flock_protocol::session::DeviceId(device);
             match net.revoke(&id).await {
                 Ok(epoch) => {
                     core.sessions.kill(&device);

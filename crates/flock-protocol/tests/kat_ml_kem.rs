@@ -20,11 +20,11 @@
 #[path = "kat_ml_kem_data.rs"]
 mod kat_ml_kem_data;
 
-use chml_protocol::kem;
-use chml_protocol::ml_kem::{
+use flock_protocol::kem;
+use flock_protocol::ml_kem::{
     ml_kem_768::MlKem768, Decapsulate, DecapsulationKey, EncapsulationKey, Key, KeyExport,
 };
-use chml_protocol::ml_kem::ExpandedKeyEncoding;
+use flock_protocol::ml_kem::ExpandedKeyEncoding;
 
 /// keyGen：seed(d‖z) → ek 逐字节复现官方向量。
 #[test]

@@ -16,7 +16,7 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 
-use chml_protocol::trust::InviteFile;
+use flock_protocol::trust::InviteFile;
 use chmlvpn_client::config::ClientConfig;
 use chmlvpn_client::connector::{self, Backoff, ClientError, ClientState, ConnEvent};
 use chmlvpn_client::route::{self, RoutePlan};
@@ -106,7 +106,7 @@ fn run_cli() -> Result<(), String> {
                 out,
                 "device-id={}",
                 hex::encode(
-                    chml_protocol::session::DeviceId::from_ed25519(&device.ed25519_public()).0
+                    flock_protocol::session::DeviceId::from_ed25519(&device.ed25519_public()).0
                 )
             );
             let _ = writeln!(out, "device-x={}", b64.encode(device.x25519_public().to_bytes()));
@@ -188,7 +188,7 @@ fn run_cli() -> Result<(), String> {
                     "chmlvpn-client: 守护启动（端点: {}）",
                     state.endpoints().join(", ")
                 );
-                connector::supervise(&state, &tun, chml_protocol::session::TunnelConfig::default(), Backoff::default(), |ev| {
+                connector::supervise(&state, &tun, flock_protocol::session::TunnelConfig::default(), Backoff::default(), |ev| {
                     match ev {
                         ConnEvent::Dialing { endpoint, attempt } => eprintln!(
                             "chmlvpn-client: 拨号 {endpoint}（attempt {attempt}）"

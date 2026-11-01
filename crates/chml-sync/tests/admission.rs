@@ -12,8 +12,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use chml_protocol::session::{DeviceStaticKeys, ServerEntry, ServerPin, TunnelConfig};
-use chml_protocol::trust::ClusterDirectory;
+use flock_protocol::session::{DeviceStaticKeys, ServerEntry, ServerPin, TunnelConfig};
+use flock_protocol::trust::ClusterDirectory;
 use chml_sync::wire::Fabric;
 use common::{bootstrap, sid, TestCluster};
 
@@ -35,7 +35,7 @@ async fn rogue_handshake(
     target: NodeId,
     pin_root: &ed25519_dalek::SigningKey,
     claimed_entry: ServerEntry,
-) -> Result<chml_protocol::session::Tunnel, chml_protocol::session::SessionError> {
+) -> Result<flock_protocol::session::Tunnel, flock_protocol::session::SessionError> {
     let fabric =
         chml_sync::testutil::MemoryFabric::new(sid(0xABCD), &c.reg, common::RTT_HALF, 1024 * 1024);
     let io = fabric.dial(&sid(target)).await.expect("dial");
@@ -45,7 +45,7 @@ async fn rogue_handshake(
         cluster_root_pub: pin_root.verifying_key(),
         entry: claimed_entry,
     };
-    chml_protocol::session::initiate(io, &rogue, &pin, TunnelConfig::default()).await
+    flock_protocol::session::initiate(io, &rogue, &pin, TunnelConfig::default()).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -56,7 +56,7 @@ async fn rogue_without_credential_rejected_at_handshake() {
 
     // 无凭证：rogue 持随机设备密钥，对真 entry（公开材料可拼出）发起——
     // 应答侧 PeerDirectory 只认根签目录内的身份 ⇒ 握手层拒。对发起端表现为不透明的
-    // 连接终止（chml-protocol 的时序对齐设计：DeviceRejected 不外泄具体原因）。
+    // 连接终止（flock-protocol 的时序对齐设计：DeviceRejected 不外泄具体原因）。
     let target = c.node_of(2);
     let before = target.rejected_handshakes();
     let _ = rogue_handshake(&c, 2, &c.fx.root, target.entry().clone())
@@ -353,7 +353,7 @@ async fn rewrap_requires_root_and_targets_new_server() {
     // 有根签名 ⇒ 封装副本 +1 可观测（wraps 集内出现 node4 条目）。
     let secret = b"opaque-oprf-key-material-32-bytes!!!";
     let mut wrapped = Vec::new();
-    chml_protocol::envelope::seal_v2(&n4.entry.static_hybrid_pub, &secret[..], &mut wrapped)
+    flock_protocol::envelope::seal_v2(&n4.entry.static_hybrid_pub, &secret[..], &mut wrapped)
         .expect("seal");
     let before = {
         let v = c.nodes[writer]
@@ -388,7 +388,7 @@ async fn rewrap_requires_root_and_targets_new_server() {
     // 新服务器能取出并以自己的私钥开封（真实拿到 OPRF key 副本）。
     // node4 不在本测试集群进程内——用其身份材料在本地验证（envelope v2 往返）。
     let mut opened = Vec::new();
-    chml_protocol::envelope::open_v2(&n4.static_hybrid, &wrapped[..], &mut opened).expect("open");
+    flock_protocol::envelope::open_v2(&n4.static_hybrid, &wrapped[..], &mut opened).expect("open");
     assert_eq!(opened, secret);
 
     // 票据根跨节点一致（TicketIssuer 已随第一部分落地——此处复证新目录节点可验）。

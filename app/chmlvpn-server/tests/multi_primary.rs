@@ -16,14 +16,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chml_protocol::mux::Prio;
-use chml_protocol::pake::server_setup_new;
-use chml_protocol::session::{
+use flock_protocol::mux::Prio;
+use flock_protocol::pake::server_setup_new;
+use flock_protocol::session::{
     initiate, DeviceId, DeviceStaticKeys, ServerEntry, ServerId, ServerPin, Tunnel, TunnelConfig,
 };
-use chml_protocol::sig::UserKey;
-use chml_protocol::trust::{InviteFile, PinStore, PinVerdict};
-use chml_protocol::{ed25519_dalek, rand};
+use flock_protocol::sig::UserKey;
+use flock_protocol::trust::{InviteFile, PinStore, PinVerdict};
+use flock_protocol::{ed25519_dalek, rand};
 use chml_sync::hooks::HookRecorder;
 use chml_sync::proto::{NodeId, SyncRequest};
 use chml_sync::testutil::MemoryFabric;
@@ -48,10 +48,10 @@ fn sid(n: NodeId) -> ServerId {
 
 struct Node3 {
     root: ed25519_dalek::SigningKey,
-    cluster_id: chml_protocol::session::ClusterId,
+    cluster_id: flock_protocol::session::ClusterId,
     nodes: Vec<Arc<SyncNode>>,
-    idents: Vec<Arc<chml_protocol::session::ServerIdentity>>,
-    directory: chml_protocol::trust::ClusterDirectory,
+    idents: Vec<Arc<flock_protocol::session::ServerIdentity>>,
+    directory: flock_protocol::trust::ClusterDirectory,
     #[allow(dead_code)] // 保留观察面（apply 钩子记录器）
     recorders: Vec<Arc<HookRecorder>>,
     _tmp: tempfile::TempDir,
@@ -59,12 +59,12 @@ struct Node3 {
 
 async fn build_cluster() -> Node3 {
     let root = ed25519_dalek::SigningKey::from_bytes(&rand::random::<[u8; 32]>());
-    let cluster_id = chml_protocol::session::ClusterId(rand::random());
+    let cluster_id = flock_protocol::session::ClusterId(rand::random());
     let voters: Vec<NodeId> = vec![1, 2, 3];
-    let idents: Vec<Arc<chml_protocol::session::ServerIdentity>> = voters
+    let idents: Vec<Arc<flock_protocol::session::ServerIdentity>> = voters
         .iter()
         .map(|n| {
-            Arc::new(chml_protocol::session::ServerIdentity::enroll(
+            Arc::new(flock_protocol::session::ServerIdentity::enroll(
                 &root,
                 cluster_id,
                 sid(*n),
@@ -73,7 +73,7 @@ async fn build_cluster() -> Node3 {
         })
         .collect();
     let entries: Vec<ServerEntry> = idents.iter().map(|i| i.entry.clone()).collect();
-    let directory = chml_protocol::trust::ClusterDirectory::issue(&root, cluster_id, 1, entries);
+    let directory = flock_protocol::trust::ClusterDirectory::issue(&root, cluster_id, 1, entries);
 
     let reg = MemoryFabric::registry();
     let tmp = tempfile::tempdir().expect("tmpdir");
@@ -223,12 +223,12 @@ async fn connect(device: &DeviceStaticKeys, pin: &ServerPin) -> Tunnel {
 
 mod cli {
     use super::*;
-    use chml_protocol::sig as sr_sig;
+    use flock_protocol::sig as sr_sig;
     use chmlvpn_server::control::{recv_ctrl_msg, send_ctrl_msg, CtrlRequest, CtrlResponse};
 
     pub struct Ctrl {
         pub tunnel: Tunnel,
-        stream: chml_protocol::mux::Stream,
+        stream: flock_protocol::mux::Stream,
     }
 
     impl Ctrl {
@@ -248,7 +248,7 @@ mod cli {
         /// 设置口令（PwBegin/PwCommit——复制形态 SetPassword）。
         pub async fn set_password(&mut self, user: &str, pw: &str) -> CtrlResponse {
             let mut rng = rand::rngs::OsRng;
-            let (state, m1) = chml_protocol::pake::reg_start(&mut rng, pw, user).unwrap();
+            let (state, m1) = flock_protocol::pake::reg_start(&mut rng, pw, user).unwrap();
             let resp = self
                 .req(CtrlRequest::PwBegin {
                     user: user.into(),
@@ -259,7 +259,7 @@ mod cli {
                 panic!("pw begin shape: {resp:?}")
             };
             let record =
-                chml_protocol::pake::reg_finish(&mut rng, state, pw, user, &m2_b64).unwrap();
+                flock_protocol::pake::reg_finish(&mut rng, state, pw, user, &m2_b64).unwrap();
             self.req(CtrlRequest::PwCommit {
                 record_b64: record,
                 profile: 0,
@@ -275,7 +275,7 @@ mod cli {
             pin: &ServerPin,
         ) -> Result<(TicketWire, [u8; 16]), String> {
             let mut rng = rand::rngs::OsRng;
-            let (state, ke1) = chml_protocol::pake::login_start(&mut rng, pw, user).unwrap();
+            let (state, ke1) = flock_protocol::pake::login_start(&mut rng, pw, user).unwrap();
             let resp = self
                 .req(CtrlRequest::LoginBegin {
                     user: user.into(),
@@ -360,7 +360,7 @@ mod cli {
 
     /// SR-SIG1 授权头（§1.3.2 七字段）。
     fn sr_auth(user: &str, key: &UserKey) -> chmlvpn_server::control::SrAuth {
-        let now = chml_protocol::trust::now_unix() as i64;
+        let now = flock_protocol::trust::now_unix() as i64;
         let nonce = sr_sig::nonce_hex();
         chmlvpn_server::control::SrAuth {
             header: sr_sig::sign_prehashed(
@@ -419,7 +419,7 @@ async fn three_node_cluster_forward_and_revocation() {
 
     // —— 开户（Raft 提交：redeem 在 server-2 侧发起，server-1 侧可读）——
     let invite_id: [u8; 16] = rand::random();
-    let expiry = chml_protocol::trust::now_unix() + 3600;
+    let expiry = flock_protocol::trust::now_unix() + 3600;
     c3.nodes[0]
         .write(SyncRequest::RecordInvite {
             invite_id,
@@ -451,7 +451,7 @@ async fn three_node_cluster_forward_and_revocation() {
             device_ed25519: *dev_a.ed25519_public().as_bytes(),
             expected_root_pub: *c3.root.verifying_key().as_bytes(),
             expected_cluster_id: c3.cluster_id.0,
-            now_unix: chml_protocol::trust::now_unix(),
+            now_unix: flock_protocol::trust::now_unix(),
         })
         .await
         .expect("redeem A（经 server-2，Raft 提交）");
@@ -467,7 +467,7 @@ async fn three_node_cluster_forward_and_revocation() {
             device_ed25519: *dev_b.ed25519_public().as_bytes(),
             expected_root_pub: *c3.root.verifying_key().as_bytes(),
             expected_cluster_id: c3.cluster_id.0,
-            now_unix: chml_protocol::trust::now_unix(),
+            now_unix: flock_protocol::trust::now_unix(),
         })
         .await;
     assert!(
@@ -482,7 +482,7 @@ async fn three_node_cluster_forward_and_revocation() {
     c3.nodes[1]
         .write(SyncRequest::RecordInvite {
             invite_id: invite2_id,
-            expiry_unix: chml_protocol::trust::now_unix() + 3600,
+            expiry_unix: flock_protocol::trust::now_unix() + 3600,
         })
         .await
         .expect("record invite 2");
@@ -491,7 +491,7 @@ async fn three_node_cluster_forward_and_revocation() {
         c3.cluster_id,
         c3.directory.dir_version,
         c3.directory.servers.clone(),
-        chml_protocol::trust::now_unix() + 3600,
+        flock_protocol::trust::now_unix() + 3600,
         invite2_id,
     );
     let out_b = s1
@@ -504,7 +504,7 @@ async fn three_node_cluster_forward_and_revocation() {
             device_ed25519: *dev_b.ed25519_public().as_bytes(),
             expected_root_pub: *c3.root.verifying_key().as_bytes(),
             expected_cluster_id: c3.cluster_id.0,
-            now_unix: chml_protocol::trust::now_unix(),
+            now_unix: flock_protocol::trust::now_unix(),
         })
         .await
         .expect("redeem B（经 server-1）");

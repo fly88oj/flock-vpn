@@ -11,7 +11,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chml_protocol::session::ServerId;
+use flock_protocol::session::ServerId;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use tokio::io::DuplexStream;

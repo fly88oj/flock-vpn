@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chml_protocol::session::{DeviceDirectory, DeviceId, LookupVerdict};
+use flock_protocol::session::{DeviceDirectory, DeviceId, LookupVerdict};
 use futures::future::BoxFuture;
 use tokio::sync::watch;
 

@@ -1,4 +1,4 @@
-# chml-protocol
+# flock-protocol
 
 ChmlVPN 与 showroom 共享的协议契约层（`docs/design.md` §1）：混合 KEM、文件信封 v2、
 SR-SIG1、OPAQUE、压缩档位、隧道会话（session）、复用（mux）、首登信任锚（trust）。
@@ -58,10 +58,10 @@ feature 矩阵（§1.3.1）：默认＝全 VPN 档；`legacy`（信封 v1 只读
 ## 构建/门禁（§7-M1）
 
 ```sh
-cargo test -p chml-protocol --all-features          # 全量测试
-cargo clippy -p chml-protocol --all-features -- -D warnings
-cargo bench -p chml-protocol --bench aead           # 末行机读：BENCH_AESGCM_4M <数值> GB/s（门槛 ≥4）
-cargo check -p chml-protocol --no-default-features --features legacy,wasm --target wasm32-unknown-unknown
+cargo test -p flock-protocol --all-features          # 全量测试
+cargo clippy -p flock-protocol --all-features -- -D warnings
+cargo bench -p flock-protocol --bench aead           # 末行机读：BENCH_AESGCM_4M <数值> GB/s（门槛 ≥4）
+cargo check -p flock-protocol --no-default-features --features legacy,wasm --target wasm32-unknown-unknown
 ```
 
 wasm32 构建前置：需一个**带 WebAssembly 后端的 clang**（zstd-sys C 源交叉编译）。

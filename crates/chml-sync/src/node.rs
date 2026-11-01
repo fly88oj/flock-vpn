@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chml_protocol::session::ServerIdentity;
-use chml_protocol::trust::ClusterDirectory;
+use flock_protocol::session::ServerIdentity;
+use flock_protocol::trust::ClusterDirectory;
 use futures::future::BoxFuture;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::{BasicNode, Raft};
@@ -293,13 +293,13 @@ fn ic_peer_ids(ic: &Interconnect) -> Vec<NodeId> {
 }
 
 /// ServerId([u8;16]) ↔ NodeId(u64)（前 8B 大端）。
-pub fn node_id_of(sid: &chml_protocol::session::ServerId) -> NodeId {
+pub fn node_id_of(sid: &flock_protocol::session::ServerId) -> NodeId {
     u64::from_be_bytes(sid.0[..8].try_into().expect("8B"))
 }
 
 pub(crate) struct NodeInner {
     pub id: NodeId,
-    pub entry: chml_protocol::session::ServerEntry,
+    pub entry: flock_protocol::session::ServerEntry,
     pub raft: Raft<SyncConfig>,
     pub sm: Arc<SmCore>,
     pub lag: Arc<LagMonitor>,
@@ -562,7 +562,7 @@ impl SyncNode {
     }
 
     /// 本机入群凭证公开部分（ServerEntry——server_keys/rewrap 封装目标等用）。
-    pub fn entry(&self) -> &chml_protocol::session::ServerEntry {
+    pub fn entry(&self) -> &flock_protocol::session::ServerEntry {
         &self.inner.entry
     }
 

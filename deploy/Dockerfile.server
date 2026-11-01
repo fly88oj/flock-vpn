@@ -10,26 +10,26 @@
 # GLIBC_2.x 取决于构建段基底；rust:1.98-slim 当前=trixie(glibc 2.41)，而运行段若用
 # bookworm(2.36) 会 crash（GLIBC_2.39 not found）——两侧显式钉 bookworm。
 FROM rust:1.98-slim-bookworm AS builder
-# zstd-sys（chml-protocol 默认档）含 C 源，需要 gcc
+# zstd-sys（flock-protocol 默认档）含 C 源，需要 gcc
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates/chml-protocol/Cargo.toml crates/chml-protocol/
+COPY crates/flock-protocol/Cargo.toml crates/flock-protocol/
 COPY crates/chml-frpc/Cargo.toml crates/chml-frpc/
 COPY crates/chml-sync/Cargo.toml crates/chml-sync/
 COPY app/chmlvpn-server/Cargo.toml app/chmlvpn-server/
 # chmlvpn-server 依赖 chmlvpn-client（M3 数据面：TunDevice/route 接缝复用，§2.2/§3.12）。
 COPY app/chmlvpn-client/Cargo.toml app/chmlvpn-client/
 # —— 依赖层（stub 源）——
-# stub benches/aead.rs：chml-protocol manifest 声明 [[bench]]，cargo 解析 manifest
+# stub benches/aead.rs：flock-protocol manifest 声明 [[bench]]，cargo 解析 manifest
 # 需该文件存在（依赖层不编译 bench 本体）。
-RUN mkdir -p crates/chml-protocol/src crates/chml-protocol/benches \
+RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
              crates/chml-frpc/src crates/chml-sync/src \
              app/chmlvpn-server/src app/chmlvpn-client/src \
- && echo 'pub fn _stub() {}' > crates/chml-protocol/src/lib.rs \
- && echo 'fn main() {}' > crates/chml-protocol/benches/aead.rs \
+ && echo 'pub fn _stub() {}' > crates/flock-protocol/src/lib.rs \
+ && echo 'fn main() {}' > crates/flock-protocol/benches/aead.rs \
  && echo 'pub fn _stub() {}' > crates/chml-frpc/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/chml-sync/src/lib.rs \
  && echo 'pub fn _stub() {}' > app/chmlvpn-server/src/lib.rs \
@@ -38,19 +38,19 @@ RUN mkdir -p crates/chml-protocol/src crates/chml-protocol/benches \
  && echo 'fn main() {}' > app/chmlvpn-client/src/main.rs \
  && cargo build --release --locked -p chmlvpn-server \
  && rm -rf target/release/deps/chmlvpn_server* target/release/deps/chmlvpn_server_lib* \
-          target/release/deps/chmlvpn_client* target/release/deps/chml_protocol* \
+          target/release/deps/chmlvpn_client* target/release/deps/flock_protocol* \
           target/release/deps/chml_frpc* target/release/deps/chml_sync* \
  && rm -f target/release/chmlvpn-server target/release/chmlvpn-client
 
 # —— 源码层 ——
 # server_features：构建档（e2e 多主拓扑传 "multi-primary"——§6.2 M5；缺省空 = 单服）。
 ARG server_features=""
-COPY crates/chml-protocol/src crates/chml-protocol/src
+COPY crates/flock-protocol/src crates/flock-protocol/src
 COPY crates/chml-frpc/src crates/chml-frpc/src
 COPY crates/chml-sync/src crates/chml-sync/src
 COPY app/chmlvpn-client/src app/chmlvpn-client/src
 COPY app/chmlvpn-server/src app/chmlvpn-server/src
-RUN touch crates/chml-protocol/src/lib.rs crates/chml-frpc/src/lib.rs \
+RUN touch crates/flock-protocol/src/lib.rs crates/chml-frpc/src/lib.rs \
       crates/chml-sync/src/lib.rs \
       app/chmlvpn-client/src/lib.rs app/chmlvpn-client/src/main.rs \
       app/chmlvpn-server/src/lib.rs app/chmlvpn-server/src/main.rs \

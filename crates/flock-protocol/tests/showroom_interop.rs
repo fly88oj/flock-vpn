@@ -13,7 +13,7 @@
 //! （3.0.0 样本验签 / seal 产物解封），已合并到该文件（ponytail 去重）；JSON 中的
 //! sig/envelope_v1 字段保留作生成记录。
 
-use chml_protocol::pake;
+use flock_protocol::pake;
 use rand::rngs::OsRng;
 
 const VECTOR: &str = include_str!("vectors/showroom-3.0.0.json");

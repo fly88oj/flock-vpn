@@ -7,7 +7,7 @@ repository.workspace = true
 description = "ChmlVPN 服务端装配（单服形态）：TCP :9443 E2E 会话 + 控制流（OPAQUE 登录锚/票据/设备注册表）+ ListenerMode 直连|frp（docs/design.md §2.2/§3.11/§7-M2）"
 
 [dependencies]
-chml-protocol = { path = "../../crates/chml-protocol", features = ["anchor"] }
+flock-protocol = { path = "../../crates/flock-protocol", features = ["anchor"] }
 chml-frpc = { path = "../../crates/chml-frpc" }
 # M4 多主同步（§3.10/§4）：Raft 状态机 + 两级读目录 + 租约/转发承载 + Raft 内票据根。
 # 可选档（feature `multi-primary`）——单服部署（m2/m2-direct 形态）默认构建零依赖面。

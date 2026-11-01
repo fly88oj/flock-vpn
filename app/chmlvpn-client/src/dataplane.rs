@@ -17,7 +17,7 @@ use std::io;
 use std::pin::pin;
 use std::task::Poll;
 
-use chml_protocol::mux::{send_packet, PacketChannel};
+use flock_protocol::mux::{send_packet, PacketChannel};
 use futures::io::AsyncRead as _;
 
 use crate::tun::TunSession;
@@ -126,13 +126,13 @@ pub async fn bridge(sess: &mut TunSession, ch: PacketChannel) -> io::Result<()> 
 pub(crate) mod testutil {
     use std::sync::Arc;
 
-    use chml_protocol::ed25519_dalek::SigningKey;
-    use chml_protocol::session::{
+    use flock_protocol::ed25519_dalek::SigningKey;
+    use flock_protocol::session::{
         respond, ClusterId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, ServerId,
         ServerIdentity, TunnelConfig,
     };
-    use chml_protocol::trust::ClusterDirectory;
-    use chml_protocol::{rand, mux::PacketChannel};
+    use flock_protocol::trust::ClusterDirectory;
+    use flock_protocol::{rand, mux::PacketChannel};
 
     /// respond 侧真材料 + 设备注册表 + 每流回显 + 会话级 kill 开关。
     /// `chunked = true`：每个回显帧拆成「帧头 → 250ms 间隔 → 帧体」两段下发——
@@ -241,7 +241,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use chml_protocol::session::{
+    use flock_protocol::session::{
         respond, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, TunnelConfig,
     };
 
@@ -260,7 +260,7 @@ mod tests {
 
         let device = DeviceStaticKeys::generate();
         peer.register(&device);
-        let pin = chml_protocol::session::ServerPin {
+        let pin = flock_protocol::session::ServerPin {
             cluster_id: peer.directory.cluster_id,
             cluster_root_pub: peer.root.verifying_key(),
             entry: peer.directory.servers[0].clone(),
@@ -268,10 +268,10 @@ mod tests {
 
         // 隧道 + 首流控制占位 + 包通道（与 supervise 的排序契约一致）。
         let io = tokio::net::TcpStream::connect(&ep).await.unwrap();
-        let tunnel = chml_protocol::session::initiate(io, &device, &pin, TunnelConfig::default())
+        let tunnel = flock_protocol::session::initiate(io, &device, &pin, TunnelConfig::default())
             .await
             .expect("1-RTT initiate");
-        let _control_hold = tunnel.open_stream(chml_protocol::mux::Prio::Control).await.unwrap();
+        let _control_hold = tunnel.open_stream(flock_protocol::mux::Prio::Control).await.unwrap();
         let ch = tunnel.open_packet_channel().await.unwrap();
 
         // mock tun + 桥任务。
@@ -327,16 +327,16 @@ mod tests {
 
         let device = DeviceStaticKeys::generate();
         peer.register(&device);
-        let pin = chml_protocol::session::ServerPin {
+        let pin = flock_protocol::session::ServerPin {
             cluster_id: peer.directory.cluster_id,
             cluster_root_pub: peer.root.verifying_key(),
             entry: peer.directory.servers[0].clone(),
         };
         let io = tokio::net::TcpStream::connect(&ep).await.unwrap();
-        let tunnel = chml_protocol::session::initiate(io, &device, &pin, TunnelConfig::default())
+        let tunnel = flock_protocol::session::initiate(io, &device, &pin, TunnelConfig::default())
             .await
             .expect("1-RTT initiate");
-        let _control_hold = tunnel.open_stream(chml_protocol::mux::Prio::Control).await.unwrap();
+        let _control_hold = tunnel.open_stream(flock_protocol::mux::Prio::Control).await.unwrap();
         let ch = tunnel.open_packet_channel().await.unwrap();
 
         let mock = Arc::new(MockTunDevice::open(&TunSpec::default()).unwrap());
@@ -385,7 +385,7 @@ mod tests {
         let peer = EchoPeer::new("127.0.0.1:9443");
         let device = DeviceStaticKeys::generate();
         peer.register(&device);
-        let pin = chml_protocol::session::ServerPin {
+        let pin = flock_protocol::session::ServerPin {
             cluster_id: peer.directory.cluster_id,
             cluster_root_pub: peer.root.verifying_key(),
             entry: peer.directory.servers[0].clone(),
@@ -418,7 +418,7 @@ mod tests {
         });
         let tunnel = tokio::time::timeout(
             Duration::from_secs(5),
-            chml_protocol::session::initiate(a, &device, &pin, TunnelConfig::default()),
+            flock_protocol::session::initiate(a, &device, &pin, TunnelConfig::default()),
         )
         .await;
         let tunnel = match tunnel {
@@ -440,10 +440,10 @@ mod tests {
 
     /// 控制流占位打开（首流排序契约；返回持有句柄防止过早 Drop）。
     async fn t_open_hold(
-        tunnel: &chml_protocol::session::Tunnel,
-    ) -> chml_protocol::mux::Stream {
+        tunnel: &flock_protocol::session::Tunnel,
+    ) -> flock_protocol::mux::Stream {
         tunnel
-            .open_stream(chml_protocol::mux::Prio::Control)
+            .open_stream(flock_protocol::mux::Prio::Control)
             .await
             .expect("control stream")
     }

@@ -12,14 +12,14 @@
 
 use std::time::Duration;
 
-use chml_protocol::mux::Prio;
-use chml_protocol::session::{
+use flock_protocol::mux::Prio;
+use flock_protocol::session::{
     fingerprint_ed25519, initiate, initiate_tofu, respond, AeadChoice, AeadPreference, ClusterId,
     CloseReason, DeviceId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory,
     ManualClock, ServerIdentity, ServerId, ServerPin, SessionError, Tunnel, TunnelConfig,
     RT_DATA, RT_I0, RT_I1, RT_R1, RT_REKEY_RESP,
 };
-use chml_protocol::{ed25519_dalek, rand};
+use flock_protocol::{ed25519_dalek, rand};
 
 use ed25519_dalek::SigningKey;
 
@@ -220,7 +220,7 @@ async fn pinned_handshake_over_tcp_pair() {
         .await
         .expect("accept timeout")
         .expect("stream");
-    let mut spc = chml_protocol::mux::PacketChannel::from_stream(accepted);
+    let mut spc = flock_protocol::mux::PacketChannel::from_stream(accepted);
     let mut first = true;
     for size in [1usize, 1280, 60000] {
         let pkt: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
@@ -246,7 +246,7 @@ async fn packet_channel_recv_stream_and_finish() {
         .await
         .expect("accept")
         .expect("stream");
-    let mut spc = chml_protocol::mux::PacketChannel::from_stream(accepted);
+    let mut spc = flock_protocol::mux::PacketChannel::from_stream(accepted);
 
     // 双向包
 
@@ -1037,7 +1037,7 @@ async fn batch_resp_proxy(client_side: DuplexStream, server_side: DuplexStream) 
 }
 
 /// 双向数据泵：`total` 个 chunk（前 4B = LE 序号）。
-async fn bulk_send(mut s: chml_protocol::mux::Stream, total: usize, chunk: usize) {
+async fn bulk_send(mut s: flock_protocol::mux::Stream, total: usize, chunk: usize) {
     for i in 0..total {
         let mut b = vec![(i % 251) as u8; chunk];
         b[..4].copy_from_slice(&(i as u32).to_le_bytes());
@@ -1046,7 +1046,7 @@ async fn bulk_send(mut s: chml_protocol::mux::Stream, total: usize, chunk: usize
 }
 
 /// 收全 `total` 个 chunk：返回（收到字节数, 序号全覆盖）。
-async fn bulk_recv(mut s: chml_protocol::mux::Stream, total: usize, chunk: usize) -> (usize, bool) {
+async fn bulk_recv(mut s: flock_protocol::mux::Stream, total: usize, chunk: usize) -> (usize, bool) {
     let mut seen = vec![false; total];
     let mut bytes = 0usize;
     for _ in 0..total {

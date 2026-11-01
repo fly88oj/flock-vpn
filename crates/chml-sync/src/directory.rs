@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
-use chml_protocol::trust::ClusterDirectory;
+use flock_protocol::trust::ClusterDirectory;
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 
@@ -123,7 +123,7 @@ impl Directory {
     }
 
     /// 目录内全部条目（node_id → ServerEntry；供互连热更新）。
-    pub fn node_entries(&self) -> BTreeMap<u64, chml_protocol::session::ServerEntry> {
+    pub fn node_entries(&self) -> BTreeMap<u64, flock_protocol::session::ServerEntry> {
         let cur = self.cur.read().expect("dir").clone();
         let mut out = BTreeMap::new();
         if let Some(d) = cur {
@@ -151,15 +151,15 @@ impl std::fmt::Debug for Directory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chml_protocol::session::{ClusterId, ServerEntry, ServerId};
+    use flock_protocol::session::{ClusterId, ServerEntry, ServerId};
 
     fn entry(n: u8) -> ServerEntry {
         ServerEntry {
             server_id: ServerId([n; 16]),
             relay_endpoint: format!("n{n}.test:9443"),
             identity_pub: ed25519_dalek::SigningKey::from_bytes(&[n; 32]).verifying_key(),
-            static_hybrid_pub: chml_protocol::kem::HybridKeypair::generate(
-                &mut chml_protocol::rand::rngs::OsRng,
+            static_hybrid_pub: flock_protocol::kem::HybridKeypair::generate(
+                &mut flock_protocol::rand::rngs::OsRng,
             )
             .public(),
         }

@@ -290,13 +290,13 @@ fn hex32(s: &str) -> Result<[u8; 32], String> {
 
 /// root.seed（init-cluster 产物，hex 32B）→ 根签名钥（运维侧离线保管的物化）。
 #[cfg_attr(not(feature = "multi-primary"), allow(dead_code))]
-fn load_root_seed(path: &str) -> Result<chml_protocol::ed25519_dalek::SigningKey, String> {
+fn load_root_seed(path: &str) -> Result<flock_protocol::ed25519_dalek::SigningKey, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("读 {path}: {e}"))?;
     let bytes = hex::decode(text.trim()).map_err(|e| format!("root.seed hex: {e}"))?;
     let seed: [u8; 32] = bytes
         .try_into()
         .map_err(|v: Vec<u8>| format!("root.seed 期望 64 hex（32B），得 {}B", v.len()))?;
-    Ok(chml_protocol::ed25519_dalek::SigningKey::from_bytes(&seed))
+    Ok(flock_protocol::ed25519_dalek::SigningKey::from_bytes(&seed))
 }
 
 fn run_cli() -> Result<(), String> {
@@ -380,10 +380,10 @@ fn run_cli() -> Result<(), String> {
                 }
                 #[cfg(feature = "multi-primary")]
                 {
-                    use chml_protocol::ed25519_dalek::{Signature, Signer, Verifier};
+                    use flock_protocol::ed25519_dalek::{Signature, Signer, Verifier};
                     let root = load_root_seed(&root_seed)?;
                     // 票据密钥根：32B 随机（提交后全网共享；Bootstrap 幂等 ⇒ 重跑不换根）。
-                    let ticket_root: [u8; 32] = chml_protocol::rand::random();
+                    let ticket_root: [u8; 32] = flock_protocol::rand::random();
                     // 本机 ServerIdentity 的 cluster_id（bundle.bin；捆绑与根密钥同源）。
                     let cfg2 = cfg.clone();
                     let bundle_path = cfg2
@@ -402,7 +402,7 @@ fn run_cli() -> Result<(), String> {
                         ticket_root,
                     );
                     // SetOprf：共享 OPRF key（本进程生成；根签后全网可验——§2.4）。
-                    let oprf_b64 = chml_protocol::pake::server_setup_new(&mut chml_protocol::rand::rngs::OsRng);
+                    let oprf_b64 = flock_protocol::pake::server_setup_new(&mut flock_protocol::rand::rngs::OsRng);
                     let l_oprf: &[u8] = b"chml-sync/set-oprf/v1";
                     let mut canon = Vec::with_capacity(l_oprf.len() + 4 + oprf_b64.len());
                     canon.extend_from_slice(l_oprf);
@@ -477,8 +477,8 @@ fn run_cli() -> Result<(), String> {
                         .ok_or("捆绑文件解码失败")?;
                     let cluster_id = b.verify()?;
                     let dir = b.directory()?;
-                    let invite_id: [u8; 16] = chml_protocol::rand::random();
-                    let expiry = chml_protocol::trust::now_unix() + ttl_secs;
+                    let invite_id: [u8; 16] = flock_protocol::rand::random();
+                    let expiry = flock_protocol::trust::now_unix() + ttl_secs;
                     let record = chml_sync::proto::SyncRequest::RecordInvite {
                         invite_id,
                         expiry_unix: expiry,
@@ -499,7 +499,7 @@ fn run_cli() -> Result<(), String> {
                         }
                         _ => return Err("admin 响应形态不符".into()),
                     }
-                    let inv = chml_protocol::trust::InviteFile::issue(
+                    let inv = flock_protocol::trust::InviteFile::issue(
                         &root,
                         cluster_id,
                         dir.dir_version,

@@ -537,7 +537,7 @@ a7() {
 a8() {
     log "A8 单隧道多会话：100 并发 yamux 流持续 60s 无错（单测入口：session_mux ignored 档）"
     local out
-    out="$(cd "$REPO" && cargo test -p chml-protocol --test session_mux hundred_streams -- --ignored --nocapture 2>&1)"
+    out="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux hundred_streams -- --ignored --nocapture 2>&1)"
     printf '%s\n' "$out" | grep -E 'A8:|test hundred|test result' | sed 's/^/    /'
     # 判据必须是**真执行**：具名测试 ok + "N passed" 且 N≥1——空跑（0 passed，如
     # --ignored 配无 ignore 标记的历史缺陷）绝不得记 PASS。
@@ -656,7 +656,7 @@ a11() {
     printf '    zeros=%sB random=%sB（内层各 4MiB=4194304B）\n' "$bytes0" "$bytesR"
 
     local unit
-    unit="$(cd "$REPO" && cargo test -p chml-protocol --lib compress 2>&1 | grep 'test result')"
+    unit="$(cd "$REPO" && cargo test -p flock-protocol --lib compress 2>&1 | grep 'test result')"
     printf '    %s\n' "$unit"
 
     local ok_wire=0 ok_unit=0
@@ -680,8 +680,8 @@ a11() {
 a12() {
     log "A12 抗重放：replayed_record_rejected_and_counted + forge 限额（单测入口复跑）"
     local out1 out2
-    out1="$(cd "$REPO" && cargo test -p chml-protocol --test session_mux replayed_record 2>&1)"
-    out2="$(cd "$REPO" && cargo test -p chml-protocol --test session_mux forge 2>&1)"
+    out1="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux replayed_record 2>&1)"
+    out2="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux forge 2>&1)"
     printf '%s\n' "$out1$out2" | grep -E 'test .*(replay|forge)' | sed 's/^/    /'
     local n_ok n_all
     n_ok="$(printf '%s\n' "$out1$out2" | grep -c 'test result: ok')"

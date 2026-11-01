@@ -399,7 +399,7 @@ impl NetStateData {
         let Some(cluster) = self.cluster.clone() else {
             return ApplyOutcome::err(StateError::NotBootstrapped);
         };
-        let invite = match chml_protocol::trust::InviteFile::from_bytes(invite_bytes) {
+        let invite = match flock_protocol::trust::InviteFile::from_bytes(invite_bytes) {
             Ok(i) => i,
             Err(e) => return ApplyOutcome::err(StateError::BadInvite(e.to_string())),
         };
@@ -655,18 +655,18 @@ mod tests {
         let root = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
         let mut d = bootstrapped(&root);
         // 邀请 fixture（根签 v3）。
-        let entry = chml_protocol::session::ServerEntry {
-            server_id: chml_protocol::session::ServerId([1; 16]),
+        let entry = flock_protocol::session::ServerEntry {
+            server_id: flock_protocol::session::ServerId([1; 16]),
             relay_endpoint: "127.0.0.1:9443".into(),
             identity_pub: ed25519_dalek::SigningKey::from_bytes(&[5; 32]).verifying_key(),
-            static_hybrid_pub: chml_protocol::kem::HybridKeypair::generate(
-                &mut chml_protocol::rand::rngs::OsRng,
+            static_hybrid_pub: flock_protocol::kem::HybridKeypair::generate(
+                &mut flock_protocol::rand::rngs::OsRng,
             )
             .public(),
         };
-        let inv = chml_protocol::trust::InviteFile::issue(
+        let inv = flock_protocol::trust::InviteFile::issue(
             &root,
-            chml_protocol::session::ClusterId([7; 16]),
+            flock_protocol::session::ClusterId([7; 16]),
             1,
             vec![entry],
             999_999,

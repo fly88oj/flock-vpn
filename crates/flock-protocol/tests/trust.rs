@@ -8,15 +8,15 @@
 
 use std::time::Duration;
 
-use chml_protocol::session::{
+use flock_protocol::session::{
     initiate, initiate_tofu, respond, DeviceRecord, DeviceStaticKeys, InMemoryDirectory,
     ServerIdentity, ServerId, TunnelConfig, RT_I1,
 };
-use chml_protocol::trust::{
+use flock_protocol::trust::{
     confirm_tofu_and_pin, load_invite, save_invite, ClusterDirectory, InviteFile, PinStore,
     PinVerdict, TrustError, INVITE_DEFAULT_TTL_SECS,
 };
-use chml_protocol::{ed25519_dalek, rand};
+use flock_protocol::{ed25519_dalek, rand};
 
 use ed25519_dalek::SigningKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -58,7 +58,7 @@ struct Cluster {
 
 fn cluster_of(n: usize) -> Cluster {
     let root = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
-    let cluster_id = chml_protocol::session::ClusterId(rand::random());
+    let cluster_id = flock_protocol::session::ClusterId(rand::random());
     let mut servers = Vec::new();
     let mut entries = Vec::new();
     for i in 0..n {
@@ -76,7 +76,7 @@ fn cluster_of(n: usize) -> Cluster {
 }
 
 /// 单端点 1-RTT 对拨：pin 来自目录条目；断言首帧 == I1 且数据回显可用。
-async fn endpoint_1rtt(cluster: &Cluster, idx: usize, device: &DeviceStaticKeys) -> chml_protocol::session::Tunnel {
+async fn endpoint_1rtt(cluster: &Cluster, idx: usize, device: &DeviceStaticKeys) -> flock_protocol::session::Tunnel {
     let entry = cluster.directory.servers[idx].clone();
     let server = &cluster.servers[idx];
 
@@ -90,11 +90,11 @@ async fn endpoint_1rtt(cluster: &Cluster, idx: usize, device: &DeviceStaticKeys)
     let (proxy_s, server_io) = duplex_pair();
     let probe = first_frame_probe(proxy_c, proxy_s).await;
 
-    let server_ident = chml_protocol::session::ServerIdentity {
+    let server_ident = flock_protocol::session::ServerIdentity {
         cluster_id: server.cluster_id,
         server_id: server.server_id,
         identity: SigningKey::from_bytes(&server.identity.to_bytes()),
-        static_hybrid: chml_protocol::kem::HybridKeypair::from_bytes(&server.static_hybrid.to_bytes()).expect("sk"),
+        static_hybrid: flock_protocol::kem::HybridKeypair::from_bytes(&server.static_hybrid.to_bytes()).expect("sk"),
         entry: server.entry.clone(),
         root_pub: server.root_pub,
         entry_sig: server.entry_sig,
@@ -105,7 +105,7 @@ async fn endpoint_1rtt(cluster: &Cluster, idx: usize, device: &DeviceStaticKeys)
             .expect("respond timeout")
             .expect("respond")
     });
-    let pin = chml_protocol::session::ServerPin {
+    let pin = flock_protocol::session::ServerPin {
         cluster_id: cluster.directory.cluster_id,
         cluster_root_pub: cluster.root.verifying_key(),
         entry,
@@ -128,7 +128,7 @@ async fn endpoint_1rtt(cluster: &Cluster, idx: usize, device: &DeviceStaticKeys)
     assert_eq!(first, RT_I1, "端点 {idx}：任意端点均 1-RTT，I0 不得出现");
 
     // 守门断言 2：握手后数据面可用
-    let mut cs = client.open_stream(chml_protocol::mux::Prio::Normal).await.expect("open");
+    let mut cs = client.open_stream(flock_protocol::mux::Prio::Normal).await.expect("open");
     let msg = format!("endpoint-{idx}");
     cs.write_all(msg.as_bytes()).await.expect("write");
     let mut ss = tokio::time::timeout(Duration::from_secs(5), server_tunnel.accept_stream())
@@ -149,7 +149,7 @@ async fn invite_multi_endpoint_all_1rtt() {
     let device = DeviceStaticKeys::generate();
 
     // 邀请文件 v3 落盘/读回
-    let now = chml_protocol::trust::now_unix();
+    let now = flock_protocol::trust::now_unix();
     let invite = InviteFile::issue(
         &cluster.root,
         cluster.directory.cluster_id,
@@ -180,7 +180,7 @@ async fn invite_file_rejects_tampered_and_old_versions() {
         cluster.directory.cluster_id,
         1,
         cluster.directory.servers.clone(),
-        chml_protocol::trust::now_unix() + 3600,
+        flock_protocol::trust::now_unix() + 3600,
         [7; 16],
     );
     let bytes = invite.to_bytes();
@@ -222,11 +222,11 @@ async fn tofu_bootstrap_lands_in_pinstore() {
 
     // 首连 TOFU：confirm_tofu_and_pin 落钉扎
     let (a, b) = duplex_pair();
-    let server_ident = chml_protocol::session::ServerIdentity {
+    let server_ident = flock_protocol::session::ServerIdentity {
         cluster_id: server.cluster_id,
         server_id: server.server_id,
         identity: SigningKey::from_bytes(&server.identity.to_bytes()),
-        static_hybrid: chml_protocol::kem::HybridKeypair::from_bytes(&server.static_hybrid.to_bytes()).expect("sk"),
+        static_hybrid: flock_protocol::kem::HybridKeypair::from_bytes(&server.static_hybrid.to_bytes()).expect("sk"),
         entry: server.entry.clone(),
         root_pub: server.root_pub,
         entry_sig: server.entry_sig,
@@ -251,7 +251,7 @@ async fn tofu_bootstrap_lands_in_pinstore() {
         "TOFU 确认后根公钥已钉扎"
     );
     assert_eq!(
-        chml_protocol::session::fingerprint_ed25519(pins.pinned_root(&cluster.directory.cluster_id).unwrap()),
+        flock_protocol::session::fingerprint_ed25519(pins.pinned_root(&cluster.directory.cluster_id).unwrap()),
         expected_fp,
         "钉扎的即展示指纹的本体"
     );

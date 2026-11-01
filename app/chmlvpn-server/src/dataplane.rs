@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
-use chml_protocol::mux::{send_packet, PacketChannel, Stream};
+use flock_protocol::mux::{send_packet, PacketChannel, Stream};
 use chmlvpn_client::dataplane::{FrameBuf, READ_CHUNK};
 use futures::io::AsyncRead as _;
 use tokio::sync::mpsc;
@@ -497,15 +497,15 @@ mod tests {
     ///    不得删除新登记——新流下行必须照常（旧代码下该设备下行黑洞）。
     #[tokio::test]
     async fn serve_stream_inbound_check_outbound_and_reregistration_race() {
-        use chml_protocol::session::{
+        use flock_protocol::session::{
             respond, ClusterId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, ServerId,
             ServerIdentity, TunnelConfig,
         };
-        use chml_protocol::trust::ClusterDirectory;
+        use flock_protocol::trust::ClusterDirectory;
         use std::time::Duration;
 
         // respond 侧材料 + 已注册设备（与客户端测试 harness 同构）。
-        let root = chml_protocol::ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
         let identity = ServerIdentity::enroll(&root, ClusterId([7; 16]), ServerId([1; 16]), "t:1");
         let directory =
             ClusterDirectory::issue(&root, identity.cluster_id, 1, vec![identity.entry.clone()]);
@@ -515,7 +515,7 @@ mod tests {
             device_x25519: device.x25519_public(),
             device_ed25519: device.ed25519_public(),
         });
-        let pin = chml_protocol::session::ServerPin {
+        let pin = flock_protocol::session::ServerPin {
             cluster_id: directory.cluster_id,
             cluster_root_pub: root.verifying_key(),
             entry: directory.servers[0].clone(),
@@ -534,7 +534,7 @@ mod tests {
                 }
             }
         });
-        let tunnel = chml_protocol::session::initiate(a, &device, &pin, TunnelConfig::default())
+        let tunnel = flock_protocol::session::initiate(a, &device, &pin, TunnelConfig::default())
             .await
             .expect("initiate");
 
@@ -553,7 +553,7 @@ mod tests {
 
         // 控制占位 + 通道 1（惰性 SYN：首数据帧触发服务端 accept 产出流）。
         let _hold = tunnel
-            .open_stream(chml_protocol::mux::Prio::Control)
+            .open_stream(flock_protocol::mux::Prio::Control)
             .await
             .unwrap();
         let mut ch1 = tunnel.open_packet_channel().await.unwrap();

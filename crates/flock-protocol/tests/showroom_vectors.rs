@@ -21,7 +21,7 @@ const SIG_TS: i64 = 1_700_000_000;
 
 #[test]
 fn showroom_sig_vector_byte_exact() {
-    use chml_protocol::sig;
+    use flock_protocol::sig;
 
     let seed: [u8; 32] = hex::decode(SIG_SEED_HEX).unwrap().try_into().unwrap();
     let k = sig::UserKey::from_seed(&seed);
@@ -60,7 +60,7 @@ fn showroom_sig_vector_byte_exact() {
 
 #[cfg(feature = "legacy")]
 mod v1 {
-    use chml_protocol::envelope::{open_v1_legacy, KEY_LEN, NONCE_LEN, SEG, TAG_LEN, WRAP_LEN};
+    use flock_protocol::envelope::{open_v1_legacy, KEY_LEN, NONCE_LEN, SEG, TAG_LEN, WRAP_LEN};
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::RsaPrivateKey;
     use std::io::Cursor;

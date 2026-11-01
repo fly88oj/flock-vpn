@@ -19,11 +19,11 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::Duration;
 
-use chml_protocol::rand;
-use chml_protocol::session::{
+use flock_protocol::rand;
+use flock_protocol::session::{
     initiate, CloseReason, DeviceStaticKeys, ServerPin, Tunnel, TunnelConfig,
 };
-use chml_protocol::trust::{ClusterDirectory, InviteFile, PinStore, PinVerdict, TrustError};
+use flock_protocol::trust::{ClusterDirectory, InviteFile, PinStore, PinVerdict, TrustError};
 use tokio::net::TcpStream;
 
 use crate::dataplane;
@@ -46,7 +46,7 @@ pub const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 #[derive(Debug)]
 pub enum ClientError {
     Io(io::Error),
-    Session(chml_protocol::session::SessionError),
+    Session(flock_protocol::session::SessionError),
     Trust(TrustError),
     /// 状态目录/配置问题（消息自带上下文）。
     State(String),
@@ -77,8 +77,8 @@ impl From<TrustError> for ClientError {
     }
 }
 
-impl From<chml_protocol::session::SessionError> for ClientError {
-    fn from(e: chml_protocol::session::SessionError) -> Self {
+impl From<flock_protocol::session::SessionError> for ClientError {
+    fn from(e: flock_protocol::session::SessionError) -> Self {
         ClientError::Session(e)
     }
 }
@@ -216,7 +216,7 @@ fn write_keys(state_dir: &Path, device: &DeviceStaticKeys) -> Result<(), ClientE
 /// Mismatch **显式告警拒绝**）→ `record_directory`（版本回退拒收）→ 落盘三件套。
 pub fn ingest_invite(state_dir: &Path, invite: &InviteFile) -> Result<ClientState, ClientError> {
     invite
-        .check(chml_protocol::trust::now_unix())
+        .check(flock_protocol::trust::now_unix())
         .map_err(ClientError::Trust)?;
     let device = ClientState::load_keys(state_dir, true)?;
     let mut pins = match std::fs::read(state_dir.join(PINS)) {
@@ -339,7 +339,7 @@ pub enum ConnEvent {
     /// 正在尝试某端点（attempt 从 1 起）。
     Dialing { endpoint: String, attempt: u32 },
     /// 隧道建立（server = 对端服务器标识）。
-    Connected { endpoint: String, server: chml_protocol::session::ServerId },
+    Connected { endpoint: String, server: flock_protocol::session::ServerId },
     /// 数据面结束（reason = 会话层终止原因；None = 通道 IO 错误先于会话判定）。
     SessionEnded { endpoint: String, reason: Option<CloseReason> },
 }
@@ -373,7 +373,7 @@ pub async fn supervise(
                 // 首流 = 控制流（排序契约，见模块文档）：M3 不发控制业务，占位并**持有到
                 // 会话结束**（保序 + 防止过早 Drop 引入的流生命周期变量）。
                 // 控制流打不开 ⇒ 会话已坏，直接走退避（不得让包通道变成首流破坏分派）。
-                let control = match tunnel.open_stream(chml_protocol::mux::Prio::Control).await {
+                let control = match tunnel.open_stream(flock_protocol::mux::Prio::Control).await {
                     Ok(s) => s,
                     Err(_) => {
                         events(ConnEvent::SessionEnded { endpoint: endpoint.clone(), reason: tunnel.stats().closed });
@@ -446,7 +446,7 @@ mod tests {
     use super::*;
     use crate::dataplane::testutil::EchoPeer;
     use crate::tun::{MockTunDevice, TunDevice as _, TunIo, TunSpec};
-    use chml_protocol::trust::PinStore;
+    use flock_protocol::trust::PinStore;
 
     /// 守护循环集成：连接 → 数据面 → 对端拆链 → SessionEnded → 退避 → 重连成功
     /// （A9 客户端语义「检测进入重连」的宿主可跑对应物；静默死链计时在会话层 M1
@@ -585,22 +585,22 @@ mod tests {
         assert!(empty.next_endpoint().is_none());
     }
 
-    fn invite_fixture(root: &chml_protocol::ed25519_dalek::SigningKey, ttl: u64) -> chml_protocol::trust::InviteFile {
-        use chml_protocol::session::{ClusterId, ServerEntry, ServerId};
-        let identity = chml_protocol::ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+    fn invite_fixture(root: &flock_protocol::ed25519_dalek::SigningKey, ttl: u64) -> flock_protocol::trust::InviteFile {
+        use flock_protocol::session::{ClusterId, ServerEntry, ServerId};
+        let identity = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
         let entry = ServerEntry {
             server_id: ServerId([9; 16]),
             relay_endpoint: "frps.test:27500".into(),
             identity_pub: identity.verifying_key(),
-            static_hybrid_pub: chml_protocol::kem::HybridKeypair::generate(&mut rand::rngs::OsRng)
+            static_hybrid_pub: flock_protocol::kem::HybridKeypair::generate(&mut rand::rngs::OsRng)
                 .public(),
         };
-        chml_protocol::trust::InviteFile::issue(
+        flock_protocol::trust::InviteFile::issue(
             root,
             ClusterId([7; 16]),
             1,
             vec![entry],
-            chml_protocol::trust::now_unix() + ttl,
+            flock_protocol::trust::now_unix() + ttl,
             [5; 16],
         )
     }
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn ingest_invite_pins_root_and_persists_state() {
         let dir = tempfile::tempdir().unwrap();
-        let root = chml_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
         let inv = invite_fixture(&root, 3600);
         let state = ingest_invite(dir.path(), &inv).expect("落地");
         assert_eq!(state.endpoints(), vec!["frps.test:27500".to_string()]);
@@ -630,9 +630,9 @@ mod tests {
     #[test]
     fn ingest_invite_rejects_expired_and_root_change() {
         let dir = tempfile::tempdir().unwrap();
-        let root = chml_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
         // 过期拒。
-        let expired = chml_protocol::trust::InviteFile {
+        let expired = flock_protocol::trust::InviteFile {
             expiry_unix: 1,
             ..invite_fixture(&root, 3600)
         };
@@ -642,9 +642,9 @@ mod tests {
         );
         // 根变更：先钉 A，再拿 B 签的邀请 ⇒ RootChanged（显式告警，不静默）。
         ingest_invite(dir.path(), &invite_fixture(&root, 3600)).expect("首钉");
-        let other = chml_protocol::ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
+        let other = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
         match ingest_invite(dir.path(), &invite_fixture(&other, 3600)) {
-            Err(ClientError::Trust(chml_protocol::trust::TrustError::RootChanged { .. })) => {}
+            Err(ClientError::Trust(flock_protocol::trust::TrustError::RootChanged { .. })) => {}
             other_res => panic!("期望 RootChanged，得 {other_res:?}"),
         }
     }
@@ -660,7 +660,7 @@ mod tests {
         ));
         // VIP 解析：config 覆盖优先；缺省读 vip 文件。
         let state = {
-            let root = chml_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+            let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
             ingest_invite(dir.path(), &invite_fixture(&root, 3600)).unwrap()
         };
         assert_eq!(

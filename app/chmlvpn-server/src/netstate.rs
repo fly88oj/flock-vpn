@@ -19,8 +19,8 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
 
-use chml_protocol::session::{DeviceId, DeviceRecord, LookupVerdict};
-use chml_protocol::{ed25519_dalek, x25519_dalek};
+use flock_protocol::session::{DeviceId, DeviceRecord, LookupVerdict};
+use flock_protocol::{ed25519_dalek, x25519_dalek};
 use ed25519_dalek::VerifyingKey;
 use futures::future::BoxFuture;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -765,7 +765,7 @@ impl NetState for StateStore {
     fn redeem_invite(&self, req: RedeemRequest<'_>) -> Result<RedeemOutcome, RedeemError> {
         let device_id: [u8; 32] = Sha256::digest(req.device_ed25519).into();
         // 根签名/结构校验 + 本集群身份钉死，先于任何状态触碰。
-        let invite = chml_protocol::trust::InviteFile::from_bytes(req.invite_bytes)
+        let invite = flock_protocol::trust::InviteFile::from_bytes(req.invite_bytes)
             .map_err(|e| RedeemError::BadInvite(e.to_string()))?;
         if !invite.verify() {
             return Err(RedeemError::BadInvite("root signature mismatch".into()));
@@ -909,7 +909,7 @@ impl NetState for StateStore {
 /// session::DeviceDirectory 适配（respond 侧注入，§3.5 lookup 接缝）。
 pub struct DirAdapter(pub Arc<StateStore>);
 
-impl chml_protocol::session::DeviceDirectory for DirAdapter {
+impl flock_protocol::session::DeviceDirectory for DirAdapter {
     fn lookup(&self, id: &DeviceId) -> BoxFuture<'static, LookupVerdict> {
         let v = NetState::lookup(&*self.0, id);
         Box::pin(async move { v })
@@ -923,9 +923,9 @@ impl chml_protocol::session::DeviceDirectory for DirAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chml_protocol::session::{ClusterId, ServerEntry, ServerId};
-    use chml_protocol::trust::InviteFile;
-    use chml_protocol::{rand, sig::UserKey};
+    use flock_protocol::session::{ClusterId, ServerEntry, ServerId};
+    use flock_protocol::trust::InviteFile;
+    use flock_protocol::{rand, sig::UserKey};
     use ed25519_dalek::SigningKey;
 
     fn store() -> StateStore {
@@ -938,7 +938,7 @@ mod tests {
             server_id: ServerId([7; 16]),
             relay_endpoint: "127.0.0.1:9443".into(),
             identity_pub: SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            static_hybrid_pub: chml_protocol::kem::HybridKeypair::generate(&mut rand::rngs::OsRng)
+            static_hybrid_pub: flock_protocol::kem::HybridKeypair::generate(&mut rand::rngs::OsRng)
                 .public(),
         };
         let inv = InviteFile::issue(

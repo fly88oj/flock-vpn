@@ -14,8 +14,8 @@
 //! 在异步派发路径内是死锁陷阱，故门面在装配层异步化（`§1.3.3c` lookup 接缝本就要求
 //! BoxFuture 的同一理由）。
 
-use chml_protocol::ed25519_dalek::VerifyingKey;
-use chml_protocol::session::{DeviceId, LookupVerdict};
+use flock_protocol::ed25519_dalek::VerifyingKey;
+use flock_protocol::session::{DeviceId, LookupVerdict};
 use futures::future::BoxFuture;
 
 use crate::netstate::{

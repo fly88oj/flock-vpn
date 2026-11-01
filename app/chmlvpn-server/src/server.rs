@@ -10,14 +10,14 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 
-use chml_protocol::ed25519_dalek::{Signer, SigningKey};
-use chml_protocol::kem::HybridKeypair;
-use chml_protocol::pake::{server_setup_load, server_setup_new, Suite};
-use chml_protocol::rand;
-use chml_protocol::session::{
+use flock_protocol::ed25519_dalek::{Signer, SigningKey};
+use flock_protocol::kem::HybridKeypair;
+use flock_protocol::pake::{server_setup_load, server_setup_new, Suite};
+use flock_protocol::rand;
+use flock_protocol::session::{
     respond, sign_server_entry, ClusterId, ServerEntry, ServerId, ServerIdentity, TunnelConfig,
 };
-use chml_protocol::trust::ClusterDirectory;
+use flock_protocol::trust::ClusterDirectory;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -143,7 +143,7 @@ pub struct ServerCore {
     pub identity: ServerIdentity,
     /// OPAQUE 服务端 OPRF key（§2.4：常驻；轮换使全部 pass.opaque 失效。
     /// 多主形态 = Raft 内共享（SetOprf 根签登记）——OPAQUE 记录全网可验）。
-    pub oprf: chml_protocol::opaque_ke::ServerSetup<Suite>,
+    pub oprf: flock_protocol::opaque_ke::ServerSetup<Suite>,
     /// 票据权威（Local = 状态库种子；Sync = Raft 内票据根，任何服务器都验得了）。
     pub guard: CtrlGuard,
     /// 本地会话表（Arc：SyncHooks 装配侧共享——apply 回调杀会话/租约冲突踢出）。
@@ -313,7 +313,7 @@ impl ServerCore {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
-        let oprf = chml_protocol::pake::server_setup_load(&oprf_b64)
+        let oprf = flock_protocol::pake::server_setup_load(&oprf_b64)
             .map_err(|e| format!("集群 OPRF key: {e}"))?;
         let sessions = Arc::new(LiveSessions::default());
         node.sm().register_hook(Arc::new(ServerSyncHooks {
@@ -324,10 +324,10 @@ impl ServerCore {
         let identity = ServerIdentity {
             cluster_id: src.cluster_id,
             server_id: src.server_id,
-            identity: chml_protocol::ed25519_dalek::SigningKey::from_bytes(
+            identity: flock_protocol::ed25519_dalek::SigningKey::from_bytes(
                 &src.identity.to_bytes(),
             ),
-            static_hybrid: chml_protocol::kem::HybridKeypair::from_bytes(
+            static_hybrid: flock_protocol::kem::HybridKeypair::from_bytes(
                 &src.static_hybrid.to_bytes(),
             )
             .map_err(|e| e.to_string())?,
@@ -395,13 +395,13 @@ impl ServerCore {
             return Err("多主形态邀请签发需集群根密钥（运维侧 init-cluster 产物）".into());
         };
         let invite_id: [u8; 16] = rand::random();
-        let expiry = chml_protocol::trust::now_unix() + ttl_secs;
+        let expiry = flock_protocol::trust::now_unix() + ttl_secs;
         self.net
             .record_invite(&invite_id, expiry)
             .await
             .map_err(|e| e.to_string())?;
         let dir = self.build_directory();
-        let inv = chml_protocol::trust::InviteFile::issue(
+        let inv = flock_protocol::trust::InviteFile::issue(
             root,
             self.identity.cluster_id,
             dir.dir_version,

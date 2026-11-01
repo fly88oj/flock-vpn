@@ -1,4 +1,4 @@
-//! # chml-protocol
+//! # flock-protocol
 //!
 //! ChmlVPN 与 showroom 共享的协议契约层（docs/design.md §1）。本批次（M1 session/mux）交付：
 //!

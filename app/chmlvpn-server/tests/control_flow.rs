@@ -12,20 +12,20 @@
 
 mod common;
 
-use chml_protocol::pake::login_start;
-use chml_protocol::rand;
-use chml_protocol::session::{
+use flock_protocol::pake::login_start;
+use flock_protocol::rand;
+use flock_protocol::session::{
     fingerprint_ed25519, initiate, initiate_tofu, DeviceId, DeviceStaticKeys, ServerPin,
     SessionError, TunnelConfig,
 };
-use chml_protocol::sig as sr_sig;
-use chml_protocol::sig::UserKey;
-use chml_protocol::trust::{confirm_tofu_and_pin, InviteFile, PinStore, PinVerdict};
+use flock_protocol::sig as sr_sig;
+use flock_protocol::sig::UserKey;
+use flock_protocol::trust::{confirm_tofu_and_pin, InviteFile, PinStore, PinVerdict};
 use chmlvpn_server::control::{client_login_finish_anchored, CtrlError, CtrlResponse, DeviceOp};
 use common::{connect, pin_from_invite, pin_with_root, CtrlClient, TestServer};
 
 fn now() -> i64 {
-    chml_protocol::trust::now_unix() as i64
+    flock_protocol::trust::now_unix() as i64
 }
 
 fn dev_id(d: &DeviceStaticKeys) -> [u8; 32] {

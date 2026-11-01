@@ -16,7 +16,7 @@
 
 ## 0. 设计总览
 
-一句话：**ChmlVPN = showroom 协议层的「升级档位化抽库」+ 长寿命隧道会话层 + 接入端点（Direct 缺省 / FRP 中转可选）+ openraft 多主多活控制面**。协议层抽成独立库 `chml-protocol`（深模块：文件信封/签名/认证/会话/复用/压缩/信任锚七个小接口藏大实现），ChmlVPN 与 showroom 两项目共用；VPN 特有的 tun 适配、frpc 托管、多主同步以「接缝 + 适配器」形式落在协议库外圈的 ChmlVPN workspace crate 里。
+一句话：**ChmlVPN = showroom 协议层的「升级档位化抽库」+ 长寿命隧道会话层 + 接入端点（Direct 缺省 / FRP 中转可选）+ openraft 多主多活控制面**。协议层抽成独立库 `flock-protocol`（深模块：文件信封/签名/认证/会话/复用/压缩/信任锚七个小接口藏大实现），ChmlVPN 与 showroom 两项目共用；VPN 特有的 tun 适配、frpc 托管、多主同步以「接缝 + 适配器」形式落在协议库外圈的 ChmlVPN workspace crate 里。
 
 **硬约束（用户令，最高优先级，覆盖任何相反表述）**：ChmlVPN **不得与 frp/chmlfrp 强绑定**。frp 只服务于「服务端无公网 IP 或客户端无法直连服务端 IP」的场景；服务端可直连时**不执行任何 frp 相关逻辑**（无 frpc 子进程、无配置生成）——listener mode 缺省 = `Direct`，`Frp` 是可选适配器而非前提（§2.1/§2.2/§3.11/§5）。
 
@@ -29,7 +29,7 @@
 └──────────────────────────────────────────┼────────────────────────┘
                                             │ 单条 TCP（密文；路径=接入端点：
                                             │  Direct 直连 或 经 FRP 中转）
-┌─ chml-protocol（会话层）──────────────────┼───────────────────────┐
+┌─ flock-protocol（会话层）──────────────────┼───────────────────────┐
 │ SecureStream(记录层: 计数器nonce AEAD+抗重放+rekey) ← yamux 跑在加密内 │
 │ 握手: 已钉扎 1-RTT Noise-IK / TOFU 首连 2-RTT；X25519+ML-KEM-768 混合 │
 │       KEM + 服务端身份签名（邀请文件携带静态混合公钥）                  │
@@ -46,19 +46,19 @@
 
 ---
 
-## 1. 共享协议库：`chml-protocol`
+## 1. 共享协议库：`flock-protocol`
 
 ### 1.1 名字与落位
 
-- **crate 名**：`chml-protocol`（lib 名 `chml_protocol`）。
-- **落位**：本仓库 workspace member，`E:\Works\ChmlVPN\crates\chml-protocol`。
+- **crate 名**：`flock-protocol`（lib 名 `flock_protocol`）。
+- **落位**：本仓库 workspace member，`E:\Works\ChmlVPN\crates\flock-protocol`。
   workspace 布局：
 
   ```
   E:\Works\ChmlVPN\
   ├── Cargo.toml            # workspace root（成员见下）
   ├── crates/
-  │   ├── chml-protocol/    # ★ 共享协议库（ChmlVPN 与 showroom 两边引用）
+  │   ├── flock-protocol/    # ★ 共享协议库（ChmlVPN 与 showroom 两边引用）
   │   ├── chml-frpc/        # frpc 子进程托管双栈（ChmlVPN 专用）
   │   └── chml-sync/        # openraft 状态机 + gossip 租约（ChmlVPN 专用）
   ├── app/
@@ -77,18 +77,18 @@
 
 双轨引用，开发期零摩擦、生产期可钉版：
 
-1. **ChmlVPN（本仓库）**：workspace path 成员依赖 `chml-protocol = { path = "crates/chml-protocol" }`。
+1. **ChmlVPN（本仓库）**：workspace path 成员依赖 `flock-protocol = { path = "crates/flock-protocol" }`。
 2. **showroom（外部仓库）**：git 依赖钉 tag：
-   `chml-protocol = { git = "<ChmlVPN 仓库 URL>", tag = "chml-protocol-v0.1.0", default-features = false, features = ["legacy", "wasm"] }`；
+   `flock-protocol = { git = "<ChmlVPN 仓库 URL>", tag = "flock-protocol-v0.1.0", default-features = false, features = ["legacy", "wasm"] }`；
    开发期在 showroom 仓库 `.cargo/config.toml` 用 `[patch."<git-url>"]` 覆盖为本地路径
-   `path = "../ChmlVPN/crates/chml-protocol"`（标准 patch 工作流，showroom 不改 Cargo.toml 即可本地联调）。
+   `path = "../ChmlVPN/crates/flock-protocol"`（标准 patch 工作流，showroom 不改 Cargo.toml 即可本地联调）。
 3. **发布策略**：阶段一 git+tag（够用、无发布仪式）；若 showroom CI 或第三方需要，阶段二
    发 crates.io（许可 Apache-2.0 OR MIT，与 RustCrypto 生态一致，crypto-2026 §5）。
    版本纪律：showroom-common 的 `pub use {ed25519_dalek, rsa}`「版本收口」语义保留
-   （showroom-analysis §2 再导出注意点）——chml-protocol 继续再导出其锁定的 dalek/x25519-dalek 等，
+   （showroom-analysis §2 再导出注意点）——flock-protocol 继续再导出其锁定的 dalek/x25519-dalek 等，
    两项目不得另引版本。
 
-showroom 的迁移面（兼容保留，见 §1.3）：`showroom-common` 改为对 `chml-protocol` 的薄再导出
+showroom 的迁移面（兼容保留，见 §1.3）：`showroom-common` 改为对 `flock-protocol` 的薄再导出
 （保留全部既有 pub 项签名），showroomctl/showroom 源码零改动。此迁移本身属 showroom 侧工作，
 本仓库只保证接口可替换；不在本设计交付范围（本仓库不写 showroom 代码）。
 
@@ -493,34 +493,34 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
 每个 spec：**接口**（调用方需知的一切）· **接缝**（接口落点、谁可替换）· **实现要点**。
 深模块检验：接口方法数 ≤5、安全前提进类型/契约、删除测试（删掉则复杂度回到 N 个调用方）。
 
-### 3.1 `chml-protocol::kem`（混合 KEM 原语）
+### 3.1 `flock-protocol::kem`（混合 KEM 原语）
 - **接口**：`HybridKeypair/HybridPubkey/HybridCt` 三类型 + `encapsulate/decapsulate/fingerprint`
   三函数（§1.3.3a）。
 - **接缝**：KEM 算法槽位——`trait KemGroup` 内部缝（X25519、ML-KEM-768 各一实现），未来
   换 ML-KEM-1024/纯 PQ 不动调用方。
 - **实现要点**：ml-kem 0.3.3 + x25519-dalek 3.0.0；HKDF 合流；`legacy` 下 RSA-OAEP 只读。
 
-### 3.2 `chml-protocol::envelope`（文件信封 v1/v2）
+### 3.2 `flock-protocol::envelope`（文件信封 v1/v2）
 - **接口**：`seal_v2(recipient, plain_reader, out) -> SealInfo`、`open_v2(sk, in, out)`、
   `open_v1_legacy(rsa_sk, in, out)`；SealInfo 含 envelope_id/段数/总长。
 - **接缝**：封装算法（头的 ver 字节分派 v1/v2）；段 AAD 构造为内部实现细节。
 - **实现要点**：v2 头 1137B（§1.3.3b）；流式恒定内存（沿用 showroom seal/open 缓冲模型，
   showroom-analysis §4.1）；AAD=ver‖id‖seg_idx‖is_final；长度不变量测试（v1 的测试思想平移）。
 
-### 3.3 `chml-protocol::sig`（SR-SIG1 + 密钥档案）
+### 3.3 `flock-protocol::sig`（SR-SIG1 + 密钥档案）
 - **接口**：v1 兼容五函数（§1.3.2）+ `KeyProfile::verify_dispatch(kid)`（kid→Ed25519/ML-DSA）。
 - **接缝**：kid 算法分派表——`ProfileKey` enum 扩展新算法零调用方改动。
 - **实现要点**：ed25519-dalek 3.0.0；预哈希流式签名保留；`pq-sign` off by default
   （ml-dsa 0.1.1 未审计，crypto-2026 §5——如实标注）。
 
-### 3.4 `chml-protocol::pake`（OPAQUE + 身份锚）
+### 3.4 `flock-protocol::pake`（OPAQUE + 身份锚）
 - **接口**：showroom 兼容函数族 + `login_finish_anchored(...) -> (SessionSeed, ServerIdentity)`
   （`anchor` feature）；`rwd(pw, user, profile)`。
 - **接缝**：argon2 profile 参数化（版本化升级不破老记录）；锚签名层可开关（showroom 先关）。
 - **实现要点**：opaque-ke 4.0.1；固定向量互通测试（3.0.0 记录样本 → 4.0.1 可解，M1 守门）；
   RFC 引用 9807；dummy 假记录防枚举保留。
 
-### 3.5 `chml-protocol::session`（会话/记录层/握手）
+### 3.5 `flock-protocol::session`（会话/记录层/握手）
 - **接口**：`initiate/respond(async)/Tunnel{async open_stream, async open_packet_channel, stats}`
   （§1.3.3c）；握手双形态：已钉扎 1-RTT / TOFU 首连 2-RTT 引导。
 - **接缝**：`trait DeviceDirectory: fn lookup(&self, &DeviceId) -> BoxFuture<LookupVerdict>`
@@ -532,7 +532,7 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
   I1 全字段 + 协议上下文（cluster_id/期望身份指纹）——防 UKS，M1 有对应失败向量**；
   transcript 哈希链 + 测试向量（M1）；严格递增计数校验 + 窗口结构留 UDP 路径。
 
-### 3.6 `chml-protocol::mux`（yamux 承载与包通道）
+### 3.6 `flock-protocol::mux`（yamux 承载与包通道）
 - **接口**：`Stream`（AsyncRead/Write + 显式 `finish()`）、`PacketChannel::send(pkt)/recv_stream()`、
   `Prio` 调度档。
 - **接缝**：复用器实现——`trait Multiplexer` 内部缝（yamux 适配器为唯一首发实现；第二个
@@ -540,13 +540,13 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
 - **实现要点**：rust-yamux 0.14.1 跑在 SecureStream 内；控制流 stream 0 高优先级；
   keepalive = yamux ping 10s；FIN 表达单向结束（禁半关闭）。
 
-### 3.7 `chml-protocol::compress`（压缩档位）
+### 3.7 `flock-protocol::compress`（压缩档位）
 - **接口**：`CompressPolicy` + `compress_frame/decompress_frame`（§1.3.3e）。
 - **接缝**：策略档位（Off/Interactive/Bulk/Archive）+ 字典版本协商（dictID 进握手扩展）。
 - **实现要点**：zstd 0.14.3（Windows/MSVC 已证可编译，compression-2026 §5）+ lz4_flex 0.14；
   非膨胀回退 MUST；默认 Off + 填充联动。
 
-### 3.8 `chml-protocol::trust`（TOFU/邀请）
+### 3.8 `flock-protocol::trust`（TOFU/邀请）
 - **接口**：`PinStore`（钉扎粒度 = cluster_id → 集群根公钥）、`InviteFile`（v3：根签
   ClusterDirectory 全套服务器接入材料 + 一次性 invite_id + expiry 默认 7 天，§1.3.3f）、
   `ClusterDirectory/ServerEntry`（= §4 入群凭证公开部分；`access_endpoint` = 接入端点——
@@ -791,11 +791,11 @@ CI 校验 `rustc --version` ≥1.98）；若追求更稳可用完整版 `rust:1-
 
 ## 7. 里程碑拆分（每个有可验证完成标准）
 
-### M1 协议库（crates/chml-protocol）
+### M1 协议库（crates/flock-protocol）
 范围：§1.3 全部档位 + 兼容面 + feature 矩阵；upgradeList 落位 P0-1/2/3/4/5、P1-6/7/8/9/10、
 P2-11/12/13（协议库部分）。
 完成标准（全部可跑）：
-- `cargo test -p chml-protocol --all-features` 全绿，其中必须包含：
+- `cargo test -p flock-protocol --all-features` 全绿，其中必须包含：
   - OPAQUE 向量：showroom 3.0.0 生成的注册记录/登录样本在 4.0.1 下互通（P2-11 守门）；
   - 信封 v1 只读兼容：showroom `seal` 产物被 `open_v1_legacy` 解开且长度不变量断言通过（P0-1 兼容档）；
   - 信封 v2 AAD：段重排/拼接/删尾用例必须失败（P0-3）；
@@ -811,9 +811,9 @@ P2-11/12/13（协议库部分）。
   - trust：钉扎变更触发告警路径；邀请文件 v3 结构向量——根签名不匹配/目录条目被篡改/
     dir_version 回退 → 拒载入；同一根公钥下**多端点 ServerEntry 各自可完成 1-RTT 封装**
     （多服务器钉扎模型 §1.3.3f 的守门用例）（P0-5）。
-- `cargo bench -p chml-protocol --bench aead`：aes-gcm 0.11.1 @4MiB ≥ 4 GB/s
+- `cargo bench -p flock-protocol --bench aead`：aes-gcm 0.11.1 @4MiB ≥ 4 GB/s
   （本机旧内核基线 2.2，P1-6 的 2.3× 预期下限）。
-- `cargo clippy -p chml-protocol --all-features -- -D warnings` 通过。
+- `cargo clippy -p flock-protocol --all-features -- -D warnings` 通过。
 
 ### M2 服务端（app/chmlvpn-server + chml-frpc，单服形态）
 范围：监听器（ListenerMode：Direct 缺省 / Frp）/控制流/OPAQUE 登录+锚/设备注册（本地
@@ -1033,3 +1033,5 @@ ChmlFrp 节点）；移动端（Android/iOS）真机（M3 后独立排期，接�
      client-3 直连；A13 收窄为仅 Frp 形态 server-a/b；新增 A16（Direct 会话连通 + 容器内
      无 frp 进程 + Direct↔Frp 跨服转发同构）；M5 断言范围 A1–A16；R 表新增 R26（本约束
      消除的风险）。A2/A5/A15 语义核对不受影响（client-1/2 的接入映射与跨服路径未变）。
+
+- 2026-11-01 命名调整：chml-protocol → flock-protocol（协议层独立于 chml/frp 品牌；flock=雁群，小型分布式网络意象；行为零变化）。

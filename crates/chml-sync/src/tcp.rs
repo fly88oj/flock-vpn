@@ -45,7 +45,7 @@ impl TcpFabric {
 impl Fabric for TcpFabric {
     fn dial(
         &self,
-        target: &chml_protocol::session::ServerId,
+        target: &flock_protocol::session::ServerId,
     ) -> BoxFuture<'static, io::Result<PeerIo>> {
         // ServerId ↔ NodeId 逆映射（前 8B 大端——与 wire::sid_of 成对）。
         let mut b = [0u8; 8];

@@ -12,7 +12,7 @@
 //! - [`sm`]：状态机适配器 + **apply 回调钩子**（吊销 → 杀本地会话/清拒票据）+
 //!   测试用 apply 滞后注入。
 //! - [`wire`]：Raft 网络传输——**服务器-服务器 profile 的 E2E 会话**（复用
-//!   chml-protocol session/trust：双向入群凭证认证，无凭证即拒）+ RPC 帧分发 +
+//!   flock-protocol session/trust：双向入群凭证认证，无凭证即拒）+ RPC 帧分发 +
 //!   **apply-lag 熔断**（§4 读与缓存）。
 //! - [`dir`]：`session::DeviceDirectory` 两级读实现（记录缓存 + epoch + lag 熔断降级
 //!   线性一致读）。

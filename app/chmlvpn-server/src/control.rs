@@ -23,15 +23,15 @@
 //! 控制流 = 隧道内首条 yamux 流（客户端 `open_stream(Prio::Control)`；服务端按流 id=1
 //! 分派）。每条消息 = `[u32 LE len][postcard CtrlRequest/CtrlResponse]`。
 
-use chml_protocol::opaque_ke;
-use chml_protocol::pake::{
+use flock_protocol::opaque_ke;
+use flock_protocol::pake::{
     anchor_sign, login_finish_anchored, server_login_finish, server_login_start, server_reg_start,
     AnchorExpectation, Profile as PakeProfile,
 };
-use chml_protocol::rand;
-use chml_protocol::session::DeviceId;
-use chml_protocol::sig;
-use chml_protocol::{ed25519_dalek, x25519_dalek};
+use flock_protocol::rand;
+use flock_protocol::session::DeviceId;
+use flock_protocol::sig;
+use flock_protocol::{ed25519_dalek, x25519_dalek};
 use ed25519_dalek::{Signature, Verifier};
 use serde::{Deserialize, Serialize};
 
@@ -447,7 +447,7 @@ pub async fn serve_control<S: futures::io::AsyncRead + futures::io::AsyncWrite +
 
 async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlResponse {
     let net = &core.net;
-    let now_unix = chml_protocol::trust::now_unix();
+    let now_unix = flock_protocol::trust::now_unix();
     match req {
         CtrlRequest::Hello { ver } => {
             if ver != CTRL_PROTO_VERSION {
@@ -481,7 +481,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                 return err(CtrlError::NotAuthorized);
             };
             // 记录侧规范化（解码验证）。
-            let canonical = match chml_protocol::pake::server_reg_canonical(&record_b64) {
+            let canonical = match flock_protocol::pake::server_reg_canonical(&record_b64) {
                 Ok(c) => c,
                 Err(_) => return err(CtrlError::Internal),
             };
@@ -502,7 +502,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             let record = net
                 .password(&user)
                 .await
-                .and_then(|(r, _)| chml_protocol::pake::server_record_from_b64(&r).ok());
+                .and_then(|(r, _)| flock_protocol::pake::server_record_from_b64(&r).ok());
             match server_login_start(
                 &mut rand::rngs::OsRng,
                 &core.oprf,
@@ -858,7 +858,7 @@ pub struct AnchorLoginExpectation {
 
 /// 客户端 anchor 版 login-finish 封装（tests/smoke 共用）。
 pub fn client_login_finish_anchored(
-    state: opaque_ke::ClientLogin<chml_protocol::pake::Suite>,
+    state: opaque_ke::ClientLogin<flock_protocol::pake::Suite>,
     pw: &str,
     user: &str,
     ke2_b64: &str,
@@ -890,8 +890,8 @@ mod tests {
     use crate::backend::NetBackend;
     use crate::netstate::{DeviceStatus, NetState as _, StateStore};
     use crate::ticket::{TicketIssuer, TicketWire};
-    use chml_protocol::session::{DeviceRecord, LookupVerdict};
-    use chml_protocol::x25519_dalek::PublicKey;
+    use flock_protocol::session::{DeviceRecord, LookupVerdict};
+    use flock_protocol::x25519_dalek::PublicKey;
 
     fn dummy_auth(user: &str, nonce: &str, now: i64) -> SrAuth {
         use base64::Engine as _;

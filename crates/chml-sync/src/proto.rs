@@ -444,8 +444,8 @@ pub enum VerdictW {
 
 impl VerdictW {
     /// 转协议库判定（损坏公钥按不可信处理 → NotFound，fail-closed）。
-    pub fn to_verdict(&self) -> chml_protocol::session::LookupVerdict {
-        use chml_protocol::session::{DeviceRecord, LookupVerdict};
+    pub fn to_verdict(&self) -> flock_protocol::session::LookupVerdict {
+        use flock_protocol::session::{DeviceRecord, LookupVerdict};
         use ed25519_dalek::VerifyingKey;
         match self {
             VerdictW::NotFound => LookupVerdict::NotFound,
@@ -454,7 +454,7 @@ impl VerdictW {
             },
             VerdictW::Active { x25519, ed25519 } => match VerifyingKey::from_bytes(ed25519) {
                 Ok(device_ed25519) => LookupVerdict::Active(DeviceRecord {
-                    device_x25519: chml_protocol::x25519_dalek::PublicKey::from(*x25519),
+                    device_x25519: flock_protocol::x25519_dalek::PublicKey::from(*x25519),
                     device_ed25519,
                 }),
                 Err(_) => LookupVerdict::NotFound,
@@ -463,8 +463,8 @@ impl VerdictW {
     }
 
     /// 由协议库判定转线格式。
-    pub fn from_verdict(v: &chml_protocol::session::LookupVerdict) -> Self {
-        use chml_protocol::session::LookupVerdict;
+    pub fn from_verdict(v: &flock_protocol::session::LookupVerdict) -> Self {
+        use flock_protocol::session::LookupVerdict;
         match v {
             LookupVerdict::NotFound => VerdictW::NotFound,
             LookupVerdict::Revoked { since_epoch } => VerdictW::Revoked {
@@ -572,9 +572,9 @@ mod tests {
 
     #[test]
     fn verdict_wire_roundtrip() {
-        use chml_protocol::session::{DeviceRecord, LookupVerdict};
+        use flock_protocol::session::{DeviceRecord, LookupVerdict};
         let v = LookupVerdict::Active(DeviceRecord {
-            device_x25519: chml_protocol::x25519_dalek::PublicKey::from([9u8; 32]),
+            device_x25519: flock_protocol::x25519_dalek::PublicKey::from([9u8; 32]),
             device_ed25519: ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key(),
         });
         let w = VerdictW::from_verdict(&v);

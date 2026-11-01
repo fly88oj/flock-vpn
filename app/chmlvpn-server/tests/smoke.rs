@@ -19,14 +19,14 @@
 
 mod common;
 
-use chml_protocol::pake::login_start;
-use chml_protocol::rand;
-use chml_protocol::session::{
+use flock_protocol::pake::login_start;
+use flock_protocol::rand;
+use flock_protocol::session::{
     initiate, initiate_tofu, DeviceStaticKeys, ServerPin, SessionError, TunnelConfig,
 };
-use chml_protocol::sig as sr_sig;
-use chml_protocol::sig::UserKey;
-use chml_protocol::trust::{confirm_tofu_and_pin, InviteFile, PinStore, PinVerdict};
+use flock_protocol::sig as sr_sig;
+use flock_protocol::sig::UserKey;
+use flock_protocol::trust::{confirm_tofu_and_pin, InviteFile, PinStore, PinVerdict};
 use chmlvpn_server::control::{client_login_finish_anchored, CtrlError, CtrlResponse, DeviceOp};
 use common::{connect, pin_from_invite, pin_with_root, CtrlClient};
 
@@ -130,8 +130,8 @@ async fn wait_tcp(addr: &str) {
 
 /// 每次运行唯一的用户名（named volume 跨次保留状态 ⇒ 冒烟必须可重入：同库再开户）。
 fn uname(base: &str) -> String {
-    use chml_protocol::rand::RngCore as _;
-    let mut rng = chml_protocol::rand::rng();
+    use flock_protocol::rand::RngCore as _;
+    let mut rng = flock_protocol::rand::rng();
     let mut b = [0u8; 3];
     rng.fill_bytes(&mut b);
     format!("{base}-{}", hex::encode(b))
@@ -153,7 +153,7 @@ fn assert_vip_in_pool(vip: u32) {
 }
 
 fn now() -> i64 {
-    chml_protocol::trust::now_unix() as i64
+    flock_protocol::trust::now_unix() as i64
 }
 
 fn expect_err(resp: CtrlResponse) -> CtrlError {
@@ -164,7 +164,7 @@ fn expect_err(resp: CtrlResponse) -> CtrlError {
 }
 
 fn dev_id(d: &DeviceStaticKeys) -> [u8; 32] {
-    chml_protocol::session::DeviceId::from_ed25519(&d.ed25519_public()).0
+    flock_protocol::session::DeviceId::from_ed25519(&d.ed25519_public()).0
 }
 
 // ============================================================================

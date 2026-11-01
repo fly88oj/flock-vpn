@@ -10,8 +10,8 @@
 //!
 //! 该序先于 SR-SIG1 验签与 nonce 记账（`control::CtrlGuard::admit_state_change`）。
 
-use chml_protocol::ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
-use chml_protocol::session::DeviceId;
+use flock_protocol::ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
+use flock_protocol::session::DeviceId;
 use serde::{Deserialize, Serialize};
 
 /// 票据签名域分离标签。
@@ -113,7 +113,7 @@ impl TicketIssuer {
 
     /// 随机种子（bootstrap 用；持久化由调用方负责）。
     pub fn generate_seed() -> [u8; 32] {
-        chml_protocol::rand::random::<[u8; 32]>()
+        flock_protocol::rand::random::<[u8; 32]>()
     }
 
     /// 签发（`now` 注入：测试可拨）。
@@ -150,7 +150,7 @@ impl TicketIssuer {
         ticket: &SignedTicket,
         now: u64,
         current_epoch: u64,
-        lookup: impl FnOnce(&DeviceId) -> chml_protocol::session::LookupVerdict,
+        lookup: impl FnOnce(&DeviceId) -> flock_protocol::session::LookupVerdict,
     ) -> Result<TicketClaims, TicketReason> {
         let claims = ticket.claims()?;
         // 1) 签名
@@ -174,7 +174,7 @@ impl TicketIssuer {
         // 4) 设备态（吊销/禁用 ⇒ 拒）
         let dev = DeviceId(claims.device);
         match lookup(&dev) {
-            chml_protocol::session::LookupVerdict::Active(_) => Ok(claims),
+            flock_protocol::session::LookupVerdict::Active(_) => Ok(claims),
             _ => Err(TicketReason::DeviceNotActive),
         }
     }
@@ -251,7 +251,7 @@ impl TicketAuthority {
         session_device: &DeviceId,
         now: u64,
         current_epoch: u64,
-        lookup: impl FnOnce(&DeviceId) -> chml_protocol::session::LookupVerdict,
+        lookup: impl FnOnce(&DeviceId) -> flock_protocol::session::LookupVerdict,
     ) -> Result<TicketPrincipal, TicketReason> {
         match ticket {
             TicketWire::Local(t) => {
@@ -285,7 +285,7 @@ impl TicketAuthority {
                     })?;
                 // 设备态（吊销/禁用 ⇒ 拒）——与 Local 序第 4 步对齐。
                 match lookup(session_device) {
-                    chml_protocol::session::LookupVerdict::Active(_) => {}
+                    flock_protocol::session::LookupVerdict::Active(_) => {}
                     _ => return Err(TicketReason::DeviceNotActive),
                 }
                 Ok(TicketPrincipal {
@@ -313,7 +313,7 @@ impl NonceLedger {
 
     /// 查重 + 入账（false = 重放）。仅在票据与签名校验**之后**调用（§2.2 契约序）。
     pub fn check_and_record(&self, user: &str, nonce: &str, ts: i64, now: i64) -> bool {
-        const WINDOW: i64 = chml_protocol::SIG_WINDOW_SECS;
+        const WINDOW: i64 = flock_protocol::SIG_WINDOW_SECS;
         let mut g = self.inner.lock().expect("nonce ledger poisoned");
         let entry = g.entry(user.to_string()).or_default();
         // 惰性清理：滑出 ±300s 窗的旧 nonce（重放窗之外本就由时间窗拒绝）。
@@ -344,8 +344,8 @@ impl NonceLedger {
 mod tests {
     use super::*;
     use crate::netstate::DeviceStatus;
-    use chml_protocol::session::{DeviceRecord, LookupVerdict};
-    use chml_protocol::x25519_dalek::PublicKey;
+    use flock_protocol::session::{DeviceRecord, LookupVerdict};
+    use flock_protocol::x25519_dalek::PublicKey;
 
     fn issuer() -> TicketIssuer {
         TicketIssuer::from_seed([5u8; 32])

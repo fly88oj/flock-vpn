@@ -1,7 +1,7 @@
 //! 服务器-服务器 profile E2E 会话传输（§3.10 接缝 / §4-2 互连认证）+ RPC 分发 +
 //! apply-lag 熔断监控（§4 读与缓存）。
 //!
-//! **互连认证**：服务器互连（Raft/gossip）跑 chml-protocol 会话协议的服务器-服务器
+//! **互连认证**：服务器互连（Raft/gossip）跑 flock-protocol 会话协议的服务器-服务器
 //! profile——双向入群凭证：
 //! - 发起侧 `session::initiate`：以本机身份/静态密钥为「设备」材料，对端 ServerPin 来自
 //!   根签 ClusterDirectory（I1 的 KEM 封给对端静态混合公钥；R1 身份签名按根签条目验证）；
@@ -22,12 +22,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chml_protocol::mux::{Prio, Stream as MuxStream};
-use chml_protocol::session::{
+use flock_protocol::mux::{Prio, Stream as MuxStream};
+use flock_protocol::session::{
     self, ClusterId, DeviceDirectory, DeviceId, DeviceRecord, DeviceStaticKeys, LookupVerdict,
     ServerEntry, ServerIdentity, ServerPin,
 };
-use chml_protocol::trust::ClusterDirectory;
+use flock_protocol::trust::ClusterDirectory;
 use ed25519_dalek::VerifyingKey;
 use futures::future::BoxFuture;
 use openraft::error::{RPCError, RaftError, RemoteError, Timeout, Unreachable};
@@ -62,16 +62,16 @@ pub type PeerIo = Box<dyn AsyncReadWrite + Unpin>;
 pub trait Fabric: Send + Sync + 'static {
     fn dial(
         &self,
-        target: &chml_protocol::session::ServerId,
+        target: &flock_protocol::session::ServerId,
     ) -> BoxFuture<'static, io::Result<PeerIo>>;
     fn accept(&self) -> BoxFuture<'static, io::Result<PeerIo>>;
 }
 
 /// NodeId(u64) ↔ ServerId([u8;16]) 映射（前 8B 大端承载，低位补零——目录内一一对应）。
-pub fn sid_of(node: NodeId) -> chml_protocol::session::ServerId {
+pub fn sid_of(node: NodeId) -> flock_protocol::session::ServerId {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&node.to_be_bytes());
-    chml_protocol::session::ServerId(b)
+    flock_protocol::session::ServerId(b)
 }
 
 // ============================================================================
