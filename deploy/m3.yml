@@ -4,7 +4,8 @@
 #   bash deploy/m3_assert.sh          # A2/A3/A4/A9 单服版
 #
 # 拓扑（m2.yml 的 frp 中转变体加真客户端；网络 m3net = 「模拟不可信公网」）：
-#   frps（原版 v0.71.1；用户口 27500/27501 容器网内可达，不映射宿主）
+#   frps（原版 v0.71.1；用户口 27500/27501 容器网内可达；宿主 127.0.0.1 映射口
+#     供 Windows 真机手工清单——§7-M3/§7-M5 宿主 `--smoke`/run 连本地中转）
 #     └─ server（Frp 模式 + M3 数据面：tun0 VIP 100.64.0.1；--cap-add NET_ADMIN
 #                --device /dev/net/tun，§6.1 实测可行的 WSL2 后端 tun 直通）
 #   client（chmlvpn-client；tun0 VIP = device-add 分配值；同 NET_ADMIN/tun 直通）
@@ -22,6 +23,11 @@ services:
       additional_contexts:
         bins: ../.tmp/frp_0.71.1_linux_amd64
     image: chmlvpn/frps:0.71.1
+    # 宿主映射（仅回环）：Windows 真机清单（§7-M3/§7-M5）宿主 client 经
+    # 127.0.0.1:27500/27501 连本地中转；容器网内口不受影响。
+    ports:
+      - "127.0.0.1:27500:27500"
+      - "127.0.0.1:27501:27501"
     networks: [m3net]
     restart: unless-stopped
 
