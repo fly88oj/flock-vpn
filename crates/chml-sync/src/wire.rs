@@ -7,7 +7,7 @@
 //!   根签 ClusterDirectory（I1 的 KEM 封给对端静态混合公钥；R1 身份签名按根签条目验证）；
 //! - 应答侧 `session::respond` + [`PeerDirectory`]：只认根签 ClusterDirectory 内的
 //!   服务器身份（设备目录三态查无 ⇒ 同一不透明 `DeviceRejected`）。
-//! ⇒ **无有效入群凭证的对端在握手层即被拒**（拿不到快照也进不了 Raft，R19 红线）。
+//!   ⇒ **无有效入群凭证的对端在握手层即被拒**（拿不到快照也进不了 Raft，R19 红线）。
 //!
 //! **RPC 帧协议**：一条互连会话（Tunnel）内每 RPC 开一条 yamux 流，帧 = `[u32 LE 长度]
 //! postcard(WireRpc)`，响应同构。长连会话由 [`Interconnect`] 缓存复用（断流重建）。
@@ -31,11 +31,13 @@ use chml_protocol::trust::ClusterDirectory;
 use ed25519_dalek::VerifyingKey;
 use futures::future::BoxFuture;
 use openraft::error::{RPCError, RaftError, RemoteError, Timeout, Unreachable};
-use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest, VoteResponse};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
 use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
-
 
 use crate::lease::{GossipMsg, LeaseTable};
 use crate::proto::{NodeId, ReadQuery, ReadView, SyncError, SyncRequest};
@@ -58,7 +60,10 @@ pub type PeerIo = Box<dyn AsyncReadWrite + Unpin>;
 /// 原始传输织物接缝：`dial` 拨对端、`accept` 收入连（生产 = TCP 监听；测试 = 内存
 /// duplex 对，可叠加 RTT/故障注入）。
 pub trait Fabric: Send + Sync + 'static {
-    fn dial(&self, target: &chml_protocol::session::ServerId) -> BoxFuture<'static, io::Result<PeerIo>>;
+    fn dial(
+        &self,
+        target: &chml_protocol::session::ServerId,
+    ) -> BoxFuture<'static, io::Result<PeerIo>>;
     fn accept(&self) -> BoxFuture<'static, io::Result<PeerIo>>;
 }
 
@@ -91,7 +96,11 @@ struct MonitorSt {
 impl LagMonitor {
     /// `applied` = SM 维护的已 apply 最高 index（`SmCore`）。
     pub fn new(threshold: Duration, applied: Arc<AtomicU64>) -> Arc<Self> {
-        Arc::new(LagMonitor { threshold, applied, st: Mutex::new(MonitorSt::default()) })
+        Arc::new(LagMonitor {
+            threshold,
+            applied,
+            st: Mutex::new(MonitorSt::default()),
+        })
     }
 
     /// 分发器观察 leader commit index（AppendEntries 携带）。
@@ -174,8 +183,7 @@ struct Pipe {
 }
 
 impl Drop for Pipe {
-    fn drop(&mut self) {
-    }
+    fn drop(&mut self) {}
 }
 
 impl Pipe {
@@ -250,7 +258,12 @@ impl Interconnect {
 
     /// 目录内全部节点号（gossip fan-out / location_query fan-out 用）。
     pub fn node_ids(&self) -> Vec<NodeId> {
-        self.nodes.read().expect("ic nodes").keys().copied().collect()
+        self.nodes
+            .read()
+            .expect("ic nodes")
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// 热更新互连目录映射（准入新服务器：根签新目录全网 install 后调用）。
@@ -264,9 +277,17 @@ impl Interconnect {
     }
 
     fn peer_entry(&self, peer: NodeId) -> io::Result<ServerEntry> {
-        self.nodes.read().expect("ic nodes").get(&peer).cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("no directory entry for node {peer}"))
-        })
+        self.nodes
+            .read()
+            .expect("ic nodes")
+            .get(&peer)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no directory entry for node {peer}"),
+                )
+            })
     }
 
     async fn connect_pipe(&self, peer: NodeId) -> io::Result<Arc<Pipe>> {
@@ -307,7 +328,10 @@ impl Interconnect {
     /// 每对端 RPC 门闩（无则建）。
     fn gate_of(&self, peer: NodeId) -> Arc<tokio::sync::Mutex<()>> {
         let mut gates = self.gates.lock().expect("ic gates");
-        gates.entry(peer).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        gates
+            .entry(peer)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// 逐出对端缓存会话（超时/IO 故障后由下一条 RPC 重建）。
@@ -316,7 +340,12 @@ impl Interconnect {
     }
 
     /// 一次 RPC 往返（门闩内：开流 → 帧请求 → 帧响应；超时/IO 错误逐出会话重建）。
-    pub async fn call(&self, peer: NodeId, rpc: WireRpc, timeout: Duration) -> Result<WireResp, WireCallError> {
+    pub async fn call(
+        &self,
+        peer: NodeId,
+        rpc: WireRpc,
+        timeout: Duration,
+    ) -> Result<WireResp, WireCallError> {
         let gate = self.gate_of(peer);
         let _guard = gate.lock().await;
         let mut stream = match self.open_stream(peer).await {
@@ -325,7 +354,8 @@ impl Interconnect {
                 return Err(WireCallError::Io(e));
             }
         };
-        let req = postcard::to_allocvec(&rpc).map_err(|e| WireCallError::Io(io::Error::other(format!("encode: {e}"))))?;
+        let req = postcard::to_allocvec(&rpc)
+            .map_err(|e| WireCallError::Io(io::Error::other(format!("encode: {e}"))))?;
         let fut = async {
             send_frame(&mut stream, &req).await?;
             let resp = recv_frame(&mut stream).await?;
@@ -422,7 +452,9 @@ pub enum WireRpc {
     /// 跨服转发（FRWD 流承载 ForwardEnvelope，§2.2-3）。
     Forward(crate::forward::ForwardEnvelope),
     /// dir_pull（客户端经控制流发起；此处为服务器侧 serve 实现，§3.10）。
-    DirPull { since: u64 },
+    DirPull {
+        since: u64,
+    },
 }
 
 /// 互连 RPC 响应（远端 Raft 致命错误统一折算 `Err(String)` → 调用方按 Unreachable 处理；
@@ -485,7 +517,9 @@ pub async fn dispatch(target: &RpcTarget, rpc: WireRpc) -> WireResp {
     match rpc {
         WireRpc::Append(req) => {
             // §4：心跳/AppendEntries 携带 leader commit index——follower 据此自监听 lag。
-            target.lag.observe_leader_commit(req.leader_commit.map(|l| l.index).unwrap_or(0));
+            target
+                .lag
+                .observe_leader_commit(req.leader_commit.map(|l| l.index).unwrap_or(0));
             WireResp::Append(target.raft.append_entries(req).await)
         }
         WireRpc::Vote(req) => WireResp::Vote(target.raft.vote(req).await),
@@ -520,7 +554,7 @@ pub async fn dispatch(target: &RpcTarget, rpc: WireRpc) -> WireResp {
             WireResp::Locate(target.lease.observe(&device).map(|l| l.holder))
         }
         WireRpc::Forward(env) => WireResp::Forward(target.forward.receive(env)),
-        WireRpc::DirPull { since } => WireResp::DirPull(target.directory.dir_pull_response(since).into()),
+        WireRpc::DirPull { since } => WireResp::DirPull(target.directory.dir_pull_response(since)),
     }
 }
 
@@ -532,14 +566,26 @@ pub fn read_view(sm: &SmCore, q: ReadQuery) -> ReadView {
         Q::Epoch => V::Epoch(d.epoch),
         Q::DeviceRow(id) => V::Device(d.devices.get(&id).cloned()),
         Q::Wrap(server) => V::Wrap(d.wraps.get(&server).cloned()),
+        Q::User(u) => V::User(d.users.get(&u).cloned()),
+        Q::DevicesOf(owner) => V::Devices(
+            d.devices
+                .iter()
+                .filter(|(_, r)| r.owner == *owner)
+                .map(|(k, v)| (*k, v.clone()))
+                .collect(),
+        ),
         Q::State => V::State(d.state_view()),
     })
 }
 
-fn sync_error_from_write(e: RaftError<u64, openraft::error::ClientWriteError<u64, BasicNode>>) -> SyncError {
+fn sync_error_from_write(
+    e: RaftError<u64, openraft::error::ClientWriteError<u64, BasicNode>>,
+) -> SyncError {
     match e {
         RaftError::APIError(openraft::error::ClientWriteError::ForwardToLeader(f)) => {
-            SyncError::ForwardToLeader { leader: f.leader_id }
+            SyncError::ForwardToLeader {
+                leader: f.leader_id,
+            }
         }
         other => SyncError::Raft(other.to_string()),
     }
@@ -550,7 +596,9 @@ fn sync_error_from_check(
 ) -> SyncError {
     match e {
         RaftError::APIError(openraft::error::CheckIsLeaderError::ForwardToLeader(f)) => {
-            SyncError::ForwardToLeader { leader: f.leader_id }
+            SyncError::ForwardToLeader {
+                leader: f.leader_id,
+            }
         }
         other => SyncError::Raft(other.to_string()),
     }
@@ -608,7 +656,11 @@ pub fn rpc_error_of(peer: NodeId, e: WireCallError) -> RPCError<u64, BasicNode, 
 
 /// 远端 Raft 致命错误 → RemoteError 包装（Append/Vote 线格式已带 RaftError）。
 pub fn remote_error(peer: NodeId, e: RaftError<u64>) -> RPCError<u64, BasicNode, RaftError<u64>> {
-    RPCError::RemoteError(RemoteError { target: peer, target_node: None, source: e })
+    RPCError::RemoteError(RemoteError {
+        target: peer,
+        target_node: None,
+        source: e,
+    })
 }
 
 // ============================================================================
@@ -634,7 +686,10 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            self.outbox.lock().expect("mem io").extend(buf.iter().copied());
+            self.outbox
+                .lock()
+                .expect("mem io")
+                .extend(buf.iter().copied());
             self.woken.wake();
             Poll::Ready(Ok(buf.len()))
         }
@@ -672,8 +727,16 @@ mod tests {
         let q2 = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::<u8>::new()));
         let w1 = std::sync::Arc::new(futures::task::AtomicWaker::default());
         let w2 = std::sync::Arc::new(futures::task::AtomicWaker::default());
-        let a = MemIo { inbox: q1.clone(), outbox: q2.clone(), woken: w2 };
-        let b = MemIo { inbox: q2, outbox: q1, woken: w1 };
+        let a = MemIo {
+            inbox: q1.clone(),
+            outbox: q2.clone(),
+            woken: w2,
+        };
+        let b = MemIo {
+            inbox: q2,
+            outbox: q1,
+            woken: w1,
+        };
         let (mut a, mut b) = (a, b);
         send_frame(&mut a, b"hello wire").await.expect("send");
         let got = recv_frame(&mut b).await.expect("recv");
@@ -700,6 +763,9 @@ mod tests {
         let applied = Arc::new(AtomicU64::new(5));
         let mon = LagMonitor::new(Duration::from_millis(50), applied);
         tokio::time::sleep(Duration::from_millis(120)).await;
-        assert!(!mon.breaker_open(), "未观察到 leader commit（如分区）不误开");
+        assert!(
+            !mon.breaker_open(),
+            "未观察到 leader commit（如分区）不误开"
+        );
     }
 }

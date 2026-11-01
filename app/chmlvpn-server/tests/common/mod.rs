@@ -26,9 +26,9 @@ use chmlvpn_server::control::{
     CtrlResponse, DeviceOp, DevicePubs, SrAuth, CTRL_METHOD, CTRL_PROTO_VERSION, PATH_DEVICE_OP,
     PATH_REDEEM_INVITE, PATH_TICKET_RENEW,
 };
-use chmlvpn_server::netstate::{NetState, RedeemRequest};
+use chmlvpn_server::netstate::RedeemRequest;
 use chmlvpn_server::server::ServerCore;
-use chmlvpn_server::ticket::SignedTicket;
+use chmlvpn_server::ticket::TicketWire;
 
 pub fn b64(bytes: &[u8]) -> String {
     use base64::Engine as _;
@@ -99,7 +99,7 @@ impl CtrlClient {
         user: &str,
         pw: &str,
         pin: &ServerPin,
-    ) -> Result<(SignedTicket, [u8; 16]), String> {
+    ) -> Result<(TicketWire, [u8; 16]), String> {
         let mut rng = rand::rngs::OsRng;
         let (state, ke1) = login_start(&mut rng, pw, user).expect("login start");
         let (ke2, bind_token, anchor_sig) = match self
@@ -145,7 +145,7 @@ impl CtrlClient {
     /// key-bind：登记设备 B 静态公钥 + 用户 SR-SIG1 公钥（设备签名 = 占有证明）。
     pub async fn key_bind(
         &mut self,
-        ticket: &SignedTicket,
+        ticket: &TicketWire,
         bind_token: [u8; 16],
         user: &str,
         cluster_id: &[u8; 16],
@@ -208,11 +208,7 @@ impl CtrlClient {
         PATH_REDEEM_INVITE
     }
 
-    pub async fn ticket_renew(
-        &mut self,
-        ticket: Option<SignedTicket>,
-        auth: SrAuth,
-    ) -> CtrlResponse {
+    pub async fn ticket_renew(&mut self, ticket: Option<TicketWire>, auth: SrAuth) -> CtrlResponse {
         self.req(CtrlRequest::TicketRenew { ticket, auth })
             .await
             .unwrap()
@@ -220,7 +216,7 @@ impl CtrlClient {
 
     pub async fn device_op(
         &mut self,
-        ticket: Option<SignedTicket>,
+        ticket: Option<TicketWire>,
         auth: SrAuth,
         op: DeviceOp,
     ) -> CtrlResponse {
@@ -231,7 +227,7 @@ impl CtrlClient {
 
     pub async fn redeem(
         &mut self,
-        ticket: Option<SignedTicket>,
+        ticket: Option<TicketWire>,
         auth: SrAuth,
         invite_bytes: &[u8],
         username: &str,
@@ -332,6 +328,7 @@ impl TestServer {
             admin_bind: "127.0.0.1:0".parse().unwrap(),
             tun_name: "tun0".into(),
             frp: None,
+            sync: None,
         };
         let (core, created) = ServerCore::open_or_init(cfg).expect("core");
         assert!(created, "全新状态库");
@@ -348,28 +345,29 @@ impl TestServer {
         }
     }
 
-    /// 管理面签发邀请。
-    pub fn mint_invite(&self, ttl_secs: u64) -> Vec<u8> {
-        self.core.mint_invite(ttl_secs).expect("mint")
+    /// 管理面签发邀请（单服形态：根密钥在库）。
+    pub async fn mint_invite(&self, ttl_secs: u64) -> Vec<u8> {
+        self.core.mint_invite(ttl_secs).await.expect("mint")
     }
 
     /// 管理面注册设备（TOFU 流程的服务器侧预置）。
-    pub fn device_add(&self, user: &str, device: &DeviceStaticKeys) -> [u8; 4] {
+    pub async fn device_add(&self, user: &str, device: &DeviceStaticKeys) -> [u8; 4] {
         self.core
-            .store
+            .net
             .register_device(
                 user,
                 device.x25519_public().to_bytes(),
                 *device.ed25519_public().as_bytes(),
             )
+            .await
             .expect("device add")
             .vip
     }
 
     /// 管理面兑换邀请（开户：建用户/设备 + VIP）。
-    pub fn redeem(&self, invite: &[u8], user: &str, device: &DeviceStaticKeys) -> [u8; 4] {
+    pub async fn redeem(&self, invite: &[u8], user: &str, device: &DeviceStaticKeys) -> [u8; 4] {
         self.core
-            .store
+            .net
             .redeem_invite(RedeemRequest {
                 invite_bytes: invite,
                 username: user,
@@ -379,6 +377,7 @@ impl TestServer {
                 expected_cluster_id: self.core.identity.cluster_id.0,
                 now_unix: chml_protocol::trust::now_unix(),
             })
+            .await
             .expect("redeem")
             .vip
     }

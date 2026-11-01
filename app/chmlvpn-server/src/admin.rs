@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 use crate::control::DevicePubs;
-use crate::netstate::{NetState, RedeemRequest};
+use crate::netstate::RedeemRequest;
 use crate::server::ServerCore;
 
 /// 单条 admin 消息上限。
@@ -104,14 +104,14 @@ pub async fn serve(
 
 async fn handle_conn(core: &ServerCore, io: &mut TcpStream) -> std::io::Result<()> {
     let req: AdminRequest = recv_msg(io).await?;
-    let resp = dispatch(core, req);
+    let resp = dispatch(core, req).await;
     send_msg(io, &resp).await
 }
 
-fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
-    let net: &dyn NetState = &*core.store;
+async fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
+    let net = &core.net;
     match req {
-        AdminRequest::Invite { ttl_secs } => match core.mint_invite(ttl_secs) {
+        AdminRequest::Invite { ttl_secs } => match core.mint_invite(ttl_secs).await {
             Ok(bytes) => AdminResponse::Invite {
                 invite_b64: b64_encode(&bytes),
             },
@@ -126,15 +126,18 @@ fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
                 Ok(v) => v,
                 Err(e) => return AdminResponse::Err { msg: e },
             };
-            match net.redeem_invite(RedeemRequest {
-                invite_bytes: &invite,
-                username: &username,
-                device_x25519: device.x25519,
-                device_ed25519: device.ed25519,
-                expected_root_pub: *core.identity.root_pub.as_bytes(),
-                expected_cluster_id: core.identity.cluster_id.0,
-                now_unix: chml_protocol::trust::now_unix(),
-            }) {
+            match net
+                .redeem_invite(RedeemRequest {
+                    invite_bytes: &invite,
+                    username: &username,
+                    device_x25519: device.x25519,
+                    device_ed25519: device.ed25519,
+                    expected_root_pub: *core.identity.root_pub.as_bytes(),
+                    expected_cluster_id: core.identity.cluster_id.0,
+                    now_unix: chml_protocol::trust::now_unix(),
+                })
+                .await
+            {
                 Ok(out) => AdminResponse::Redeemed {
                     device_id: out.device_id,
                     vip: out.vip,
@@ -143,7 +146,10 @@ fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
             }
         }
         AdminRequest::DeviceAdd { username, device } => {
-            match net.register_device(&username, device.x25519, device.ed25519) {
+            match net
+                .register_device(&username, device.x25519, device.ed25519)
+                .await
+            {
                 Ok(row) => AdminResponse::DeviceAdded {
                     device_id: chml_protocol::session::DeviceId(
                         *chml_protocol::ed25519_dalek::VerifyingKey::from_bytes(&device.ed25519)
@@ -158,7 +164,7 @@ fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
         }
         AdminRequest::Revoke { device } => {
             let id = chml_protocol::session::DeviceId(device);
-            match net.revoke(&id) {
+            match net.revoke(&id).await {
                 Ok(epoch) => {
                     core.sessions.kill(&device);
                     AdminResponse::Revoked { epoch }

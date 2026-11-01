@@ -13,7 +13,9 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chml_sync::forward::{ForwardEnvelope, ForwardOutcome, IngestResult, PacketSink, RejectReason, FORWARD_VER};
+use chml_sync::forward::{
+    ForwardEnvelope, ForwardOutcome, IngestResult, PacketSink, RejectReason, FORWARD_VER,
+};
 use chml_sync::proto::{NodeId, SyncRequest, SyncResponse};
 
 use common::{bootstrap, wait_local_row, TestCluster};
@@ -71,9 +73,27 @@ async fn two_devices(c: &TestCluster, writer: usize) -> ([u8; 32], [u8; 32]) {
     let dev_b = ed25519_dalek::SigningKey::from_bytes(&[0xB2; 32]);
     let a_pub = *dev_a.verifying_key().as_bytes();
     let b_pub = *dev_b.verifying_key().as_bytes();
-    let ra = must_write(c, writer, SyncRequest::RegisterDevice { owner: "a".into(), x25519: [1; 32], ed25519: a_pub }).await;
+    let ra = must_write(
+        c,
+        writer,
+        SyncRequest::RegisterDevice {
+            owner: "a".into(),
+            x25519: [1; 32],
+            ed25519: a_pub,
+        },
+    )
+    .await;
     assert!(matches!(ra, SyncResponse::Device(_)));
-    let rb = must_write(c, writer, SyncRequest::RegisterDevice { owner: "b".into(), x25519: [2; 32], ed25519: b_pub }).await;
+    let rb = must_write(
+        c,
+        writer,
+        SyncRequest::RegisterDevice {
+            owner: "b".into(),
+            x25519: [2; 32],
+            ed25519: b_pub,
+        },
+    )
+    .await;
     assert!(matches!(rb, SyncResponse::Device(_)));
     (dev_id(&a_pub), dev_id(&b_pub))
 }
@@ -93,10 +113,32 @@ async fn src_vip_binding_violation_dropped_and_counted() {
     let dev_b = ed25519_dalek::SigningKey::from_bytes(&[0xB2; 32]);
     let a_pub = *dev_a.verifying_key().as_bytes();
     let b_pub = *dev_b.verifying_key().as_bytes();
-    let ra = must_write(&c, writer, SyncRequest::RegisterDevice { owner: "a".into(), x25519: [1; 32], ed25519: a_pub }).await;
-    let SyncResponse::Device(row_a) = ra else { panic!() };
-    let rb = must_write(&c, writer, SyncRequest::RegisterDevice { owner: "b".into(), x25519: [2; 32], ed25519: b_pub }).await;
-    let SyncResponse::Device(row_b) = rb else { panic!() };
+    let ra = must_write(
+        &c,
+        writer,
+        SyncRequest::RegisterDevice {
+            owner: "a".into(),
+            x25519: [1; 32],
+            ed25519: a_pub,
+        },
+    )
+    .await;
+    let SyncResponse::Device(row_a) = ra else {
+        panic!()
+    };
+    let rb = must_write(
+        &c,
+        writer,
+        SyncRequest::RegisterDevice {
+            owner: "b".into(),
+            x25519: [2; 32],
+            ed25519: b_pub,
+        },
+    )
+    .await;
+    let SyncResponse::Device(row_b) = rb else {
+        panic!()
+    };
     let id_a = dev_id(&a_pub);
 
     let sink_a = Arc::new(RecvSink::default());
@@ -111,7 +153,10 @@ async fn src_vip_binding_violation_dropped_and_counted() {
     // devA 的会话发 src=devB 的 VIP（身份嫁祸）⇒ 丢 + 计数；不投递、不转发。
     let spoofed = ip4(row_b.vip, row_a.vip, b"spoof");
     let r = n1.ingest_packet(&id_a, &spoofed).await;
-    assert!(matches!(r, IngestResult::SrcViolation), "第 0 步拦下: {r:?}");
+    assert!(
+        matches!(r, IngestResult::SrcViolation),
+        "第 0 步拦下: {r:?}"
+    );
     let st = n1.forward().stats();
     assert_eq!(st.src_violations, 1, "丢 + 计数");
     assert_eq!(st.delivered_local + st.forwarded, 0, "不投递不转发");
@@ -153,12 +198,26 @@ async fn envelope_src_dev_mismatch_rejected_at_receiver() {
         payload: pkt,
     };
     let out = n2.forward().receive(env);
-    assert!(matches!(out, ForwardOutcome::Rejected(RejectReason::SrcBinding)), "{out:?}");
-    assert_eq!(n2.forward().stats().src_mismatch_rejected, 1, "收端拒 + 计数");
+    assert!(
+        matches!(out, ForwardOutcome::Rejected(RejectReason::SrcBinding)),
+        "{out:?}"
+    );
+    assert_eq!(
+        n2.forward().stats().src_mismatch_rejected,
+        1,
+        "收端拒 + 计数"
+    );
 
     // 对照：src_dev 与内层源一致 ⇒ 不因绑定被拒（dst 不在本机 ⇒ NotHere）。
     let pkt2 = ip4(vip_a.octets(), [100, 64, 0, 9], b"x");
-    let env2 = ForwardEnvelope { ver: FORWARD_VER, src_dev: id_a, dst_dev: [9; 32], origin_server: 1, hop: 1, payload: pkt2 };
+    let env2 = ForwardEnvelope {
+        ver: FORWARD_VER,
+        src_dev: id_a,
+        dst_dev: [9; 32],
+        origin_server: 1,
+        hop: 1,
+        payload: pkt2,
+    };
     let out2 = n2.forward().receive(env2);
     assert!(matches!(out2, ForwardOutcome::NotHere), "{out2:?}");
 }
@@ -178,10 +237,32 @@ async fn forward_local_delivery_and_redirect_with_hop_guard() {
     let dev_c = ed25519_dalek::SigningKey::from_bytes(&[0xC3; 32]);
     let a_pub = *dev_a.verifying_key().as_bytes();
     let c_pub = *dev_c.verifying_key().as_bytes();
-    let ra = must_write(&c, writer, SyncRequest::RegisterDevice { owner: "a".into(), x25519: [1; 32], ed25519: a_pub }).await;
-    let SyncResponse::Device(row_a) = ra else { panic!() };
-    let rc = must_write(&c, writer, SyncRequest::RegisterDevice { owner: "c".into(), x25519: [3; 32], ed25519: c_pub }).await;
-    let SyncResponse::Device(row_c) = rc else { panic!() };
+    let ra = must_write(
+        &c,
+        writer,
+        SyncRequest::RegisterDevice {
+            owner: "a".into(),
+            x25519: [1; 32],
+            ed25519: a_pub,
+        },
+    )
+    .await;
+    let SyncResponse::Device(row_a) = ra else {
+        panic!()
+    };
+    let rc = must_write(
+        &c,
+        writer,
+        SyncRequest::RegisterDevice {
+            owner: "c".into(),
+            x25519: [3; 32],
+            ed25519: c_pub,
+        },
+    )
+    .await;
+    let SyncResponse::Device(row_c) = rc else {
+        panic!()
+    };
     let (id_a, id_c) = (dev_id(&a_pub), dev_id(&c_pub));
 
     // A 连在 node1；C **当前**连在 node3（租约域真相），但 node1 的租约表还指着 node2
@@ -215,11 +296,13 @@ async fn forward_local_delivery_and_redirect_with_hop_guard() {
     // 构造迁移窗口：node1 的租约域最后听到的是 node2（term 最新——设备随后迁到
     // node3 而 node1 尚未收到事件）；node3 自己的表持有 holder=3（对位置询问作答）。
     let stale_term = now_ms();
-    c.nodes[0].lease().merge_remote(chml_sync::lease::GossipMsg::Publish {
-        device: id_c,
-        holder: 2,
-        term_ms: stale_term + 200,
-    });
+    c.nodes[0]
+        .lease()
+        .merge_remote(chml_sync::lease::GossipMsg::Publish {
+            device: id_c,
+            holder: 2,
+            term_ms: stale_term + 200,
+        });
     let r = c.nodes[0].ingest_packet(&id_a, &pkt).await;
     assert!(
         matches!(r, IngestResult::Forwarded(ForwardOutcome::Delivered)),
@@ -244,8 +327,15 @@ async fn forward_local_delivery_and_redirect_with_hop_guard() {
         payload: pkt.clone(),
     };
     let out = c.nodes[2].forward().receive(env_hop0);
-    assert!(matches!(out, ForwardOutcome::Rejected(RejectReason::Hop)), "{out:?}");
-    assert_eq!(c.nodes[2].forward().stats().hop_dropped, before + 1, "防环计数");
+    assert!(
+        matches!(out, ForwardOutcome::Rejected(RejectReason::Hop)),
+        "{out:?}"
+    );
+    assert_eq!(
+        c.nodes[2].forward().stats().hop_dropped,
+        before + 1,
+        "防环计数"
+    );
     assert_eq!(sink_c.count(), 1, "hop 耗尽的包不投递");
 }
 
@@ -262,8 +352,19 @@ async fn unresolved_destination_drops_with_best_effort_icmp() {
 
     let dev_a = ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]);
     let a_pub = *dev_a.verifying_key().as_bytes();
-    let ra = must_write(&c, writer, SyncRequest::RegisterDevice { owner: "a".into(), x25519: [1; 32], ed25519: a_pub }).await;
-    let SyncResponse::Device(row_a) = ra else { panic!() };
+    let ra = must_write(
+        &c,
+        writer,
+        SyncRequest::RegisterDevice {
+            owner: "a".into(),
+            x25519: [1; 32],
+            ed25519: a_pub,
+        },
+    )
+    .await;
+    let SyncResponse::Device(row_a) = ra else {
+        panic!()
+    };
     let id_a = dev_id(&a_pub);
 
     let sink_a = Arc::new(RecvSink::default());
@@ -289,16 +390,29 @@ async fn unresolved_destination_drops_with_best_effort_icmp() {
     // 租约存在但目标不在线（NOT_HERE 后 location_query 也找不到）⇒ 同样丢 + ICMP。
     let dev_d = ed25519_dalek::SigningKey::from_bytes(&[0xD4; 32]);
     let d_pub = *dev_d.verifying_key().as_bytes();
-    let rd = must_write(&c, writer, SyncRequest::RegisterDevice { owner: "d".into(), x25519: [4; 32], ed25519: d_pub }).await;
-    let SyncResponse::Device(row_d) = rd else { panic!() };
+    let rd = must_write(
+        &c,
+        writer,
+        SyncRequest::RegisterDevice {
+            owner: "d".into(),
+            x25519: [4; 32],
+            ed25519: d_pub,
+        },
+    )
+    .await;
+    let SyncResponse::Device(row_d) = rd else {
+        panic!()
+    };
     let id_d = dev_id(&d_pub);
     wait_local_row(&c.nodes[0], &id_d, "dev-d row").await;
     // 陈旧租约指向 node2，但 node2 没有该设备会话且无人认领。
-    c.nodes[0].lease().merge_remote(chml_sync::lease::GossipMsg::Publish {
-        device: id_d,
-        holder: 2,
-        term_ms: now_ms() + 100, // 较新 term 使其胜出本地空表
-    });
+    c.nodes[0]
+        .lease()
+        .merge_remote(chml_sync::lease::GossipMsg::Publish {
+            device: id_d,
+            holder: 2,
+            term_ms: now_ms() + 100, // 较新 term 使其胜出本地空表
+        });
     let pkt2 = ip4(row_a.vip, row_d.vip, b"stale-lease");
     let r2 = c.nodes[0].ingest_packet(&id_a, &pkt2).await;
     match r2 {
@@ -323,8 +437,19 @@ async fn lease_domain_semantics_and_locate_fanout() {
 
     let dev = ed25519_dalek::SigningKey::from_bytes(&[0xE5; 32]);
     let d_pub = *dev.verifying_key().as_bytes();
-    let rd = must_write(&c, leader_idx, SyncRequest::RegisterDevice { owner: "e".into(), x25519: [5; 32], ed25519: d_pub }).await;
-    let SyncResponse::Device(row) = rd else { panic!() };
+    let rd = must_write(
+        &c,
+        leader_idx,
+        SyncRequest::RegisterDevice {
+            owner: "e".into(),
+            x25519: [5; 32],
+            ed25519: d_pub,
+        },
+    )
+    .await;
+    let SyncResponse::Device(row) = rd else {
+        panic!()
+    };
     let id = dev_id(&d_pub);
 
     // publish（node1）→ observe（node3）：事件推送路径。
@@ -350,10 +475,19 @@ async fn lease_domain_semantics_and_locate_fanout() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(c.nodes[2].lease().observe(&id).map(|l| l.holder), Some(2), "新者胜");
+    assert_eq!(
+        c.nodes[2].lease().observe(&id).map(|l| l.holder),
+        Some(2),
+        "新者胜"
+    );
     // NetState 设备行不存当前位置：VIP/状态原样（快照视图无 holder 字段可言）。
-    let v = c.nodes[0].read_linearizable(chml_sync::proto::ReadQuery::DeviceRow(id)).await.expect("read");
-    let chml_sync::proto::ReadView::Device(Some(d)) = v else { panic!() };
+    let v = c.nodes[0]
+        .read_linearizable(chml_sync::proto::ReadQuery::DeviceRow(id))
+        .await
+        .expect("read");
+    let chml_sync::proto::ReadView::Device(Some(d)) = v else {
+        panic!()
+    };
     assert_eq!(d.vip, row.vip, "静态注册信息不变（NetState 不存位置）");
     assert_eq!(d.status, chml_sync::proto::DeviceStatus::Active);
 
@@ -365,13 +499,25 @@ async fn lease_domain_semantics_and_locate_fanout() {
     let t0 = Instant::now();
     let none = c.nodes[0].location_query(&unknown).await;
     assert_eq!(none, None, "无人认领");
-    assert!(t0.elapsed() < Duration::from_secs(8), "一次性 ≤3 扇出在预算内（{:?}）", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_secs(8),
+        "一次性 ≤3 扇出在预算内（{:?}）",
+        t0.elapsed()
+    );
 
     // TTL 30s：租约到期 ⇒ observe None（唯一真相源的时效性）。
     // （短路等待 31s 太慢——用表内直改 expires 不可行（私有），改以反熵/事件路径
     // 已覆盖；此处断言 LEASE_TTL 常量与 observe 语义一致。）
-    assert_eq!(chml_sync::lease::LEASE_TTL, Duration::from_secs(30), "租约 TTL 30s（§3.10）");
-    assert_eq!(chml_sync::lease::ANTI_ENTROPY, Duration::from_secs(5), "反熵 5s（§3.10）");
+    assert_eq!(
+        chml_sync::lease::LEASE_TTL,
+        Duration::from_secs(30),
+        "租约 TTL 30s（§3.10）"
+    );
+    assert_eq!(
+        chml_sync::lease::ANTI_ENTROPY,
+        Duration::from_secs(5),
+        "反熵 5s（§3.10）"
+    );
     let _ = NodeId::default();
 }
 

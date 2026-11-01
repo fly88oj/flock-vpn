@@ -101,7 +101,14 @@ impl Cluster {
             nodes.push(node);
             recorders.push(rec);
         }
-        Cluster { root, nodes, recorders, reg, idents, _tmp: tmp }
+        Cluster {
+            root,
+            nodes,
+            recorders,
+            reg,
+            idents,
+            _tmp: tmp,
+        }
     }
 
     /// 等 leader 出现并返回**其自身**下标（≤15s）——「任一节点知道 leader」≠ leader 本体。
@@ -110,8 +117,17 @@ impl Cluster {
         while Instant::now() < deadline {
             for n in &self.nodes {
                 if let Some(l) = n.current_leader().await {
-                    if l == n.id() && matches!(n.raft().metrics().borrow().state, openraft::ServerState::Leader) {
-                        let idx = self.nodes.iter().position(|x| x.id() == l).expect("leader in nodes");
+                    if l == n.id()
+                        && matches!(
+                            n.raft().metrics().borrow().state,
+                            openraft::ServerState::Leader
+                        )
+                    {
+                        let idx = self
+                            .nodes
+                            .iter()
+                            .position(|x| x.id() == l)
+                            .expect("leader in nodes");
                         return (idx, l);
                     }
                 }
@@ -148,29 +164,53 @@ async fn write_any_read_any_linearizable_within_2s() {
     let t0 = Instant::now();
     let resp = must_write(
         &cluster.nodes[writer],
-        SyncRequest::RegisterDevice { owner: "alice".into(), x25519: [1; 32], ed25519: [1; 32] },
+        SyncRequest::RegisterDevice {
+            owner: "alice".into(),
+            x25519: [1; 32],
+            ed25519: [1; 32],
+        },
     )
     .await;
-    let SyncResponse::Device(row) = resp else { panic!() };
+    let SyncResponse::Device(row) = resp else {
+        panic!()
+    };
     let id = dev_id(&[1; 32]);
-    let v = cluster.nodes[reader].read_linearizable(ReadQuery::Lookup(id.0)).await.expect("read");
+    let v = cluster.nodes[reader]
+        .read_linearizable(ReadQuery::Lookup(id.0))
+        .await
+        .expect("read");
     let elapsed = t0.elapsed();
     assert!(
         matches!(v, ReadView::Verdict(VerdictW::Active { .. })),
         "任意节点线性一致读可见: {v:?}"
     );
-    assert!(elapsed <= Duration::from_secs(2), "写→读 ≤2s（实际 {:?}）", elapsed);
-    assert_eq!(row.vip, chml_sync::VIP_FIRST.to_be_bytes(), "首 VIP = 100.64.0.2");
+    assert!(
+        elapsed <= Duration::from_secs(2),
+        "写→读 ≤2s（实际 {:?}）",
+        elapsed
+    );
+    assert_eq!(
+        row.vip,
+        chml_sync::VIP_FIRST.to_be_bytes(),
+        "首 VIP = 100.64.0.2"
+    );
 
     // 吊销记录同样 ≤2s 线性一致可见。
     let t1 = Instant::now();
     must_write(&cluster.nodes[writer], SyncRequest::Revoke { device: id.0 }).await;
-    let v = cluster.nodes[reader].read_linearizable(ReadQuery::Lookup(id.0)).await.expect("read");
+    let v = cluster.nodes[reader]
+        .read_linearizable(ReadQuery::Lookup(id.0))
+        .await
+        .expect("read");
     assert!(
         matches!(v, ReadView::Verdict(VerdictW::Revoked { .. })),
         "吊销记录线性一致可见: {v:?}"
     );
-    assert!(t1.elapsed() <= Duration::from_secs(2), "吊销写→读 ≤2s（实际 {:?}）", t1.elapsed());
+    assert!(
+        t1.elapsed() <= Duration::from_secs(2),
+        "吊销写→读 ≤2s（实际 {:?}）",
+        t1.elapsed()
+    );
 }
 
 // ============================================================================
@@ -198,7 +238,10 @@ async fn kill_leader_reelects_within_15s_no_lost_writes() {
     }
 
     // kill leader：Raft 停机 + 织物切除（dial 拒绝）。
-    cluster.nodes[leader_idx].shutdown().await.expect("leader shutdown");
+    cluster.nodes[leader_idx]
+        .shutdown()
+        .await
+        .expect("leader shutdown");
     MemoryFabric::cut(&cluster.reg, &sid(leader_id));
 
     // 重选举 ≤15s（选举超时 1.5~3s + RTT 100ms）。
@@ -221,21 +264,35 @@ async fn kill_leader_reelects_within_15s_no_lost_writes() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let (_ni, _nl) = new_leader.expect("15s 内重选举");
-    assert!(t0.elapsed() <= Duration::from_secs(15), "重选举 {:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() <= Duration::from_secs(15),
+        "重选举 {:?}",
+        t0.elapsed()
+    );
 
     // 无丢提交：经幸存 follower 线性一致读（读转发）= 全部 5 台设备在册。
     let survivor = (leader_idx + 1) % 3;
-    let view = cluster.nodes[survivor].read_linearizable(ReadQuery::State).await.expect("read");
+    let view = cluster.nodes[survivor]
+        .read_linearizable(ReadQuery::State)
+        .await
+        .expect("read");
     let ReadView::State(st) = view else { panic!() };
     assert_eq!(st.devices, 5, "无丢提交（5 台在册）");
 
     // 新 leader 继续可写。
     let resp = must_write(
         &cluster.nodes[survivor],
-        SyncRequest::RegisterDevice { owner: "post".into(), x25519: [9; 32], ed25519: [9; 32] },
+        SyncRequest::RegisterDevice {
+            owner: "post".into(),
+            x25519: [9; 32],
+            ed25519: [9; 32],
+        },
     )
     .await;
-    assert!(matches!(resp, SyncResponse::Device(_)), "新 leader 可写: {resp:?}");
+    assert!(
+        matches!(resp, SyncResponse::Device(_)),
+        "新 leader 可写: {resp:?}"
+    );
 }
 
 // ============================================================================
@@ -252,7 +309,11 @@ async fn lease_conflict_newer_wins_old_side_evicted() {
     // 节点 1 先发布（设备连在节点 1）。
     cluster.nodes[0].publish_lease(&device).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(cluster.nodes[1].lease().observe(&device).unwrap().holder, 1, "租约传播到节点 2");
+    assert_eq!(
+        cluster.nodes[1].lease().observe(&device).unwrap().holder,
+        1,
+        "租约传播到节点 2"
+    );
 
     // 节点 2 发布同设备更新租约 ⇒ 新者胜 + 节点 1 踢出回调（事件推送 ≤1s + 反熵兜底）。
     let t0 = Instant::now();
@@ -269,10 +330,19 @@ async fn lease_conflict_newer_wins_old_side_evicted() {
         "旧端（节点 1）踢出回调触发（实际 {:?}）",
         cluster.recorders[0].evictions()
     );
-    assert!(t0.elapsed() <= Duration::from_secs(3), "踢出回调 ≤3s（实际 {:?}）", t0.elapsed());
+    assert!(
+        t0.elapsed() <= Duration::from_secs(3),
+        "踢出回调 ≤3s（实际 {:?}）",
+        t0.elapsed()
+    );
     // 新者胜：各节点 observe 一致指向节点 2。
     for n in &cluster.nodes {
-        assert_eq!(n.lease().observe(&device).unwrap().holder, 2, "新者胜（节点 {}）", n.id());
+        assert_eq!(
+            n.lease().observe(&device).unwrap().holder,
+            2,
+            "新者胜（节点 {}）",
+            n.id()
+        );
     }
 }
 
@@ -289,16 +359,28 @@ async fn register_revoke_register_ip_never_reused() {
 
     let a = must_write(
         &cluster.nodes[writer],
-        SyncRequest::RegisterDevice { owner: "u".into(), x25519: [1; 32], ed25519: [1; 32] },
+        SyncRequest::RegisterDevice {
+            owner: "u".into(),
+            x25519: [1; 32],
+            ed25519: [1; 32],
+        },
     )
     .await;
     let SyncResponse::Device(a) = a else { panic!() };
     let id_a = dev_id(&[1; 32]);
-    must_write(&cluster.nodes[writer], SyncRequest::Revoke { device: id_a.0 }).await;
+    must_write(
+        &cluster.nodes[writer],
+        SyncRequest::Revoke { device: id_a.0 },
+    )
+    .await;
 
     let b = must_write(
         &cluster.nodes[writer],
-        SyncRequest::RegisterDevice { owner: "u".into(), x25519: [2; 32], ed25519: [2; 32] },
+        SyncRequest::RegisterDevice {
+            owner: "u".into(),
+            x25519: [2; 32],
+            ed25519: [2; 32],
+        },
     )
     .await;
     let SyncResponse::Device(b) = b else { panic!() };
@@ -306,10 +388,17 @@ async fn register_revoke_register_ip_never_reused() {
     assert!(ib > ia, "IP 不复用：水位线只进不退（{ia} → {ib}）");
     // 同设备重注册拒（禁用不删除：Revoked 终态行保留）。
     let again = cluster.nodes[writer]
-        .write(SyncRequest::RegisterDevice { owner: "u".into(), x25519: [1; 32], ed25519: [1; 32] })
+        .write(SyncRequest::RegisterDevice {
+            owner: "u".into(),
+            x25519: [1; 32],
+            ed25519: [1; 32],
+        })
         .await
         .expect("write ok");
-    assert!(matches!(again, SyncResponse::Error(StateError::DeviceExists)), "{again:?}");
+    assert!(
+        matches!(again, SyncResponse::Error(StateError::DeviceExists)),
+        "{again:?}"
+    );
 }
 
 // ============================================================================
@@ -334,19 +423,35 @@ async fn server_keys_rewrap_roundtrip() {
     // 无根签名（他签）⇒ 状态机拒绝（被入侵的在册服务器没有根密钥，无法触发 rewrap）。
     let forged_root = SigningKey::from_bytes(&[8u8; 32]);
     let bad = cluster.nodes[writer]
-        .write(SyncRequest::server_keys_signed(&forged_root, entries.clone()))
+        .write(SyncRequest::server_keys_signed(
+            &forged_root,
+            entries.clone(),
+        ))
         .await
         .expect("write ok");
-    assert!(matches!(bad, SyncResponse::Error(StateError::BadRootSignature)), "他签 server_keys 拒: {bad:?}");
+    assert!(
+        matches!(bad, SyncResponse::Error(StateError::BadRootSignature)),
+        "他签 server_keys 拒: {bad:?}"
+    );
     let bad_rw = cluster.nodes[writer]
         .write(SyncRequest::rewrap_signed(&forged_root, 2, vec![1, 2, 3]))
         .await
         .expect("write ok");
-    assert!(matches!(bad_rw, SyncResponse::Error(StateError::BadRootSignature)), "他签 rewrap 拒: {bad_rw:?}");
+    assert!(
+        matches!(bad_rw, SyncResponse::Error(StateError::BadRootSignature)),
+        "他签 rewrap 拒: {bad_rw:?}"
+    );
 
     // 根签 server_keys 落库。
-    let resp = must_write(&cluster.nodes[writer], SyncRequest::server_keys_signed(&cluster.root, entries)).await;
-    assert!(matches!(resp, SyncResponse::ServerKeys { servers: 1 }), "{resp:?}");
+    let resp = must_write(
+        &cluster.nodes[writer],
+        SyncRequest::server_keys_signed(&cluster.root, entries),
+    )
+    .await;
+    assert!(
+        matches!(resp, SyncResponse::ServerKeys { servers: 1 }),
+        "{resp:?}"
+    );
 
     // OPRF 类秘密 → envelope v2 封装到节点 2 的混合公钥 → 根签 rewrap 提交。
     let secret = b"opaque-oprf-key-material-32-bytes!!!";
@@ -358,12 +463,27 @@ async fn server_keys_rewrap_roundtrip() {
         SyncRequest::rewrap_signed(&cluster.root, 2, wrapped.clone()),
     )
     .await;
-    let SyncResponse::Admin(AdminAck::Rewrap { server_id: 2, bytes }) = resp else { panic!() };
-    assert_eq!(bytes, wrapped.len(), "OPRF key 副本数 +1 可观测（封装字节数入账）");
+    let SyncResponse::Admin(AdminAck::Rewrap {
+        server_id: 2,
+        bytes,
+    }) = resp
+    else {
+        panic!()
+    };
+    assert_eq!(
+        bytes,
+        wrapped.len(),
+        "OPRF key 副本数 +1 可观测（封装字节数入账）"
+    );
 
     // 节点 2 线性一致读取出封装副本，以自己的静态混合私钥开封 → 原秘密。
-    let view = cluster.nodes[1].read_linearizable(ReadQuery::Wrap(2)).await.expect("read");
-    let ReadView::Wrap(Some(got)) = view else { panic!("wrap 落库: {view:?}") };
+    let view = cluster.nodes[1]
+        .read_linearizable(ReadQuery::Wrap(2))
+        .await
+        .expect("read");
+    let ReadView::Wrap(Some(got)) = view else {
+        panic!("wrap 落库: {view:?}")
+    };
     assert_eq!(got, wrapped, "封装副本原样落库");
     let mut opened = Vec::new();
     chml_protocol::envelope::open_v2(&cluster.idents[1].static_hybrid, &got[..], &mut opened)
@@ -384,25 +504,39 @@ async fn revoke_apply_callback_epoch_and_kill_hook_within_2s() {
 
     let resp = must_write(
         &cluster.nodes[writer],
-        SyncRequest::RegisterDevice { owner: "bob".into(), x25519: [3; 32], ed25519: [3; 32] },
+        SyncRequest::RegisterDevice {
+            owner: "bob".into(),
+            x25519: [3; 32],
+            ed25519: [3; 32],
+        },
     )
     .await;
-    let SyncResponse::Device(_) = resp else { panic!() };
+    let SyncResponse::Device(_) = resp else {
+        panic!()
+    };
     let id = dev_id(&[3; 32]);
 
     // 吊销前签发的票据（epoch = 0）——清拒票据断言用。
-    let pre_ticket = cluster.nodes[writer].issue_ticket(id.0, 1_000).expect("ticket");
+    let pre_ticket = cluster.nodes[writer]
+        .issue_ticket(id.0, 1_000)
+        .expect("ticket");
 
     let t_commit = Instant::now();
     let resp = must_write(&cluster.nodes[writer], SyncRequest::Revoke { device: id.0 }).await;
-    let SyncResponse::Epoch(new_epoch) = resp else { panic!() };
+    let SyncResponse::Epoch(new_epoch) = resp else {
+        panic!()
+    };
     assert!(new_epoch >= 1, "吊销推进 revocation_epoch");
 
     // 各节点（含 follower）apply 回调 ≤2s：epoch 前进 + 杀会话钩子触发。
     for (i, rec) in cluster.recorders.iter().enumerate() {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let events: Vec<_> = rec.revocations().into_iter().filter(|e| e.device == id.0).collect();
+            let events: Vec<_> = rec
+                .revocations()
+                .into_iter()
+                .filter(|e| e.device == id.0)
+                .collect();
             if let Some(ev) = events.last() {
                 assert_eq!(ev.new_epoch, new_epoch, "节点 {} epoch 前进一致", i + 1);
                 break;
@@ -448,15 +582,24 @@ async fn apply_lag_breaker_rejects_cache_and_new_handshake() {
     let dev_pub = *dev.verifying_key().as_bytes();
     let resp = must_write(
         &cluster.nodes[writer],
-        SyncRequest::RegisterDevice { owner: "carol".into(), x25519: [4; 32], ed25519: dev_pub },
+        SyncRequest::RegisterDevice {
+            owner: "carol".into(),
+            x25519: [4; 32],
+            ed25519: dev_pub,
+        },
     )
     .await;
-    let SyncResponse::Device(_) = resp else { panic!() };
+    let SyncResponse::Device(_) = resp else {
+        panic!()
+    };
     let id = dev_id(&dev_pub);
 
     // 预热缓存：一次成功查询后该设备在 lagging follower 缓存中为 Active。
     let v = lagger.dir().lookup_async(id).await;
-    assert!(matches!(v, LookupVerdict::Active(_)), "预热：查询给 Active（{v:?}）");
+    assert!(
+        matches!(v, LookupVerdict::Active(_)),
+        "预热：查询给 Active（{v:?}）"
+    );
     let v = lagger.dir().lookup_async(id).await;
     assert!(matches!(v, LookupVerdict::Active(_)));
 
@@ -494,7 +637,10 @@ async fn apply_lag_breaker_rejects_cache_and_new_handshake() {
         stats_after.cache_hits == stats_before.cache_hits,
         "熔断期拒用本地缓存（cache_hits 不前进）"
     );
-    assert!(t_lookup.elapsed() <= Duration::from_secs(2), "降级读在预算内");
+    assert!(
+        t_lookup.elapsed() <= Duration::from_secs(2),
+        "降级读在预算内"
+    );
 
     // 对照：健康 follower（未滞后）不受熔断影响——epoch 前进后缓存失效，同样给 Revoked。
     let v2 = cluster.nodes[writer].dir().lookup_async(id).await;
@@ -523,18 +669,29 @@ async fn ticket_root_in_raft_cross_node_and_epoch_invalidation() {
 
     let resp = must_write(
         &cluster.nodes[writer],
-        SyncRequest::RegisterDevice { owner: "dave".into(), x25519: [5; 32], ed25519: [5; 32] },
+        SyncRequest::RegisterDevice {
+            owner: "dave".into(),
+            x25519: [5; 32],
+            ed25519: [5; 32],
+        },
     )
     .await;
-    let SyncResponse::Device(_) = resp else { panic!() };
+    let SyncResponse::Device(_) = resp else {
+        panic!()
+    };
     let id = dev_id(&[5; 32]).0;
 
     // A（writer）签发；等 Bootstrap/注册在全网 apply（≤3s）后 A/B/C 全部可验——
     // 票据密钥根在 Raft 状态内复制，任何服务器都验得。
-    let ticket = cluster.nodes[writer].issue_ticket(id, 1_000).expect("ticket");
+    let ticket = cluster.nodes[writer]
+        .issue_ticket(id, 1_000)
+        .expect("ticket");
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let all_ok = cluster.nodes.iter().all(|n| n.verify_ticket(&ticket, &id, 1_001).is_ok());
+        let all_ok = cluster
+            .nodes
+            .iter()
+            .all(|n| n.verify_ticket(&ticket, &id, 1_001).is_ok());
         if all_ok {
             break;
         }
@@ -547,7 +704,10 @@ async fn ticket_root_in_raft_cross_node_and_epoch_invalidation() {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let all_stale = cluster.nodes.iter().all(|n| {
-            matches!(n.verify_ticket(&ticket, &id, 1_002), Err(TicketError::StaleEpoch { .. }))
+            matches!(
+                n.verify_ticket(&ticket, &id, 1_002),
+                Err(TicketError::StaleEpoch { .. })
+            )
         });
         if all_stale {
             break;

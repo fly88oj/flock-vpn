@@ -1,20 +1,27 @@
 //! 控制流（docs/design.md §2.2 / §3.11：yamux 控制流、postcard 消息、版本化）。
 //!
 //! 承载：OPAQUE 登录（`anchor`：服务端身份签名覆盖 SERVER_ID‖user‖ke2‖bind_token）→
-//! 会话票据签发（TTL、revocation_epoch）→ key-bind（设备公钥登记）→ 设备注册表操作 →
-//! SR-SIG1 请求验签 → dir_pull（根签 ClusterDirectory 下发）。
+//! 会话票据签发（TTL、revocation_epoch；票据根 = 本地种子（单服）或 Raft 状态内根
+//! （多主，任何服务器都验得了——SR-SIG1 跨服重放面的闭合前提，§2.2））→ key-bind
+//! （设备公钥登记）→ 设备注册表操作 → SR-SIG1 请求验签 → dir_pull（根签
+//! ClusterDirectory 下发）。
 //!
 //! # 票据强制契约（§2.2，接口契约级）
 //!
 //! 所有受 SR-SIG1 保护的**状态变更**请求必须携带有效票据；[`CtrlGuard::admit_state_change`]
 //! 的校验顺序 = **票据（签名+TTL+epoch+吊销）→ SR-SIG1 验签 → nonce 记账**——票据/签名
-//! 失败时 nonce **不入账**（`ticket.rs::tests` + `tests/control_flow.rs::ticket_contract_*`
+//! 失败时 nonce **不入账**（`ticket.rs::tests` + `tests/control_flow.rs::full_chain_*`
 //! 断言该顺序：错误票据 + 全新 nonce ⇒ 拒且不记账）。
+//!
+//! # 异步派发（M4 多主批次）
+//!
+//! 写读经 [`NetBackend`]（single = 本地 redb 立即完成；multi-primary = Raft 提交/线性
+//! 一致读——网络往返，故派发为 async；§1.3.3c lookup 接缝的同一理由）。
 //!
 //! # 帧格式
 //!
-//! 控制流 = 隧道内首条 yamux 流（客户端 `open_stream(Prio::Control)`；服务端 accept 首流）。
-//! 每条消息 = `[u32 LE len][postcard CtrlRequest/CtrlResponse]`。
+//! 控制流 = 隧道内首条 yamux 流（客户端 `open_stream(Prio::Control)`；服务端按流 id=1
+//! 分派）。每条消息 = `[u32 LE len][postcard CtrlRequest/CtrlResponse]`。
 
 use chml_protocol::opaque_ke;
 use chml_protocol::pake::{
@@ -28,9 +35,10 @@ use chml_protocol::{ed25519_dalek, x25519_dalek};
 use ed25519_dalek::{Signature, Verifier};
 use serde::{Deserialize, Serialize};
 
-use crate::netstate::{NetError, NetState, RedeemError, RedeemRequest, StateStore};
+use crate::backend::NetBackend;
+use crate::netstate::{NetError, RedeemError, RedeemRequest};
 use crate::server::ServerCore;
-use crate::ticket::{NonceLedger, SignedTicket, TicketIssuer};
+use crate::ticket::{NonceLedger, TicketAuthority, TicketWire};
 
 /// 控制协议版本（Hello 交换；不匹配即拒——版本化，§3.11）。
 pub const CTRL_PROTO_VERSION: u32 = 1;
@@ -102,20 +110,20 @@ pub enum CtrlRequest {
     },
     /// 设备公钥登记（状态变更：需票据 + bind_token 一次性 + 设备签名）。
     KeyBind {
-        ticket: SignedTicket,
+        ticket: TicketWire,
         bind_token: [u8; 16],
         device: DevicePubs,
         sr_sig_pub: [u8; 32],
         device_sig: Vec<u8>,
     },
-    /// 票据换发（状态变更：SR-SIG1 + 票据 + nonce； = 无票据 ⇒ TicketMissing）。
+    /// 票据换发（状态变更：SR-SIG1 + 票据 + nonce；`ticket: None` = 无票据 ⇒ TicketMissing）。
     TicketRenew {
-        ticket: Option<SignedTicket>,
+        ticket: Option<TicketWire>,
         auth: SrAuth,
     },
     /// 邀请兑换（状态变更：SR-SIG1 + 票据 + nonce）。
     RedeemInvite {
-        ticket: Option<SignedTicket>,
+        ticket: Option<TicketWire>,
         auth: SrAuth,
         invite_b64: String,
         username: String,
@@ -123,7 +131,7 @@ pub enum CtrlRequest {
     },
     /// 注册表操作（状态变更：SR-SIG1 + 票据 + nonce）。
     DeviceOp {
-        ticket: Option<SignedTicket>,
+        ticket: Option<TicketWire>,
         auth: SrAuth,
         op: DeviceOp,
     },
@@ -150,7 +158,7 @@ pub enum CtrlResponse {
         anchor_sig: Vec<u8>,
     },
     LoginOk {
-        ticket: SignedTicket,
+        ticket: TicketWire,
         epoch: u64,
     },
     KeyBound {
@@ -158,7 +166,7 @@ pub enum CtrlResponse {
         vip: [u8; 4],
     },
     TicketRenewed {
-        ticket: SignedTicket,
+        ticket: TicketWire,
     },
     Redeemed {
         device_id: [u8; 32],
@@ -326,50 +334,72 @@ pub async fn recv_ctrl_msg<S: futures::io::AsyncRead + Unpin, M: for<'de> Deseri
 ///    且票据绑定设备 == 当前会话设备（票据绑 device，§2.2）。
 /// 3. nonce 查重 + 入账（最后一步；只有前两步都过才执行）。
 pub struct CtrlGuard {
-    pub tickets: TicketIssuer,
+    /// 票据权威（Local 种子 / Sync = Raft 内根——校验语义一致，见 [`TicketAuthority`]）。
+    pub authority: TicketAuthority,
     pub nonces: NonceLedger,
 }
 
 impl CtrlGuard {
-    pub fn new(tickets: TicketIssuer) -> Self {
+    pub fn new(authority: TicketAuthority) -> Self {
         CtrlGuard {
-            tickets,
+            authority,
             nonces: NonceLedger::new(),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn admit_state_change(
+    /// 票据校验 + user 解析（KeyBind 与 admit 共用；epoch/设备态来自 NetBackend）。
+    async fn ticket_principal(
         &self,
-        net: &dyn NetState,
+        net: &NetBackend,
         session_device: &DeviceId,
-        ticket: &SignedTicket,
+        ticket: &TicketWire,
+        now_unix: u64,
+    ) -> Result<String, crate::ticket::TicketReason> {
+        let epoch = net.epoch().await;
+        let verdict = net.lookup(session_device).await;
+        let principal = self
+            .authority
+            .verify(ticket, session_device, now_unix, epoch, |_| verdict)?;
+        match principal.user {
+            // Local 票据内嵌 user；Sync 票据绑 device——user 由注册表 owner 解析。
+            None => net
+                .device_row(session_device)
+                .await
+                .map(|r| r.owner)
+                .filter(|u| !u.is_empty())
+                .ok_or(crate::ticket::TicketReason::DeviceNotActive),
+            Some(u) => Ok(u),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admit_state_change(
+        &self,
+        net: &NetBackend,
+        session_device: &DeviceId,
+        ticket: &TicketWire,
         auth: &SrAuth,
         path: &str,
         body: &[u8],
         now_unix: i64,
     ) -> Result<String, CtrlError> {
         // ① 票据（先于一切 nonce 记账——§2.2 契约序）。
-        let claims = self
-            .tickets
-            .verify(ticket, now_unix as u64, net.epoch(), |id| net.lookup(id))
+        let user = self
+            .ticket_principal(net, session_device, ticket, now_unix as u64)
+            .await
             .map_err(|r| {
                 eprintln!("chmlvpn-server: ticket rejected: {r}");
                 CtrlError::TicketBad
             })?;
-        if claims.device != session_device.0 {
-            eprintln!("chmlvpn-server: ticket device != session device");
-            return Err(CtrlError::TicketBad);
-        }
-        // ② SR-SIG1 验签（user 公钥集来自注册表）。
-        let keys = net.user_sig_pubs(&claims.user);
+        // ② SR-SIG1 验签（user 公钥集来自注册表——线性一致）。
+        let keys = net.user_sig_pubs(&user).await;
         let verified = sig::verify(&auth.header, &keys, CTRL_METHOD, path, body, now_unix)
             .map_err(|e| match e {
                 sig::AuthError::Format => CtrlError::SigFormat,
                 sig::AuthError::Stale => CtrlError::SigStale,
                 sig::AuthError::BadSignature => CtrlError::SigBad,
             })?;
-        if verified.user != claims.user {
+        if verified.user != user {
             return Err(CtrlError::SigBad);
         }
         // ③ nonce 记账（查重 + 入账；仅在前两步通过后到达此处）。
@@ -379,7 +409,7 @@ impl CtrlGuard {
         {
             return Err(CtrlError::NonceReplay);
         }
-        Ok(claims.user)
+        Ok(user)
     }
 }
 
@@ -410,14 +440,13 @@ pub async fn serve_control<S: futures::io::AsyncRead + futures::io::AsyncWrite +
             Ok(r) => r,
             Err(_) => return Ok(()), // EOF/坏帧：控制流结束
         };
-        let resp = dispatch(core, &mut ctx, req);
+        let resp = dispatch(core, &mut ctx, req).await;
         send_ctrl_msg(io, &resp).await?;
     }
 }
 
-fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlResponse {
-    let net: &StateStore = &core.store;
-    let net_dyn: &dyn NetState = net;
+async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlResponse {
+    let net = &core.net;
     let now_unix = chml_protocol::trust::now_unix();
     match req {
         CtrlRequest::Hello { ver } => {
@@ -433,10 +462,10 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
 
         // —— OPAQUE 注册（设置口令；授权 = 本会话设备 owner）——
         CtrlRequest::PwBegin { user, m1_b64 } => {
-            if owner_of_device(net_dyn, &ctx.device).as_deref() != Some(user.as_str()) {
+            if owner_of_device(net, &ctx.device).await.as_deref() != Some(user.as_str()) {
                 return err(CtrlError::NotAuthorized);
             }
-            if net.password(&user).is_some() {
+            if net.password(&user).await.is_some() {
                 return err(CtrlError::PasswordExists);
             }
             match server_reg_start(&core.oprf, &m1_b64, &user) {
@@ -448,7 +477,7 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
             record_b64,
             profile,
         } => {
-            let Some(owner) = owner_of_device(net_dyn, &ctx.device) else {
+            let Some(owner) = owner_of_device(net, &ctx.device).await else {
                 return err(CtrlError::NotAuthorized);
             };
             // 记录侧规范化（解码验证）。
@@ -456,7 +485,7 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
                 Ok(c) => c,
                 Err(_) => return err(CtrlError::Internal),
             };
-            match net.set_password(&owner, &canonical, profile) {
+            match net.set_password(&owner, &canonical, profile).await {
                 Ok(()) => CtrlResponse::Ok,
                 Err(e) => state_err(e),
             }
@@ -464,7 +493,7 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
 
         // —— OPAQUE 登录（anchor）→ 票据签发 ——
         CtrlRequest::LoginBegin { user, ke1_b64 } => {
-            let Some(owner) = owner_of_device(net_dyn, &ctx.device) else {
+            let Some(owner) = owner_of_device(net, &ctx.device).await else {
                 return err(CtrlError::NotAuthorized);
             };
             if owner != user {
@@ -472,6 +501,7 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
             }
             let record = net
                 .password(&user)
+                .await
                 .and_then(|(r, _)| chml_protocol::pake::server_record_from_b64(&r).ok());
             match server_login_start(
                 &mut rand::rngs::OsRng,
@@ -507,17 +537,23 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
             if server_login_finish(&state, &ke3_b64).is_err() {
                 return err(CtrlError::LoginFailed);
             }
-            let Some(user) = owner_of_device(net_dyn, &ctx.device) else {
+            let Some(user) = owner_of_device(net, &ctx.device).await else {
                 return err(CtrlError::NotAuthorized);
             };
-            let epoch = net.epoch();
-            let ticket = core.guard.tickets.issue(
+            let epoch = net.epoch().await;
+            let ticket = match core.guard.authority.issue(
                 &user,
                 ctx.device,
                 epoch,
                 now_unix,
                 core.cfg.ticket_ttl_secs,
-            );
+            ) {
+                Ok(t) => t,
+                Err(m) => {
+                    eprintln!("chmlvpn-server: ticket issue: {m}");
+                    return err(CtrlError::Internal);
+                }
+            };
             CtrlResponse::LoginOk { ticket, epoch }
         }
 
@@ -530,25 +566,19 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
             device_sig,
         } => {
             // 票据（状态变更必带；含会话设备绑定检查）。
-            let user = {
-                match core
-                    .guard
-                    .tickets
-                    .verify(&ticket, now_unix, net.epoch(), |id| net.lookup(id))
-                {
-                    Ok(c) if c.device == ctx.device.0 => c.user,
-                    Ok(_) => {
-                        eprintln!("chmlvpn-server: key-bind ticket bound to another device");
-                        return err(CtrlError::TicketBad);
-                    }
-                    Err(r) => {
-                        eprintln!("chmlvpn-server: key-bind ticket rejected: {r}");
-                        return err(CtrlError::TicketBad);
-                    }
+            let user = match core
+                .guard
+                .ticket_principal(net, &ctx.device, &ticket, now_unix)
+                .await
+            {
+                Ok(u) => u,
+                Err(r) => {
+                    eprintln!("chmlvpn-server: key-bind ticket rejected: {r}");
+                    return err(CtrlError::TicketBad);
                 }
             };
             // bind_token 一次性（§2.4 线性一致查重）。
-            if !net.consume_bind_token(&bind_token) {
+            if !net.consume_bind_token(&bind_token).await {
                 return err(CtrlError::BindTokenUsed);
             }
             // 设备签名（占有证明）：覆盖 cluster‖user‖bind_token‖设备公钥‖SR-SIG1 公钥。
@@ -568,9 +598,12 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
             if vk.verify(&sig_bytes, &signature).is_err() {
                 return err(CtrlError::BindSigBad);
             }
-            match net.register_device(&user, device.x25519, device.ed25519) {
+            match net
+                .register_device(&user, device.x25519, device.ed25519)
+                .await
+            {
                 Ok(row) => {
-                    let _ = net.add_user_sig_key(&user, sr_sig_pub);
+                    let _ = net.add_user_sig_key(&user, sr_sig_pub).await;
                     CtrlResponse::KeyBound {
                         device_id: DeviceId::from_ed25519(&vk).0,
                         vip: row.vip,
@@ -585,23 +618,34 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
             let Some(ticket) = ticket else {
                 return err(CtrlError::TicketMissing);
             };
-            match core.guard.admit_state_change(
-                net_dyn,
-                &ctx.device,
-                &ticket,
-                &auth,
-                PATH_TICKET_RENEW,
-                b"",
-                now_unix as i64,
-            ) {
+            match core
+                .guard
+                .admit_state_change(
+                    net,
+                    &ctx.device,
+                    &ticket,
+                    &auth,
+                    PATH_TICKET_RENEW,
+                    b"",
+                    now_unix as i64,
+                )
+                .await
+            {
                 Ok(user) => {
-                    let t = core.guard.tickets.issue(
+                    let epoch = net.epoch().await;
+                    let t = match core.guard.authority.issue(
                         &user,
                         ctx.device,
-                        net.epoch(),
+                        epoch,
                         now_unix,
                         core.cfg.ticket_ttl_secs,
-                    );
+                    ) {
+                        Ok(t) => t,
+                        Err(m) => {
+                            eprintln!("chmlvpn-server: ticket issue: {m}");
+                            return err(CtrlError::Internal);
+                        }
+                    };
                     CtrlResponse::TicketRenewed { ticket: t }
                 }
                 Err(code) => err(code),
@@ -618,28 +662,36 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
                 return err(CtrlError::TicketMissing);
             };
             let body = redeem_body(&username, &device);
-            match core.guard.admit_state_change(
-                net_dyn,
-                &ctx.device,
-                &ticket,
-                &auth,
-                PATH_REDEEM_INVITE,
-                &body,
-                now_unix as i64,
-            ) {
+            match core
+                .guard
+                .admit_state_change(
+                    net,
+                    &ctx.device,
+                    &ticket,
+                    &auth,
+                    PATH_REDEEM_INVITE,
+                    &body,
+                    now_unix as i64,
+                )
+                .await
+            {
                 Ok(_) => {
                     let Ok(invite_bytes) = b64_decode(&invite_b64) else {
                         return err(CtrlError::InviteBadSig);
                     };
-                    match net.redeem_invite(RedeemRequest {
-                        invite_bytes: &invite_bytes,
-                        username: &username,
-                        device_x25519: device.x25519,
-                        device_ed25519: device.ed25519,
-                        expected_root_pub: *core.identity.root_pub.as_bytes(),
-                        expected_cluster_id: core.identity.cluster_id.0,
-                        now_unix,
-                    }) {
+                    // 集群身份钉扎：Sync 形态由状态机 bootstrap 身份自证；单服以库内根比对。
+                    match net
+                        .redeem_invite(RedeemRequest {
+                            invite_bytes: &invite_bytes,
+                            username: &username,
+                            device_x25519: device.x25519,
+                            device_ed25519: device.ed25519,
+                            expected_root_pub: *core.identity.root_pub.as_bytes(),
+                            expected_cluster_id: core.identity.cluster_id.0,
+                            now_unix,
+                        })
+                        .await
+                    {
                         Ok(out) => CtrlResponse::Redeemed {
                             device_id: out.device_id,
                             vip: out.vip,
@@ -655,49 +707,54 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
                 return err(CtrlError::TicketMissing);
             };
             let body = postcard::to_allocvec(&op).unwrap_or_default();
-            let user = match core.guard.admit_state_change(
-                net_dyn,
-                &ctx.device,
-                &ticket,
-                &auth,
-                PATH_DEVICE_OP,
-                &body,
-                now_unix as i64,
-            ) {
+            let user = match core
+                .guard
+                .admit_state_change(
+                    net,
+                    &ctx.device,
+                    &ticket,
+                    &auth,
+                    PATH_DEVICE_OP,
+                    &body,
+                    now_unix as i64,
+                )
+                .await
+            {
                 Ok(u) => u,
                 Err(code) => return err(code),
             };
             match op {
                 DeviceOp::Revoke { device } => {
-                    if !authorize_owner(net_dyn, &user, &DeviceId(device)) {
+                    if !authorize_owner(net, &user, &DeviceId(device)).await {
                         return err(CtrlError::NotAuthorized);
                     }
-                    match net.revoke(&DeviceId(device)) {
+                    match net.revoke(&DeviceId(device)).await {
                         Ok(_) => {
-                            // 杀本地该设备会话（§2.2 吊销传播界：apply 回调内本地执行）。
-                            core.sessions.kill(&device);
+                            // 杀本地该设备会话（§2.2 吊销传播界：apply 回调内本地执行——
+                            // 多主形态经 SyncHooks 于各节点 apply 现场触发；单机即时执行）。
+                            core.sessions.kill(&DeviceId(device).0);
                             CtrlResponse::Ok
                         }
                         Err(e) => state_err(e),
                     }
                 }
                 DeviceOp::Disable { device } => {
-                    if !authorize_owner(net_dyn, &user, &DeviceId(device)) {
+                    if !authorize_owner(net, &user, &DeviceId(device)).await {
                         return err(CtrlError::NotAuthorized);
                     }
-                    match net.disable(&DeviceId(device)) {
+                    match net.disable(&DeviceId(device)).await {
                         Ok(_) => {
-                            core.sessions.kill(&device);
+                            core.sessions.kill(&DeviceId(device).0);
                             CtrlResponse::Ok
                         }
                         Err(e) => state_err(e),
                     }
                 }
                 DeviceOp::Enable { device } => {
-                    if !authorize_owner(net_dyn, &user, &DeviceId(device)) {
+                    if !authorize_owner(net, &user, &DeviceId(device)).await {
                         return err(CtrlError::NotAuthorized);
                     }
-                    match net.enable(&DeviceId(device)) {
+                    match net.enable(&DeviceId(device)).await {
                         Ok(()) => CtrlResponse::Ok,
                         Err(e) => state_err(e),
                     }
@@ -705,6 +762,7 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
                 DeviceOp::List => {
                     let rows = net
                         .devices_of(&user)
+                        .await
                         .into_iter()
                         .map(|(id, row)| DeviceRowWire {
                             device_id: id.0,
@@ -739,13 +797,14 @@ fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> CtrlRespo
     }
 }
 
-fn owner_of_device(net: &dyn NetState, device: &DeviceId) -> Option<String> {
-    net.device_row(device).map(|r| r.owner)
+async fn owner_of_device(net: &NetBackend, device: &DeviceId) -> Option<String> {
+    net.device_row(device).await.map(|r| r.owner)
 }
 
 /// owner 检查（用户只能操作自己名下设备）。
-fn authorize_owner(net: &dyn NetState, user: &str, device: &DeviceId) -> bool {
+async fn authorize_owner(net: &NetBackend, user: &str, device: &DeviceId) -> bool {
     net.device_row(device)
+        .await
         .map(|r| r.owner == user)
         .unwrap_or(false)
 }
@@ -828,6 +887,9 @@ const _: fn([u8; 32]) -> x25519_dalek::PublicKey = x25519_dalek::PublicKey::from
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::NetBackend;
+    use crate::netstate::{DeviceStatus, NetState as _, StateStore};
+    use crate::ticket::{TicketIssuer, TicketWire};
     use chml_protocol::session::{DeviceRecord, LookupVerdict};
     use chml_protocol::x25519_dalek::PublicKey;
 
@@ -841,19 +903,35 @@ mod tests {
         }
     }
 
+    fn local(t: TicketWire) -> crate::ticket::SignedTicket {
+        match t {
+            TicketWire::Local(s) => s,
+            TicketWire::Sync(_) => panic!("local authority"),
+        }
+    }
+
     /// 错误票据 + 全新 nonce ⇒ 拒且 nonce 不入账；同 nonce 持有效票据走到下一层（顺序证明）。
-    #[test]
-    fn ticket_checked_before_nonce_accounting() {
+    #[tokio::test]
+    async fn ticket_checked_before_nonce_accounting() {
         let dir = tempfile::tempdir().unwrap();
-        let net = StateStore::open(&dir.path().join("n.redb")).unwrap();
+        let store = std::sync::Arc::new(StateStore::open(&dir.path().join("n.redb")).unwrap());
         let vk = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
-        net.register_device("alice", [1; 32], *vk.as_bytes())
+        store
+            .register_device("alice", [1; 32], *vk.as_bytes())
             .unwrap();
         let device = DeviceId::from_ed25519(&vk);
 
-        let guard = CtrlGuard::new(TicketIssuer::from_seed([9u8; 32]));
+        let guard = CtrlGuard::new(TicketAuthority::Local(Box::new(TicketIssuer::from_seed(
+            [9u8; 32],
+        ))));
+        let net = NetBackend::Single(store.clone());
         let now = 10_000i64;
-        let good = guard.tickets.issue("alice", device, 0, now as u64, 60);
+        let good = local(
+            guard
+                .authority
+                .issue("alice", device, 0, now as u64, 60)
+                .unwrap(),
+        );
         let mut bad = good.clone();
         bad.exp += 100; // 篡改覆盖字段 ⇒ BadSignature
 
@@ -862,12 +940,13 @@ mod tests {
             .admit_state_change(
                 &net,
                 &device,
-                &bad,
+                &TicketWire::Local(bad),
                 &dummy_auth("alice", "n1", now),
                 PATH_TICKET_RENEW,
                 b"",
                 now,
             )
+            .await
             .unwrap_err();
         assert_eq!(e, CtrlError::TicketBad, "错误票据被拒");
         assert!(
@@ -879,12 +958,13 @@ mod tests {
             .admit_state_change(
                 &net,
                 &device,
-                &good,
+                &TicketWire::Local(good.clone()),
                 &dummy_auth("alice", "n1", now),
                 PATH_TICKET_RENEW,
                 b"",
                 now,
             )
+            .await
             .unwrap_err();
         assert_eq!(e2, CtrlError::SigBad, "有效票据 ⇒ 校验推进到签名层");
         assert!(!guard.nonces.contains("alice", "n1"), "签名失败亦不入账");
@@ -894,31 +974,37 @@ mod tests {
             .admit_state_change(
                 &net,
                 &other,
-                &good,
+                &TicketWire::Local(good.clone()),
                 &dummy_auth("alice", "n2", now),
                 PATH_TICKET_RENEW,
                 b"",
                 now,
             )
+            .await
             .unwrap_err();
         assert_eq!(e3, CtrlError::TicketBad);
         // ④ 会话设备已吊销 ⇒ 票据层拒（DeviceNotActive → TicketBad）。
-        net.revoke(&device).unwrap();
+        store.revoke(&device).unwrap();
         let e4 = guard
             .admit_state_change(
                 &net,
                 &device,
-                &good,
+                &TicketWire::Local(good),
                 &dummy_auth("alice", "n3", now),
                 PATH_TICKET_RENEW,
                 b"",
                 now,
             )
+            .await
             .unwrap_err();
         assert_eq!(e4, CtrlError::TicketBad, "吊销后票据被拒（epoch/设备态）");
-        let _ = (LookupVerdict::Active(DeviceRecord {
+        assert_eq!(
+            store.device_row(&device).unwrap().status,
+            DeviceStatus::Revoked
+        );
+        let _ = LookupVerdict::Active(DeviceRecord {
             device_x25519: PublicKey::from([0u8; 32]),
             device_ed25519: vk,
-        }),);
+        });
     }
 }

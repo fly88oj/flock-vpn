@@ -22,7 +22,10 @@ chmlvpn-server [--config <server.toml>] [<subcommand>]
 
 子命令：
   (run)                          起服（缺省；listener.mode = direct 缺省 / frp）
-  init-cluster                   引导状态库（已初始化则报错；须服务停止时执行）
+  init-cluster [--voters N --out DIR]
+                                 单服：引导状态库；--voters：生成多主集群材料
+                                 （根密钥 root.seed + 各 voter 入群捆绑 node-i.bundle）
+  enroll --bundle FILE           装载并验证节点捆绑（根签目录+入群凭证），落状态目录
   invite [--ttl-secs N]          签发邀请 → stdout 单行 b64
   redeem --user U --invite-b64 B --device-x B32 --device-ed B32
                                  兑换邀请开户（建用户/设备 + 分 VIP）
@@ -49,7 +52,13 @@ struct Cli {
 
 enum Cmd {
     Run,
-    InitCluster,
+    InitCluster {
+        voters: Option<usize>,
+        out: Option<String>,
+    },
+    Enroll {
+        bundle: String,
+    },
     Invite {
         ttl_secs: u64,
     },
@@ -88,7 +97,35 @@ fn parse_args() -> Result<Cli, String> {
         None | Some("run") => Cmd::Run,
         Some("init-cluster") => {
             it.next();
-            Cmd::InitCluster
+            let (mut voters, mut out) = (None, None);
+            while let Some(k) = it.next() {
+                let v = it.next().ok_or(format!("{k} 值"))?;
+                match k.as_str() {
+                    "--voters" => {
+                        voters = Some(v.parse().map_err(|e| format!("voters: {e}"))?);
+                    }
+                    "--out" => out = Some(v),
+                    other => return Err(format!("init-cluster: 未知参数 {other:?}")),
+                }
+            }
+            if voters.is_some() && out.is_none() {
+                return Err("init-cluster --voters 需要 --out DIR".into());
+            }
+            Cmd::InitCluster { voters, out }
+        }
+        Some("enroll") => {
+            it.next();
+            let mut bundle = None;
+            while let Some(k) = it.next() {
+                let v = it.next().ok_or(format!("{k} 值"))?;
+                match k.as_str() {
+                    "--bundle" => bundle = Some(v),
+                    other => return Err(format!("enroll: 未知参数 {other:?}")),
+                }
+            }
+            Cmd::Enroll {
+                bundle: bundle.ok_or("enroll 需要 --bundle FILE")?,
+            }
         }
         Some("invite") => {
             it.next();
@@ -160,9 +197,6 @@ fn parse_args() -> Result<Cli, String> {
                 device: device.ok_or("revoke 需要 --device")?,
             }
         }
-        Some("enroll") => {
-            return Err("enroll（多服入群）为 M4 范围（§4 准入流水），本里程碑未提供".into())
-        }
         Some(other) => return Err(format!("未知子命令 {other:?}\n\n{USAGE}")),
     };
     Ok(Cli { config, cmd })
@@ -194,13 +228,51 @@ fn run_cli() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     rt.block_on(async move {
         match cli.cmd {
-            Cmd::InitCluster => {
+            Cmd::InitCluster { voters, out } => {
+                if let (Some(n), Some(out)) = (voters, out) {
+                    // 多主集群材料（§4-1）：根密钥 + 各 voter 入群凭证 + 根签目录。
+                    let m = chmlvpn_server::bundle::ClusterMaterial::generate(n, None, |i| {
+                        format!("node-{i}:9443")
+                    });
+                    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+                    // 根密钥种子：仅此一份（运维离线保管；bundle 只含 root_pub——§4-3 红线）。
+                    std::fs::write(
+                        std::path::Path::new(&out).join("root.seed"),
+                        hex::encode(m.root.to_bytes()),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    for i in 0..n {
+                        let path = std::path::Path::new(&out).join(format!("node-{i}.bundle"));
+                        std::fs::write(&path, m.bundle(i).to_bytes())
+                            .map_err(|e| format!("{}: {e}", path.display()))?;
+                    }
+                    println!("cluster_id={}", hex::encode(m.cluster_id.0));
+                    println!("voters={n}");
+                    println!("out={out}（root.seed 保密；node-*.bundle 分发各机 + enroll）");
+                    return Ok(());
+                }
                 let (core, created) = chmlvpn_server::server::ServerCore::open_or_init(cfg)?;
                 if !created {
                     return Err("状态库已初始化（init-cluster 仅首次）".into());
                 }
                 println!("cluster_id={}", hex::encode(core.identity.cluster_id.0));
                 println!("server_id={}", hex::encode(core.identity.server_id.0));
+                Ok(())
+            }
+            Cmd::Enroll { bundle } => {
+                let bytes = std::fs::read(&bundle).map_err(|e| format!("read {bundle}: {e}"))?;
+                let b = chmlvpn_server::bundle::NodeBundle::from_bytes(&bytes)
+                    .ok_or("捆绑文件解码失败")?;
+                let cid = b.verify()?;
+                let ident = b.identity()?;
+                let dst = cfg.state_dir.join("bundle.bin");
+                std::fs::create_dir_all(&cfg.state_dir).map_err(|e| e.to_string())?;
+                std::fs::write(&dst, &bytes).map_err(|e| e.to_string())?;
+                println!("cluster_id={}", hex::encode(cid.0));
+                println!("server_id={}", hex::encode(ident.server_id.0));
+                println!("bundle={}", dst.display());
+                // 注：raft 形态的进程间织物（TCP/中转 Fabric）随 §6/§7-M5 部署批次接入；
+                // 进程内装配路径见 tests/multi_primary.rs。
                 Ok(())
             }
             Cmd::Invite { ttl_secs } => {
@@ -222,7 +294,7 @@ fn run_cli() -> Result<(), String> {
                     if created {
                         eprintln!("note: 已引导新状态库（建议改用 init-cluster）");
                     }
-                    let bytes = core.mint_invite(ttl_secs)?;
+                    let bytes = core.mint_invite(ttl_secs).await?;
                     use base64::Engine as _;
                     println!(
                         "{}",
@@ -280,6 +352,16 @@ fn run_cli() -> Result<(), String> {
                 }
             }
             Cmd::Run => {
+                if let Some(sync) = &cfg.sync {
+                    if sync.mode == "raft" {
+                        return Err(
+                            "raft 形态需集群织物（TCP/中转 Fabric 随 §6/§7-M5 部署批次接入）；\n
+                             本批次的多主装配为进程内形态（tests/multi_primary.rs），\n
+                             单服部署请用缺省 [sync] mode = single（缺省即无 [sync] 节）。"
+                                .into(),
+                        );
+                    }
+                }
                 let mode = cfg.listener_mode()?;
                 let (core, created) = chmlvpn_server::server::ServerCore::open_or_init(cfg)?;
                 if created {

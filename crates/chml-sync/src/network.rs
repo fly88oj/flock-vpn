@@ -4,11 +4,14 @@
 
 use openraft::error::{RPCError, RaftError};
 use openraft::network::{RaftNetwork, RaftNetworkFactory};
-use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest, VoteResponse};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
 use openraft::BasicNode;
 
 use crate::raft_types::SyncConfig;
-use crate::wire::{rpc_error_of, remote_error, Interconnect, WireCallError, WireResp, WireRpc};
+use crate::wire::{remote_error, rpc_error_of, Interconnect, WireCallError, WireResp, WireRpc};
 
 /// 网络工厂（Raft 每个复制/投票任务各建一个客户端——实现为互连管理器的轻柄）。
 #[derive(Clone)]
@@ -20,7 +23,10 @@ impl RaftNetworkFactory<SyncConfig> for SyncNetFactory {
     type Network = SyncNetwork;
 
     async fn new_client(&mut self, target: u64, _node: &BasicNode) -> Self::Network {
-        SyncNetwork { ic: self.ic.clone(), target }
+        SyncNetwork {
+            ic: self.ic.clone(),
+            target,
+        }
     }
 }
 
@@ -69,9 +75,11 @@ impl RaftNetwork<SyncConfig> for SyncNetwork {
     > {
         match self.call(WireRpc::Snapshot(rpc), option.hard_ttl()).await {
             Ok(WireResp::Snapshot(Ok(r))) => Ok(r),
-            Ok(WireResp::Snapshot(Err(m))) => Err(RPCError::Unreachable(openraft::error::Unreachable::new(
-                &std::io::Error::other(format!("remote snapshot error: {m}")),
-            ))),
+            Ok(WireResp::Snapshot(Err(m))) => {
+                Err(RPCError::Unreachable(openraft::error::Unreachable::new(
+                    &std::io::Error::other(format!("remote snapshot error: {m}")),
+                )))
+            }
             Ok(_) => Err(RPCError::Unreachable(openraft::error::Unreachable::new(
                 &std::io::Error::other("rpc response mismatch"),
             ))),

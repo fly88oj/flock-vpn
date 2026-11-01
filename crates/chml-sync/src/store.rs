@@ -46,9 +46,11 @@ impl fmt::Debug for RedbLogStore {
 
 impl RedbLogStore {
     /// 打开/创建（文件不存在则建库；目录自动创建）。
+    /// （Err 载荷 = openraft StorageError（224B）——trait 签名约束，盒装不可行，显式豁免。）
+    #[allow(clippy::result_large_err)]
     pub fn open(path: &Path) -> Result<Self, openraft::StorageError<u64>> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| storage_err(e))?;
+            std::fs::create_dir_all(dir).map_err(storage_err)?;
         }
         let db = Database::create(path).map_err(storage_err)?;
         let db = Arc::new(db);
@@ -57,6 +59,7 @@ impl RedbLogStore {
     }
 
     /// 建表（幂等；装配方自持 Database 时调用——状态机快照表同库创建）。
+    #[allow(clippy::result_large_err)]
     pub fn init_tables(db: &Arc<Database>) -> Result<(), openraft::StorageError<u64>> {
         let txn = db.begin_write().map_err(storage_err)?;
         {
@@ -72,6 +75,7 @@ impl RedbLogStore {
         RedbLogStore { db }
     }
 
+    #[allow(clippy::result_large_err)]
     fn write_txn(&self) -> Result<redb::WriteTransaction, openraft::StorageError<u64>> {
         self.db.begin_write().map_err(storage_err)
     }
@@ -114,7 +118,10 @@ impl RaftLogStorage<SyncConfig> for RedbLogStore {
             Some(v) => postcard::from_bytes(v.value()).map_err(storage_err)?,
             None => None,
         };
-        Ok(LogState { last_purged_log_id: last_purged, last_log_id: last })
+        Ok(LogState {
+            last_purged_log_id: last_purged,
+            last_log_id: last,
+        })
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -125,8 +132,11 @@ impl RaftLogStorage<SyncConfig> for RedbLogStore {
         let txn = self.write_txn()?;
         {
             let mut kv = txn.open_table(KV).map_err(storage_err)?;
-            kv.insert("vote", postcard::to_allocvec(vote).map_err(storage_err)?.as_slice())
-                .map_err(storage_err)?;
+            kv.insert(
+                "vote",
+                postcard::to_allocvec(vote).map_err(storage_err)?.as_slice(),
+            )
+            .map_err(storage_err)?;
         }
         txn.commit().map_err(storage_err)
     }
@@ -151,7 +161,10 @@ impl RaftLogStorage<SyncConfig> for RedbLogStore {
     {
         let mut serialized = Vec::new();
         for e in entries {
-            serialized.push((e.log_id.index, postcard::to_allocvec(&e).map_err(storage_err)?));
+            serialized.push((
+                e.log_id.index,
+                postcard::to_allocvec(&e).map_err(storage_err)?,
+            ));
         }
         let txn = self.write_txn()?;
         {
@@ -201,7 +214,9 @@ impl RaftLogStorage<SyncConfig> for RedbLogStore {
             let mut kv = txn.open_table(KV).map_err(storage_err)?;
             kv.insert(
                 "last_purged",
-                postcard::to_allocvec(&Some(log_id)).map_err(storage_err)?.as_slice(),
+                postcard::to_allocvec(&Some(log_id))
+                    .map_err(storage_err)?
+                    .as_slice(),
             )
             .map_err(storage_err)?;
         }

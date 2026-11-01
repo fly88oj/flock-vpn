@@ -95,7 +95,10 @@ impl SyncDirectory {
             Ok(ReadView::Verdict(v)) => {
                 if !breaker {
                     // 熔断期不写缓存：避免「读后立刻又落后」的陈旧命中。
-                    self.cache.lock().expect("dir cache").insert(id.0, v.clone());
+                    self.cache
+                        .lock()
+                        .expect("dir cache")
+                        .insert(id.0, v.clone());
                 }
                 v.to_verdict()
             }
@@ -150,7 +153,10 @@ mod tests {
                     return Err(SyncError::NoLeader);
                 }
                 let v = match q {
-                    ReadQuery::Lookup(id) => ReadView::Verdict(VerdictW::Active { x25519: id, ed25519: [1; 32] }),
+                    ReadQuery::Lookup(id) => ReadView::Verdict(VerdictW::Active {
+                        x25519: id,
+                        ed25519: [1; 32],
+                    }),
                     _ => unreachable!(),
                 };
                 Ok(v)
@@ -164,17 +170,33 @@ mod tests {
 
     #[tokio::test]
     async fn cache_hit_until_epoch_advances() {
-        let reader = Arc::new(CountingReader { reads: AtomicU64::new(0), fail: AtomicBool::new(false) });
+        let reader = Arc::new(CountingReader {
+            reads: AtomicU64::new(0),
+            fail: AtomicBool::new(false),
+        });
         let (tx, rx) = watch::channel(0u64);
         let dir = SyncDirectory::new(reader.clone(), monitor(), rx);
         let id = DeviceId([2; 32]);
-        assert!(matches!(dir.lookup_async(id).await, LookupVerdict::Active(_)));
-        assert!(matches!(dir.lookup_async(id).await, LookupVerdict::Active(_)));
+        assert!(matches!(
+            dir.lookup_async(id).await,
+            LookupVerdict::Active(_)
+        ));
+        assert!(matches!(
+            dir.lookup_async(id).await,
+            LookupVerdict::Active(_)
+        ));
         assert_eq!(reader.reads.load(Ordering::SeqCst), 1, "第二次命中本地缓存");
         // epoch 前进 ⇒ 缓存失效 ⇒ 再线性一致读。
         tx.send(1).expect("epoch advance");
-        assert!(matches!(dir.lookup_async(id).await, LookupVerdict::Active(_)));
-        assert_eq!(reader.reads.load(Ordering::SeqCst), 2, "epoch 前进后失效缓存");
+        assert!(matches!(
+            dir.lookup_async(id).await,
+            LookupVerdict::Active(_)
+        ));
+        assert_eq!(
+            reader.reads.load(Ordering::SeqCst),
+            2,
+            "epoch 前进后失效缓存"
+        );
         let stats = dir.stats();
         assert_eq!(stats.cache_hits, 1);
         assert_eq!(stats.linearizable_reads, 2);
@@ -182,19 +204,28 @@ mod tests {
 
     #[tokio::test]
     async fn breaker_open_degrades_to_linearizable() {
-        let reader = Arc::new(CountingReader { reads: AtomicU64::new(0), fail: AtomicBool::new(false) });
+        let reader = Arc::new(CountingReader {
+            reads: AtomicU64::new(0),
+            fail: AtomicBool::new(false),
+        });
         let (_tx, rx) = watch::channel(0u64);
         let applied = Arc::new(AtomicU64::new(0));
         let lag = LagMonitor::new(Duration::from_millis(30), applied.clone());
         let dir = SyncDirectory::new(reader.clone(), lag.clone(), rx);
         let id = DeviceId([3; 32]);
-        assert!(matches!(dir.lookup_async(id).await, LookupVerdict::Active(_)));
+        assert!(matches!(
+            dir.lookup_async(id).await,
+            LookupVerdict::Active(_)
+        ));
         assert_eq!(dir.stats().cache_hits, 0, "首查必走线性一致读");
         // 落后持续超阈值 ⇒ 熔断。
         lag.observe_leader_commit(5);
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(lag.breaker_open());
-        assert!(matches!(dir.lookup_async(id).await, LookupVerdict::Active(_)));
+        assert!(matches!(
+            dir.lookup_async(id).await,
+            LookupVerdict::Active(_)
+        ));
         let stats = dir.stats();
         assert_eq!(stats.breaker_degraded, 1, "熔断路径计数");
         assert_eq!(stats.cache_hits, 0, "熔断期不命中缓存");
@@ -203,22 +234,38 @@ mod tests {
         applied.store(5, Ordering::SeqCst);
         lag.observe_leader_commit(5);
         assert!(!lag.breaker_open());
-        assert!(matches!(dir.lookup_async(id).await, LookupVerdict::Active(_)));
-        assert_eq!(reader.reads.load(std::sync::atomic::Ordering::SeqCst), 2, "熔断期未写缓存（无新增线性一致读）");
+        assert!(matches!(
+            dir.lookup_async(id).await,
+            LookupVerdict::Active(_)
+        ));
+        assert_eq!(
+            reader.reads.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "熔断期未写缓存（无新增线性一致读）"
+        );
     }
 
     #[tokio::test]
     async fn linearizable_failure_fails_closed() {
-        let reader = Arc::new(CountingReader { reads: AtomicU64::new(0), fail: AtomicBool::new(true) });
+        let reader = Arc::new(CountingReader {
+            reads: AtomicU64::new(0),
+            fail: AtomicBool::new(true),
+        });
         let (_tx, rx) = watch::channel(0u64);
         let dir = SyncDirectory::new(reader, monitor(), rx);
         let id = DeviceId([4; 32]);
-        assert!(matches!(dir.lookup_async(id).await, LookupVerdict::NotFound), "fail-closed（拒握手）");
+        assert!(
+            matches!(dir.lookup_async(id).await, LookupVerdict::NotFound),
+            "fail-closed（拒握手）"
+        );
     }
 
     #[tokio::test]
     async fn dir_handle_boxes_future() {
-        let reader = Arc::new(CountingReader { reads: AtomicU64::new(0), fail: AtomicBool::new(false) });
+        let reader = Arc::new(CountingReader {
+            reads: AtomicU64::new(0),
+            fail: AtomicBool::new(false),
+        });
         let (_tx, rx) = watch::channel(0u64);
         let dir = SyncDirectory::new(reader, monitor(), rx);
         let handle = DirHandle(dir);

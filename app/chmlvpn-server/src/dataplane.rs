@@ -84,13 +84,20 @@ impl SessionIndex {
     /// 登记（同 VIP 覆盖旧通道），返回本代代次（注销凭证）。
     fn register(&self, vip: [u8; 4], tx: mpsc::Sender<Vec<u8>>) -> u64 {
         let gen = self.next_gen.fetch_add(1, Ordering::Relaxed) + 1;
-        self.map.lock().expect("router poisoned").insert(vip, (tx, gen));
+        self.map
+            .lock()
+            .expect("router poisoned")
+            .insert(vip, (tx, gen));
         gen
     }
 
     /// 当前登记的出站通道（内核回程路由用）。
     fn get(&self, vip: &[u8; 4]) -> Option<mpsc::Sender<Vec<u8>>> {
-        self.map.lock().expect("router poisoned").get(vip).map(|(tx, _)| tx.clone())
+        self.map
+            .lock()
+            .expect("router poisoned")
+            .get(vip)
+            .map(|(tx, _)| tx.clone())
     }
 
     /// 注销**仅当**当前登记仍是 `gen` 这一代（同 VIP 已被新会话覆盖 ⇒ 不动新登记）。
@@ -100,7 +107,6 @@ impl SessionIndex {
             g.remove(vip);
         }
     }
-
 }
 
 /// 单服数据面路由器（VIP → 会话包通道）。
@@ -131,7 +137,10 @@ impl PeerRouter {
         }
         #[cfg(target_os = "linux")]
         {
-            let spec = TunSpec { name: tun_name.into(), mtu: chmlvpn_client::tun::MTU };
+            let spec = TunSpec {
+                name: tun_name.into(),
+                mtu: chmlvpn_client::tun::MTU,
+            };
             let opened = match TunIo::open(&spec) {
                 Ok(tun) => {
                     let ifname = tun.name().to_string();
@@ -188,7 +197,9 @@ impl PeerRouter {
         tokio::spawn(async move {
             //（TunSession 整体移入：rx 供路由；tx 存续使写泵常驻——服务端数据面不拆。）
             while let Some(pkt) = sess.rx.recv().await {
-                let Some((_, dst)) = ipv4_src_dst(&pkt) else { continue };
+                let Some((_, dst)) = ipv4_src_dst(&pkt) else {
+                    continue;
+                };
                 if let Some(tx) = router.sessions.get(&dst) {
                     let _ = tx.send(pkt).await;
                 }
@@ -199,13 +210,21 @@ impl PeerRouter {
 
     /// 显式无数据面（测试装配）。
     pub fn none() -> Arc<Self> {
-        Arc::new(PeerRouter { tun: None, sessions: SessionIndex::new(), kernel_tx: None })
+        Arc::new(PeerRouter {
+            tun: None,
+            sessions: SessionIndex::new(),
+            kernel_tx: None,
+        })
     }
 
     /// 测试装配：注入内核通道（无真 tun；宿主集成测试驱动 serve_stream 用）。
     #[cfg(test)]
     pub(crate) fn with_kernel_tx(kernel_tx: mpsc::Sender<Vec<u8>>) -> Arc<Self> {
-        Arc::new(PeerRouter { tun: None, sessions: SessionIndex::new(), kernel_tx: Some(kernel_tx) })
+        Arc::new(PeerRouter {
+            tun: None,
+            sessions: SessionIndex::new(),
+            kernel_tx: Some(kernel_tx),
+        })
     }
 
     /// 当前登记的出站通道（内核回程路由/测试直驱用）。
@@ -301,6 +320,74 @@ enum Step {
 }
 
 // ============================================================================
+// 多主转发面（feature `multi-primary`；§2.2 判定序 + §3.10 ForwardPlane）
+// ============================================================================
+
+/// 本地会话投递 sink：ForwardPlane 的本机投递 → 会话出站通道（写泵下发到对端）。
+#[cfg(feature = "multi-primary")]
+struct ChannelSink(mpsc::Sender<Vec<u8>>);
+
+#[cfg(feature = "multi-primary")]
+impl chml_sync::PacketSink for ChannelSink {
+    fn deliver(&self, pkt: &[u8]) -> std::io::Result<()> {
+        self.0.try_send(pkt.to_vec()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("session outbound full: {e}"),
+            )
+        })
+    }
+}
+
+/// 多主形态的会话包通道服务（与 [`PeerRouter::serve_stream`] 同构的取消安全结构）。
+///
+/// - 入站：帧化读出 → [`chml_sync::SyncNode::ingest_packet`]（内部完成 §2.2 判定序：
+///   **第 0 步源 VIP 绑定校验** → 租约定位 → 本机投递 / ForwardEnvelope 跨服转发 /
+///   NOT_HERE → 一次性 location_query → 仍失败丢包+尽力 ICMP）；
+/// - 出站：ForwardPlane 本机投递（sink → out_rx）→ 整帧下发；
+/// - 生命周期：attach/detach_session（租约域登记）+ 代际语义由 ForwardPlane 的
+///   sessions 表承担（同设备新流覆盖旧 sink）。
+#[cfg(feature = "multi-primary")]
+pub async fn serve_stream_sync(node: Arc<chml_sync::SyncNode>, device: [u8; 32], stream: Stream) {
+    let mut stream = stream;
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(1024);
+    node.attach_session(device, Arc::new(ChannelSink(out_tx)));
+    let mut frames = FrameBuf::new();
+    let mut chunk = vec![0u8; READ_CHUNK];
+    loop {
+        // 已缓冲完整帧 → 转发面（判定序在 ForwardPlane::ingest 内）。
+        while let Some(pkt) = frames.take_frame() {
+            let _ = node.ingest_packet(&device, &pkt).await;
+        }
+        let step = std::future::poll_fn(|cx| {
+            match out_rx.poll_recv(cx) {
+                Poll::Ready(out) => return Poll::Ready(Step::Outbound(out)),
+                Poll::Pending => {}
+            }
+            match pin!(&mut stream).poll_read(cx, &mut chunk) {
+                Poll::Ready(Ok(0)) => Poll::Ready(Step::InEof),
+                Poll::Ready(Ok(n)) => Poll::Ready(Step::InBytes(n)),
+                Poll::Ready(Err(_)) => Poll::Ready(Step::InErr),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+        match step {
+            Step::Outbound(Some(pkt)) => {
+                if send_packet(&mut stream, &pkt).await.is_err() {
+                    break;
+                }
+            }
+            Step::Outbound(None) => break,
+            Step::InBytes(n) => frames.extend(&chunk[..n]),
+            Step::InErr => break,
+            Step::InEof => break,
+        }
+    }
+    node.detach_session(&device);
+}
+
+// ============================================================================
 // 单元测试（宿主：纯函数面；tun/路由真路径由 deploy/m3_assert.sh 容器实跑）
 // ============================================================================
 
@@ -340,15 +427,21 @@ mod tests {
         let gen_a = idx.register(vip, tx_a);
         let gen_b = idx.register(vip, tx_b); // 设备重连：覆盖 A 的发送端
         assert_ne!(gen_a, gen_b);
-        assert_eq!(idx.map.lock().unwrap().len(), 1, "同 VIP 单登记（新覆盖旧）");
+        assert_eq!(
+            idx.map.lock().unwrap().len(),
+            1,
+            "同 VIP 单登记（新覆盖旧）"
+        );
         // A 的发送端被覆盖 ⇒ drop ⇒ A 的 out_rx 将观察到 None（旧循环退出路径）。
         drop(rx_a); //（接收端随旧会话任务结束）
-        // 旧代注销：不得删除 B 的登记。
+                    // 旧代注销：不得删除 B 的登记。
         idx.unregister(&vip, gen_a);
         assert!(idx.get(&vip).is_some(), "旧代退出不得删除新登记");
         // 新代通道可用。
         let cur = idx.get(&vip).expect("B 在册");
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         rt.block_on(async {
             cur.send(vec![1, 2, 3]).await.unwrap();
             assert_eq!(rx_b.recv().await.unwrap(), vec![1, 2, 3]);
@@ -403,10 +496,9 @@ mod tests {
                 }
             }
         });
-        let tunnel =
-            chml_protocol::session::initiate(a, &device, &pin, TunnelConfig::default())
-                .await
-                .expect("initiate");
+        let tunnel = chml_protocol::session::initiate(a, &device, &pin, TunnelConfig::default())
+            .await
+            .expect("initiate");
 
         let (kernel_tx, mut kernel_rx) = mpsc::channel::<Vec<u8>>(64);
         let router = PeerRouter::with_kernel_tx(kernel_tx);
@@ -422,7 +514,10 @@ mod tests {
         let mism_before = src_vip_mismatches();
 
         // 控制占位 + 通道 1（惰性 SYN：首数据帧触发服务端 accept 产出流）。
-        let _hold = tunnel.open_stream(chml_protocol::mux::Prio::Control).await.unwrap();
+        let _hold = tunnel
+            .open_stream(chml_protocol::mux::Prio::Control)
+            .await
+            .unwrap();
         let mut ch1 = tunnel.open_packet_channel().await.unwrap();
         ch1.send(&ip_pkt(vip, 1)).await.unwrap();
         let s1 = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
@@ -472,7 +567,9 @@ mod tests {
         // 等 t1 退出（其发送端被覆盖 → out_rx None → unregister(旧代)）。
         let _ = tokio::time::timeout(Duration::from_secs(5), t1).await;
         // 关键断言：新登记未被旧退出删除；新通道下行照常（旧代码在此黑洞）。
-        let sender2 = router.outbound_sender(&vip).expect("新登记存活（旧退出不得删除）");
+        let sender2 = router
+            .outbound_sender(&vip)
+            .expect("新登记存活（旧退出不得删除）");
         sender2.send(ip_pkt(vip, 5)).await.unwrap();
         let down2 = tokio::time::timeout(Duration::from_secs(5), ch2.recv())
             .await

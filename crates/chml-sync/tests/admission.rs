@@ -13,11 +13,13 @@ mod common;
 use std::time::{Duration, Instant};
 
 use chml_protocol::session::{DeviceStaticKeys, ServerEntry, ServerPin, TunnelConfig};
-use chml_sync::wire::Fabric;
 use chml_protocol::trust::ClusterDirectory;
+use chml_sync::wire::Fabric;
 use common::{bootstrap, sid, TestCluster};
 
-use chml_sync::proto::{AdminAck, NodeId, ReadQuery, ReadView, ServerKeyEntry, StateError, SyncRequest, SyncResponse};
+use chml_sync::proto::{
+    AdminAck, NodeId, ReadQuery, ReadView, ServerKeyEntry, StateError, SyncRequest, SyncResponse,
+};
 use chml_sync::ticket::TicketIssuer;
 
 const NODES: [u64; 3] = [1, 2, 3];
@@ -34,12 +36,8 @@ async fn rogue_handshake(
     pin_root: &ed25519_dalek::SigningKey,
     claimed_entry: ServerEntry,
 ) -> Result<chml_protocol::session::Tunnel, chml_protocol::session::SessionError> {
-    let fabric = chml_sync::testutil::MemoryFabric::new(
-        sid(0xABCD),
-        &c.reg,
-        common::RTT_HALF,
-        1024 * 1024,
-    );
+    let fabric =
+        chml_sync::testutil::MemoryFabric::new(sid(0xABCD), &c.reg, common::RTT_HALF, 1024 * 1024);
     let io = fabric.dial(&sid(target)).await.expect("dial");
     let rogue = DeviceStaticKeys::generate();
     let pin = ServerPin {
@@ -87,7 +85,10 @@ async fn rogue_with_forged_root_rejected_at_handshake() {
     let _ = rogue_handshake(&c, 3, &forged_root, target.entry().clone())
         .await
         .expect_err("他签根的 rogue 必被拒");
-    assert!(target.rejected_handshakes() > before, "应答侧握手拒绝计数前进");
+    assert!(
+        target.rejected_handshakes() > before,
+        "应答侧握手拒绝计数前进"
+    );
 }
 
 // ============================================================================
@@ -113,23 +114,43 @@ async fn learner_snapshot_add_voter_promotion() {
         assert!(matches!(resp, SyncResponse::Device(_)));
     }
     let dev1: [u8; 32] = sha(&[1u8; 32]);
-    let resp = c.nodes[(leader_idx + 1) % 3].write(SyncRequest::Revoke { device: dev1 }).await.expect("revoke");
+    let resp = c.nodes[(leader_idx + 1) % 3]
+        .write(SyncRequest::Revoke { device: dev1 })
+        .await
+        .expect("revoke");
     assert!(matches!(resp, SyncResponse::Epoch(1)));
-    let expect_state = c.nodes[leader_idx].read_linearizable(ReadQuery::State).await.expect("leader state");
-    let ReadView::State(ref st) = expect_state else { panic!() };
+    let expect_state = c.nodes[leader_idx]
+        .read_linearizable(ReadQuery::State)
+        .await
+        .expect("leader state");
+    let ReadView::State(ref st) = expect_state else {
+        panic!()
+    };
 
     // —— 准入流水（§4-3）——
     // (a) 运维用根密钥签发新节点入群凭证 + 新目录（dir_version=2）。
     let n4 = c.fx.enroll(4);
-    let dir_v2 = c.fx.directory(2, &[c.idents[0].clone(), c.idents[1].clone(), c.idents[2].clone(), n4.clone()]);
+    let dir_v2 = c.fx.directory(
+        2,
+        &[
+            c.idents[0].clone(),
+            c.idents[1].clone(),
+            c.idents[2].clone(),
+            n4.clone(),
+        ],
+    );
     // (b) 现有节点 install 新目录（根验签 + 互连映射热更新——leader 才能拨新节点）。
     for n in &c.nodes {
         n.install_directory(&dir_v2).expect("install dir v2");
     }
     // 换根签名的目录 ⇒ 拒（准入材料不可被他签注入）。
     let other_root = ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]);
-    let forged_dir = ClusterDirectory::issue(&other_root, c.fx.cluster_id, 3, vec![n4.entry.clone()]);
-    assert!(c.nodes[0].install_directory(&forged_dir).is_err(), "他签目录拒");
+    let forged_dir =
+        ClusterDirectory::issue(&other_root, c.fx.cluster_id, 3, vec![n4.entry.clone()]);
+    assert!(
+        c.nodes[0].install_directory(&forged_dir).is_err(),
+        "他签目录拒"
+    );
 
     // dir_pull serve：下发的是根签 v2 目录（客户端 PinStore::record_directory 可直接
     // 落地：根验签 + 版本单调）；since=2 ⇒ 无新内容（304 语义）。
@@ -138,55 +159,87 @@ async fn learner_snapshot_add_voter_promotion() {
     let served = ClusterDirectory::from_bytes(&resp.bytes.expect("full dir")).expect("parse");
     assert!(served.verify(&c.fx.root.verifying_key()), "根签目录");
     assert_eq!(served.servers.len(), 4);
-    assert!(c.nodes[0].directory().dir_pull_response(2).bytes.is_none(), "304");
+    assert!(
+        c.nodes[0].directory().dir_pull_response(2).bytes.is_none(),
+        "304"
+    );
 
     // (c) 新节点以 learner 加入（不做 initialize——不是初始成员）。
     let n4_idx = c.build_node(&n4, &dir_v2, None).await;
 
     // (d) leader 压实日志（触发快照 + purge）⇒ learner 只能走快照同步路径。
-    c.nodes[leader_idx].snapshot_and_purge().await.expect("snapshot+purge");
+    c.nodes[leader_idx]
+        .snapshot_and_purge()
+        .await
+        .expect("snapshot+purge");
 
     // (e) add_learner（blocking：等复制/快照追平）。
-    c.nodes[leader_idx].add_learner(4).await.expect("add learner");
+    c.nodes[leader_idx]
+        .add_learner(4)
+        .await
+        .expect("add learner");
 
     // 快照同步断言：learner 的状态机拿到完整状态（设备/epoch/票据根），
     // 且其日志为空（purge 后仅快照可携带这些状态）。
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let got = c.nodes[n4_idx].read_linearizable(ReadQuery::State).await.expect("learner read");
+        let got = c.nodes[n4_idx]
+            .read_linearizable(ReadQuery::State)
+            .await
+            .expect("learner read");
         let ReadView::State(g) = got else { panic!() };
-        if g.devices == 2 && g.epoch == 1 && g.ticket_root_present && g.last_applied.unwrap_or(0) > 0 {
+        if g.devices == 2
+            && g.epoch == 1
+            && g.ticket_root_present
+            && g.last_applied.unwrap_or(0) > 0
+        {
             assert_eq!(g.revoked, 1, "吊销记录随快照");
             assert_eq!(g.config_version, st.config_version);
             break;
         }
-        assert!(Instant::now() < deadline, "learner 快照同步超时（state={:?}）", g);
+        assert!(
+            Instant::now() < deadline,
+            "learner 快照同步超时（state={:?}）",
+            g
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // learner 可读但不可写（client_write 转发 leader——非 voter 不参与表决；此处断言
     // 其尚不在 voters 集内）。
     {
-        let v = c.nodes[leader_idx].read_linearizable(ReadQuery::State).await.expect("state");
+        let v = c.nodes[leader_idx]
+            .read_linearizable(ReadQuery::State)
+            .await
+            .expect("state");
         let ReadView::State(g) = v else { panic!() };
         assert!(!g.voters.contains(&4), "提升前 node4 不是 voter");
     }
 
     // (f) add_voter 无根签名 ⇒ 状态机拒绝 + 不提升。
     let forged_root = ed25519_dalek::SigningKey::from_bytes(&[0xEE; 32]);
-    let bad = c.nodes[leader_idx].add_voter_signed(&forged_root, 4).await.expect("write ok");
+    let bad = c.nodes[leader_idx]
+        .add_voter_signed(&forged_root, 4)
+        .await
+        .expect("write ok");
     assert!(
         matches!(bad, SyncResponse::Error(StateError::BadRootSignature)),
         "他签 add_voter 拒: {bad:?}"
     );
     {
-        let v = c.nodes[leader_idx].read_linearizable(ReadQuery::State).await.expect("state");
+        let v = c.nodes[leader_idx]
+            .read_linearizable(ReadQuery::State)
+            .await
+            .expect("state");
         let ReadView::State(g) = v else { panic!() };
         assert!(!g.voters.contains(&4), "拒绝路径不提升");
     }
 
     // (g) add_voter 有根签名 ⇒ 状态机记录 + openraft 提升（joint 共识）。
-    let ok = c.nodes[leader_idx].add_voter_signed(&c.fx.root, 4).await.expect("add voter");
+    let ok = c.nodes[leader_idx]
+        .add_voter_signed(&c.fx.root, 4)
+        .await
+        .expect("add voter");
     assert!(
         matches!(ok, SyncResponse::Admin(AdminAck::AddVoter { node_id: 4 })),
         "{ok:?}"
@@ -194,7 +247,12 @@ async fn learner_snapshot_add_voter_promotion() {
     // 成员收敛：全网 metrics 的 voters 含 4。
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let m = c.nodes[n4_idx].raft().metrics().borrow().membership_config.clone();
+        let m = c.nodes[n4_idx]
+            .raft()
+            .metrics()
+            .borrow()
+            .membership_config
+            .clone();
         if m.membership().voter_ids().any(|v| v == 4) {
             break;
         }
@@ -204,11 +262,18 @@ async fn learner_snapshot_add_voter_promotion() {
 
     // 提升后 node4 可承载写（任意节点写语义）且全网可见。
     let resp = c.nodes[n4_idx]
-        .write(SyncRequest::RegisterDevice { owner: "n4".into(), x25519: [7; 32], ed25519: [7; 32] })
+        .write(SyncRequest::RegisterDevice {
+            owner: "n4".into(),
+            x25519: [7; 32],
+            ed25519: [7; 32],
+        })
         .await
         .expect("voter 写");
     assert!(matches!(resp, SyncResponse::Device(_)));
-    let v = c.nodes[0].read_linearizable(ReadQuery::State).await.expect("read");
+    let v = c.nodes[0]
+        .read_linearizable(ReadQuery::State)
+        .await
+        .expect("read");
     let ReadView::State(g) = v else { panic!() };
     assert_eq!(g.devices, 3, "node4 的写全网可见");
 }
@@ -226,18 +291,38 @@ async fn rewrap_requires_root_and_targets_new_server() {
 
     // 新服务器 node4 入目录（准入后形态——此处只测 rewrap 授权面，无需进 Raft）。
     let n4 = c.fx.enroll(4);
-    let dir_v2 = c.fx.directory(2, &[c.idents[0].clone(), c.idents[1].clone(), c.idents[2].clone(), n4.clone()]);
+    let dir_v2 = c.fx.directory(
+        2,
+        &[
+            c.idents[0].clone(),
+            c.idents[1].clone(),
+            c.idents[2].clone(),
+            n4.clone(),
+        ],
+    );
     for n in &c.nodes {
         n.install_directory(&dir_v2).expect("install");
     }
 
     // 无根签名 ⇒ 状态机拒绝（被入侵的在册服务器没有根密钥，无法触发 rewrap）。
     let forged = ed25519_dalek::SigningKey::from_bytes(&[0xEE; 32]);
-    let bad = c.nodes[writer].write(SyncRequest::rewrap_signed(&forged, 4, vec![1; 16])).await.expect("write ok");
-    assert!(matches!(bad, SyncResponse::Error(StateError::BadRootSignature)), "{bad:?}");
+    let bad = c.nodes[writer]
+        .write(SyncRequest::rewrap_signed(&forged, 4, vec![1; 16]))
+        .await
+        .expect("write ok");
+    assert!(
+        matches!(bad, SyncResponse::Error(StateError::BadRootSignature)),
+        "{bad:?}"
+    );
     // 未登记 server_keys 前即便根签也拒（封装目标必须在册——先 server_keys 后 rewrap）。
-    let bad2 = c.nodes[writer].write(SyncRequest::rewrap_signed(&c.fx.root, 4, vec![1; 16])).await.expect("write ok");
-    assert!(matches!(bad2, SyncResponse::Error(StateError::NotFound(_))), "{bad2:?}");
+    let bad2 = c.nodes[writer]
+        .write(SyncRequest::rewrap_signed(&c.fx.root, 4, vec![1; 16]))
+        .await
+        .expect("write ok");
+    assert!(
+        matches!(bad2, SyncResponse::Error(StateError::NotFound(_))),
+        "{bad2:?}"
+    );
 
     // server_keys（根签）登记全套混合公钥（含新服务器——node4 仅入目录，未进 Raft）。
     let mut entries: Vec<ServerKeyEntry> = [1u64, 2, 3]
@@ -260,14 +345,21 @@ async fn rewrap_requires_root_and_targets_new_server() {
         .write(SyncRequest::server_keys_signed(&c.fx.root, entries))
         .await
         .expect("server_keys");
-    assert!(matches!(resp, SyncResponse::ServerKeys { servers: 4 }), "{resp:?}");
+    assert!(
+        matches!(resp, SyncResponse::ServerKeys { servers: 4 }),
+        "{resp:?}"
+    );
 
     // 有根签名 ⇒ 封装副本 +1 可观测（wraps 集内出现 node4 条目）。
     let secret = b"opaque-oprf-key-material-32-bytes!!!";
     let mut wrapped = Vec::new();
-    chml_protocol::envelope::seal_v2(&n4.entry.static_hybrid_pub, &secret[..], &mut wrapped).expect("seal");
+    chml_protocol::envelope::seal_v2(&n4.entry.static_hybrid_pub, &secret[..], &mut wrapped)
+        .expect("seal");
     let before = {
-        let v = c.nodes[writer].read_linearizable(ReadQuery::State).await.expect("state");
+        let v = c.nodes[writer]
+            .read_linearizable(ReadQuery::State)
+            .await
+            .expect("state");
         let ReadView::State(g) = v else { panic!() };
         g.wraps.len()
     };
@@ -276,11 +368,17 @@ async fn rewrap_requires_root_and_targets_new_server() {
         .await
         .expect("rewrap");
     assert!(
-        matches!(resp, SyncResponse::Admin(AdminAck::Rewrap { server_id: 4, .. })),
+        matches!(
+            resp,
+            SyncResponse::Admin(AdminAck::Rewrap { server_id: 4, .. })
+        ),
         "{resp:?}"
     );
     let after = {
-        let v = c.nodes[writer].read_linearizable(ReadQuery::State).await.expect("state");
+        let v = c.nodes[writer]
+            .read_linearizable(ReadQuery::State)
+            .await
+            .expect("state");
         let ReadView::State(g) = v else { panic!() };
         g.wraps.clone()
     };
@@ -294,8 +392,12 @@ async fn rewrap_requires_root_and_targets_new_server() {
     assert_eq!(opened, secret);
 
     // 票据根跨节点一致（TicketIssuer 已随第一部分落地——此处复证新目录节点可验）。
-    let t = c.nodes[writer].issue_ticket(dev_id_of(&[8; 32]), 1_000).expect("ticket");
-    assert!(c.nodes[0].verify_ticket(&t, &dev_id_of(&[8; 32]), 1_001).is_ok());
+    let t = c.nodes[writer]
+        .issue_ticket(dev_id_of(&[8; 32]), 1_000)
+        .expect("ticket");
+    assert!(c.nodes[0]
+        .verify_ticket(&t, &dev_id_of(&[8; 32]), 1_001)
+        .is_ok());
     let _ = TicketIssuer::from_root(&[42; 32]); // 密钥根派生确定性
 }
 

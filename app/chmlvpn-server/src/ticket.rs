@@ -181,8 +181,123 @@ impl TicketIssuer {
 }
 
 // ============================================================================
-// nonce 记账（SR-SIG1 请求级，本地 ±300s 窗；§2.4 分级归属）
+// 线上票据（TicketWire）：单服（本地票据根）与多主（Raft 内票据根）双形态
 // ============================================================================
+
+/// 控制流承载的会话票据（对客户端不透明 blob：登录取回、状态变更请求回呈）。
+///
+/// - [`TicketWire::Local`]：单服形态——票据根 = 本地状态库种子（[`SignedTicket`]）；
+/// - [`TicketWire::Sync`]：多主形态——票据根在 Raft 状态内（`chml_sync::ticket::Ticket`
+///   线格式；任何服务器都验得了——SR-SIG1 跨服重放面的闭合前提，§2.2）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TicketWire {
+    Local(SignedTicket),
+    Sync(Vec<u8>),
+}
+
+/// 票据校验通过的产物（user 对 Local 内嵌于票据；Sync 票据绑定 device，
+/// user 由注册表 owner 解析——调用方兜底）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketPrincipal {
+    pub user: Option<String>,
+    pub device: [u8; 32],
+}
+
+/// 票据签发/校验权威（装配期按 sync 模式选定）。
+pub enum TicketAuthority {
+    /// 单服：本地种子（状态库 META；盒装——dalek SigningKey 体积大于 Arc 变体）。
+    Local(Box<TicketIssuer>),
+    /// 多主：密钥根在 Raft（Bootstrap 落库；签发/校验经 SyncNode——不依赖 leader）。
+    #[cfg(feature = "multi-primary")]
+    Sync(std::sync::Arc<chml_sync::SyncNode>),
+}
+
+impl TicketAuthority {
+    fn local_issuer(&self) -> Result<&TicketIssuer, TicketReason> {
+        match self {
+            TicketAuthority::Local(i) => Ok(i),
+            #[cfg(feature = "multi-primary")]
+            TicketAuthority::Sync(_) => Err(TicketReason::BadSignature),
+        }
+    }
+
+    /// 签发。`epoch` = 当前 revocation_epoch（Local 进 claims；Sync 由节点内部取）。
+    pub fn issue(
+        &self,
+        user: &str,
+        device: DeviceId,
+        epoch: u64,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<TicketWire, &'static str> {
+        match self {
+            TicketAuthority::Local(iss) => Ok(TicketWire::Local(
+                iss.issue(user, device, epoch, now, ttl_secs),
+            )),
+            #[cfg(feature = "multi-primary")]
+            TicketAuthority::Sync(node) => Ok(TicketWire::Sync(
+                node.issue_ticket(device.0, now)
+                    .map_err(|_| "not bootstrapped")?
+                    .to_bytes(),
+            )),
+        }
+    }
+
+    /// 校验序（Local：签名→TTL→epoch→设备态；Sync：chml-sync 同语义 + 本机 epoch）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify(
+        &self,
+        ticket: &TicketWire,
+        session_device: &DeviceId,
+        now: u64,
+        current_epoch: u64,
+        lookup: impl FnOnce(&DeviceId) -> chml_protocol::session::LookupVerdict,
+    ) -> Result<TicketPrincipal, TicketReason> {
+        match ticket {
+            TicketWire::Local(t) => {
+                // 复用 TicketIssuer::verify 的完整序（签名→TTL→epoch→设备态）。
+                let issuer = self.local_issuer()?;
+                let claims = issuer.verify(t, now, current_epoch, lookup)?;
+                if claims.device != session_device.0 {
+                    return Err(TicketReason::DeviceMismatch);
+                }
+                Ok(TicketPrincipal {
+                    user: Some(claims.user),
+                    device: claims.device,
+                })
+            }
+            #[cfg(feature = "multi-primary")]
+            TicketWire::Sync(bytes) => {
+                let t =
+                    chml_sync::ticket::Ticket::from_bytes(bytes).ok_or(TicketReason::Malformed)?;
+                let node = match self {
+                    TicketAuthority::Sync(n) => n,
+                    TicketAuthority::Local(_) => return Err(TicketReason::BadSignature),
+                };
+                node.verify_ticket(&t, &session_device.0, now)
+                    .map_err(|e| match e {
+                        chml_sync::ticket::TicketError::BadSignature => TicketReason::BadSignature,
+                        chml_sync::ticket::TicketError::Expired { .. } => TicketReason::Expired,
+                        chml_sync::ticket::TicketError::StaleEpoch { .. } => {
+                            TicketReason::StaleEpoch
+                        }
+                        chml_sync::ticket::TicketError::WrongDevice => TicketReason::DeviceMismatch,
+                    })?;
+                // 设备态（吊销/禁用 ⇒ 拒）——与 Local 序第 4 步对齐。
+                match lookup(session_device) {
+                    chml_protocol::session::LookupVerdict::Active(_) => {}
+                    _ => return Err(TicketReason::DeviceNotActive),
+                }
+                Ok(TicketPrincipal {
+                    user: None,
+                    device: session_device.0,
+                })
+            }
+            #[cfg(not(feature = "multi-primary"))]
+            TicketWire::Sync(_) => Err(TicketReason::Malformed),
+        }
+    }
+}
 
 /// 用户 → {nonce → ts}。窗口外条目在写入时惰性清理（§1.3.2 SIG_WINDOW_SECS=300）。
 #[derive(Default)]

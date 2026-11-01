@@ -9,6 +9,9 @@ description = "ChmlVPN 服务端装配（单服形态）：TCP :9443 E2E 会话 
 [dependencies]
 chml-protocol = { path = "../../crates/chml-protocol", features = ["anchor"] }
 chml-frpc = { path = "../../crates/chml-frpc" }
+# M4 多主同步（§3.10/§4）：Raft 状态机 + 两级读目录 + 租约/转发承载 + Raft 内票据根。
+# 可选档（feature `multi-primary`）——单服部署（m2/m2-direct 形态）默认构建零依赖面。
+chml-sync = { path = "../../crates/chml-sync", optional = true }
 # M3 数据面（§2.2 服务端自身也是 peer / §3.11「对上挂 tun 适配器」）：复用客户端 crate 的
 # TunDevice/route/TunIo 接缝（§3.12 接缝落位客户端 crate，本 crate 是其第二个消费者）。
 chmlvpn-client = { path = "../chmlvpn-client" }
@@ -24,10 +27,17 @@ futures = { workspace = true }
 # 每入连一会话任务 + accept 循环 + admin loopback 端点：workspace tokio 之上加多线程 rt。
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
+[features]
+default = []
+# 多主装配（§2.2/§3.11 M4 批次）：NetBackend::Sync / Raft 票据根 / FRWD 转发面。
+multi-primary = ["dep:chml-sync"]
+
 [dev-dependencies]
-# 集成测试（tests/control_flow.rs 全链 in-process）多线程运行时。
+# 集成测试（tests/control_flow.rs 全链 in-process；tests/multi_primary.rs 3 节点内存
+# 集群——test-util = MemoryFabric 织物 + RTT 注入）多线程运行时。
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
+chml-sync = { path = "../../crates/chml-sync", features = ["test-util"] }
 
 # Direct 模式零 frp 逻辑（§2.1/§3.11 硬约束）：chml-frpc 的类型只允许出现在 src/frp.rs
 # （Frp 分支装配）与 src/config.rs 的 FrpPlan 字段；Direct 代码路径（listener.rs 的

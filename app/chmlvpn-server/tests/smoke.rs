@@ -336,7 +336,9 @@ async fn smoke_full_chain(profile: Profile) {
     );
     // (2) 坏票据 + 全新 nonce ⇒ 拒；同 nonce 好票据 ⇒ 过（顺序契约的端到端实证）。
     let mut bad = ticket_a.clone();
-    bad.epoch += 1;
+    if let chmlvpn_server::ticket::TicketWire::Local(t) = &mut bad {
+        t.exp += 100;
+    }
     let n = sr_sig::nonce_hex();
     let auth_n = CtrlClient::sr_auth(
         &user,

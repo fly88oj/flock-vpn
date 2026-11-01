@@ -49,10 +49,16 @@ pub struct ApplyOutcome {
 
 impl ApplyOutcome {
     fn ok(resp: SyncResponse) -> Self {
-        ApplyOutcome { resp, revoked: None }
+        ApplyOutcome {
+            resp,
+            revoked: None,
+        }
     }
     fn err(e: StateError) -> Self {
-        ApplyOutcome { resp: SyncResponse::Error(e), revoked: None }
+        ApplyOutcome {
+            resp: SyncResponse::Error(e),
+            revoked: None,
+        }
     }
 }
 
@@ -70,6 +76,8 @@ pub struct NetStateData {
     pub server_keys: BTreeMap<NodeId, ServerKeyEntry>,
     pub wraps: BTreeMap<NodeId, Vec<u8>>,
     pub ticket_root: Option<[u8; 32]>,
+    /// 集群共享 OPRF key（b64 ServerSetup；根签 SetOprf 登记——OPAQUE 记录全网可验，§2.4）。
+    pub oprf_b64: Option<String>,
     pub voters: BTreeSet<NodeId>,
     /// 最后一条已 apply 的普通/成员日志（快照边界；由 sm 包装层维护）。
     pub last_applied: Option<LogId<u64>>,
@@ -100,9 +108,9 @@ impl NetStateData {
                     x25519: row.device_x25519,
                     ed25519: row.device_ed25519,
                 },
-                DeviceStatus::Disabled | DeviceStatus::Revoked => {
-                    VerdictW::Revoked { since_epoch: row.since_epoch }
-                }
+                DeviceStatus::Disabled | DeviceStatus::Revoked => VerdictW::Revoked {
+                    since_epoch: row.since_epoch,
+                },
             },
             None => VerdictW::NotFound,
         }
@@ -111,6 +119,11 @@ impl NetStateData {
     /// 当前全局 revocation_epoch。
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// 集群共享 OPRF key（b64；未登记 ⇒ None）。
+    pub fn oprf_b64(&self) -> Option<&str> {
+        self.oprf_b64.as_deref()
     }
 
     /// 状态摘要（线性一致读 ReadQuery::State）。
@@ -142,40 +155,95 @@ impl NetStateData {
     /// 确定性执行一条写操作。
     ///
     /// `expected_root`：本机配置钉住的集群根公钥（None = 未配置，仅 Bootstrap 自证生效）。
-    pub fn apply(&mut self, req: &SyncRequest, expected_root: Option<&VerifyingKey>) -> ApplyOutcome {
+    pub fn apply(
+        &mut self,
+        req: &SyncRequest,
+        expected_root: Option<&VerifyingKey>,
+    ) -> ApplyOutcome {
         match req {
-            SyncRequest::Bootstrap { cluster_id, root_pub, ticket_root, sig } => {
-                self.apply_bootstrap(*cluster_id, *root_pub, *ticket_root, *sig, expected_root)
-            }
-            SyncRequest::RegisterDevice { owner, x25519, ed25519 } => {
-                self.apply_register(owner, *x25519, *ed25519)
-            }
+            SyncRequest::Bootstrap {
+                cluster_id,
+                root_pub,
+                ticket_root,
+                sig,
+            } => self.apply_bootstrap(*cluster_id, *root_pub, *ticket_root, *sig, expected_root),
+            SyncRequest::RegisterDevice {
+                owner,
+                x25519,
+                ed25519,
+            } => self.apply_register(owner, *x25519, *ed25519),
             SyncRequest::Revoke { device } => self.apply_set_status(device, DeviceStatus::Revoked),
-            SyncRequest::Disable { device } => self.apply_set_status(device, DeviceStatus::Disabled),
+            SyncRequest::Disable { device } => {
+                self.apply_set_status(device, DeviceStatus::Disabled)
+            }
             SyncRequest::Enable { device } => self.apply_set_status(device, DeviceStatus::Active),
             SyncRequest::AllocateIp => match self.alloc_vip() {
                 Ok(vip) => ApplyOutcome::ok(SyncResponse::Ip(vip)),
                 Err(e) => ApplyOutcome::err(e),
             },
-            SyncRequest::RecordInvite { invite_id, expiry_unix } => {
+            SyncRequest::RecordInvite {
+                invite_id,
+                expiry_unix,
+            } => {
                 // 幂等登记：同 id 同 expiry 且未消费 ⇒ 重复登记放行（签发侧重放）。
                 match self.invites.get(invite_id) {
-                    Some(row) if row.expiry_unix == *expiry_unix && row.status == InviteStatus::Valid => {
+                    Some(row)
+                        if row.expiry_unix == *expiry_unix && row.status == InviteStatus::Valid =>
+                    {
                         ApplyOutcome::ok(SyncResponse::Ok)
                     }
                     Some(_) => ApplyOutcome::err(StateError::AlreadyUsed),
                     None => {
                         self.invites.insert(
                             *invite_id,
-                            InviteRow { expiry_unix: *expiry_unix, status: InviteStatus::Valid },
+                            InviteRow {
+                                expiry_unix: *expiry_unix,
+                                status: InviteStatus::Valid,
+                            },
                         );
                         ApplyOutcome::ok(SyncResponse::Ok)
                     }
                 }
             }
-            SyncRequest::RedeemInvite { invite_bytes, username, x25519, ed25519, now_unix } => {
-                self.apply_redeem(invite_bytes, username, *x25519, *ed25519, *now_unix)
+            SyncRequest::RedeemInvite {
+                invite_bytes,
+                username,
+                x25519,
+                ed25519,
+                now_unix,
+            } => self.apply_redeem(invite_bytes, username, *x25519, *ed25519, *now_unix),
+            SyncRequest::SetPassword {
+                user,
+                record_b64,
+                profile,
+            } => {
+                let Some(row) = self.users.get_mut(user) else {
+                    return ApplyOutcome::err(StateError::NoSuchUser);
+                };
+                if row.opaque_record.is_some() {
+                    return ApplyOutcome::err(StateError::PasswordExists);
+                }
+                row.opaque_record = Some(record_b64.clone());
+                row.opaque_profile = *profile;
+                ApplyOutcome::ok(SyncResponse::Ok)
             }
+            SyncRequest::AddUserSigKey { user, pub32 } => {
+                let Some(row) = self.users.get_mut(user) else {
+                    return ApplyOutcome::err(StateError::NoSuchUser);
+                };
+                if !row.sr_sig_pubs.contains(pub32) {
+                    row.sr_sig_pubs.push(*pub32);
+                }
+                ApplyOutcome::ok(SyncResponse::Ok)
+            }
+            SyncRequest::ConsumeBindToken { token } => {
+                if self.bind_tokens.contains(token) {
+                    return ApplyOutcome::err(StateError::BindTokenUsed);
+                }
+                self.bind_tokens.insert(*token);
+                ApplyOutcome::ok(SyncResponse::Ok)
+            }
+            SyncRequest::SetOprf(rs) => self.apply_set_oprf(rs, expected_root),
             SyncRequest::BumpConfigVersion => {
                 self.config_version += 1;
                 ApplyOutcome::ok(SyncResponse::ConfigVersion(self.config_version))
@@ -199,7 +267,10 @@ impl NetStateData {
         };
         // 自证：根公钥对 canonical 字节的签名（防字段拼接）。
         if vk
-            .verify(&bootstrap_canonical(&cluster_id, &root_pub, &ticket_root), &Signature::from_bytes(&sig))
+            .verify(
+                &bootstrap_canonical(&cluster_id, &root_pub, &ticket_root),
+                &Signature::from_bytes(&sig),
+            )
             .is_err()
         {
             return ApplyOutcome::err(StateError::BadRootSignature);
@@ -223,8 +294,44 @@ impl NetStateData {
                         return ApplyOutcome::err(StateError::RootMismatch);
                     }
                 }
-                self.cluster = Some(ClusterIdent { cluster_id, root_pub });
+                self.cluster = Some(ClusterIdent {
+                    cluster_id,
+                    root_pub,
+                });
                 self.ticket_root = Some(ticket_root);
+                ApplyOutcome::ok(SyncResponse::Ok)
+            }
+        }
+    }
+
+    fn apply_set_oprf(
+        &mut self,
+        rs: &RootSigned<String>,
+        expected_root: Option<&VerifyingKey>,
+    ) -> ApplyOutcome {
+        let _ = expected_root; // 根公钥固定为 bootstrap 身份（下方与 cluster 比对）
+        let Some(cluster) = &self.cluster else {
+            return ApplyOutcome::err(StateError::NotBootstrapped);
+        };
+        let Ok(root_vk) = VerifyingKey::from_bytes(&cluster.root_pub) else {
+            return ApplyOutcome::err(StateError::BadRootSignature);
+        };
+        let l_oprf: &[u8] = b"chml-sync/set-oprf/v1";
+        let mut canon = Vec::with_capacity(l_oprf.len() + 4 + rs.op.len());
+        canon.extend_from_slice(l_oprf);
+        canon.extend_from_slice(&(rs.op.len() as u32).to_le_bytes());
+        canon.extend_from_slice(rs.op.as_bytes());
+        if root_vk
+            .verify(&canon, &Signature::from_bytes(&rs.sig))
+            .is_err()
+        {
+            return ApplyOutcome::err(StateError::BadRootSignature);
+        }
+        match &self.oprf_b64 {
+            Some(cur) if cur == &rs.op => ApplyOutcome::ok(SyncResponse::Ok), // 幂等重放
+            Some(_) => ApplyOutcome::err(StateError::AlreadyBootstrapped),
+            None => {
+                self.oprf_b64 = Some(rs.op.clone());
                 ApplyOutcome::ok(SyncResponse::Ok)
             }
         }
@@ -267,7 +374,10 @@ impl NetStateData {
             if status != DeviceStatus::Active {
                 self.epoch += 1;
                 row.since_epoch = self.epoch;
-                effect = Some(RevocationEffect { device: *device, new_epoch: self.epoch });
+                effect = Some(RevocationEffect {
+                    device: *device,
+                    new_epoch: self.epoch,
+                });
             }
             row.status = status;
         }
@@ -315,7 +425,10 @@ impl NetStateData {
         }
         let expiry = row.expiry_unix;
         if now_unix >= expiry {
-            return ApplyOutcome::err(StateError::InviteExpired { now_unix, expiry_unix: expiry });
+            return ApplyOutcome::err(StateError::InviteExpired {
+                now_unix,
+                expiry_unix: expiry,
+            });
         }
         let device_id: [u8; 32] = Sha256::digest(ed25519).into();
         if self.devices.contains_key(&device_id) {
@@ -343,9 +456,16 @@ impl NetStateData {
         // 同一状态转移内标记 used（查重与标记间无窗口——Raft 单次提交）。
         self.invites.insert(
             invite_id,
-            InviteRow { expiry_unix: expiry, status: InviteStatus::Used },
+            InviteRow {
+                expiry_unix: expiry,
+                status: InviteStatus::Used,
+            },
         );
-        ApplyOutcome::ok(SyncResponse::Redeem { username: username.to_string(), device_id, vip })
+        ApplyOutcome::ok(SyncResponse::Redeem {
+            username: username.to_string(),
+            device_id,
+            vip,
+        })
     }
 
     fn apply_server_keys(
@@ -357,7 +477,10 @@ impl NetStateData {
             return ApplyOutcome::err(StateError::NotBootstrapped);
         };
         if vk
-            .verify(&server_keys_canonical(&rs.op), &Signature::from_bytes(&rs.sig))
+            .verify(
+                &server_keys_canonical(&rs.op),
+                &Signature::from_bytes(&rs.sig),
+            )
             .is_err()
         {
             return ApplyOutcome::err(StateError::BadRootSignature);
@@ -367,10 +490,16 @@ impl NetStateData {
             self.server_keys.insert(e.server_id, e.clone());
         }
         self.config_version += 1;
-        ApplyOutcome::ok(SyncResponse::ServerKeys { servers: self.server_keys.len() })
+        ApplyOutcome::ok(SyncResponse::ServerKeys {
+            servers: self.server_keys.len(),
+        })
     }
 
-    fn apply_admin(&mut self, rs: &RootSigned<AdminOp>, expected_root: Option<&VerifyingKey>) -> ApplyOutcome {
+    fn apply_admin(
+        &mut self,
+        rs: &RootSigned<AdminOp>,
+        expected_root: Option<&VerifyingKey>,
+    ) -> ApplyOutcome {
         let Some(vk) = self.root_verifier(expected_root) else {
             return ApplyOutcome::err(StateError::NotBootstrapped);
         };
@@ -384,7 +513,9 @@ impl NetStateData {
             AdminOp::AddVoter { node_id } => {
                 self.voters.insert(*node_id);
                 self.config_version += 1;
-                ApplyOutcome::ok(SyncResponse::Admin(AdminAck::AddVoter { node_id: *node_id }))
+                ApplyOutcome::ok(SyncResponse::Admin(AdminAck::AddVoter {
+                    node_id: *node_id,
+                }))
             }
             AdminOp::Rewrap { server_id, wrapped } => {
                 if !self.server_keys.contains_key(server_id) {
@@ -394,7 +525,10 @@ impl NetStateData {
                 }
                 let bytes = wrapped.len();
                 self.wraps.insert(*server_id, wrapped.clone());
-                ApplyOutcome::ok(SyncResponse::Admin(AdminAck::Rewrap { server_id: *server_id, bytes }))
+                ApplyOutcome::ok(SyncResponse::Admin(AdminAck::Rewrap {
+                    server_id: *server_id,
+                    bytes,
+                }))
             }
             AdminOp::RevokeInvite { invite_id } => {
                 let Some(row) = self.invites.get_mut(invite_id) else {
@@ -421,7 +555,11 @@ impl NetStateData {
 
     /// VIP 水位分配（单调 +1；首分配 [`VIP_FIRST`]，越 [`VIP_LAST`] 即耗尽）。
     fn alloc_vip(&mut self) -> Result<[u8; 4], StateError> {
-        let cur = if self.vip_next == 0 { VIP_FIRST } else { self.vip_next };
+        let cur = if self.vip_next == 0 {
+            VIP_FIRST
+        } else {
+            self.vip_next
+        };
         if cur > VIP_LAST {
             return Err(StateError::IpExhausted);
         }
@@ -444,7 +582,11 @@ mod tests {
             &SyncRequest::bootstrap_signed(root, [7; 16], [9; 32]),
             Some(&root.verifying_key()),
         );
-        assert!(matches!(out.resp, SyncResponse::Ok), "bootstrap: {:?}", out.resp);
+        assert!(
+            matches!(out.resp, SyncResponse::Ok),
+            "bootstrap: {:?}",
+            out.resp
+        );
         d
     }
 
@@ -452,27 +594,45 @@ mod tests {
     fn vip_monotonic_and_never_reused() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
         let mut d = bootstrapped(&root);
-        let a = d.apply(&SyncRequest::RegisterDevice {
-            owner: "u".into(),
-            x25519: [1; 32],
-            ed25519: [1; 32],
-        }, None).resp;
+        let a = d
+            .apply(
+                &SyncRequest::RegisterDevice {
+                    owner: "u".into(),
+                    x25519: [1; 32],
+                    ed25519: [1; 32],
+                },
+                None,
+            )
+            .resp;
         let SyncResponse::Device(a) = a else { panic!() };
         let id: [u8; 32] = Sha256::digest([1u8; 32]).into();
         let e1 = d.apply(&SyncRequest::Revoke { device: id }, None).resp;
         assert!(matches!(e1, SyncResponse::Epoch(1)), "吊销推进 epoch");
-        let b = d.apply(&SyncRequest::RegisterDevice {
-            owner: "u".into(),
-            x25519: [2; 32],
-            ed25519: [2; 32],
-        }, None).resp;
+        let b = d
+            .apply(
+                &SyncRequest::RegisterDevice {
+                    owner: "u".into(),
+                    x25519: [2; 32],
+                    ed25519: [2; 32],
+                },
+                None,
+            )
+            .resp;
         let SyncResponse::Device(b) = b else { panic!() };
         let (ia, ib) = (u32::from_be_bytes(a.vip), u32::from_be_bytes(b.vip));
         assert_eq!(ia, VIP_FIRST, "首 VIP = 100.64.0.2");
         assert!(ib > ia, "IP 不复用（水位线只进不退）");
         // 同设备重注册拒（行保留）。
         assert!(matches!(
-            d.apply(&SyncRequest::RegisterDevice { owner: "u".into(), x25519: [1; 32], ed25519: [1; 32] }, None).resp,
+            d.apply(
+                &SyncRequest::RegisterDevice {
+                    owner: "u".into(),
+                    x25519: [1; 32],
+                    ed25519: [1; 32]
+                },
+                None
+            )
+            .resp,
             SyncResponse::Error(StateError::DeviceExists)
         ));
         // 禁用不删除：行保留、VIP 不回收。
@@ -499,7 +659,10 @@ mod tests {
             server_id: chml_protocol::session::ServerId([1; 16]),
             relay_endpoint: "127.0.0.1:9443".into(),
             identity_pub: ed25519_dalek::SigningKey::from_bytes(&[5; 32]).verifying_key(),
-            static_hybrid_pub: chml_protocol::kem::HybridKeypair::generate(&mut chml_protocol::rand::rngs::OsRng).public(),
+            static_hybrid_pub: chml_protocol::kem::HybridKeypair::generate(
+                &mut chml_protocol::rand::rngs::OsRng,
+            )
+            .public(),
         };
         let inv = chml_protocol::trust::InviteFile::issue(
             &root,
@@ -509,24 +672,40 @@ mod tests {
             999_999,
             [1; 16],
         );
-        d.apply(&SyncRequest::RecordInvite { invite_id: [1; 16], expiry_unix: 999_999 }, None);
+        d.apply(
+            &SyncRequest::RecordInvite {
+                invite_id: [1; 16],
+                expiry_unix: 999_999,
+            },
+            None,
+        );
         // 首次兑换成功。
-        let r = d.apply(&SyncRequest::RedeemInvite {
-            invite_bytes: inv.to_bytes(),
-            username: "alice".into(),
-            x25519: [3; 32],
-            ed25519: [3; 32],
-            now_unix: 1000,
-        }, None).resp;
+        let r = d
+            .apply(
+                &SyncRequest::RedeemInvite {
+                    invite_bytes: inv.to_bytes(),
+                    username: "alice".into(),
+                    x25519: [3; 32],
+                    ed25519: [3; 32],
+                    now_unix: 1000,
+                },
+                None,
+            )
+            .resp;
         assert!(matches!(r, SyncResponse::Redeem { .. }), "{r:?}");
         // 二次兑换拒（单次消费查重）。
-        let r2 = d.apply(&SyncRequest::RedeemInvite {
-            invite_bytes: inv.to_bytes(),
-            username: "bob".into(),
-            x25519: [4; 32],
-            ed25519: [4; 32],
-            now_unix: 1000,
-        }, None).resp;
+        let r2 = d
+            .apply(
+                &SyncRequest::RedeemInvite {
+                    invite_bytes: inv.to_bytes(),
+                    username: "bob".into(),
+                    x25519: [4; 32],
+                    ed25519: [4; 32],
+                    now_unix: 1000,
+                },
+                None,
+            )
+            .resp;
         assert_eq!(r2, SyncResponse::Error(StateError::AlreadyUsed));
     }
 
@@ -555,7 +734,10 @@ mod tests {
         let rw = SyncRequest::rewrap_signed(&root, 2, vec![1, 2, 3]);
         assert_eq!(
             d.apply(&rw, Some(&root.verifying_key())).resp,
-            SyncResponse::Admin(AdminAck::Rewrap { server_id: 2, bytes: 3 })
+            SyncResponse::Admin(AdminAck::Rewrap {
+                server_id: 2,
+                bytes: 3
+            })
         );
         assert_eq!(d.wraps.get(&2).map(|v| v.len()), Some(3), "rewrap 落库");
         // rewrap 到未登记 server ⇒ 拒。
@@ -580,17 +762,29 @@ mod tests {
         let mut d = NetStateData::new();
         // 未钉扎根时自证签名即可成立。
         assert!(matches!(
-            d.apply(&SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32]), None).resp,
+            d.apply(
+                &SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32]),
+                None
+            )
+            .resp,
             SyncResponse::Ok
         ));
         // 幂等重放放行。
         assert!(matches!(
-            d.apply(&SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32]), None).resp,
+            d.apply(
+                &SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32]),
+                None
+            )
+            .resp,
             SyncResponse::Ok
         ));
         // 不同身份再 bootstrap ⇒ 拒。
         assert!(matches!(
-            d.apply(&SyncRequest::bootstrap_signed(&root, [7; 16], [8; 32]), None).resp,
+            d.apply(
+                &SyncRequest::bootstrap_signed(&root, [7; 16], [8; 32]),
+                None
+            )
+            .resp,
             SyncResponse::Error(StateError::AlreadyBootstrapped)
         ));
         // 钉扎根不符 ⇒ 拒（防他签根）。
@@ -598,7 +792,11 @@ mod tests {
         let pinned = root.verifying_key();
         let other = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         assert!(matches!(
-            e.apply(&SyncRequest::bootstrap_signed(&other, [7; 16], [9; 32]), Some(&pinned)).resp,
+            e.apply(
+                &SyncRequest::bootstrap_signed(&other, [7; 16], [9; 32]),
+                Some(&pinned)
+            )
+            .resp,
             SyncResponse::Error(StateError::RootMismatch)
         ));
     }
@@ -607,7 +805,14 @@ mod tests {
     fn snapshot_roundtrip() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
         let mut d = bootstrapped(&root);
-        d.apply(&SyncRequest::RegisterDevice { owner: "u".into(), x25519: [1; 32], ed25519: [1; 32] }, None);
+        d.apply(
+            &SyncRequest::RegisterDevice {
+                owner: "u".into(),
+                x25519: [1; 32],
+                ed25519: [1; 32],
+            },
+            None,
+        );
         let bytes = d.to_bytes();
         let back = NetStateData::from_bytes(&bytes).expect("roundtrip");
         assert_eq!(back.devices.len(), 1);

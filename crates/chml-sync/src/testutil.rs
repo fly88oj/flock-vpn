@@ -20,7 +20,11 @@ use tokio::sync::mpsc;
 use crate::wire::{Fabric, PeerIo};
 
 /// 单向泵：读 `r` → sleep `delay` → 写 `w`（线路传播延迟模型）。
-async fn pump(mut r: tokio::io::ReadHalf<DuplexStream>, mut w: tokio::io::WriteHalf<DuplexStream>, delay: Duration) {
+async fn pump(
+    mut r: tokio::io::ReadHalf<DuplexStream>,
+    mut w: tokio::io::WriteHalf<DuplexStream>,
+    delay: Duration,
+) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -77,8 +81,16 @@ impl MemoryFabric {
     /// 建节点织物并注册。`delay` = 单向传播延迟（RTT = 2×delay）；`buf` = duplex 缓冲。
     pub fn new(me: ServerId, reg: &FabricRegistry, delay: Duration, buf: usize) -> Arc<Self> {
         let (tx, rx) = mpsc::channel::<PeerIo>(64);
-        reg.lock().expect("fabric reg").insert(me.0, NodeSlot { tx, alive: true });
-        Arc::new(MemoryFabric { me, reg: reg.clone(), rx: Arc::new(tokio::sync::Mutex::new(rx)), delay, buf })
+        reg.lock()
+            .expect("fabric reg")
+            .insert(me.0, NodeSlot { tx, alive: true });
+        Arc::new(MemoryFabric {
+            me,
+            reg: reg.clone(),
+            rx: Arc::new(tokio::sync::Mutex::new(rx)),
+            delay,
+            buf,
+        })
     }
 
     /// 节点下线（dial 拒绝；在途 accept 队列保留至耗尽——kill leader 用例）。
@@ -110,11 +122,14 @@ impl Fabric for MemoryFabric {
         async move {
             let tx = {
                 let mut reg = reg.lock().expect("fabric reg");
-                let slot = reg
-                    .get_mut(&target.0)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionRefused, "no such node"))?;
+                let slot = reg.get_mut(&target.0).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::ConnectionRefused, "no such node")
+                })?;
                 if !slot.alive {
-                    return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "node down"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "node down",
+                    ));
                 }
                 slot.tx.clone()
             };
@@ -135,9 +150,9 @@ impl Fabric for MemoryFabric {
         async move {
             // tokio Mutex：guard 可跨 await（单 serve_loop 消费者，无争用）。
             let mut rx = rx.lock().await;
-            rx.recv().await.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::ConnectionAborted, "fabric closed")
-            })
+            rx.recv()
+                .await
+                .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "fabric closed"))
         }
         .boxed()
     }

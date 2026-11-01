@@ -31,12 +31,20 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
-        Fixture { root: SigningKey::from_bytes(&[7u8; 32]), cluster_id: ClusterId([9u8; 16]) }
+        Fixture {
+            root: SigningKey::from_bytes(&[7u8; 32]),
+            cluster_id: ClusterId([9u8; 16]),
+        }
     }
 
     /// enroll 一个新服务器身份（运维签发入群凭证，§4-1）。
     pub fn enroll(&self, n: NodeId) -> Arc<ServerIdentity> {
-        Arc::new(ServerIdentity::enroll(&self.root, self.cluster_id, sid(n), &format!("node-{n}.test:9443")))
+        Arc::new(ServerIdentity::enroll(
+            &self.root,
+            self.cluster_id,
+            sid(n),
+            &format!("node-{n}.test:9443"),
+        ))
     }
 
     /// 根签目录（dir_version 递增）。
@@ -96,7 +104,9 @@ impl TestCluster {
             ident.clone(),
             directory.clone(),
             fabric,
-            self.tmp.path().join(format!("db-{}-{}.redb", ident.server_id.0[0], self.next_db)),
+            self.tmp
+                .path()
+                .join(format!("db-{}-{}.redb", ident.server_id.0[0], self.next_db)),
         )
         .hook(rec.clone());
         if let Some(m) = members {
@@ -116,9 +126,16 @@ impl TestCluster {
             for n in &self.nodes {
                 if let Some(l) = n.current_leader().await {
                     if l == n.id()
-                        && matches!(n.raft().metrics().borrow().state, openraft::ServerState::Leader)
+                        && matches!(
+                            n.raft().metrics().borrow().state,
+                            openraft::ServerState::Leader
+                        )
                     {
-                        let idx = self.nodes.iter().position(|x| x.id() == l).expect("leader in nodes");
+                        let idx = self
+                            .nodes
+                            .iter()
+                            .position(|x| x.id() == l)
+                            .expect("leader in nodes");
                         return (idx, l);
                     }
                 }
@@ -147,7 +164,11 @@ impl TestCluster {
                     return v;
                 }
             }
-            assert!(Instant::now() < deadline, "等待 {what} 超时（{}s）", budget.as_secs());
+            assert!(
+                Instant::now() < deadline,
+                "等待 {what} 超时（{}s）",
+                budget.as_secs()
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }

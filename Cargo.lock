@@ -428,6 +428,7 @@ dependencies = [
  "base64",
  "chml-frpc",
  "chml-protocol",
+ "chml-sync",
  "chmlvpn-client",
  "futures",
  "hex",

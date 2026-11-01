@@ -15,11 +15,16 @@
 //! - [`frp`]：**唯一触碰 chml-frpc 的模块**（仅 Frp 模式装配；Direct 代码路径不经过）；
 //! - [`admin`]：admin loopback 端点（CLI 写操作的进程内单写者入口）；
 //! - [`dataplane`]：M3 服务端数据面（tun VIP 100.64.0.1 + 源 VIP 校验 + 会话包通道，
-//!   复用 `chmlvpn-client` 的 TunDevice/route 接缝，§2.2/§3.12）。
+//!   复用 `chmlvpn-client` 的 TunDevice/route 接缝，§2.2/§3.12）；
+//! - [`backend`]：NetBackend——单服（redb）与多主（chml-sync Raft）的统一异步写读门面
+//!   （feature `multi-primary`；§2.2/§3.11 M4 装配批次）；
+//! - [`bundle`]：init-cluster/enroll 的节点捆绑文件（根公钥 + 入群凭证 + 根签目录）。
 
 #![forbid(unsafe_code)]
 
 pub mod admin;
+pub mod backend;
+pub mod bundle;
 pub mod config;
 pub mod control;
 pub mod dataplane;

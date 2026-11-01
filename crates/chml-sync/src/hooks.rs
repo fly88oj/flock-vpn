@@ -48,7 +48,11 @@ impl HookRegistry {
 
     /// 触发吊销传播钩子（幂等：每条阻断性转移恰好一次）。
     pub fn fire_revocation(&self, ev: RevocationEffect, log_index: u64) {
-        let event = RevocationEvent { device: ev.device, new_epoch: ev.new_epoch, log_index };
+        let event = RevocationEvent {
+            device: ev.device,
+            new_epoch: ev.new_epoch,
+            log_index,
+        };
         for h in self.hooks.lock().expect("hook registry").iter() {
             h.on_revocation_applied(event);
         }
@@ -92,7 +96,10 @@ impl HookRecorder {
 
     /// 指定设备的吊销事件数。
     pub fn revocation_count(&self, device: &[u8; 32]) -> usize {
-        self.revocations().iter().filter(|e| &e.device == device).count()
+        self.revocations()
+            .iter()
+            .filter(|e| &e.device == device)
+            .count()
     }
 }
 

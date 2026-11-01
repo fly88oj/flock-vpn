@@ -30,9 +30,15 @@ pub const ANTI_ENTROPY: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GossipMsg {
     /// 单条租约事件推送（publish 即时广播，≤1s 语义）。
-    Publish { device: [u8; 32], holder: NodeId, term_ms: u64 },
+    Publish {
+        device: [u8; 32],
+        holder: NodeId,
+        term_ms: u64,
+    },
     /// 全表摘要（反熵；TTL 由收端以本机时钟重置）。
-    Anti { entries: Vec<(Vec<u8>, NodeId, u64)> },
+    Anti {
+        entries: Vec<(Vec<u8>, NodeId, u64)>,
+    },
 }
 
 /// 单条租约。
@@ -54,7 +60,12 @@ pub struct LeaseTable {
 impl LeaseTable {
     /// `hooks` 与状态机共用同一注册表（on_lease_evicted 与 on_revocation_applied 同源）。
     pub fn new(me: NodeId, ttl: Duration, hooks: HookRegistry) -> Arc<Self> {
-        Arc::new(LeaseTable { me, ttl, hooks, st: Mutex::new(BTreeMap::new()) })
+        Arc::new(LeaseTable {
+            me,
+            ttl,
+            hooks,
+            st: Mutex::new(BTreeMap::new()),
+        })
     }
 
     /// 本机节点号。
@@ -69,7 +80,11 @@ impl LeaseTable {
         let mut st = self.st.lock().expect("lease table");
         let prev = st.insert(
             *device,
-            Lease { holder: self.me, term_ms: term, expires_at: Instant::now() + self.ttl },
+            Lease {
+                holder: self.me,
+                term_ms: term,
+                expires_at: Instant::now() + self.ttl,
+            },
         );
         prev.filter(|p| p.holder != self.me).map(|p| p.holder)
     }
@@ -78,7 +93,11 @@ impl LeaseTable {
     /// 触发踢出钩子（旧端踢会话）。
     pub fn merge_remote(&self, msg: GossipMsg) {
         let entries: Vec<([u8; 32], NodeId, u64)> = match msg {
-            GossipMsg::Publish { device, holder, term_ms } => vec![(device, holder, term_ms)],
+            GossipMsg::Publish {
+                device,
+                holder,
+                term_ms,
+            } => vec![(device, holder, term_ms)],
             GossipMsg::Anti { entries } => entries
                 .into_iter()
                 .filter_map(|(d, h, t)| <[u8; 32]>::try_from(d).ok().map(|d| (d, h, t)))
@@ -99,7 +118,14 @@ impl LeaseTable {
                             evicted.push(device);
                         }
                     }
-                    st.insert(device, Lease { holder, term_ms: term, expires_at: Instant::now() + self.ttl });
+                    st.insert(
+                        device,
+                        Lease {
+                            holder,
+                            term_ms: term,
+                            expires_at: Instant::now() + self.ttl,
+                        },
+                    );
                 }
             }
         }
@@ -124,7 +150,11 @@ impl LeaseTable {
     /// 一次性跨服位置询问（§3.10 `location_query`：fan-out ≤3，不缓存不重试——
     /// 失败即丢包+ICMP，由上层恢复）。本地租约域命中即答（唯一真相源）；
     /// 否则经 [`LocateFanout`] 问互连服务器「谁在托管该设备」，取首个肯定回答。
-    pub async fn location_query(&self, device: &[u8; 32], fanout: &dyn LocateFanout) -> Option<NodeId> {
+    pub async fn location_query(
+        &self,
+        device: &[u8; 32],
+        fanout: &dyn LocateFanout,
+    ) -> Option<NodeId> {
         if let Some(l) = self.observe(device) {
             return Some(l.holder);
         }
@@ -182,11 +212,19 @@ mod tests {
         t1.publish(&[7; 32]);
         assert_eq!(t1.observe(&[7; 32]).unwrap().holder, 1);
         // 节点 2 的更新租约到达节点 1 ⇒ 新者胜 + 节点 1 踢出回调。
-        t1.merge_remote(GossipMsg::Publish { device: [7; 32], holder: 2, term_ms: now_ms() + 50 });
+        t1.merge_remote(GossipMsg::Publish {
+            device: [7; 32],
+            holder: 2,
+            term_ms: now_ms() + 50,
+        });
         assert_eq!(t1.observe(&[7; 32]).unwrap().holder, 2, "新者胜");
         assert_eq!(rec.evictions(), vec![[7u8; 32]], "旧端踢出回调触发");
         // 旧 term 再来 ⇒ 不回退。
-        t1.merge_remote(GossipMsg::Publish { device: [7; 32], holder: 1, term_ms: 1 });
+        t1.merge_remote(GossipMsg::Publish {
+            device: [7; 32],
+            holder: 1,
+            term_ms: 1,
+        });
         assert_eq!(t1.observe(&[7; 32]).unwrap().holder, 2, "旧者不覆盖");
     }
 

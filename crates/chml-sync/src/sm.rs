@@ -17,7 +17,10 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use openraft::storage::RaftSnapshotBuilder;
-use openraft::{BasicNode, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Snapshot, SnapshotMeta, StorageError, StoredMembership, ToStorageResult};
+use openraft::{
+    BasicNode, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Snapshot, SnapshotMeta,
+    StorageError, StoredMembership, ToStorageResult,
+};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -48,7 +51,10 @@ pub struct LagInjector {
 
 impl LagInjector {
     pub fn new() -> Arc<Self> {
-        Arc::new(LagInjector { armed: AtomicBool::new(false), delay: RwLock::new(Duration::ZERO) })
+        Arc::new(LagInjector {
+            armed: AtomicBool::new(false),
+            delay: RwLock::new(Duration::ZERO),
+        })
     }
 
     /// 武装（delay = 每批次 apply 停摆时长）。
@@ -164,6 +170,11 @@ impl SmCore {
     }
 
     /// 票据密钥根（Raft 内；Bootstrap 后存在）。
+    /// 集群共享 OPRF key（b64；Bootstrap+SetOprf 后可用）。
+    pub fn oprf_b64(&self) -> Option<String> {
+        self.with_data(|d| d.oprf_b64.clone())
+    }
+
     pub fn ticket_root(&self) -> Option<[u8; 32]> {
         self.with_data(|d| d.ticket_root)
     }
@@ -175,7 +186,12 @@ impl SmCore {
 
     /// 按 VIP 反查设备（目标归属解析；NetState 只存静态注册信息——不含当前位置）。
     pub fn device_by_vip(&self, vip: &[u8; 4]) -> Option<[u8; 32]> {
-        self.with_data(|d| d.devices.iter().find(|(_, r)| &r.vip == vip).map(|(id, _)| *id))
+        self.with_data(|d| {
+            d.devices
+                .iter()
+                .find(|(_, r)| &r.vip == vip)
+                .map(|(id, _)| *id)
+        })
     }
 
     /// 执行一批日志的 apply（核心转移 + 钩子触发 + watch 推进）。
@@ -196,7 +212,10 @@ impl SmCore {
                         d.apply(req, pinned)
                     };
                     if let Some(ev) = outcome.revoked {
-                        self.hooks.lock().expect("sm hooks").fire_revocation(ev, idx);
+                        self.hooks
+                            .lock()
+                            .expect("sm hooks")
+                            .fire_revocation(ev, idx);
                         new_epoch = Some(ev.new_epoch);
                     }
                     out.push(outcome.resp);
@@ -232,7 +251,13 @@ impl SmCore {
                 last_membership: d.last_membership.clone(),
                 snapshot_id: format!("chml-sync-{:016x}", rng_u64()),
             };
-            (SnapBundle { meta: meta.clone(), data: d.clone() }, meta)
+            (
+                SnapBundle {
+                    meta: meta.clone(),
+                    data: d.clone(),
+                },
+                meta,
+            )
         };
         let bytes = postcard::to_allocvec(&bundle).expect("sm snapshot serialize");
         persist_snapshot(&self.db, &bytes);
@@ -292,16 +317,12 @@ impl openraft::storage::RaftStateMachine<SyncConfig> for RedbStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>>
-    {
+    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
         let d = self.core.data.read().expect("sm data");
         Ok((d.last_applied, d.last_membership.clone()))
     }
 
-    async fn apply<I>(
-        &mut self,
-        entries: I,
-    ) -> Result<Vec<SyncResponse>, StorageError<u64>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<SyncResponse>, StorageError<u64>>
     where
         I: IntoIterator<Item = Entry<SyncConfig>> + Send,
         I::IntoIter: Send,
@@ -311,10 +332,14 @@ impl openraft::storage::RaftStateMachine<SyncConfig> for RedbStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        SmSnapshotBuilder { core: self.core.clone() }
+        SmSnapshotBuilder {
+            core: self.core.clone(),
+        }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<u64>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<u64>> {
         Ok(Box::new(std::io::Cursor::new(Vec::new())))
     }
 
@@ -352,10 +377,15 @@ impl openraft::storage::RaftStateMachine<SyncConfig> for RedbStateMachine {
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<SyncConfig>>, StorageError<u64>> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<SyncConfig>>, StorageError<u64>> {
         Ok(read_snapshot(&self.core.db).map(|b| {
             let bytes = postcard::to_allocvec(&b).expect("sm snapshot serialize");
-            Snapshot::<SyncConfig> { meta: b.meta, snapshot: Box::new(std::io::Cursor::new(bytes)) }
+            Snapshot::<SyncConfig> {
+                meta: b.meta,
+                snapshot: Box::new(std::io::Cursor::new(bytes)),
+            }
         }))
     }
 }
@@ -395,8 +425,20 @@ mod tests {
         let root = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
         let entries = vec![
             entry(1, SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32])),
-            entry(2, SyncRequest::RegisterDevice { owner: "u".into(), x25519: [1; 32], ed25519: [1; 32] }),
-            entry(3, SyncRequest::Revoke { device: sha(&[1; 32]) }),
+            entry(
+                2,
+                SyncRequest::RegisterDevice {
+                    owner: "u".into(),
+                    x25519: [1; 32],
+                    ed25519: [1; 32],
+                },
+            ),
+            entry(
+                3,
+                SyncRequest::Revoke {
+                    device: sha(&[1; 32]),
+                },
+            ),
         ];
         let res = c.apply_entries(&entries).await;
         assert_eq!(res.len(), 3);
@@ -415,8 +457,16 @@ mod tests {
         c.lag.arm(Duration::from_millis(300));
         let root = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
         let t0 = std::time::Instant::now();
-        let _ = c.apply_entries(&[entry(1, SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32]))]).await;
-        assert!(t0.elapsed() >= Duration::from_millis(300), "武装后 apply 停摆");
+        let _ = c
+            .apply_entries(&[entry(
+                1,
+                SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32]),
+            )])
+            .await;
+        assert!(
+            t0.elapsed() >= Duration::from_millis(300),
+            "武装后 apply 停摆"
+        );
         c.lag.disarm();
         let t1 = std::time::Instant::now();
         let _ = c.apply_entries(&[entry(2, SyncRequest::AllocateIp)]).await;
@@ -432,7 +482,14 @@ mod tests {
         let _ = c
             .apply_entries(&[
                 entry(1, SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32])),
-                entry(2, SyncRequest::RegisterDevice { owner: "u".into(), x25519: [1; 32], ed25519: [1; 32] }),
+                entry(
+                    2,
+                    SyncRequest::RegisterDevice {
+                        owner: "u".into(),
+                        x25519: [1; 32],
+                        ed25519: [1; 32],
+                    },
+                ),
             ])
             .await;
         let snap = c.build_and_persist_snapshot();

@@ -48,7 +48,7 @@ async fn full_chain_invite_login_keybind_srsig1_revoke() {
     let srv = TestServer::start(60).await;
 
     // —— 邀请（根签 v3，含全套服务器材料/双端点）——
-    let invite_bytes = srv.mint_invite(3600);
+    let invite_bytes = srv.mint_invite(3600).await;
     let invite = InviteFile::from_bytes(&invite_bytes).expect("invite parse");
     assert!(invite.verify_against(&srv.core.identity.root_pub), "根验签");
     assert_eq!(invite.directory.servers.len(), 2, "目录含主端点+第二暴露口");
@@ -56,7 +56,7 @@ async fn full_chain_invite_login_keybind_srsig1_revoke() {
 
     // —— 开户：兑换邀请（建用户/设备 + VIP）——
     let dev_a = DeviceStaticKeys::generate();
-    let vip_a = srv.redeem(&invite_bytes, "alice", &dev_a);
+    let vip_a = srv.redeem(&invite_bytes, "alice", &dev_a).await;
     assert_eq!(
         vip_a,
         [100, 64, 0, 2],
@@ -121,8 +121,13 @@ async fn full_chain_invite_login_keybind_srsig1_revoke() {
         .login_anchored("alice", "pw-123", &pin)
         .await
         .expect("login");
-    assert_eq!(ticket_a.user, "alice");
-    assert_eq!(ticket_a.device, dev_id(&dev_a).to_vec(), "票据绑定会话设备");
+    match &ticket_a {
+        chmlvpn_server::ticket::TicketWire::Local(t) => {
+            assert_eq!(t.user, "alice");
+            assert_eq!(t.device, dev_id(&dev_a).to_vec(), "票据绑定会话设备");
+        }
+        other => panic!("单服形态票据应为 Local：{other:?}"),
+    }
 
     // —— key-bind：设备 B 公钥登记（票据 + bind_token 一次性 + 设备签名）——
     let dev_b = DeviceStaticKeys::generate();
@@ -187,8 +192,11 @@ async fn full_chain_invite_login_keybind_srsig1_revoke() {
     );
 
     // (b) 契约顺序：坏票据 + 全新 nonce ⇒ TicketBad；同 nonce 持有效票据 ⇒ 过（未入账证明）。
+    // 篡改覆盖字段 ⇒ 签名失效（TicketWire::Local 的 exp 进 canonical 字节）。
     let mut bad_ticket = ticket_a.clone();
-    bad_ticket.epoch += 1; // 篡改覆盖字段 ⇒ 签名失效
+    if let chmlvpn_server::ticket::TicketWire::Local(t) = &mut bad_ticket {
+        t.exp += 100;
+    }
     let n3 = sr_sig::nonce_hex();
     let auth3 = CtrlClient::sr_auth(
         "alice",
@@ -348,7 +356,7 @@ async fn tofu_bootstrap_pin_second_connect_and_endpoint_switch() {
     let srv = TestServer::start(60).await;
     // TOFU 设备经管理面预置（TOFU 解决的是**信任**引导，不是账号开通，§1.3.3f）。
     let dev = DeviceStaticKeys::generate();
-    srv.device_add("tofu-user", &dev);
+    srv.device_add("tofu-user", &dev).await;
 
     // —— 首连 I0→R0（无邀请/无钉扎）——
     let io = tokio::net::TcpStream::connect(&srv.primary).await.unwrap();
@@ -415,11 +423,11 @@ async fn tofu_bootstrap_pin_second_connect_and_endpoint_switch() {
 #[tokio::test]
 async fn ticket_expiry_rejected_after_ttl() {
     let srv = TestServer::start(2).await; // TTL 2s（部署可调，缺省 60 = §2.2 硬顶）
-    let invite_bytes = srv.mint_invite(3600);
+    let invite_bytes = srv.mint_invite(3600).await;
     let invite = InviteFile::from_bytes(&invite_bytes).unwrap();
     let pin = pin_from_invite(&invite, 0);
     let dev = DeviceStaticKeys::generate();
-    srv.redeem(&invite_bytes, "bob", &dev);
+    srv.redeem(&invite_bytes, "bob", &dev).await;
 
     let t = connect(&dev, &pin).await;
     let mut c = CtrlClient::open(t).await.unwrap();

@@ -66,6 +66,19 @@ pub struct ServerConfig {
     pub tun_name: String,
     /// 仅 mode = "frp" 时读取。
     pub frp: Option<FrpSection>,
+    /// 多主同步（§2.2/§3.11 M4 批次；缺省 None = 单服形态——m2/m2-direct 部署不变）。
+    #[serde(default)]
+    pub sync: Option<SyncSection>,
+}
+
+/// `[sync]` 配置节。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncSection {
+    /// `single`（缺省）| `raft`。
+    #[serde(default = "default_sync_mode")]
+    pub mode: String,
+    /// raft 形态：节点捆绑文件（init-cluster 产物；根公钥 + 入群凭证 + 根签目录）。
+    pub bundle: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +112,9 @@ fn default_tun_name() -> String {
 }
 fn default_frpc_bin() -> PathBuf {
     PathBuf::from("/usr/local/bin/frpc")
+}
+fn default_sync_mode() -> String {
+    "single".into()
 }
 
 impl ServerConfig {

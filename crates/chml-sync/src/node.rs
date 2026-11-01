@@ -128,7 +128,9 @@ impl SyncNodeBuilder {
     pub async fn build(self) -> Result<SyncNode, SyncError> {
         // 根签目录验证（无签名/换根 ⇒ 拒装配）。
         if !self.directory.verify(&self.ident.root_pub) {
-            return Err(SyncError::Raft("cluster directory failed root verification".into()));
+            return Err(SyncError::Raft(
+                "cluster directory failed root verification".into(),
+            ));
         }
         let pinned = self.pinned_root.unwrap_or(self.ident.root_pub);
 
@@ -140,7 +142,10 @@ impl SyncNodeBuilder {
             install_snapshot_timeout: 10_000,
             ..Default::default()
         };
-        let cfg = Arc::new(cfg.validate().map_err(|e| SyncError::Raft(format!("config: {e}")))?);
+        let cfg = Arc::new(
+            cfg.validate()
+                .map_err(|e| SyncError::Raft(format!("config: {e}")))?,
+        );
 
         let db = Database::create(&self.db_path)
             .map_err(|e| SyncError::Raft(format!("redb open {}: {e}", self.db_path.display())))?;
@@ -155,14 +160,22 @@ impl SyncNodeBuilder {
         let ic = Interconnect::new(self.ident.clone(), &self.directory, self.fabric.clone());
         let net = crate::network::SyncNetFactory { ic: ic.clone() };
         let ic_serve_ic = ic.clone();
-        let raft = Raft::new(self.node_id, cfg, net, log_store, RedbStateMachine::new(sm.clone()))
-            .await
-            .map_err(|e| SyncError::Raft(format!("raft start: {e}")))?;
+        let raft = Raft::new(
+            self.node_id,
+            cfg,
+            net,
+            log_store,
+            RedbStateMachine::new(sm.clone()),
+        )
+        .await
+        .map_err(|e| SyncError::Raft(format!("raft start: {e}")))?;
 
         let lag = LagMonitor::new(self.settings.lag_threshold, sm.applied_counter());
         let lease = LeaseTable::new(self.node_id, self.settings.lease_ttl, sm.shared_hooks());
-        let directory = Arc::new(Directory::new(self.ident.root_pub, &self.directory)
-            .map_err(|e| SyncError::Raft(format!("directory: {e}")))?);
+        let directory = Arc::new(
+            Directory::new(self.ident.root_pub, &self.directory)
+                .map_err(|e| SyncError::Raft(format!("directory: {e}")))?,
+        );
         let forward = ForwardPlane::new(self.node_id, sm.clone(), lease.clone());
 
         // 互连应答循环（无凭证对端在此层被拒）。
@@ -188,7 +201,10 @@ impl SyncNodeBuilder {
 
         // 转发面互连接缝（FRWD 流 + location_query 扇出）。
         let fwd_transport = Arc::new(IcForwardTransport { ic: ic.clone() });
-        let fwd_fanout = Arc::new(IcLocateFanout { ic: ic.clone(), me: self.node_id });
+        let fwd_fanout = Arc::new(IcLocateFanout {
+            ic: ic.clone(),
+            me: self.node_id,
+        });
         forward.set_transport(fwd_transport, fwd_fanout);
 
         let inner = Arc::new(NodeInner {
@@ -217,7 +233,9 @@ async fn anti_entropy_loop(ic: Arc<Interconnect>, lease: Arc<LeaseTable>) {
         tick.tick().await;
         let msg = lease.anti_entropy_msg();
         for peer in ic_peer_ids(&ic) {
-            let _ = ic.call(peer, WireRpc::Gossip(msg.clone()), Duration::from_secs(2)).await;
+            let _ = ic
+                .call(peer, WireRpc::Gossip(msg.clone()), Duration::from_secs(2))
+                .await;
         }
     }
 }
@@ -251,10 +269,17 @@ struct IcForwardTransport {
 }
 
 impl ForwardTransport for IcForwardTransport {
-    fn send(&self, peer: NodeId, env: ForwardEnvelope) -> BoxFuture<'static, io::Result<ForwardOutcome>> {
+    fn send(
+        &self,
+        peer: NodeId,
+        env: ForwardEnvelope,
+    ) -> BoxFuture<'static, io::Result<ForwardOutcome>> {
         let ic = self.ic.clone();
         Box::pin(async move {
-            match ic.call(peer, WireRpc::Forward(env), Duration::from_secs(3)).await {
+            match ic
+                .call(peer, WireRpc::Forward(env), Duration::from_secs(3))
+                .await
+            {
                 Ok(WireResp::Forward(r)) => Ok(r),
                 Ok(_) => Err(io::Error::other("forward rpc response mismatch")),
                 Err(e) => Err(io::Error::from(e)),
@@ -275,10 +300,16 @@ impl LocateFanout for IcLocateFanout {
         let me = self.me;
         let device = *device;
         Box::pin(async move {
-            let peers: Vec<NodeId> = ic.node_ids().into_iter().filter(|p| *p != me).take(3).collect();
+            let peers: Vec<NodeId> = ic
+                .node_ids()
+                .into_iter()
+                .filter(|p| *p != me)
+                .take(3)
+                .collect();
             for peer in peers {
-                if let Ok(WireResp::Locate(Some(holder))) =
-                    ic.call(peer, WireRpc::Locate(device), Duration::from_secs(2)).await
+                if let Ok(WireResp::Locate(Some(holder))) = ic
+                    .call(peer, WireRpc::Locate(device), Duration::from_secs(2))
+                    .await
                 {
                     return Some(holder);
                 }
@@ -309,7 +340,11 @@ impl NodeInner {
                     if let Some(leader) = f.leader_id.filter(|l| *l != self.id) {
                         if let Ok(WireResp::Write(r)) = self
                             .ic
-                            .call(leader, WireRpc::Write(req.clone()), self.settings.rpc_timeout)
+                            .call(
+                                leader,
+                                WireRpc::Write(req.clone()),
+                                self.settings.rpc_timeout,
+                            )
                             .await
                         {
                             return r;
@@ -435,9 +470,21 @@ impl SyncNode {
     }
 
     /// 签发本地票据（TTL 60s，绑定 device + 当前本地 epoch）。
-    pub fn issue_ticket(&self, device: [u8; 32], now_unix: u64) -> Result<crate::ticket::Ticket, SyncError> {
-        let issuer = self.inner.ticket_issuer().ok_or(SyncError::Raft("not bootstrapped".into()))?;
-        Ok(issuer.issue(device, self.inner.sm.epoch(), now_unix, self.inner.next_ticket_seq()))
+    pub fn issue_ticket(
+        &self,
+        device: [u8; 32],
+        now_unix: u64,
+    ) -> Result<crate::ticket::Ticket, SyncError> {
+        let issuer = self
+            .inner
+            .ticket_issuer()
+            .ok_or(SyncError::Raft("not bootstrapped".into()))?;
+        Ok(issuer.issue(
+            device,
+            self.inner.sm.epoch(),
+            now_unix,
+            self.inner.next_ticket_seq(),
+        ))
     }
 
     /// 校验票据（以本机当前 epoch——§2.2-3 清拒语义）。
@@ -447,7 +494,10 @@ impl SyncNode {
         device: &[u8; 32],
         now_unix: u64,
     ) -> Result<(), crate::ticket::TicketError> {
-        let issuer = self.inner.ticket_issuer().ok_or(crate::ticket::TicketError::BadSignature)?;
+        let issuer = self
+            .inner
+            .ticket_issuer()
+            .ok_or(crate::ticket::TicketError::BadSignature)?;
         issuer.verify(t, device, self.inner.sm.epoch(), now_unix)
     }
 
@@ -467,7 +517,9 @@ impl SyncNode {
                 let ic = self.inner.ic.clone();
                 let m = msg.clone();
                 tokio::spawn(async move {
-                    let _ = ic.call(peer, WireRpc::Gossip(m), Duration::from_secs(2)).await;
+                    let _ = ic
+                        .call(peer, WireRpc::Gossip(m), Duration::from_secs(2))
+                        .await;
                 });
             }
         }
@@ -499,7 +551,9 @@ impl SyncNode {
             .directory
             .install(dir)
             .map_err(|e| SyncError::Raft(format!("install directory: {e}")))?;
-        self.inner.ic.update_nodes(self.inner.directory.node_entries());
+        self.inner
+            .ic
+            .update_nodes(self.inner.directory.node_entries());
         Ok(())
     }
 
@@ -512,7 +566,11 @@ impl SyncNode {
     pub async fn add_learner(&self, node_id: NodeId) -> Result<(), SyncError> {
         self.inner
             .raft
-            .add_learner(node_id, openraft::BasicNode::new(format!("node-{node_id}")), true)
+            .add_learner(
+                node_id,
+                openraft::BasicNode::new(format!("node-{node_id}")),
+                true,
+            )
             .await
             .map(|_| ())
             .map_err(|e| SyncError::Raft(format!("add_learner: {e}")))
@@ -529,7 +587,15 @@ impl SyncNode {
             .map_err(|e| SyncError::Raft(format!("trigger snapshot: {e}")))?;
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if self.inner.raft.get_snapshot().await.ok().flatten().is_some() {
+            if self
+                .inner
+                .raft
+                .get_snapshot()
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -553,7 +619,9 @@ impl SyncNode {
         root: &ed25519_dalek::SigningKey,
         node_id: NodeId,
     ) -> Result<SyncResponse, SyncError> {
-        let resp = self.write(SyncRequest::add_voter_signed(root, node_id)).await?;
+        let resp = self
+            .write(SyncRequest::add_voter_signed(root, node_id))
+            .await?;
         if matches!(resp, SyncResponse::Error(_)) {
             return Ok(resp);
         }
@@ -590,13 +658,20 @@ impl SyncNode {
     }
 
     /// 会话入向处理（§2.2 转发判定序；装配层从 PacketChannel 读出后调用）。
-    pub async fn ingest_packet(&self, device: &[u8; 32], pkt: &[u8]) -> crate::forward::IngestResult {
+    pub async fn ingest_packet(
+        &self,
+        device: &[u8; 32],
+        pkt: &[u8],
+    ) -> crate::forward::IngestResult {
         self.inner.forward.ingest(device, pkt).await
     }
 
     /// 一次性位置询问（本地租约域优先；fan-out ≤3 台互连服务器）。
     pub async fn location_query(&self, device: &[u8; 32]) -> Option<NodeId> {
-        let fanout = IcLocateFanout { ic: self.inner.ic.clone(), me: self.inner.id };
+        let fanout = IcLocateFanout {
+            ic: self.inner.ic.clone(),
+            me: self.inner.id,
+        };
         self.inner.lease.location_query(device, &fanout).await
     }
 

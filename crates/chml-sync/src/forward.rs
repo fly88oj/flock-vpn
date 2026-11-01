@@ -74,7 +74,11 @@ pub trait PacketSink: Send + Sync + 'static {
 
 /// 互连发送接缝（node 装配注入：WireRpc::Forward 经 E2E 会话）。
 pub trait ForwardTransport: Send + Sync + 'static {
-    fn send(&self, peer: NodeId, env: ForwardEnvelope) -> BoxFuture<'static, io::Result<ForwardOutcome>>;
+    fn send(
+        &self,
+        peer: NodeId,
+        env: ForwardEnvelope,
+    ) -> BoxFuture<'static, io::Result<ForwardOutcome>>;
 }
 
 /// 转发面计数（断言/告警面；§2.2-0「丢+计数+超限告警」）。
@@ -161,7 +165,10 @@ impl ForwardPlane {
 
     /// 挂载/卸载本地设备会话（登录建立/断链拆除）。
     pub fn attach_session(&self, device: [u8; 32], sink: Arc<dyn PacketSink>) {
-        self.sessions.lock().expect("fwd sessions").insert(device, sink);
+        self.sessions
+            .lock()
+            .expect("fwd sessions")
+            .insert(device, sink);
     }
 
     pub fn detach_session(&self, device: &[u8; 32]) {
@@ -216,7 +223,13 @@ impl ForwardPlane {
             return self.drop_with_icmp(device, pkt);
         };
         // 2. 归属本机 ⇒ 直接投递。
-        if let Some(sink) = self.sessions.lock().expect("fwd sessions").get(&dst_dev).cloned() {
+        if let Some(sink) = self
+            .sessions
+            .lock()
+            .expect("fwd sessions")
+            .get(&dst_dev)
+            .cloned()
+        {
             if sink.deliver(pkt).is_ok() {
                 self.stats.delivered_local.fetch_add(1, Ordering::Relaxed);
                 return IngestResult::DeliveredLocal;
@@ -237,17 +250,17 @@ impl ForwardPlane {
                 match outcome {
                     Ok(ForwardOutcome::Delivered) => {
                         self.stats.forwarded.fetch_add(1, Ordering::Relaxed);
-                        return IngestResult::Forwarded(ForwardOutcome::Delivered);
+                        IngestResult::Forwarded(ForwardOutcome::Delivered)
                     }
                     Ok(ForwardOutcome::NotHere) => {
                         // 4. 一次性 location_query 重定向；仍失败 ⇒ 丢 + ICMP。
                         self.stats.not_here.fetch_add(1, Ordering::Relaxed);
-                        return self.redirect_once(device, dst_dev, pkt).await;
+                        self.redirect_once(device, dst_dev, pkt).await
                     }
                     Ok(ForwardOutcome::Rejected(_)) | Err(_) => {
                         self.stats.forwarded.fetch_add(1, Ordering::Relaxed);
                         self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                        return IngestResult::Dropped;
+                        IngestResult::Dropped
                     }
                 }
             }
@@ -261,7 +274,12 @@ impl ForwardPlane {
 
     /// NOT_HERE 容错：一次性位置询问（fan-out ≤3，不重试不缓存）→ 重定向一次。
     /// 注意：询问**只问对端**——本地租约正是刚失败的那个答案（陈旧即病因）。
-    async fn redirect_once(&self, src_dev: &[u8; 32], dst_dev: [u8; 32], pkt: &[u8]) -> IngestResult {
+    async fn redirect_once(
+        &self,
+        src_dev: &[u8; 32],
+        dst_dev: [u8; 32],
+        pkt: &[u8],
+    ) -> IngestResult {
         let holder = {
             let fanout = self.fanout.lock().expect("fwd fanout").clone();
             match fanout {
@@ -286,7 +304,11 @@ impl ForwardPlane {
         self.drop_with_icmp(src_dev, pkt)
     }
 
-    async fn send_envelope(&self, peer: NodeId, env: ForwardEnvelope) -> io::Result<ForwardOutcome> {
+    async fn send_envelope(
+        &self,
+        peer: NodeId,
+        env: ForwardEnvelope,
+    ) -> io::Result<ForwardOutcome> {
         let t = self.transport.lock().expect("fwd transport").clone();
         let Some(t) = t else {
             return Err(io::Error::other("forward transport not wired"));
@@ -298,7 +320,12 @@ impl ForwardPlane {
     fn drop_with_icmp(&self, src_dev: &[u8; 32], pkt: &[u8]) -> IngestResult {
         self.stats.dropped.fetch_add(1, Ordering::Relaxed);
         let icmp = icmp_host_unreachable(pkt);
-        let sink = self.sessions.lock().expect("fwd sessions").get(src_dev).cloned();
+        let sink = self
+            .sessions
+            .lock()
+            .expect("fwd sessions")
+            .get(src_dev)
+            .cloned();
         if let Some(sink) = sink {
             if sink.deliver(&icmp).is_ok() {
                 self.stats.icmp_unreachable.fetch_add(1, Ordering::Relaxed);
@@ -327,11 +354,18 @@ impl ForwardPlane {
             None => false,
         };
         if !ok {
-            self.stats.src_mismatch_rejected.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .src_mismatch_rejected
+                .fetch_add(1, Ordering::Relaxed);
             return ForwardOutcome::Rejected(RejectReason::SrcBinding);
         }
         // 本机投递或 NOT_HERE（hop 语义内禁止二次转发）。
-        let sink = self.sessions.lock().expect("fwd sessions").get(&env.dst_dev).cloned();
+        let sink = self
+            .sessions
+            .lock()
+            .expect("fwd sessions")
+            .get(&env.dst_dev)
+            .cloned();
         match sink {
             Some(sink) if sink.deliver(&env.payload).is_ok() => ForwardOutcome::Delivered,
             _ => ForwardOutcome::NotHere,
@@ -345,16 +379,14 @@ impl ForwardPlane {
 
 /// 解析 IPv4 包源地址（20B 基本头；非 IPv4/截断 ⇒ None）。
 pub fn ipv4_src(pkt: &[u8]) -> Option<Ipv4Addr> {
-    let h = ipv4_header(pkt)?;
-    Some(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]))
-        .filter(|_| h >= 20)
+    ipv4_header(pkt)?;
+    (pkt.len() >= 20).then_some(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]))
 }
 
 /// 解析 IPv4 包目标地址。
 pub fn ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
-    let h = ipv4_header(pkt)?;
-    Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
-        .filter(|_| h >= 20)
+    ipv4_header(pkt)?;
+    (pkt.len() >= 20).then_some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
 }
 
 fn ipv4_header(pkt: &[u8]) -> Option<usize> {
@@ -404,11 +436,11 @@ pub fn icmp_host_unreachable(orig: &[u8]) -> Vec<u8> {
 
 fn ones_complement_sum(bytes: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = bytes.chunks_exact(2);
-    for c in &mut chunks {
-        sum = sum.wrapping_add(u16::from_be_bytes([c[0], c[1]]) as u32);
+    let chunks = bytes.as_chunks::<2>();
+    for c in chunks.0 {
+        sum = sum.wrapping_add(u16::from_be_bytes(*c) as u32);
     }
-    if let Some(b) = chunks.remainder().first() {
+    if let Some(b) = chunks.1.first() {
         sum = sum.wrapping_add((*b as u32) << 8);
     }
     while sum >> 16 != 0 {
@@ -449,7 +481,11 @@ mod tests {
 
     #[test]
     fn ipv4_parse() {
-        let p = ip4("100.64.0.2".parse().unwrap(), "100.64.0.3".parse().unwrap(), b"x");
+        let p = ip4(
+            "100.64.0.2".parse().unwrap(),
+            "100.64.0.3".parse().unwrap(),
+            b"x",
+        );
         assert_eq!(ipv4_src(&p).unwrap().to_string(), "100.64.0.2");
         assert_eq!(ipv4_dst(&p).unwrap().to_string(), "100.64.0.3");
         assert_eq!(ipv4_src(b"short"), None);
@@ -460,7 +496,11 @@ mod tests {
 
     #[test]
     fn icmp_shape() {
-        let orig = ip4("100.64.0.2".parse().unwrap(), "100.64.0.9".parse().unwrap(), &[7u8; 32]);
+        let orig = ip4(
+            "100.64.0.2".parse().unwrap(),
+            "100.64.0.9".parse().unwrap(),
+            &[7u8; 32],
+        );
         let icmp = icmp_host_unreachable(&orig);
         assert_eq!(icmp[20], 3, "type = destination unreachable");
         assert_eq!(icmp[21], 1, "code = host unreachable");

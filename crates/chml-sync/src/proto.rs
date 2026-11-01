@@ -19,7 +19,8 @@ pub(crate) mod arr64 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
         let v = Vec::<u8>::deserialize(d)?;
-        v.try_into().map_err(|_| serde::de::Error::custom("expected 64 bytes"))
+        v.try_into()
+            .map_err(|_| serde::de::Error::custom("expected 64 bytes"))
     }
 }
 
@@ -172,7 +173,11 @@ pub fn server_keys_canonical(entries: &[ServerKeyEntry]) -> Vec<u8> {
 }
 
 /// Bootstrap 写操作的 canonical 字节（根密钥自证：root_pub 对这些字节的签名）。
-pub fn bootstrap_canonical(cluster_id: &[u8; 16], root_pub: &[u8; 32], ticket_root: &[u8; 32]) -> Vec<u8> {
+pub fn bootstrap_canonical(
+    cluster_id: &[u8; 16],
+    root_pub: &[u8; 32],
+    ticket_root: &[u8; 32],
+) -> Vec<u8> {
     let mut v = Vec::with_capacity(L_BOOTSTRAP.len() + 80);
     v.extend_from_slice(L_BOOTSTRAP);
     v.extend_from_slice(cluster_id);
@@ -228,17 +233,34 @@ pub enum SyncRequest {
         ed25519: [u8; 32],
         now_unix: u64,
     },
+    /// 设置用户口令记录（仅未设置时；控制流 PwCommit 的复制形态）。
+    SetPassword {
+        user: String,
+        record_b64: String,
+        profile: u16,
+    },
+    /// 登记 SR-SIG1 用户公钥（key-bind 路径的复制形态）。
+    AddUserSigKey { user: String, pub32: [u8; 32] },
+    /// bind_token 一次性消费（§2.4 线性一致查重的复制形态）。
+    ConsumeBindToken { token: [u8; 16] },
     /// 网络配置版本推进（派生数据由状态机版本化，vpn-mesh §5.2）。
     BumpConfigVersion,
     /// 服务器密钥集登记/轮换（根签管理操作）。
     ServerKeys(RootSigned<Vec<ServerKeyEntry>>),
+    /// 集群 OPRF key 登记（根签管理操作；OPAQUE 记录全网可验——§2.4「OPRF key 在
+    /// Raft 状态机内」。幂等：同值重放放行，异值拒绝）。
+    SetOprf(RootSigned<String>),
     /// admin_op（add_voter/rewrap/revoke_invite；根签管理操作，状态机验签后生效）。
     AdminOp(RootSigned<AdminOp>),
 }
 
 impl SyncRequest {
     /// 便捷构造：根密钥签名的 rewrap 管理操作。
-    pub fn rewrap_signed(root: &ed25519_dalek::SigningKey, server_id: NodeId, wrapped: Vec<u8>) -> Self {
+    pub fn rewrap_signed(
+        root: &ed25519_dalek::SigningKey,
+        server_id: NodeId,
+        wrapped: Vec<u8>,
+    ) -> Self {
         let op = AdminOp::Rewrap { server_id, wrapped };
         let sig = root.sign(&admin_canonical(&op)).to_bytes();
         SyncRequest::AdminOp(RootSigned { op, sig })
@@ -259,7 +281,10 @@ impl SyncRequest {
     }
 
     /// 便捷构造：根密钥签名的 server_keys 管理操作。
-    pub fn server_keys_signed(root: &ed25519_dalek::SigningKey, entries: Vec<ServerKeyEntry>) -> Self {
+    pub fn server_keys_signed(
+        root: &ed25519_dalek::SigningKey,
+        entries: Vec<ServerKeyEntry>,
+    ) -> Self {
         let sig = root.sign(&server_keys_canonical(&entries)).to_bytes();
         SyncRequest::ServerKeys(RootSigned { op: entries, sig })
     }
@@ -271,8 +296,15 @@ impl SyncRequest {
         ticket_root: [u8; 32],
     ) -> Self {
         let root_pub = *root.verifying_key().as_bytes();
-        let sig = root.sign(&bootstrap_canonical(&cluster_id, &root_pub, &ticket_root)).to_bytes();
-        SyncRequest::Bootstrap { cluster_id, root_pub, ticket_root, sig }
+        let sig = root
+            .sign(&bootstrap_canonical(&cluster_id, &root_pub, &ticket_root))
+            .to_bytes();
+        SyncRequest::Bootstrap {
+            cluster_id,
+            root_pub,
+            ticket_root,
+            sig,
+        }
     }
 }
 
@@ -289,11 +321,19 @@ pub enum StateError {
     UserExists,
     AlreadyUsed,
     InviteRevoked,
-    InviteExpired { now_unix: u64, expiry_unix: u64 },
+    InviteExpired {
+        now_unix: u64,
+        expiry_unix: u64,
+    },
     UnknownInvite,
     BadInvite(String),
     IpExhausted,
     NotFound(String),
+    /// 口令已设置（改密走登录态，未实现面）。
+    PasswordExists,
+    NoSuchUser,
+    /// bind_token 已消费（一次性凭据重放）。
+    BindTokenUsed,
 }
 
 impl std::fmt::Display for StateError {
@@ -309,13 +349,19 @@ impl std::fmt::Display for StateError {
             StateError::UserExists => write!(f, "username already exists"),
             StateError::AlreadyUsed => write!(f, "invite already redeemed"),
             StateError::InviteRevoked => write!(f, "invite revoked"),
-            StateError::InviteExpired { now_unix, expiry_unix } => {
+            StateError::InviteExpired {
+                now_unix,
+                expiry_unix,
+            } => {
                 write!(f, "invite expired (now={now_unix}, expiry={expiry_unix})")
             }
             StateError::UnknownInvite => write!(f, "unknown invite_id"),
             StateError::BadInvite(m) => write!(f, "bad invite: {m}"),
             StateError::IpExhausted => write!(f, "VIP pool exhausted"),
             StateError::NotFound(m) => write!(f, "not found: {m}"),
+            StateError::PasswordExists => write!(f, "password already set"),
+            StateError::NoSuchUser => write!(f, "no such user"),
+            StateError::BindTokenUsed => write!(f, "bind_token already consumed"),
         }
     }
 }
@@ -349,9 +395,14 @@ impl std::error::Error for SyncError {}
 /// admin_op 执行回执。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminAck {
-    AddVoter { node_id: NodeId },
+    AddVoter {
+        node_id: NodeId,
+    },
     /// rewrap 落库后的封装字节数（OPRF key 副本可观测，§7-M4 admission 断言用）。
-    Rewrap { server_id: NodeId, bytes: usize },
+    Rewrap {
+        server_id: NodeId,
+        bytes: usize,
+    },
     RevokeInvite,
 }
 
@@ -369,7 +420,9 @@ pub enum SyncResponse {
         vip: [u8; 4],
     },
     ConfigVersion(u64),
-    ServerKeys { servers: usize },
+    ServerKeys {
+        servers: usize,
+    },
     Admin(AdminAck),
     /// 状态机级拒绝（见 [`StateError`]）。
     Error(StateError),
@@ -394,16 +447,16 @@ impl VerdictW {
         use ed25519_dalek::VerifyingKey;
         match self {
             VerdictW::NotFound => LookupVerdict::NotFound,
-            VerdictW::Revoked { since_epoch } => LookupVerdict::Revoked { since_epoch: *since_epoch },
-            VerdictW::Active { x25519, ed25519 } => {
-                match VerifyingKey::from_bytes(ed25519) {
-                    Ok(device_ed25519) => LookupVerdict::Active(DeviceRecord {
-                        device_x25519: chml_protocol::x25519_dalek::PublicKey::from(*x25519),
-                        device_ed25519,
-                    }),
-                    Err(_) => LookupVerdict::NotFound,
-                }
-            }
+            VerdictW::Revoked { since_epoch } => LookupVerdict::Revoked {
+                since_epoch: *since_epoch,
+            },
+            VerdictW::Active { x25519, ed25519 } => match VerifyingKey::from_bytes(ed25519) {
+                Ok(device_ed25519) => LookupVerdict::Active(DeviceRecord {
+                    device_x25519: chml_protocol::x25519_dalek::PublicKey::from(*x25519),
+                    device_ed25519,
+                }),
+                Err(_) => LookupVerdict::NotFound,
+            },
         }
     }
 
@@ -412,9 +465,11 @@ impl VerdictW {
         use chml_protocol::session::LookupVerdict;
         match v {
             LookupVerdict::NotFound => VerdictW::NotFound,
-            LookupVerdict::Revoked { since_epoch } => VerdictW::Revoked { since_epoch: *since_epoch },
+            LookupVerdict::Revoked { since_epoch } => VerdictW::Revoked {
+                since_epoch: *since_epoch,
+            },
             LookupVerdict::Active(rec) => VerdictW::Active {
-                x25519: rec.device_x25519.as_bytes().to_owned().try_into().expect("32B"),
+                x25519: *rec.device_x25519.as_bytes(),
                 ed25519: *rec.device_ed25519.as_bytes(),
             },
         }
@@ -444,6 +499,10 @@ pub enum ReadQuery {
     DeviceRow([u8; 32]),
     /// 取某服务器的 rewrap 封装副本（服务器本地开封校验用）。
     Wrap(NodeId),
+    /// 用户行（口令记录 + SR-SIG1 公钥集；控制面登录/验签用）。
+    User(String),
+    /// owner 名下全部设备（注册表操作 List 用）。
+    DevicesOf(String),
     /// 全状态摘要（断言用）。
     State,
 }
@@ -455,6 +514,8 @@ pub enum ReadView {
     Epoch(u64),
     Device(Option<DeviceRow>),
     Wrap(Option<Vec<u8>>),
+    User(Option<UserRow>),
+    Devices(Vec<([u8; 32], DeviceRow)>),
     State(StateView),
 }
 
@@ -497,7 +558,10 @@ mod tests {
             .verify(&admin_canonical(&op), &Signature::from_bytes(&sig))
             .is_ok());
         // 篡改 op ⇒ 验签失败。
-        let tampered = AdminOp::Rewrap { server_id: 10, wrapped: vec![7; 32] };
+        let tampered = AdminOp::Rewrap {
+            server_id: 10,
+            wrapped: vec![7; 32],
+        };
         assert!(root
             .verifying_key()
             .verify(&admin_canonical(&tampered), &Signature::from_bytes(&sig))
@@ -517,6 +581,9 @@ mod tests {
             VerdictW::Revoked { since_epoch: 4 }.to_verdict(),
             LookupVerdict::Revoked { since_epoch: 4 }
         ));
-        assert!(matches!(VerdictW::NotFound.to_verdict(), LookupVerdict::NotFound));
+        assert!(matches!(
+            VerdictW::NotFound.to_verdict(),
+            LookupVerdict::NotFound
+        ));
     }
 }

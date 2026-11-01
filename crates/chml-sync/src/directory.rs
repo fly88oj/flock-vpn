@@ -27,7 +27,10 @@ impl std::fmt::Display for DirError {
         match self {
             DirError::BadSignature => write!(f, "directory: root signature mismatch"),
             DirError::VersionRollback { stored, got } => {
-                write!(f, "directory: version rollback (stored={stored}, got={got})")
+                write!(
+                    f,
+                    "directory: version rollback (stored={stored}, got={got})"
+                )
             }
         }
     }
@@ -55,7 +58,10 @@ impl Directory {
         if !initial.verify(&root_pub) {
             return Err(DirError::BadSignature);
         }
-        Ok(Directory { root_pub, cur: RwLock::new(Some(initial.clone())) })
+        Ok(Directory {
+            root_pub,
+            cur: RwLock::new(Some(initial.clone())),
+        })
     }
 
     /// 根公钥（客户端邀请/钉扎同源）。
@@ -65,7 +71,12 @@ impl Directory {
 
     /// 当前版本（无目录 = 0）。
     pub fn version(&self) -> u64 {
-        self.cur.read().expect("dir").as_ref().map(|d| d.dir_version).unwrap_or(0)
+        self.cur
+            .read()
+            .expect("dir")
+            .as_ref()
+            .map(|d| d.dir_version)
+            .unwrap_or(0)
     }
 
     /// 当前目录快照。
@@ -100,8 +111,14 @@ impl Directory {
                 version: d.dir_version,
                 bytes: Some(d.to_bytes()),
             },
-            Some(d) => DirPullResp { version: d.dir_version, bytes: None },
-            None => DirPullResp { version: 0, bytes: None },
+            Some(d) => DirPullResp {
+                version: d.dir_version,
+                bytes: None,
+            },
+            None => DirPullResp {
+                version: 0,
+                bytes: None,
+            },
         }
     }
 
@@ -121,7 +138,9 @@ impl Directory {
 
 impl std::fmt::Debug for Directory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Directory").field("version", &self.version()).finish()
+        f.debug_struct("Directory")
+            .field("version", &self.version())
+            .finish()
     }
 }
 
@@ -174,7 +193,10 @@ mod tests {
             Err(DirError::VersionRollback { stored: 2, got: 1 })
         ));
         assert_eq!(d.version(), 2);
-        assert!(d.dir_pull_response(1).bytes.is_some(), "v1 客户端可刷新到 v2");
+        assert!(
+            d.dir_pull_response(1).bytes.is_some(),
+            "v1 客户端可刷新到 v2"
+        );
         assert_eq!(d.node_entries().len(), 2);
     }
 }

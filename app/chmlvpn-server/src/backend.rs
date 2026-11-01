@@ -1,0 +1,469 @@
+//! NetBackend：控制面/管理面的统一**异步**写读门面（docs/design.md §2.2/§3.11 M4 批次）。
+//!
+//! 两形态（`server.toml [sync].mode`，缺省 `single`——m2/m2-direct 部署不受影响）：
+//!
+//! - [`NetBackend::Single`]：M2 本地 redb 状态库（同步 [`StateStore`]——方法立即完成）；
+//! - [`NetBackend::Sync`]（feature `multi-primary`）：写经 Raft 提交（任意节点进入，
+//!   非 leader 自动转发 leader，§4 写转发）；读按一致性档位——注册表行/用户面走
+//!   **线性一致读**（任意节点进入，跨节点读后写正确），目录三态走
+//!   `SyncNode::device_directory()` 的**两级读**（记录缓存 + epoch + apply-lag 熔断，
+//!   §4 读与缓存——正是 `session::respond` 的注入点）。
+//!
+//! 为什么是异步门面而非给 [`crate::netstate::NetState`] 加 async：单服形态的同步 trait
+//! 保持不动（redb 是同步 IO），Raft 写/线性一致读是网络往返——同步 trait 上 block_on
+//! 在异步派发路径内是死锁陷阱，故门面在装配层异步化（`§1.3.3c` lookup 接缝本就要求
+//! BoxFuture 的同一理由）。
+
+use chml_protocol::ed25519_dalek::VerifyingKey;
+use chml_protocol::session::{DeviceId, LookupVerdict};
+use futures::future::BoxFuture;
+
+use crate::netstate::{
+    DeviceRow, DeviceStatus, NetError, NetState as _, RedeemError, RedeemOutcome, RedeemRequest,
+    StateStore,
+};
+
+#[cfg(feature = "multi-primary")]
+use chml_sync::proto as sync_proto;
+
+/// 形态分派的统一后端。
+pub enum NetBackend {
+    /// 单服：本地状态库（M2 形态；m2-direct.yml 等部署）。
+    Single(std::sync::Arc<StateStore>),
+    /// 多主：chml-sync Raft 状态机（feature `multi-primary`）。
+    #[cfg(feature = "multi-primary")]
+    Sync(std::sync::Arc<SyncNetState>),
+}
+
+impl NetBackend {
+    /// 当前全局 revocation_epoch（Sync = 本机已 apply 的 epoch）。
+    pub async fn epoch(&self) -> u64 {
+        match self {
+            NetBackend::Single(s) => s.epoch(),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => s.node.local_epoch(),
+        }
+    }
+
+    /// 目录三态（respond/票据设备态数据源）。Sync 走两级读（缓存+epoch+熔断）。
+    pub async fn lookup(&self, id: &DeviceId) -> LookupVerdict {
+        match self {
+            NetBackend::Single(s) => s.lookup(id),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => s.node.dir().lookup_async(*id).await,
+        }
+    }
+
+    /// 注册表行（owner 面板/VIP）。Sync = 线性一致读。
+    pub async fn device_row(&self, id: &DeviceId) -> Option<DeviceRow> {
+        match self {
+            NetBackend::Single(s) => s.device_row(id),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => match s
+                .node
+                .read_linearizable(chml_sync::proto::ReadQuery::DeviceRow(id.0))
+                .await
+            {
+                Ok(sync_proto::ReadView::Device(Some(row))) => Some(row.into()),
+                _ => None,
+            },
+        }
+    }
+
+    /// owner 名下全部设备（DeviceList）。
+    pub async fn devices_of(&self, owner: &str) -> Vec<(DeviceId, DeviceRow)> {
+        match self {
+            NetBackend::Single(s) => s.devices_of(owner),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                match s
+                    .node
+                    .read_linearizable(chml_sync::proto::ReadQuery::DevicesOf(owner.to_string()))
+                    .await
+                {
+                    Ok(sync_proto::ReadView::Devices(rows)) => rows
+                        .into_iter()
+                        .map(|(id, row)| (DeviceId(id), row.into()))
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            }
+        }
+    }
+
+    /// 注册设备（分配 VIP，单调不复用）。
+    pub async fn register_device(
+        &self,
+        owner: &str,
+        x25519: [u8; 32],
+        ed25519: [u8; 32],
+    ) -> Result<DeviceRow, NetError> {
+        match self {
+            NetBackend::Single(s) => s.register_device(owner, x25519, ed25519),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                let resp = s
+                    .write(sync_proto::SyncRequest::RegisterDevice {
+                        owner: owner.to_string(),
+                        x25519,
+                        ed25519,
+                    })
+                    .await?;
+                match resp {
+                    sync_proto::SyncResponse::Device(row) => Ok(row.into()),
+                    sync_proto::SyncResponse::Error(e) => Err(net_err(&e)),
+                    _ => Err(NetError::Internal("unexpected register response".into())),
+                }
+            }
+        }
+    }
+
+    /// 吊销（行保留、VIP 不回收、epoch +1；本地杀会话经 apply 钩子，§2.2）。
+    pub async fn revoke(&self, id: &DeviceId) -> Result<u64, NetError> {
+        self.set_status(id, DeviceStatus::Revoked).await
+    }
+
+    /// 禁用（不删除；epoch +1）。
+    pub async fn disable(&self, id: &DeviceId) -> Result<u64, NetError> {
+        self.set_status(id, DeviceStatus::Disabled).await
+    }
+
+    /// 重新启用（仅 Disabled → Active；不动 epoch）。
+    pub async fn enable(&self, id: &DeviceId) -> Result<(), NetError> {
+        self.set_status(id, DeviceStatus::Active).await.map(|_| ())
+    }
+
+    async fn set_status(&self, id: &DeviceId, status: DeviceStatus) -> Result<u64, NetError> {
+        match self {
+            NetBackend::Single(s) => match status {
+                DeviceStatus::Revoked => s.revoke(id),
+                DeviceStatus::Disabled => s.disable(id),
+                DeviceStatus::Active => s.enable(id).map(|_| s.epoch()),
+            },
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                let req = match status {
+                    DeviceStatus::Revoked => sync_proto::SyncRequest::Revoke { device: id.0 },
+                    DeviceStatus::Disabled => sync_proto::SyncRequest::Disable { device: id.0 },
+                    DeviceStatus::Active => sync_proto::SyncRequest::Enable { device: id.0 },
+                };
+                match s.write(req).await? {
+                    sync_proto::SyncResponse::Epoch(e) => Ok(e),
+                    sync_proto::SyncResponse::Error(e) => Err(net_err(&e)),
+                    _ => Err(NetError::Internal("unexpected status response".into())),
+                }
+            }
+        }
+    }
+
+    /// 邀请兑换（查重+吊销+expiry → 建用户/设备+分 VIP；Raft 单次提交 = 原子）。
+    pub async fn redeem_invite(
+        &self,
+        req: RedeemRequest<'_>,
+    ) -> Result<RedeemOutcome, RedeemError> {
+        match self {
+            NetBackend::Single(s) => s.redeem_invite(req),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                // 集群身份钉扎由状态机 bootstrap 身份承担（apply_redeem 内比对根公钥）。
+                let resp = s
+                    .write(sync_proto::SyncRequest::RedeemInvite {
+                        invite_bytes: req.invite_bytes.to_vec(),
+                        username: req.username.to_string(),
+                        x25519: req.device_x25519,
+                        ed25519: req.device_ed25519,
+                        now_unix: req.now_unix,
+                    })
+                    .await
+                    .map_err(redeem_io)?;
+                match resp {
+                    sync_proto::SyncResponse::Redeem {
+                        username,
+                        device_id,
+                        vip,
+                    } => Ok(RedeemOutcome {
+                        username,
+                        device_id,
+                        vip,
+                    }),
+                    sync_proto::SyncResponse::Error(e) => Err(redeem_err(&e)),
+                    _ => Err(RedeemError::Internal("unexpected redeem response".into())),
+                }
+            }
+        }
+    }
+
+    /// 吊销未兑换邀请（根签管理操作——多主形态须运维侧根密钥，服务器不持有）。
+    pub async fn revoke_invite(&self, invite_id: &[u8; 16]) -> Result<(), NetError> {
+        match self {
+            NetBackend::Single(s) => s.revoke_invite(invite_id),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(_) => Err(NetError::InvalidState(
+                "多主形态 revoke_invite 为根签管理操作（运维侧执行）".into(),
+            )),
+        }
+    }
+
+    /// 邀请登记（单服 mint 路径；多主形态 mint 在根密钥侧）。
+    pub async fn record_invite(
+        &self,
+        invite_id: &[u8; 16],
+        expiry_unix: u64,
+    ) -> Result<(), NetError> {
+        match self {
+            NetBackend::Single(s) => s.record_invite(invite_id, expiry_unix),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                match s
+                    .write(sync_proto::SyncRequest::RecordInvite {
+                        invite_id: *invite_id,
+                        expiry_unix,
+                    })
+                    .await?
+                {
+                    sync_proto::SyncResponse::Ok => Ok(()),
+                    sync_proto::SyncResponse::Error(e) => Err(net_err(&e)),
+                    _ => Err(NetError::Internal(
+                        "unexpected record_invite response".into(),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// 设置口令记录（仅未设置时；跨节点登录 ⇒ 复制形态，§2.4 OPRF 共享）。
+    pub async fn set_password(
+        &self,
+        user: &str,
+        record_b64: &str,
+        profile: u16,
+    ) -> Result<(), NetError> {
+        match self {
+            NetBackend::Single(s) => s.set_password(user, record_b64, profile),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                match s
+                    .write(sync_proto::SyncRequest::SetPassword {
+                        user: user.to_string(),
+                        record_b64: record_b64.to_string(),
+                        profile,
+                    })
+                    .await?
+                {
+                    sync_proto::SyncResponse::Ok => Ok(()),
+                    sync_proto::SyncResponse::Error(e) => Err(net_err(&e)),
+                    _ => Err(NetError::Internal(
+                        "unexpected set_password response".into(),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// 口令记录（线性一致读）。
+    pub async fn password(&self, user: &str) -> Option<(String, u16)> {
+        match self {
+            NetBackend::Single(s) => s.password(user),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => match s
+                .node
+                .read_linearizable(chml_sync::proto::ReadQuery::User(user.to_string()))
+                .await
+            {
+                Ok(sync_proto::ReadView::User(Some(row))) => {
+                    row.opaque_record.map(|r| (r, row.opaque_profile))
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// 登记 SR-SIG1 用户公钥（key-bind 路径）。
+    pub async fn add_user_sig_key(&self, user: &str, pub32: [u8; 32]) -> Result<(), NetError> {
+        match self {
+            NetBackend::Single(s) => s.add_user_sig_key(user, pub32),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                match s
+                    .write(sync_proto::SyncRequest::AddUserSigKey {
+                        user: user.to_string(),
+                        pub32,
+                    })
+                    .await?
+                {
+                    sync_proto::SyncResponse::Ok => Ok(()),
+                    sync_proto::SyncResponse::Error(e) => Err(net_err(&e)),
+                    _ => Err(NetError::Internal(
+                        "unexpected add_user_sig_key response".into(),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// SR-SIG1 验签公钥集（线性一致读）。
+    pub async fn user_sig_pubs(&self, user: &str) -> Vec<VerifyingKey> {
+        match self {
+            NetBackend::Single(s) => s.user_sig_pubs(user),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => match s
+                .node
+                .read_linearizable(chml_sync::proto::ReadQuery::User(user.to_string()))
+                .await
+            {
+                Ok(sync_proto::ReadView::User(Some(row))) => row
+                    .sr_sig_pubs
+                    .iter()
+                    .filter_map(|k| VerifyingKey::from_bytes(k).ok())
+                    .collect(),
+                _ => Vec::new(),
+            },
+        }
+    }
+
+    /// bind_token 一次性消费（§2.4 线性一致查重）。
+    pub async fn consume_bind_token(&self, token: &[u8; 16]) -> bool {
+        match self {
+            NetBackend::Single(s) => s.consume_bind_token(token),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                matches!(
+                    s.write(sync_proto::SyncRequest::ConsumeBindToken { token: *token })
+                        .await,
+                    Ok(sync_proto::SyncResponse::Ok)
+                )
+            }
+        }
+    }
+
+    /// VIP 分配（单调水位；不回收）。
+    pub async fn allocate_ip(&self) -> Result<std::net::Ipv4Addr, NetError> {
+        match self {
+            NetBackend::Single(s) => s.allocate_ip(),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => match s.write(sync_proto::SyncRequest::AllocateIp).await? {
+                sync_proto::SyncResponse::Ip(vip) => Ok(std::net::Ipv4Addr::from(vip)),
+                sync_proto::SyncResponse::Error(e) => Err(net_err(&e)),
+                _ => Err(NetError::Internal("unexpected allocate response".into())),
+            },
+        }
+    }
+}
+
+// ============================================================================
+// 多主适配（feature multi-primary）
+// ============================================================================
+
+#[cfg(feature = "multi-primary")]
+pub use adapter::SyncNetState;
+
+#[cfg(feature = "multi-primary")]
+mod adapter {
+    use std::sync::Arc;
+
+    use chml_sync::proto::{SyncError, SyncRequest, SyncResponse};
+
+    use crate::netstate::NetError;
+
+    /// SyncNode 的 NetBackend 适配体（写转发 leader / 线性一致读经节点门面）。
+    pub struct SyncNetState {
+        pub node: Arc<chml_sync::SyncNode>,
+    }
+
+    impl SyncNetState {
+        pub fn new(node: Arc<chml_sync::SyncNode>) -> Arc<Self> {
+            Arc::new(SyncNetState { node })
+        }
+
+        /// 写（任意节点进入；非 leader 自动转发，§4）。
+        pub async fn write(&self, req: SyncRequest) -> Result<SyncResponse, NetError> {
+            self.node.write(req).await.map_err(net_of_sync)
+        }
+    }
+
+    pub(crate) fn net_of_sync(e: SyncError) -> NetError {
+        NetError::Internal(format!("sync: {e}"))
+    }
+}
+
+// —— 行类型转换（chml-sync 行 → 服务器 netstate 行；语义同构，§3.10 接口对齐）——
+#[cfg(feature = "multi-primary")]
+mod conv {
+    use crate::netstate::{DeviceRow, DeviceStatus};
+    use chml_sync::proto;
+
+    impl From<proto::DeviceRow> for DeviceRow {
+        fn from(r: proto::DeviceRow) -> Self {
+            DeviceRow {
+                owner: r.owner,
+                device_x25519: r.device_x25519,
+                device_ed25519: r.device_ed25519,
+                vip: r.vip,
+                status: match r.status {
+                    proto::DeviceStatus::Active => DeviceStatus::Active,
+                    proto::DeviceStatus::Disabled => DeviceStatus::Disabled,
+                    proto::DeviceStatus::Revoked => DeviceStatus::Revoked,
+                },
+                since_epoch: r.since_epoch,
+            }
+        }
+    }
+}
+
+// —— StateError → 服务器错误面映射 ——
+
+#[cfg(feature = "multi-primary")]
+fn net_err(e: &chml_sync::proto::StateError) -> NetError {
+    use chml_sync::proto::StateError;
+    match e {
+        StateError::DeviceExists => NetError::InvalidState("device already registered".into()),
+        StateError::DeviceNotFound => NetError::NotFound,
+        StateError::RevokedIsTerminal => NetError::InvalidState("revoked is terminal".into()),
+        StateError::IpExhausted => NetError::IpExhausted,
+        StateError::PasswordExists => NetError::InvalidState("password already set".into()),
+        StateError::NoSuchUser => NetError::NotFound,
+        StateError::BindTokenUsed => NetError::InvalidState("bind_token used".into()),
+        StateError::AlreadyUsed
+        | StateError::InviteRevoked
+        | StateError::InviteExpired { .. }
+        | StateError::UnknownInvite
+        | StateError::BadInvite(_) => NetError::InvalidState(format!("invite: {e}")),
+        other => NetError::Internal(format!("state: {other}")),
+    }
+}
+
+#[cfg(feature = "multi-primary")]
+fn redeem_io(e: NetError) -> crate::netstate::RedeemError {
+    crate::netstate::RedeemError::Internal(e.to_string())
+}
+
+#[cfg(feature = "multi-primary")]
+fn redeem_err(e: &chml_sync::proto::StateError) -> crate::netstate::RedeemError {
+    use crate::netstate::RedeemError;
+    use chml_sync::proto::StateError;
+    match e {
+        StateError::AlreadyUsed => RedeemError::AlreadyUsed,
+        StateError::InviteRevoked => RedeemError::InviteRevoked,
+        StateError::InviteExpired {
+            now_unix,
+            expiry_unix,
+        } => RedeemError::Expired {
+            now_unix: *now_unix,
+            expiry_unix: *expiry_unix,
+        },
+        StateError::UnknownInvite => RedeemError::Unknown,
+        StateError::BadInvite(m) => RedeemError::BadInvite(m.clone()),
+        StateError::UserExists => RedeemError::UserExists,
+        StateError::DeviceExists => RedeemError::DeviceExists,
+        StateError::IpExhausted => RedeemError::IpExhausted,
+        StateError::NotBootstrapped => RedeemError::Internal("cluster not bootstrapped".into()),
+        other => RedeemError::Internal(format!("state: {other}")),
+    }
+}
+
+// 供 async fn in trait 位置的后端引用（保持 BoxFuture 接缝的编译期断言。
+// 单服形态的同步 NetState trait 不变；此处仅声明本门面未来若下沉为 trait 时的形状）。
+#[allow(dead_code)]
+fn _boxfuture_witness(f: BoxFuture<'static, u64>) -> BoxFuture<'static, u64> {
+    f
+}

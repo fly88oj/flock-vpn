@@ -21,10 +21,11 @@ use chml_protocol::trust::ClusterDirectory;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+use crate::backend::NetBackend;
 use crate::config::{ListenerMode, ServerConfig};
 use crate::control::{serve_control, CtrlGuard};
 use crate::dataplane::PeerRouter;
-use crate::netstate::{DirAdapter, NetState as _, StateStore};
+use crate::netstate::{DirAdapter, StateStore};
 use crate::ticket::TicketIssuer;
 
 /// META 键（集群身份材料 + 票据根种子；bootstrap 一次写入）。
@@ -94,17 +95,54 @@ impl LiveSessions {
     }
 }
 
+/// 多主 apply/租约钩子（§2.2 吊销传播界 + vpn-mesh §5.2 租约冲突）。
+///
+/// 每台服务器在**自己的日志 apply 现场**触发：(a) 杀死本地该设备会话（watch 广播 →
+/// serve_conn 拆隧道）；(b) 票据清拒由「票据 epoch < 当前 epoch 即拒」承担（TicketAuthority
+/// 以本机 apply 后的 epoch 校验）。
+#[cfg(feature = "multi-primary")]
+struct ServerSyncHooks {
+    sessions: Arc<LiveSessions>,
+    node: Arc<chml_sync::SyncNode>,
+}
+
+#[cfg(feature = "multi-primary")]
+impl chml_sync::hooks::SyncHooks for ServerSyncHooks {
+    fn on_revocation_applied(&self, ev: chml_sync::hooks::RevocationEvent) {
+        eprintln!(
+            "chmlvpn-server: revocation applied (epoch={}, log={}) killing local sessions",
+            ev.new_epoch, ev.log_index
+        );
+        self.sessions.kill(&ev.device);
+        self.node.detach_session(&ev.device);
+    }
+    fn on_lease_evicted(&self, device: &[u8; 32]) {
+        // 租约冲突新者胜（设备已迁往他机）：旧端踢出（§3.10 LeaseTable）。
+        eprintln!("chmlvpn-server: lease evicted (device moved) killing local session");
+        self.sessions.kill(device);
+    }
+}
+
 /// 服务端核心（装配期构建；Arc 共享给 accept/admin 任务）。
 pub struct ServerCore {
     pub cfg: ServerConfig,
-    pub store: Arc<StateStore>,
-    /// 集群根密钥（单服 M2 住状态库；多服 M4 起离线保管 + 目录签发走根签流程）。
-    pub root: SigningKey,
+    /// 写读后端（§2.2/§3.11）：Single = 本地 redb（M2 形态）；Sync = chml-sync Raft
+    /// （feature `multi-primary`——写转发 leader / 线性一致读 / 两级读目录）。
+    pub net: NetBackend,
+    /// 集群根密钥签名钥（单服 = 库内根；多主 = **None**——根密钥离线保管，目录/邀请
+    /// 签发走运维侧 init-cluster 流程，服务器只持 root_pub）。
+    pub root: Option<SigningKey>,
     pub identity: ServerIdentity,
-    /// OPAQUE 服务端 OPRF key（§2.4：常驻；轮换使全部 pass.opaque 失效）。
+    /// OPAQUE 服务端 OPRF key（§2.4：常驻；轮换使全部 pass.opaque 失效。
+    /// 多主形态 = Raft 内共享（SetOprf 根签登记）——OPAQUE 记录全网可验）。
     pub oprf: chml_protocol::opaque_ke::ServerSetup<Suite>,
+    /// 票据权威（Local = 状态库种子；Sync = Raft 内票据根，任何服务器都验得了）。
     pub guard: CtrlGuard,
-    pub sessions: LiveSessions,
+    /// 本地会话表（Arc：SyncHooks 装配侧共享——apply 回调杀会话/租约冲突踢出）。
+    pub sessions: Arc<LiveSessions>,
+    /// 多主同步节点（feature `multi-primary`；单服 = None）。
+    #[cfg(feature = "multi-primary")]
+    pub sync: Option<Arc<chml_sync::SyncNode>>,
     /// M3 数据面路由器（run() 装配 tun 后注入；None = 控制流-only——宿主测试路径）。
     router: RwLock<Option<Arc<PeerRouter>>>,
 }
@@ -225,19 +263,100 @@ impl ServerCore {
 
         let core = ServerCore {
             cfg,
-            store: Arc::new(store),
-            root,
+            net: NetBackend::Single(Arc::new(store)),
+            root: Some(root),
             identity: sid,
             oprf,
-            guard: CtrlGuard::new(TicketIssuer::from_seed(ticket_seed)),
-            sessions: LiveSessions::default(),
+            guard: CtrlGuard::new(crate::ticket::TicketAuthority::Local(Box::new(
+                TicketIssuer::from_seed(ticket_seed),
+            ))),
+            sessions: Arc::new(LiveSessions::default()),
+            #[cfg(feature = "multi-primary")]
+            sync: None,
             router: RwLock::new(None),
         };
         Ok((Arc::new(core), created))
     }
 
-    /// 根签集群目录（全套端点条目：advertise + extras——同一服务器的其他暴露口）。
+    /// 多主装配（feature `multi-primary`；§2.2/§3.11 M4 批次）。
+    ///
+    /// - 目录 = `session::respond` 注入 [`chml_sync::SyncNode::device_directory`]
+    ///   （两级读：记录缓存 + epoch + apply-lag 熔断降级线性一致读，§4）；
+    /// - 票据根 = Raft 状态内（Bootstrap 落库）；
+    /// - OPRF key = Raft 内共享（SetOprf 根签登记——跨节点登录，§2.4）；
+    /// - 吊销/租约冲突经 [`chml_sync::hooks::SyncHooks`] 在 apply 现场杀本地会话（§2.2）。
+    ///
+    /// 前置：集群已 Bootstrap（ticket_root + SetOprf 就位）——init-cluster/enroll 流程或
+    /// 装配方（tests/multi_primary.rs）完成；等待窗口 15s。
+    #[cfg(feature = "multi-primary")]
+    pub async fn open_sync(
+        cfg: ServerConfig,
+        ident: Arc<ServerIdentity>,
+        node: Arc<chml_sync::SyncNode>,
+    ) -> Result<Arc<Self>, String> {
+        // 等 Bootstrap + SetOprf 复制到位（本节点 apply 即可见——本地读）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let oprf_b64 = loop {
+            if let Some(o) = node.sm().oprf_b64() {
+                break o;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("集群未就绪：15s 内未见 Bootstrap/SetOprf 在本节点 apply".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        let oprf = chml_protocol::pake::server_setup_load(&oprf_b64)
+            .map_err(|e| format!("集群 OPRF key: {e}"))?;
+        let sessions = Arc::new(LiveSessions::default());
+        node.sm().register_hook(Arc::new(ServerSyncHooks {
+            sessions: sessions.clone(),
+            node: node.clone(),
+        }));
+        let src = &*ident;
+        let identity = ServerIdentity {
+            cluster_id: src.cluster_id,
+            server_id: src.server_id,
+            identity: chml_protocol::ed25519_dalek::SigningKey::from_bytes(
+                &src.identity.to_bytes(),
+            ),
+            static_hybrid: chml_protocol::kem::HybridKeypair::from_bytes(
+                &src.static_hybrid.to_bytes(),
+            )
+            .map_err(|e| e.to_string())?,
+            entry: src.entry.clone(),
+            root_pub: src.root_pub,
+            entry_sig: src.entry_sig,
+        };
+        let core = ServerCore {
+            cfg,
+            net: NetBackend::Sync(crate::backend::SyncNetState::new(node.clone())),
+            root: None,
+            identity,
+            oprf,
+            guard: CtrlGuard::new(crate::ticket::TicketAuthority::Sync(node.clone())),
+            sessions,
+            sync: Some(node),
+            router: RwLock::new(None),
+        };
+        Ok(Arc::new(core))
+    }
+
+    /// 根签集群目录。
+    ///
+    /// - 单服：现签（advertise + extras——同一服务器的其他暴露口；根密钥在库）；
+    /// - 多主：**已安装的根签目录**（init-cluster 全网分发；服务器不持根密钥，不可自签）。
     pub fn build_directory(&self) -> ClusterDirectory {
+        #[cfg(feature = "multi-primary")]
+        if let Some(node) = &self.sync {
+            if let Some(dir) = node.directory().current() {
+                return dir;
+            }
+        }
+        self.local_directory()
+    }
+
+    /// 单服形态的现签目录。
+    fn local_directory(&self) -> ClusterDirectory {
         let mut servers = vec![self.identity.entry.clone()];
         for ep in &self.cfg.extra_endpoints {
             servers.push(ServerEntry {
@@ -247,24 +366,35 @@ impl ServerCore {
                 static_hybrid_pub: self.identity.static_hybrid.public(),
             });
         }
+        let root = self
+            .root
+            .as_ref()
+            .expect("单服形态根密钥在库（多主形态经已安装目录返回）");
         ClusterDirectory::issue(
-            &self.root,
+            root,
             self.identity.cluster_id,
             self.cfg.dir_version,
             servers,
         )
     }
 
-    /// 签发邀请（admin 路径）：登记 invite_id + 根签 v3 邀请文件（§1.3.3f）。
-    pub fn mint_invite(&self, ttl_secs: u64) -> Result<Vec<u8>, String> {
+    /// 签发邀请（admin 路径；§1.3.3f 邀请生成 = 根密钥语境的管理操作）。
+    ///
+    /// 多主形态服务器**不持根密钥** ⇒ 拒绝（签发走运维侧 init-cluster 流程）；
+    /// 邀请登记（Raft RecordInvite）仍可经 NetBackend 完成。
+    pub async fn mint_invite(&self, ttl_secs: u64) -> Result<Vec<u8>, String> {
+        let Some(root) = &self.root else {
+            return Err("多主形态邀请签发需集群根密钥（运维侧 init-cluster 产物）".into());
+        };
         let invite_id: [u8; 16] = rand::random();
         let expiry = chml_protocol::trust::now_unix() + ttl_secs;
-        self.store
+        self.net
             .record_invite(&invite_id, expiry)
+            .await
             .map_err(|e| e.to_string())?;
         let dir = self.build_directory();
         let inv = chml_protocol::trust::InviteFile::issue(
-            &self.root,
+            root,
             self.identity.cluster_id,
             dir.dir_version,
             dir.servers.clone(),
@@ -280,8 +410,30 @@ impl ServerCore {
     /// initiate 后先 `open_stream(Prio::Control)`——排序契约见 chmlvpn-client
     /// connector）；余流 = 数据面包通道（[`PeerRouter::serve_stream`]）。
     pub async fn serve_conn(self: Arc<Self>, io: TcpStream) {
-        let dir = DirAdapter(self.store.clone());
-        let tunnel = match respond(io, &self.identity, dir, TunnelConfig::default()).await {
+        // respond 的目录注入分派：Single = redb 适配器；Sync = chml-sync 两级读
+        // （缓存 + epoch + apply-lag 熔断降级线性一致读，§4——本批次的接入点）。
+        let handshake = match &self.net {
+            NetBackend::Single(store) => {
+                respond(
+                    io,
+                    &self.identity,
+                    DirAdapter(store.clone()),
+                    TunnelConfig::default(),
+                )
+                .await
+            }
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                respond(
+                    io,
+                    &self.identity,
+                    s.node.device_directory(),
+                    TunnelConfig::default(),
+                )
+                .await
+            }
+        };
+        let tunnel = match handshake {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("chmlvpn-server: handshake rejected: {e}");
@@ -292,8 +444,14 @@ impl ServerCore {
             return;
         };
         let mut kill = self.sessions.register(device.0);
-        // 该会话设备的注册 VIP（数据面源校验/路由键；查不到 ⇒ 仅控制流）。
-        let device_vip = self.store.device_row(&device).map(|r| r.vip);
+        // 该会话设备的注册行（VIP = 数据面源校验/路由键；查不到 ⇒ 仅控制流）。
+        let device_row = self.net.device_row(&device).await;
+        let device_vip = device_row.as_ref().map(|r| r.vip);
+        // 多主：发布本机租约（gossip 事件 ≤1s + 反熵兜底；设备当前位置唯一真相源，§2.2-1）。
+        #[cfg(feature = "multi-primary")]
+        if let Some(node) = &self.sync {
+            let _ = node.publish_lease(&device.0).await;
+        }
         let mut handlers = Vec::new();
         loop {
             tokio::select! {
@@ -312,6 +470,18 @@ impl ServerCore {
                                 let _ = serve_control(&core, device, &mut s).await;
                             }));
                         } else {
+                            // 多主：包通道走 chml-sync 转发面（attach_session sink +
+                            // ingest：第 0 步源 VIP 校验 → 租约定位 → 本机投递或
+                            // ForwardEnvelope 跨服，§2.2 判定序）。
+                            #[cfg(feature = "multi-primary")]
+                            if let Some(node) = self.sync.clone() {
+                                let dev = device.0;
+                                handlers.push(tokio::spawn(async move {
+                                    crate::dataplane::serve_stream_sync(node, dev, s).await;
+                                }));
+                                continue;
+                            }
+                            // 单服：本机路由器（tun 注入/回程）。
                             let router = self.router();
                             let has_router = router.is_some();
                             match (router, device_vip) {
@@ -343,7 +513,9 @@ impl ServerCore {
         let reason = tunnel.stats().closed;
         eprintln!(
             "chmlvpn-server: session ended device={device} reason={}",
-            reason.map(|r| r.to_string()).unwrap_or_else(|| "none(io/fin)".into())
+            reason
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "none(io/fin)".into())
         );
         tunnel.shutdown().await;
         self.sessions.deregister(device.0);
