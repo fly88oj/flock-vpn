@@ -1,11 +1,11 @@
 # Windows 真机 --smoke 记录（docs/design.md §7-M3 手工清单）
 
-> 2026-11-02 项目更名 ChmlVPN → **Flock VPN**：本文命令示例与输出样例中的二进制名（flock-client/flock-server）、容器/网络名（flock-m3-*）、路径（/etc/flock、/var/lib/flock）已按新命名同步；仓库目录 `E:\Works\ChmlVPN` 本身未改名，指向它的路径保持原样。
+> 2026-11-02 项目更名 ChmlVPN → **Flock VPN**：本文命令示例与输出样例中的二进制名（flock-client/flock-server）、容器/网络名（flock-m3-*）、路径（/etc/flock、/var/lib/flock）已按新命名同步；仓库目录更名 `E:\Works\FlockVPN` 经 junction 过渡（记录时目录名为 ChmlVPN；收尾步骤见 dir-rename-final.md）。
 
 - 日期：2026-11-01
 - 真机：Windows 10 Pro 26H2（build 26300，x64），管理员身份 **否**（`net session` → `ADMIN=no`；清单要求如实记录，不提权重跑）
 - Docker：Docker Desktop 29.8.2（`docker info --format '{{.ServerVersion}}'`）
-- 仓库：`E:\Works\ChmlVPN` @ main 306688f
+- 仓库：`E:\Works\FlockVPN` @ main 306688f（记录时为 ChmlVPN）
 - 结论先行：**wintun 适配器创建与 `route add` 均要求管理员权限；非提升 shell 下分别报 `os error 5（拒绝访问）` 与「请求的操作需要提升」**。清单中依赖 tun 设备的三项（route print 路由、真机 tun MTU、经中转 ping server VIP）在非提升会话下**受阻**，受阻点与证据逐项列于 §4；其余项（拓扑、引导、wintun.dll 行为、宿主单测）已实测。容器内同版本数据面对照组全通（§5）。
 
 ---
@@ -75,7 +75,7 @@ TcpTestSucceeded : True
 测试配置 `.tmp/host-client.toml`（指向 localhost 映射端点）：
 
 ```toml
-state_dir = "E:/Works/ChmlVPN/.tmp/host-client-state"
+state_dir = "E:/Works/FlockVPN/.tmp/host-client-state"
 tun_name = "tun0"
 mtu = 1280
 endpoints = ["127.0.0.1:27500", "127.0.0.1:27501"]

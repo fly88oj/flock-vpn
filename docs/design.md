@@ -51,11 +51,11 @@
 ### 1.1 名字与落位
 
 - **crate 名**：`flock-protocol`（lib 名 `flock_protocol`）。
-- **落位**：本仓库 workspace member，`E:\Works\ChmlVPN\crates\flock-protocol`。
+- **落位**：本仓库 workspace member，`E:\Works\FlockVPN\crates\flock-protocol`。
   workspace 布局：
 
   ```
-  E:\Works\ChmlVPN\
+  E:\Works\FlockVPN\
   ├── Cargo.toml            # workspace root（成员见下）
   ├── crates/
   │   ├── flock-protocol/    # ★ 共享协议库（Flock VPN 与 showroom 两边引用）
@@ -81,7 +81,7 @@
 2. **showroom（外部仓库）**：git 依赖钉 tag：
    `flock-protocol = { git = "<Flock VPN 仓库 URL>", tag = "flock-protocol-v0.1.0", default-features = false, features = ["legacy", "wasm"] }`；
    开发期在 showroom 仓库 `.cargo/config.toml` 用 `[patch."<git-url>"]` 覆盖为本地路径
-   `path = "../ChmlVPN/crates/flock-protocol"`（标准 patch 工作流，showroom 不改 Cargo.toml 即可本地联调）。
+   `path = "../FlockVPN/crates/flock-protocol"`（标准 patch 工作流，showroom 不改 Cargo.toml 即可本地联调）。
 3. **发布策略**：阶段一 git+tag（够用、无发布仪式）；若 showroom CI 或第三方需要，阶段二
    发 crates.io（许可 Apache-2.0 OR MIT，与 RustCrypto 生态一致，crypto-2026 §5）。
    版本纪律：showroom-common 的 `pub use {ed25519_dalek, rsa}`「版本收口」语义保留
@@ -1035,4 +1035,4 @@ ChmlFrp 节点）；移动端（Android/iOS）真机（M3 后独立排期，接�
      消除的风险）。A2/A5/A15 语义核对不受影响（client-1/2 的接入映射与跨服路径未变）。
 
 - 2026-11-01 命名调整：chml-protocol → flock-protocol（协议层独立于 chml/frp 品牌；flock=雁群，小型分布式网络意象；行为零变化）。
-- 2026-11-02 项目更名：ChmlVPN → Flock VPN（chmlvpn-server/client→flock-server/client、chml-sync/frpc→flock-sync/frpc、网络 chmlpub→flockpub、占位 git URL 换 flock 域；flock-protocol 线上行为零变化）。
+- 2026-11-02 项目更名：ChmlVPN → Flock VPN（chmlvpn-server/client→flock-server/client、chml-sync/frpc→flock-sync/frpc、网络 chmlpub→flockpub、占位 git URL 换 flock 域；flock-protocol 线上行为零变化）。仓库目录同步更名为 FlockVPN——会话占用期间经 junction 过渡（宿主机两路径等价、Docker 挂载内仅真实路径可见，容器命令暂用 ChmlVPN 路径），收尾步骤见 docs/manual/dir-rename-final.md。
