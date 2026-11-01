@@ -507,7 +507,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let k = UserKey::generate();
-        let dir = std::env::temp_dir().join(format!("chml-sig-seed-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("flock-sig-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("id_ed25519");

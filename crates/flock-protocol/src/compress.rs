@@ -1,6 +1,6 @@
 //! 压缩档位与帧格式（§1.3.3e / §3.7，P0-4、P1-7）。
 //!
-//! - **默认关闭**（`Mode::Off`）；按策略/按流开启——VORACLE/CRIME/BREACH 前提在 ChmlVPN
+//! - **默认关闭**（`Mode::Off`）；按策略/按流开启——VORACLE/CRIME/BREACH 前提在 flock 主仓
 //!   成立（FRP 中转即长度观察点，compression-2026 §3.2），开启时配输出填充。
 //! - 档位（compression-2026 §0/§2 实测映射）：`<128B` 直通（40B 反膨胀 122.5%、120B 零收益）；
 //!   Interactive/Bulk = zstd-1（帧级同 codec；Bulk 的分块/上下文复用属流式层，后续批次）；

@@ -309,13 +309,13 @@ struct Rng06<'a, R: rand::TryRngCore + ?Sized>(&'a mut R);
 #[cfg(feature = "legacy")]
 impl<R: rand::TryRngCore + ?Sized> rsa::rand_core::RngCore for Rng06<'_, R> {
     fn next_u32(&mut self) -> u32 {
-        self.0.try_next_u32().expect("chml-protocol: entropy source failed")
+        self.0.try_next_u32().expect("flock-protocol: entropy source failed")
     }
     fn next_u64(&mut self) -> u64 {
-        self.0.try_next_u64().expect("chml-protocol: entropy source failed")
+        self.0.try_next_u64().expect("flock-protocol: entropy source failed")
     }
     fn fill_bytes(&mut self, dst: &mut [u8]) {
-        self.0.try_fill_bytes(dst).expect("chml-protocol: entropy source failed");
+        self.0.try_fill_bytes(dst).expect("flock-protocol: entropy source failed");
     }
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
         self.0.try_fill_bytes(dst).map_err(|_| {
@@ -680,7 +680,7 @@ mod v1_tests {
     fn v1_platform_pem_roundtrip() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("chml-v1-pem-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("flock-v1-pem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let priv_path = platform().save_pem(&dir).unwrap();

@@ -1,6 +1,6 @@
 //! # flock-protocol
 //!
-//! ChmlVPN 与 showroom 共享的协议契约层（docs/design.md §1）。本批次（M1 session/mux）交付：
+//! flock 主仓与 showroom 共享的协议契约层（docs/design.md §1）。本批次（M1 session/mux）交付：
 //!
 //! - [`kem`]：X25519 + ML-KEM-768 混合 KEM（§1.3.3a / §3.1，P0-1、P0-7）；
 //! - [`envelope`]：文件信封 v2（§1.3.3b / §3.2，P0-3；`legacy` feature 下 v1 只读兼容）；

@@ -158,7 +158,7 @@ async fn invite_multi_endpoint_all_1rtt() {
         now + INVITE_DEFAULT_TTL_SECS,
         rand::random::<[u8; 16]>(),
     );
-    let path = std::env::temp_dir().join(format!("chml-invite-{}.bin", rand::random::<u64>()));
+    let path = std::env::temp_dir().join(format!("flock-invite-{}.bin", rand::random::<u64>()));
     save_invite(&path, &invite).expect("save");
     let loaded = load_invite(&path).expect("load");
     let _ = std::fs::remove_file(&path);
@@ -194,7 +194,7 @@ async fn invite_file_rejects_tampered_and_old_versions() {
         .expect("端点串必在邀请字节中");
     let mut tampered = bytes.clone();
     tampered[pos] = if tampered[pos] == b'r' { b'R' } else { b'r' };
-    let path = std::env::temp_dir().join(format!("chml-invite-bad-{}.bin", rand::random::<u64>()));
+    let path = std::env::temp_dir().join(format!("flock-invite-bad-{}.bin", rand::random::<u64>()));
     std::fs::write(&path, &tampered).expect("write tampered");
     let err = load_invite(&path).expect_err("条目被篡改 ⇒ 拒载入");
     let _ = std::fs::remove_file(&path);

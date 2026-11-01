@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ChmlVPN / showroom 共享协议契约层：混合 KEM、文件信封 v2、SR-SIG1（docs/design.md §1）"
+description = "flock 主仓 / showroom 共享协议契约层：混合 KEM、文件信封 v2、SR-SIG1（docs/design.md §1）"
 
 [dependencies]
 aes-gcm = { workspace = true }
@@ -58,7 +58,7 @@ name = "aead"
 harness = false
 
 [features]
-# 默认开 zstd 档（ChmlVPN 全量行为不变）；default-features=false 的引用方（showroom wasm）
+# 默认开 zstd 档（flock 主仓全量行为不变）；default-features=false 的引用方（showroom wasm）
 # 显式关闭后 compress 模块仅 lz4 纯 Rust 档、wasm32 构建零 C 依赖。
 default = ["zstd"]
 zstd = ["dep:zstd"]
@@ -68,7 +68,7 @@ zstd = ["dep:zstd"]
 # 信封 v1（RSA-OAEP）只读兼容：showroom 过渡用，默认关。
 # rsa/sha2：Oaep::new::<Sha256> 需与 rsa 同代的 sha2 0.10 摘要类型（rsa::sha2 再导出）。
 legacy = ["dep:rsa", "rsa/sha2"]
-# OPAQUE 服务端身份签名层（P0-5 登录锚）：ChmlVPN 构建里开，默认关（本批次仅占位）。
+# OPAQUE 服务端身份签名层（P0-5 登录锚）：flock 主仓构建里开，默认关（本批次仅占位）。
 anchor = []
 # ML-DSA-65 并行公钥档（P2-12）：ml-dsa 0.1.1 未审计（crypto-2026 §5），默认关（本批次仅占位）。
 pq-sign = []

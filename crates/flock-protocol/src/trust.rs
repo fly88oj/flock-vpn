@@ -12,7 +12,7 @@
 //!   （[`PinStore::save`]/[`PinStore::load`]，unix 下 0600）；钥匙库适配器给移动端（接缝）。
 //! - [`InviteFile`] v3：根签 ClusterDirectory 全套服务器材料 + 一次性 invite_id + expiry
 //!   （默认 7 天，§2.4）。**v1 指纹-only 与 v2 单服务器材料不再接受**——多服务器集群下
-//!   无法支撑任意端点 1-RTT（§3.8）。invite_id 单次消费语义由 chml-sync 的 Raft 状态机
+//!   无法支撑任意端点 1-RTT（§3.8）。invite_id 单次消费语义由本仓 sync crate 的 Raft 状态机
 //!   保证（redeem_invite 查重，§4）；本模块只做结构校验。
 //! - [`ClusterDirectory`]：dir_version 单调递增；`PinStore::record_directory` 是
 //!   dir_pull 刷新的落地路径（根验签 + 钉扎比对 + 版本回退拒收）。
@@ -45,8 +45,8 @@ pub const DIRECTORY_VERSION: u8 = 1;
 /// 邀请默认有效期：7 天（§1.3.3f「默认 7 天（可配）」）。
 pub const INVITE_DEFAULT_TTL_SECS: u64 = 7 * 24 * 3600;
 
-const SIG_DIRECTORY: &[u8] = b"chml-protocol/trust/cluster-directory/v1";
-const SIG_INVITE: &[u8] = b"chml-protocol/trust/invite/v3";
+const SIG_DIRECTORY: &[u8] = b"flock-protocol/trust/cluster-directory/v1";
+const SIG_INVITE: &[u8] = b"flock-protocol/trust/invite/v3";
 
 /// 信任层错误。
 #[derive(Debug)]

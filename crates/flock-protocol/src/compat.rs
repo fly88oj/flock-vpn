@@ -174,7 +174,7 @@ mod tests {
     fn write_private_is_0600() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("chml-compat-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("flock-compat-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("priv.bin");

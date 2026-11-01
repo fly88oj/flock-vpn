@@ -14,10 +14,14 @@
 
 const SIG_SEED_HEX: &str = "01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3da";
 const SIG_PUB: &str = "ed25519:5AMJmM/VrRcjwWn5VqoLnrhhm1mSvWEsKvQo68efjfA";
-const SIG_BODY: &str = "chml-protocol-cross-check";
+// 被签 body 哈希（showroom 3.0.0 固化，互通向量组成部分）：SR-SIG1 签名/验签走 prehashed，
+// SIG_AUTH 逐字节锚定本哈希；生成侧 body 字面量是 showroom 旧品牌样本，不在本文件内联。
 const SIG_BODY_SHA: &str = "4275bf77e20cdf1f5c8f4707c2adccfd5f4b60b44d3847a2a06210e5e1923c2d";
 const SIG_AUTH: &str = "SR-SIG1 alice:1700000000:cafe0011beef2233:kk4QottRyoNykwtvn0XSn0slqLLfeyx-sa2czyfHxLGy1LZ8TYHFolIy5TveIaDU8nN3-B54vhJRRdvng8NOAQ";
 const SIG_TS: i64 = 1_700_000_000;
+// 哈希一致性自洽样本（flock 品牌，自生成自断言；非互通面——仅验证 sha256_hex 与流式接口一致）。
+const HASH_BODY: &str = "flock-protocol-cross-check";
+const HASH_BODY_SHA: &str = "0a4b3d93b4ee5f9a71fe22b046263282aae9472fa6663d55d56287b90423dc1e";
 
 #[test]
 fn showroom_sig_vector_byte_exact() {
@@ -32,11 +36,11 @@ fn showroom_sig_vector_byte_exact() {
         "alice", &k, "POST", "/_api/publish?project=demo", SIG_BODY_SHA, SIG_TS, "cafe0011beef2233",
     );
     assert_eq!(auth, SIG_AUTH, "SR-SIG1 线上格式跨代际逐字节不变（§1.3.2）");
-    // 哈希与流式哈希一致
-    assert_eq!(sig::sha256_hex(SIG_BODY.as_bytes()), SIG_BODY_SHA);
+    // 哈希与流式哈希一致（自洽样本，非互通面）
+    assert_eq!(sig::sha256_hex(HASH_BODY.as_bytes()), HASH_BODY_SHA);
     assert_eq!(
-        sig::sha256_hex_stream(std::io::Cursor::new(SIG_BODY.as_bytes())).unwrap(),
-        SIG_BODY_SHA
+        sig::sha256_hex_stream(std::io::Cursor::new(HASH_BODY.as_bytes())).unwrap(),
+        HASH_BODY_SHA
     );
     // showroom 生成的签名在本 crate 验签通过（含 ±300s 窗边界）
     let vk = [sig::UserKey::from_pub_string(SIG_PUB).unwrap()];

@@ -128,15 +128,15 @@ fn bridge08<R: rand::TryRngCore + ?Sized>(rng: &mut R) -> RngBridge08<'_, R> {
 
 impl<R: rand::TryRngCore + ?Sized> opaque_ke::rand::RngCore for RngBridge08<'_, R> {
     fn next_u32(&mut self) -> u32 {
-        self.0.try_next_u32().expect("chml-protocol: entropy source failed")
+        self.0.try_next_u32().expect("flock-protocol: entropy source failed")
     }
     fn next_u64(&mut self) -> u64 {
-        self.0.try_next_u64().expect("chml-protocol: entropy source failed")
+        self.0.try_next_u64().expect("flock-protocol: entropy source failed")
     }
     fn fill_bytes(&mut self, dst: &mut [u8]) {
         self.0
             .try_fill_bytes(dst)
-            .expect("chml-protocol: entropy source failed");
+            .expect("flock-protocol: entropy source failed");
     }
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), opaque_ke::rand::Error> {
         self.0.try_fill_bytes(dst).map_err(|_| opaque_ke::rand::Error::from(std::num::NonZeroU32::new(1).expect("nonzero")))
@@ -259,7 +259,7 @@ pub fn reg_finish_profile(
     Ok(b64(&out.message.serialize()))
 }
 
-// —— 服务端（showroomctl / chmlvpn-server；serve 与管理命令共用）——
+// —— 服务端（showroomctl / 本仓服务端二进制；serve 与管理命令共用）——
 
 /// 生成服务端 OPRF key（返回 b64 串，即 `opaque.key` 落盘内容）。
 pub fn server_setup_new(rng: &mut impl CryptoRngCore) -> String {
@@ -370,7 +370,7 @@ mod anchor {
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
     /// anchor 签名域分离标签。
-    pub const ANCHOR_LABEL: &[u8] = b"chml-protocol/pake/anchor/v1";
+    pub const ANCHOR_LABEL: &[u8] = b"flock-protocol/pake/anchor/v1";
 
     /// 客户端对 OPAQUE 登录的期望服务端身份（来自隧道层钉扎 ServerPin：
     /// cluster_root_pub 背书的 entry.identity_pub / server_id）。

@@ -112,17 +112,17 @@ pub const RT_PING: u8 = 0x21;
 pub const RT_PONG: u8 = 0x22;
 
 // 领域分离标签（HKDF info / 签名上下文 / transcript 上下文）。
-const L_I1_K1: &[u8] = b"chml-protocol/session/i1-k1/v1";
-const L_I1_ENC: &[u8] = b"chml-protocol/session/i1-enc/v1";
-const L_TRAFFIC: &[u8] = b"chml-protocol/session/traffic/v1";
-const L_REKEY_TRAFFIC: &[u8] = b"chml-protocol/session/rekey-traffic/v1";
-const L_REKEY_TH: &[u8] = b"chml-protocol/session/rekey-th/v1";
-const L_TH: &[u8] = b"chml-protocol/session/transcript/v1";
-const L_CONFIRM: &[u8] = b"chml-protocol/session/confirm/v1";
-const SIG_I1: &[u8] = b"chml-protocol/session/i1-device-sig/v1";
-const SIG_R1: &[u8] = b"chml-protocol/session/r1-server-sig/v1";
-const SIG_R0: &[u8] = b"chml-protocol/session/r0-server-sig/v1";
-const SIG_ENTRY: &[u8] = b"chml-protocol/trust/server-entry/v1";
+const L_I1_K1: &[u8] = b"flock-protocol/session/i1-k1/v1";
+const L_I1_ENC: &[u8] = b"flock-protocol/session/i1-enc/v1";
+const L_TRAFFIC: &[u8] = b"flock-protocol/session/traffic/v1";
+const L_REKEY_TRAFFIC: &[u8] = b"flock-protocol/session/rekey-traffic/v1";
+const L_REKEY_TH: &[u8] = b"flock-protocol/session/rekey-th/v1";
+const L_TH: &[u8] = b"flock-protocol/session/transcript/v1";
+const L_CONFIRM: &[u8] = b"flock-protocol/session/confirm/v1";
+const SIG_I1: &[u8] = b"flock-protocol/session/i1-device-sig/v1";
+const SIG_R1: &[u8] = b"flock-protocol/session/r1-server-sig/v1";
+const SIG_R0: &[u8] = b"flock-protocol/session/r0-server-sig/v1";
+const SIG_ENTRY: &[u8] = b"flock-protocol/trust/server-entry/v1";
 
 // ============================================================================
 // 错误

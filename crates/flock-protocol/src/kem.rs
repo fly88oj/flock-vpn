@@ -9,7 +9,7 @@
 //! - [`HybridCt`]：1120B = 32(临时 X25519 公钥) ‖ 1088(ML-KEM-768 ct)。
 //!
 //! HKDF 参数（本库钉死，双方一致即逐字节确定）：salt=None（HKDF 零填充），
-//! info=`chml-protocol/hybrid-kem/x25519+ml-kem-768/v1`，OKM=32B。
+//! info=`flock-protocol/hybrid-kem/x25519+ml-kem-768/v1`，OKM=32B。
 //!
 //! RNG 面：公开函数接受 rand 0.9 的 `TryCryptoRng`（OsRng / StdRng 直接可传）；
 //! ml-kem / x25519-dalek 3.0 内部走 rand_core 0.10 代际，由私有 [`RngBridge`] 桥接，调用方无感。
@@ -43,7 +43,7 @@ pub const SHARED_LEN: usize = 32;
 pub const HYBRID_SK_LEN: usize = X25519_PUB_LEN + 64;
 
 /// HKDF info 标签：域分离（换算法/换组合规则必须换标签）。
-const HKDF_INFO: &[u8] = b"chml-protocol/hybrid-kem/x25519+ml-kem-768/v1";
+const HKDF_INFO: &[u8] = b"flock-protocol/hybrid-kem/x25519+ml-kem-768/v1";
 
 /// KEM 错误：公钥/密文反序列化或校验失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,15 +333,15 @@ impl<R: rand::TryRngCore + ?Sized> rc010::TryRng for RngBridge<'_, R> {
     type Error = Infallible;
 
     fn try_next_u32(&mut self) -> Result<u32, Infallible> {
-        Ok(self.0.try_next_u32().expect("chml-protocol: entropy source failed"))
+        Ok(self.0.try_next_u32().expect("flock-protocol: entropy source failed"))
     }
     fn try_next_u64(&mut self) -> Result<u64, Infallible> {
-        Ok(self.0.try_next_u64().expect("chml-protocol: entropy source failed"))
+        Ok(self.0.try_next_u64().expect("flock-protocol: entropy source failed"))
     }
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
         self.0
             .try_fill_bytes(dst)
-            .expect("chml-protocol: entropy source failed");
+            .expect("flock-protocol: entropy source failed");
         Ok(())
     }
 }

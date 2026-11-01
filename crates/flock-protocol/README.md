@@ -1,6 +1,6 @@
 # flock-protocol
 
-ChmlVPN 与 showroom 共享的协议契约层（`docs/design.md` §1）：混合 KEM、文件信封 v2、
+flock 主仓与 showroom 共享的协议契约层（`docs/design.md` §1）：混合 KEM、文件信封 v2、
 SR-SIG1、OPAQUE、压缩档位、隧道会话（session）、复用（mux）、首登信任锚（trust）。
 设计全文见 `docs/design.md`；本 README 只摘调用方必须知道的契约。
 
