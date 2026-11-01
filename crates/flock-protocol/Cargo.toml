@@ -1,5 +1,5 @@
 [package]
-name = "chml-protocol"
+name = "flock-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
