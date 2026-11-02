@@ -12,6 +12,7 @@
 //! ForwardEnvelope 同批落地；本模块先提供本地 `observe`（含 TTL 判定）。
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,14 @@ pub struct LeaseTable {
     ttl: Duration,
     hooks: HookRegistry,
     st: Mutex<BTreeMap<[u8; 32], Lease>>,
+    /// 已见远端 term 水位（含被拒收的旧条目——任何到达即抬升）。
+    ///
+    /// 反「时钟偏移误踢」护栏：本地 publish/续期的 term 至少取 `floor + 1`——本机墙钟
+    /// 可能落后于已见远端 term（偏移或远端时钟超前），直接用 `now` 会让本地真实在线的
+    /// 设备在「新者胜」比较中输掉自己见过的远端旧条目（单向连通下反复被踢）。
+    /// 残余依赖（诚实披露）：从未互通 term 的两节点间仍按各自墙钟定序——绝对时钟
+    /// 偏移可让先到者暂时取胜，TTL 过期 + 反熵兜底收敛。
+    term_floor: AtomicU64,
 }
 
 impl LeaseTable {
@@ -69,6 +78,7 @@ impl LeaseTable {
             ttl,
             hooks,
             st: Mutex::new(BTreeMap::new()),
+            term_floor: AtomicU64::new(0),
         })
     }
 
@@ -79,8 +89,12 @@ impl LeaseTable {
 
     /// 发布本机租约（新者胜）。返回被本机取代的旧持有者（若有——冲突场景的对端）。
     /// 远端传播由调用方（node 装配）广播 [`GossipMsg::Publish`]。
+    ///
+    /// term 至少取 `max(已见远端 term) + 1`（墙钟与本机取大）：本机时钟偏移（落后于
+    /// 已见远端条目）不得让本地真实在线的设备在续期时输掉「新者胜」（见 `term_floor`）。
     pub fn publish(&self, device: &[u8; 32]) -> Option<NodeId> {
-        let term = now_ms();
+        let floor = self.term_floor.load(Ordering::SeqCst);
+        let term = now_ms().max(floor.saturating_add(1));
         let mut st = self.st.lock().expect("lease table");
         let prev = st.insert(
             *device,
@@ -111,6 +125,9 @@ impl LeaseTable {
         {
             let mut st = self.st.lock().expect("lease table");
             for (device, holder, term) in entries {
+                // 任何到达的远端 term（含被拒收的旧条目）都抬升本地基准：
+                // 下次本地 publish 至少 term+1（时钟偏移护栏，见 `term_floor`）。
+                self.term_floor.fetch_max(term, Ordering::SeqCst);
                 let newer = match st.get(&device) {
                     Some(cur) => (term, holder) > (cur.term_ms, cur.holder),
                     None => true,
@@ -168,7 +185,9 @@ impl LeaseTable {
     /// 非过期租约条数（诊断/断言面：gossip 传播是否工作）。
     pub fn live_len(&self) -> usize {
         let st = self.st.lock().expect("lease table");
-        st.iter().filter(|(_, l)| l.expires_at > Instant::now()).count()
+        st.iter()
+            .filter(|(_, l)| l.expires_at > Instant::now())
+            .count()
     }
 
     /// 全表摘要（反熵消息体）。
@@ -265,5 +284,43 @@ mod tests {
         t3.publish(&[9; 32]);
         std::thread::sleep(Duration::from_millis(40));
         assert_eq!(t3.observe(&[9; 32]), None, "TTL 过期即失效");
+    }
+
+    /// 时钟偏移护栏：本地墙钟落后于已见远端 term（远端时钟超前 5s + 单向连通——本地
+    /// 收得到远端）时，本地续期 term 仍越过已见远端 term ⇒「新者胜」不反转、本地在线
+    /// 设备不被误踢。
+    #[test]
+    fn republish_beats_seen_remote_term_despite_clock_skew() {
+        let t1 = table_with_hooks(1, HookRecorder::new());
+        let t2 = table_with_hooks(2, HookRecorder::new());
+        let dev = [0x5e; 32];
+        // 节点 1 先持有（本地时钟正常）。
+        t1.publish(&dev);
+        let t1_term = t1.observe(&dev).unwrap().term_ms;
+        // 节点 2 见到节点 1 的租约（抬升基准），随后设备移到节点 2 —— 但节点 2 墙钟
+        // 落后（模拟：远端条目 term 超前本地 now 5s 到达）。
+        let skewed_remote = now_ms() + 5_000;
+        t2.merge_remote(GossipMsg::Publish {
+            device: dev,
+            holder: 3,
+            term_ms: skewed_remote,
+        });
+        assert_eq!(t2.observe(&dev).unwrap().holder, 3, "超前的远端条目先入表");
+        // 节点 2 本地续期（设备真实在节点 2）：term ≥ skewed_remote+1（越过已见远端）。
+        t2.publish(&dev);
+        let l2 = t2.observe(&dev).unwrap();
+        assert_eq!(l2.holder, 2);
+        assert!(
+            l2.term_ms > skewed_remote,
+            "本地续期 term 越过已见远端 term（不因时钟落后丢新者胜）"
+        );
+        assert!(l2.term_ms > t1_term);
+        // 该续期到达节点 1 ⇒ 新者胜 + 旧端（节点 3 的视角对 1 而言即覆盖）+ 踢出钩子。
+        t1.merge_remote(GossipMsg::Publish {
+            device: dev,
+            holder: 2,
+            term_ms: l2.term_ms,
+        });
+        assert_eq!(t1.observe(&dev).unwrap().holder, 2, "续期传播后新者胜");
     }
 }
