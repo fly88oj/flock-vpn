@@ -24,10 +24,11 @@ services:
       additional_contexts:
         bins: ../.tmp/frp_0.71.1_linux_amd64
     image: flock/frps:0.71.1
-    # 用户口映射宿主（客户端拨号目标；advertise_endpoint 与之对应）
+    # 用户口映射宿主（仅回环，对齐 m3.yml 范式：宿主冒烟/客户端拨号目标走
+    # 127.0.0.1，容器网内口不受影响；advertise_endpoint 与之对应）
     ports:
-      - "27500:27500"
-      - "27501:27501"
+      - "127.0.0.1:27500:27500"
+      - "127.0.0.1:27501:27501"
     networks: [frpnet]
     restart: unless-stopped
 

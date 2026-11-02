@@ -14,9 +14,11 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.server-direct
     image: flock/server:m2-direct
+    # 宿主直连映射口（仅回环，对齐 m3.yml 范式——宿主冒烟走 127.0.0.1）：
+    # 9443 主端点 + 9444→9443 第二暴露口 = 同一容器端口的第二宿主映射（换端点模拟，§7-M2）
     ports:
-      - "9443:9443"
-      - "9444:9443"   # 第二暴露口 = 同一容器端口的第二宿主映射（换端点模拟，§7-M2）
+      - "127.0.0.1:9443:9443"
+      - "127.0.0.1:9444:9443"
     volumes:
       - server-state:/var/lib/flock
     restart: unless-stopped
