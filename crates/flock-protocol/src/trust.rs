@@ -352,15 +352,37 @@ impl InviteFile {
     }
 }
 
-/// 保存邀请文件（unix 下 0600——按一次性凭据管理，§1.3.3f 邀请一生）。
-pub fn save_invite(path: &Path, invite: &InviteFile) -> Result<(), TrustError> {
-    let bytes = invite.to_bytes();
-    std::fs::write(path, &bytes)?;
+/// 凭据类文件 0600 落盘（compat::write_private 同款姿势）：unix 下以
+/// `OpenOptions::mode(0o600)` **创建**——文件诞生即 0600，不存在「先写后收紧」
+/// 的权限窗口（`fs::write` + `set_permissions` 之间存在偏宽窗口）。覆盖已存在
+/// 文件偏宽旧权限时事后收紧。Windows 原生无 POSIX 权限位，退化为常规写。
+fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        // 覆盖已存在文件可能偏宽的旧权限（创建路径本身无窗口）。
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
     }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+/// 保存邀请文件（unix 下 0600——按一次性凭据管理，§1.3.3f 邀请一生）。
+pub fn save_invite(path: &Path, invite: &InviteFile) -> Result<(), TrustError> {
+    write_private_file(path, &invite.to_bytes())?;
     Ok(())
 }
 
@@ -499,14 +521,10 @@ impl PinStore {
         Ok(PinStore { pins, dir_versions })
     }
 
-    /// 落盘（unix 0600——钉扎文件按凭据对待）。
+    /// 落盘（unix 0600——钉扎文件按凭据对待；创建即 0600，无「先写后收紧」窗口，
+    /// 见 [`write_private_file`]）。
     pub fn save(&self, path: &Path) -> Result<(), TrustStoreError> {
-        std::fs::write(path, self.to_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        write_private_file(path, &self.to_bytes())?;
         Ok(())
     }
 
@@ -685,6 +703,47 @@ mod tests {
         let bytes = pins.to_bytes();
         let back = PinStore::from_bytes(&bytes).expect("roundtrip");
         assert_eq!(back.verify_pinned(&cid, &root.verifying_key()), PinVerdict::Match);
+    }
+
+    // 落盘形态：save_invite / PinStore::save 往返 + unix 下 0600（创建即 0600，
+    // 无「fs::write 后补收紧」的权限窗口——本测试同时守「写后可读回」不回归）。
+    #[test]
+    fn invite_and_pinstore_save_roundtrip_and_mode() {
+        let (root, cid) = fixture();
+        let inv = InviteFile::issue(&root, cid, 1, vec![entry(1)], now_unix() + 3600, [6; 16]);
+        let dir = std::env::temp_dir().join(format!("flock-trust-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let ipath = dir.join("invite.bin");
+        save_invite(&ipath, &inv).unwrap();
+        assert_eq!(load_invite(&ipath).unwrap().invite_id, [6; 16], "邀请落盘可读回");
+
+        let mut pins = PinStore::new();
+        pins.pin(&cid, &root.verifying_key());
+        let ppath = dir.join("pins.bin");
+        pins.save(&ppath).unwrap();
+        assert_eq!(
+            PinStore::load(&ppath).unwrap().verify_pinned(&cid, &root.verifying_key()),
+            PinVerdict::Match,
+            "钉扎落盘可读回"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&ipath).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "invite 0600"
+            );
+            assert_eq!(
+                std::fs::metadata(&ppath).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "pins 0600"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
