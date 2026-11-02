@@ -243,6 +243,12 @@ async fn stats_lines(core: &ServerCore) -> Vec<String> {
     let (unhealthy, recovered) = crate::frp::relay_health_events();
     lines.push(format!("frp_relay_unhealthy_events={unhealthy}"));
     lines.push(format!("frp_relay_recovered={recovered}"));
+    // 评审项 7：并发上限礼貌关闭的入连累计 + 配置上限。
+    lines.push(format!(
+        "sessions_overlimit={}",
+        crate::server::sessions_overlimit()
+    ));
+    lines.push(format!("max_sessions={}", core.cfg.max_sessions));
     #[cfg(feature = "multi-primary")]
     if let Some(node) = &core.sync {
         lines.push(format!("node_id={}", node.id()));

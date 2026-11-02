@@ -22,6 +22,7 @@ fn cfg_for(mode: &str, state_dir: &std::path::Path) -> ServerConfig {
         dir_version: 1,
         ticket_ttl_secs: 60,
         admin_bind: "127.0.0.1:0".parse().unwrap(),
+        max_sessions: 1024,
         sync: None,
         tun_name: "tun0".into(),
         vip: "100.64.0.1".parse().unwrap(),
@@ -104,4 +105,48 @@ async fn frp_mode_engages_supervisor_and_fails_fast_without_binary() {
         .join("frpc.toml");
     let text = std::fs::read_to_string(&embedded).expect("embedded frpc.toml");
     assert!(text.contains("serverAddr"), "内嵌 TOML 落盘");
+}
+
+/// 评审项 7：并发会话上限——`max_sessions = 1` 时第二条入连被接受后立即礼貌关闭
+/// （对端观察到 FIN），且超限计数递增；持许可的首连不受影响（静默连接保持挂起）。
+#[tokio::test]
+async fn session_cap_politely_closes_excess_connection() {
+    use tokio::io::AsyncReadExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = cfg_for("direct", dir.path());
+    cfg.max_sessions = 1;
+    let (core, _) = ServerCore::open_or_init(cfg).unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let task = tokio::spawn(core.clone().serve_listener(l));
+
+    let before = flock_server::server::sessions_overlimit();
+    // 首连：静默 TCP（无 I0）——占住唯一许可（respond 挂起等待首帧）。
+    let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // 第二连：超限 ⇒ 接受后立即礼貌关闭（读侧观察到 EOF）。
+    let mut c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 8];
+    let t = tokio::time::timeout(std::time::Duration::from_secs(3), c2.read(&mut buf)).await;
+    match t {
+        Ok(Ok(0)) | Ok(Err(_)) => {} // EOF/错误 = 礼貌关闭的观察面
+        Ok(Ok(n)) => panic!("超限连接不应有数据（读到 {n}B）"),
+        Err(_) => panic!("3s 内超限连接未观察到关闭"),
+    }
+    // 计数递增。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while flock_server::server::sessions_overlimit() < before + 1
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        flock_server::server::sessions_overlimit(),
+        before + 1,
+        "超限关闭计数 +1"
+    );
+    // 首连不受影响：仍在服务端挂起（读侧 1s 内无 EOF）。
+    let still = tokio::time::timeout(std::time::Duration::from_secs(1), c1.read(&mut buf)).await;
+    assert!(still.is_err(), "持许可的首连不应被关闭");
+    task.abort();
 }

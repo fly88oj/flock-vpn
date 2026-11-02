@@ -61,6 +61,10 @@ pub struct ServerConfig {
     /// admin loopback 端点（邀请签发/兑换/注册表管理的进程内单写者入口；CLI 子命令走它）。
     #[serde(default = "default_admin_bind")]
     pub admin_bind: SocketAddr,
+    /// 并发会话上限（评审项 7；accept 后即占用一个许可，超限的入连被礼貌关闭并
+    /// 计数。缺省 1024）。
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
     /// TUN 接口名（M3 数据面，§2.2/§3.12；缺省 "tun0"）。
     #[serde(default = "default_tun_name")]
     pub tun_name: String,
@@ -118,6 +122,9 @@ fn default_ticket_ttl() -> u64 {
 }
 fn default_admin_bind() -> SocketAddr {
     "127.0.0.1:9444".parse().expect("const addr")
+}
+fn default_max_sessions() -> usize {
+    1024
 }
 fn default_tun_name() -> String {
     "tun0".into()
@@ -226,6 +233,7 @@ mod tests {
         ));
         assert_eq!(cfg.ticket_ttl_secs, 60);
         assert_eq!(cfg.mode, "direct");
+        assert_eq!(cfg.max_sessions, 1024, "并发会话上限缺省 1024（评审项 7）");
 
         let cfg2: ServerConfig = toml::from_str(
             r#"

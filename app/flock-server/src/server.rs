@@ -19,6 +19,7 @@ use flock_protocol::session::{
     TunnelConfig,
 };
 use flock_protocol::trust::ClusterDirectory;
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -555,13 +556,74 @@ impl ServerCore {
     }
 
     /// accept 循环（每入连一个会话任务）。
+    ///
+    /// 鲁棒性（评审项 7）：
+    /// - **瞬时 accept 错误容错**：EMFILE/ENFILE/ConnAborted/WouldBlock/Interrupted
+    ///   等记日志 + 指数退避（50ms→1s 封顶）后 continue——单次入连故障不再永久杀死
+    ///   入连服务；仅不可恢复错误向上返回退出。
+    /// - **并发会话上限**：`cfg.max_sessions`（缺省 1024）个许可的 Semaphore——超限的
+    ///   入连**接受后立即礼貌关闭**（FIN）并计数（[`sessions_overlimit`]，admin stats 面）。
     pub async fn serve_listener(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
+        let permits = Arc::new(tokio::sync::Semaphore::new(self.cfg.max_sessions.max(1)));
+        let mut backoff_ms = 50u64;
         loop {
-            let (io, _peer) = listener.accept().await?;
+            let (mut io, _peer) = match listener.accept().await {
+                Ok(a) => a,
+                Err(e) if is_transient_accept_error(&e) => {
+                    eprintln!("flock-server: accept 瞬时错误（{e}）——{backoff_ms}ms 后继续");
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(1000);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            backoff_ms = 50;
+            // 并发上限：满载时接受后礼貌关闭（让对端立刻看到 FIN 而非挂死在 SYN 队列）。
+            let permit = match permits.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    SESSIONS_OVERLIMIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "flock-server: 并发会话上限 {} 已满——礼貌关闭新入连并计数",
+                        self.cfg.max_sessions
+                    );
+                    let _ = io.shutdown().await;
+                    continue;
+                }
+            };
             let core = self.clone();
             tokio::spawn(async move {
+                let _permit = permit; // 会话任务存活期间持许可
                 core.serve_conn(io).await;
             });
+        }
+    }
+}
+
+/// 并发上限礼貌关闭的入连累计（admin stats 面，评审项 7）。
+pub fn sessions_overlimit() -> u64 {
+    SESSIONS_OVERLIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static SESSIONS_OVERLIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// accept 瞬时错误判定（评审项 7）：资源耗尽/对端先行关闭/会重启的阻塞类——
+/// 记日志退避后继续；其余（监听句柄失效等）视为不可恢复。
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        ConnectionAborted | ConnectionReset | WouldBlock | Interrupted | NotConnected
+    ) || {
+        // EMFILE(24)/ENFILE(23)：fd 表耗尽——经典瞬时故障（unix 语义；Windows 原生
+        // 错误号空间不含此对，不误判）。
+        #[cfg(unix)]
+        {
+            matches!(e.raw_os_error(), Some(23) | Some(24))
+        }
+        #[cfg(not(unix))]
+        {
+            false
         }
     }
 }

@@ -183,6 +183,7 @@ async fn serve_on(c3: &Node3, idx: usize, extra_endpoints: Vec<String>) -> SyncS
         dir_version: 1,
         ticket_ttl_secs: 60,
         admin_bind: "127.0.0.1:0".parse().unwrap(),
+        max_sessions: 1024,
         tun_name: "tun0".into(),
         vip: "100.64.0.1".parse().unwrap(),
         frp: None,
