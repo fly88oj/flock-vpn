@@ -18,8 +18,8 @@ use std::path::PathBuf;
 
 use flock_frpc::supervisor::SupervisorConfig;
 use flock_frpc::{
-    check_version_matrix, ChmlFrpMode, FrpcBinaries, FrpcBinary, FrpcError, RelayFlavor,
-    RelaySpec, Supervisor, CHMLFRP_PINNED_VERSION, ORIGINAL_PINNED_VERSION,
+    check_version_matrix, ChmlFrpMode, FrpcBinaries, FrpcBinary, FrpcError, RelayFlavor, RelaySpec,
+    Supervisor, CHMLFRP_PINNED_VERSION, ORIGINAL_PINNED_VERSION,
 };
 
 const STUB: &str = env!("CARGO_BIN_EXE_frpc_stub");
@@ -69,9 +69,7 @@ async fn probe_version(bin: &FrpcBinary) -> Result<String, FrpcError> {
         .stderr(std::process::Stdio::null())
         .output()
         .await
-        .map_err(|e| {
-            FrpcError::Spawn(format!("--version 探测失败 {}: {e}", bin.path.display()))
-        })?;
+        .map_err(|e| FrpcError::Spawn(format!("--version 探测失败 {}: {e}", bin.path.display())))?;
     if !out.status.success() {
         return Err(FrpcError::Spawn(format!(
             "--version 退出码 {:?}",

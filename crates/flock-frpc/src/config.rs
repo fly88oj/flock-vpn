@@ -674,7 +674,9 @@ mod tests {
         // 键带换行 + 节头
         assert!(base().common("k\n[shadow]", "v").is_err());
         // 值伪造新节 + 后续键值
-        assert!(base().common("token", "v\n[shadow]\nserver_addr = evil").is_err());
+        assert!(base()
+            .common("token", "v\n[shadow]\nserver_addr = evil")
+            .is_err());
         // 方括号（键/值均拒）
         assert!(base().common("[k]", "v").is_err());
         assert!(base().common("k", "a]b").is_err());
