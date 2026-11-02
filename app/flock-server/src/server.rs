@@ -15,7 +15,8 @@ use flock_protocol::kem::HybridKeypair;
 use flock_protocol::pake::{server_setup_load, server_setup_new, Suite};
 use flock_protocol::rand;
 use flock_protocol::session::{
-    respond, sign_server_entry, ClusterId, ServerEntry, ServerId, ServerIdentity, TunnelConfig,
+    respond, sign_server_entry, ClusterId, DeviceId, ServerEntry, ServerId, ServerIdentity,
+    TunnelConfig,
 };
 use flock_protocol::trust::ClusterDirectory;
 use tokio::net::{TcpListener, TcpStream};
@@ -161,6 +162,16 @@ impl ServerCore {
     /// 装配数据面（tun + 路由；失败在 [`PeerRouter::open`] 内降级并记日志）。
     pub fn set_router(&self, router: Arc<PeerRouter>) {
         *self.router.write().expect("router lock poisoned") = Some(router);
+    }
+
+    /// 吊销-register 竞态的注册后准入（评审项 5）：`sessions.register` 之后的二次
+    /// directory 判定——`respond` 的首次 lookup 与 register 之间存在毫秒级窗口，
+    /// revoke 落在窗口内时 kill 广播 miss，本判定兜底拆连接。false ⇒ 调用方拆隧道。
+    pub async fn post_register_admission(&self, device: &DeviceId) -> bool {
+        matches!(
+            self.net.lookup(device).await,
+            flock_protocol::session::LookupVerdict::Active(_)
+        )
     }
 }
 
@@ -449,6 +460,18 @@ impl ServerCore {
             return;
         };
         let mut kill = self.sessions.register(device.0);
+        // 吊销-register 竞态闭合（评审项 5）：respond 的目录 lookup 与此处 register 之间
+        // 存在毫秒级窗口——revoke 恰好落在窗口内时 kill 广播先于 register 发生（miss），
+        // 旧实现会话静默存活。register 之后立即二次 lookup，非 Active 即拆连接。
+        if !self.post_register_admission(&device).await {
+            eprintln!(
+                "flock-server: device not Active after session register \
+                 (revoke raced the handshake) — dropping session"
+            );
+            self.sessions.deregister(device.0);
+            tunnel.shutdown().await;
+            return;
+        }
         // 该会话设备的注册行（VIP = 数据面源校验/路由键；查不到 ⇒ 仅控制流）。
         let device_row = self.net.device_row(&device).await;
         let device_vip = device_row.as_ref().map(|r| r.vip);

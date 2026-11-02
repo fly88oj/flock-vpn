@@ -16,13 +16,79 @@ use common::{connect, pin_from_invite, pin_with_root, CtrlClient, TestServer};
 use flock_protocol::pake::login_start;
 use flock_protocol::rand;
 use flock_protocol::session::{
-    fingerprint_ed25519, initiate, initiate_tofu, DeviceId, DeviceStaticKeys, ServerPin,
-    SessionError, TunnelConfig,
+    fingerprint_ed25519, initiate, initiate_tofu, DeviceId, DeviceStaticKeys, LookupVerdict,
+    ServerPin, SessionError, TunnelConfig,
 };
 use flock_protocol::sig as sr_sig;
 use flock_protocol::sig::UserKey;
 use flock_protocol::trust::{confirm_tofu_and_pin, InviteFile, PinStore, PinVerdict};
 use flock_server::control::{client_login_finish_anchored, CtrlError, CtrlResponse, DeviceOp};
+
+// ============================================================================
+// 4. 吊销-register 竞态（评审项 5）
+// ============================================================================
+
+/// 时序：respond 的 lookup 放行（Active）→ revoke 在 register 之前到达 →
+/// register 后的二次 directory 判定非 Active ⇒ serve_conn 拆连接（毫秒窗口闭合）。
+///
+/// 说明：lookup→register 之间在服务器进程内无外部可控的 await 点（R1 发送后同步直达
+/// register），纯黑盒无法从进程外钉死该交错——本测试按评审描述的时序逐步驱动真实的
+/// store lookup 与真正的准入路径（`post_register_admission` 即 serve_conn register 后
+/// 调用的同一方法），三步全部落在真实组件上。
+#[tokio::test]
+async fn revoke_between_handshake_lookup_and_register_closes_session() {
+    let srv = TestServer::start(60).await;
+    let invite_bytes = srv.mint_invite(3600).await;
+    let invite = InviteFile::from_bytes(&invite_bytes).unwrap();
+    let pin = pin_from_invite(&invite, 0);
+    let dev = DeviceStaticKeys::generate();
+    srv.redeem(&invite_bytes, "race-user", &dev).await;
+    let did = DeviceId(dev_id(&dev));
+
+    // 步骤 1：respond 的 lookup（Active 放行——竞态窗口的前半）。
+    assert!(
+        matches!(srv.core.net.lookup(&did).await, LookupVerdict::Active(_)),
+        "竞态窗口前半：lookup 时设备 Active"
+    );
+
+    // 步骤 2：register 之前 revoke 到达（kill 广播 miss——会话尚未登记）。
+    srv.core.net.revoke(&did).await.expect("revoke");
+    assert_eq!(srv.core.sessions.online(&did.0), 0, "尚无会话在册");
+
+    // 步骤 3：register 后的二次准入（serve_conn 的竞态兜底）⇒ 非 Active ⇒ 拆连接。
+    assert!(
+        !srv.core.post_register_admission(&did).await,
+        "register 后判定非 Active ⇒ serve_conn 拆连接（窗口闭合）"
+    );
+
+    // 端到端对照：该设备的新握手在 lookup 一步即被拒（Revoked 不回 R1）。
+    let io = tokio::net::TcpStream::connect(&pin.entry.relay_endpoint)
+        .await
+        .unwrap();
+    let err = initiate(io, &dev, &pin, TunnelConfig::default())
+        .await
+        .expect_err("revoked device must not complete handshake");
+    assert!(matches!(
+        err,
+        SessionError::DeviceRejected | SessionError::Io(_)
+    ));
+
+    // 准入语义与注册表状态一致（对照设备）：Disable ⇒ 准入拒；Enable（Disabled→
+    // Active 可逆；Revoked 终态不可逆）⇒ 准入恢复放行。
+    let dev2 = DeviceStaticKeys::generate();
+    srv.device_add("race-user", &dev2).await;
+    let did2 = DeviceId(dev_id(&dev2));
+    srv.core.net.disable(&did2).await.expect("disable");
+    assert!(
+        !srv.core.post_register_admission(&did2).await,
+        "禁用后准入拒（拆连接语义同吊销）"
+    );
+    srv.core.net.enable(&did2).await.expect("enable");
+    assert!(
+        srv.core.post_register_admission(&did2).await,
+        "恢复 Active ⇒ 准入放行"
+    );
+}
 
 fn now() -> i64 {
     flock_protocol::trust::now_unix() as i64
