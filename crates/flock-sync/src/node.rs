@@ -383,6 +383,10 @@ impl LinearizableReader for NodeReader {
 
 impl NodeInner {
     /// 写（leader 本机 / follower 转发；§4 写转发）。
+    ///
+    /// 转发重试纪律：远端又回 `ForwardToLeader`（leader 更替中）或 `NoLeader` 时**不透传
+    /// 给调用方**——回到循环在 `forward_deadline`（12s）预算内重试，与本地 client_write
+    /// 路径一致；远端确定性错误（Raft fatal 等）才直接返回。
     pub async fn write(&self, req: SyncRequest) -> Result<SyncResponse, SyncError> {
         let deadline = Instant::now() + self.settings.forward_deadline;
         loop {
@@ -390,7 +394,7 @@ impl NodeInner {
                 Ok(r) => return Ok(r.data),
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
                     if let Some(leader) = f.leader_id.filter(|l| *l != self.id) {
-                        if let Ok(WireResp::Write(r)) = self
+                        match self
                             .ic
                             .call(
                                 leader,
@@ -399,7 +403,16 @@ impl NodeInner {
                             )
                             .await
                         {
-                            return r;
+                            Ok(WireResp::Write(Ok(resp))) => return Ok(resp),
+                            // 远端也在 leader 更替中 ⇒ 回环重试（预算内），不透传。
+                            Ok(WireResp::Write(Err(
+                                SyncError::ForwardToLeader { .. } | SyncError::NoLeader,
+                            ))) => {}
+                            Ok(WireResp::Write(Err(other))) => return Err(other),
+                            Ok(_) => {
+                                return Err(SyncError::Wire("write rpc response mismatch".into()))
+                            }
+                            Err(e) => eprintln!("write forward to {leader} failed: {e}"),
                         }
                     }
                     if Instant::now() >= deadline {
