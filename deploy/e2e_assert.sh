@@ -100,10 +100,16 @@ es_() { compose exec -T "server-$1" "${@:2}"; }         # exec server-N
 
 # A10 的 iperf3 JSON 解析依赖宿主 python：python3 优先、python 兜底；均缺 ⇒ A10 如实
 # FAIL（失败方向安全——绝不因工具缺失把断言记 PASS）。
+# 探测必须验证**可执行**而非仅存在：Windows 的 Microsoft Store「应用执行别名」使
+# python3 在 PATH 上存在但执行即失败（"Python was not found"）——只查 command -v 会
+# 选中死壳，A10 的 min_interval 恒为 PARSE_ERR（6a818a5 引入的探测缺口，实测踩中）。
+# 以 `import json` 干跑校验：死壳/缺 stdlib 的解释器一律跳过，不改变失败方向。
 PY_BIN=""
-if command -v python3 >/dev/null 2>&1; then PY_BIN=python3
-elif command -v python >/dev/null 2>&1; then PY_BIN=python
-fi
+for _py in python3 python; do
+    if command -v "$_py" >/dev/null 2>&1 && "$_py" -c 'import json' >/dev/null 2>&1; then
+        PY_BIN="$_py"; break
+    fi
+done
 
 # —— 观测面助手 ——
 stat_of() { es_ "$1" flock-server --config /etc/flock/server.toml stats 2>/dev/null; }
