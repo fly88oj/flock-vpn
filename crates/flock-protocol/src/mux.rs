@@ -24,7 +24,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::io::{AsyncRead, AsyncWrite};
-use futures::{ready, Stream as FStream};
+use futures::{ready, Stream as FStream, StreamExt as _};
 
 /// 逻辑流优先级档位（§3.6 `Prio` 调度档）。
 ///
@@ -208,27 +208,77 @@ impl PacketChannel {
 
     /// 消费为包迭代流（§3.6 `recv_stream()`）：逐包产出，错误/EOF 终止。
     pub fn recv_stream(self) -> PacketRx {
-        PacketRx { ch: self }
+        PacketRx { framer: FrameRx::new(self.stream) }
+    }
+}
+
+/// `[u16 LE len][pkt]` 帧化解码状态机（[`PacketRx`] 的内核）。
+///
+/// 帧化状态（2B 头 + 部分体缓冲）是**结构体字段**——跨 poll/跨唤醒保留。泛型化在
+/// 读取面 `R` 上，使「包体分多次唤醒到达」可用 mock 读取器直接做回归测试
+/// （[`PacketChannel::recv`]/[`recv_packet`] 的两次 read_exact 形态没有跨调用状态，
+/// 包体半途 future 被丢弃即帧流永久失步，见 `send_packet` 的取消安全注记）。
+pub(crate) struct FrameRx<R> {
+    r: R,
+    hdr: [u8; 2],
+    hdr_filled: usize,
+    body: Vec<u8>,
+    body_filled: usize,
+}
+
+impl<R: AsyncRead + Unpin> FrameRx<R> {
+    pub(crate) fn new(r: R) -> Self {
+        FrameRx { r, hdr: [0; 2], hdr_filled: 0, body: Vec::new(), body_filled: 0 }
+    }
+}
+
+impl<R: AsyncRead + Unpin> FStream for FrameRx<R> {
+    type Item = io::Result<Vec<u8>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        // 帧头：2B 增量填满（每次 poll_read 至多推进一段，Pending 即带着已收字节返回）。
+        while this.hdr_filled < this.hdr.len() {
+            match Pin::new(&mut this.r).poll_read(cx, &mut this.hdr[this.hdr_filled..]) {
+                // EOF ⇒ 沿 recv_packet 的 read_exact→UnexpectedEof→None 语义（含半帧截断）。
+                Poll::Ready(Ok(0)) => return Poll::Ready(None),
+                Poll::Ready(Ok(n)) => this.hdr_filled += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if this.body.is_empty() && this.body_filled == 0 {
+            let len = u16::from_le_bytes(this.hdr) as usize;
+            this.body = vec![0u8; len];
+        }
+        while this.body_filled < this.body.len() {
+            match Pin::new(&mut this.r).poll_read(cx, &mut this.body[this.body_filled..]) {
+                Poll::Ready(Ok(0)) => return Poll::Ready(None),
+                Poll::Ready(Ok(n)) => this.body_filled += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        let pkt = std::mem::take(&mut this.body);
+        this.body_filled = 0;
+        this.hdr_filled = 0;
+        Poll::Ready(Some(Ok(pkt)))
     }
 }
 
 /// [`PacketChannel::recv_stream`] 的产物：`futures::Stream<Item = io::Result<Vec<u8>>>`。
+///
+/// 帧化状态保存在 [`FrameRx`] 字段内跨 poll 复用——包体分多次唤醒到达时不再把
+/// body 首 2 字节误读为新帧头（回归测试 `packet_rx_frames_survive_split_arrival`）。
 pub struct PacketRx {
-    ch: PacketChannel,
+    framer: FrameRx<Stream>,
 }
 
 impl FStream for PacketRx {
     type Item = io::Result<Vec<u8>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let ch = &mut self.get_mut().ch;
-        let mut fut = std::pin::pin!(ch.recv());
-        match fut.as_mut().poll(cx) {
-            Poll::Ready(Ok(pkt)) => Poll::Ready(Some(Ok(pkt))),
-            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Poll::Ready(None),
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-            Poll::Pending => Poll::Pending,
-        }
+        self.get_mut().framer.poll_next_unpin(cx)
     }
 }
 
@@ -335,6 +385,128 @@ mod tests {
     #[test]
     fn prio_values() {
         assert_ne!(Prio::Control, Prio::Normal);
+    }
+
+    /// 分片到达 mock（延迟投递）：每次 poll_read 弹出一个预置 chunk（块大于请求 buf 时
+    /// 保留剩余字节下次续读）；队列空 ⇒ Pending（noop waker 不会自动重唤，由测试手动
+    /// 再 poll——精确控制「跨唤醒到达」的字节切面）；`eof = true` 后返回 Ok(0) 模拟 FIN。
+    struct TrickleReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        eof: bool,
+    }
+
+    impl AsyncRead for TrickleReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            match self.chunks.pop_front() {
+                Some(mut c) => {
+                    let n = c.len().min(buf.len());
+                    buf[..n].copy_from_slice(&c[..n]);
+                    if n < c.len() {
+                        c.drain(..n);
+                        self.chunks.push_front(c);
+                    }
+                    Poll::Ready(Ok(n))
+                }
+                None if self.eof => Poll::Ready(Ok(0)),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// 回归（评审确认缺陷）：旧 PacketRx 每次 poll 新建 `ch.recv()` future、Pending 即丢
+    /// ——包体跨唤醒到达时已消费的帧头/帧体状态丢失，body 首 2 字节被当新帧头，帧流
+    /// 永久失步。帧化状态上移 FrameRx 字段后：逐字节分片到达（每字节一次 poll、期间
+    /// 多次返回 Pending）必须完整分帧。
+    #[test]
+    fn packet_rx_frames_survive_split_arrival() {
+        use futures::StreamExt as _;
+        use futures::task::noop_waker;
+
+        let pkt1: Vec<u8> = (0..40u8).collect();
+        let pkt2: Vec<u8> = vec![0xA5; 5];
+        let pkt3: Vec<u8> = Vec::new(); // 0 长度包（合法帧：len=0）
+        let mut wire: Vec<u8> = Vec::new();
+        for p in [&pkt1, &pkt2, &pkt3] {
+            wire.extend_from_slice(&(p.len() as u16).to_le_bytes());
+            wire.extend_from_slice(p);
+        }
+
+        let reader = TrickleReader { chunks: std::collections::VecDeque::new(), eof: false };
+        let mut rx = FrameRx::new(reader);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        for &b in &wire {
+            // 每次只投递 1 字节再 poll：帧未齐 ⇒ Pending（旧实现的半途 future 在此被
+            // 丢弃、下一 poll 从 body 字节重建帧头）；帧齐 ⇒ Ready 收包。
+            rx.r.chunks.push_back(vec![b]);
+            loop {
+                match rx.poll_next_unpin(&mut cx) {
+                    Poll::Pending => break,
+                    Poll::Ready(Some(Ok(p))) => got.push(p),
+                    Poll::Ready(Some(Err(e))) => panic!("分片到达分帧错误: {e}"),
+                    Poll::Ready(None) => panic!("数据未尽即 EOF"),
+                }
+            }
+        }
+        assert_eq!(got, vec![pkt1, pkt2, pkt3], "分片到达逐包逐字节完整且有序");
+
+        // 全部帧收完 ⇒ Pending（等更多数据）；FIN ⇒ None 收尾。
+        assert!(rx.poll_next_unpin(&mut cx).is_pending());
+        rx.r.eof = true;
+        assert!(matches!(rx.poll_next_unpin(&mut cx), Poll::Ready(None)));
+    }
+
+    /// 分片到达回归的第二形态：帧头/帧体按「粗块」跨 poll 到达（帧头一块、帧体两半、
+    /// 下一帧紧随其后同块）——每块投递后 poll 至 Pending，半途状态跨 poll 保留。
+    #[test]
+    fn packet_rx_frames_survive_chunked_body_arrival() {
+        use futures::StreamExt as _;
+        use futures::task::noop_waker;
+
+        let pkt1: Vec<u8> = (0..100u8).collect();
+        let pkt2: Vec<u8> = vec![0x5A; 3];
+        let frame1 = {
+            let mut f = (pkt1.len() as u16).to_le_bytes().to_vec();
+            f.extend_from_slice(&pkt1);
+            f
+        };
+        let frame2 = {
+            let mut f = (pkt2.len() as u16).to_le_bytes().to_vec();
+            f.extend_from_slice(&pkt2);
+            f
+        };
+
+        let reader = TrickleReader { chunks: std::collections::VecDeque::new(), eof: false };
+        let mut rx = FrameRx::new(reader);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let chunks = vec![
+            frame1[..2].to_vec(), // 帧 1 头（体未到 ⇒ Pending）
+            frame1[2..52].to_vec(), // 帧 1 体前半（半途 ⇒ Pending）
+            [frame1[52..].to_vec(), frame2].concat(), // 帧 1 体后半 + 整帧 2 同块
+        ];
+        for c in chunks {
+            rx.r.chunks.push_back(c);
+            loop {
+                match rx.poll_next_unpin(&mut cx) {
+                    Poll::Pending => break,
+                    Poll::Ready(Some(Ok(p))) => got.push(p),
+                    Poll::Ready(Some(Err(e))) => panic!("分块到达分帧错误: {e}"),
+                    Poll::Ready(None) => panic!("数据未尽即 EOF"),
+                }
+            }
+        }
+        assert_eq!(got, vec![pkt1, pkt2], "块边界跨 poll 分帧完整");
+        rx.r.eof = true;
+        assert!(matches!(rx.poll_next_unpin(&mut cx), Poll::Ready(None)));
     }
 
     /// 回归（A9 排障实测）：写泵消失（会话拆除 ⇒ data_rx drop）后 send 立即 Err；
