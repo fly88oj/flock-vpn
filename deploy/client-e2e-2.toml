@@ -3,4 +3,4 @@ state_dir = "/var/lib/flock"
 tun_name = "tun0"
 mtu = 1280
 
-endpoints = ["frps-b:23001", "frps-b:23001", "172.28.0.22:9443"]
+endpoints = ["frps-b:23001", "frps-a:23000", "172.28.0.22:9443"]
