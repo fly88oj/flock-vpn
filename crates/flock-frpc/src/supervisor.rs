@@ -32,6 +32,10 @@ const LOG_RING_CAP: usize = 512;
 ///
 /// ChmlFrp frpc 自身重连耗尽（5+10+20=35s）后才退出，故这里的 `initial`（默认 1s）
 /// 叠加在魔改等待之上；`max_restarts = None` = 永久守护（隧道是服务端生命线）。
+///
+/// `max` 兼任**稳定窗口**：子进程一次存活超过 `max` 即视为一个成功纪元，失败计数
+/// 归零（对照 flock-client connector 的 `Backoff::reset`「成功即归零」语义）——
+/// 否则长期服务端偶发数次 crash 后，每次重启都顶格 `max`（默认 60s）空窗。
 #[derive(Clone, Debug)]
 pub struct RestartPolicy {
     pub initial: Duration,
@@ -153,6 +157,9 @@ pub struct RelayStatus {
     pub phase: RelayPhase,
     /// 累计重启次数（= 拉起次数 - 1）。
     pub restarts: u32,
+    /// 当前退避指数输入（真实退出与拉起失败重试都计；稳定运行超过
+    /// [`RestartPolicy::max`] 后归零——诊断面，退避时长由它驱动）。
+    pub failures: u32,
     /// 最近一次子进程退出。
     pub last_exit: Option<ExitRecord>,
     /// 最近一轮健康探测（未配置/首轮未完成时为 None）。
@@ -172,6 +179,7 @@ struct Inner {
 struct StateSnap {
     phase: Option<RelayPhase>,
     restarts: u32,
+    failures: u32,
     last_exit: Option<ExitRecord>,
     probe: Option<ProbeReport>,
     logs: VecDeque<String>,
@@ -445,14 +453,40 @@ async fn supervise_loop(
     // restarts = 成功拉起次数（health() 呈现，与真实子进程一一对应）；
     // failures = 退避指数输入（真实退出与「拉起失败重试」都计）——两者分离，
     // 防止 spawn 失败把 restarts 顶高而无对应进程（也避免对已收割 Child 重复 wait）。
+    // failures 的稳定复位（对照 connector 的 Backoff::reset「成功即归零」）：子进程
+    // 一次存活超过最大退避时长（policy.max）即归零——偶发 crash 各自独立计退避，
+    // 不至于长期运行后每次重启都顶格 60s 空窗。
     let mut restarts: u32 = 0;
     let mut failures: u32 = 0;
+    // 当前子进程的起跑时刻（稳定窗口计时基准；拉起失败重试期间无进程 ⇒ None）。
+    let mut stable_since: Option<Instant> = if child.is_some() {
+        Some(Instant::now())
+    } else {
+        None
+    };
     loop {
-        // 等待「子进程退出」或「停机」。wait() 只发生在活的、未收割的子进程上
-        //（`child = None` = 上轮拉起失败，无进程可等，直接走退避重试）。
+        // 等待「子进程退出」「稳定窗口达标」或「停机」。wait() 只发生在活的、未收割的
+        // 子进程上（`child = None` = 上轮拉起失败，无进程可等，直接走退避重试）。
         let exit = if let Some(c) = child.as_mut() {
+            // 稳定窗口剩余时长（failures>0 且有起跑时刻才有意义，否则该臂永久挂起）。
+            let stable_in = match stable_since {
+                Some(t0) if failures > 0 => Some(policy.max.saturating_sub(t0.elapsed())),
+                _ => None,
+            };
+            let stability = async {
+                match stable_in {
+                    Some(remain) => tokio::time::sleep(remain).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 status = c.wait() => Some(status.ok()),
+                _ = stability => {
+                    // 稳定达标：failures 归零（复位后该臂转永久挂起，回到等待退出）。
+                    failures = 0;
+                    inner.state.lock().unwrap().failures = 0;
+                    continue;
+                }
                 _ = shutdown_changed(&shutdown_rx) => None,
             }
         } else {
@@ -488,6 +522,7 @@ async fn supervise_loop(
         }
 
         failures = failures.saturating_add(1);
+        inner.state.lock().unwrap().failures = failures;
         if let Some(max) = policy.max_restarts {
             if failures > max {
                 inner.set_phase(RelayPhase::Stopped {
@@ -516,6 +551,7 @@ async fn supervise_loop(
         match spawn_child(&plan) {
             Ok(mut next) => {
                 restarts += 1;
+                stable_since = Some(Instant::now());
                 let _logs = child_pipes_to_ring(&mut next, &inner);
                 child = Some(next);
                 let mut st = inner.state.lock().unwrap();
@@ -526,6 +562,7 @@ async fn supervise_loop(
             }
             Err(e) => {
                 child = None;
+                stable_since = None;
                 inner.push_log(format!("[supervisor] 重新拉起失败: {e}"));
             }
         }
@@ -564,13 +601,14 @@ pub struct ManagedRelay {
 }
 
 impl ManagedRelay {
-    /// 健康快照：进程阶段 + 重启计数 + 最近退出 + 最近探测（§3.9 `health()`）。
+    /// 健康快照：进程阶段 + 重启/失败计数 + 最近退出 + 最近探测（§3.9 `health()`）。
     pub fn health(&self) -> RelayStatus {
         let st = self.inner.state.lock().unwrap();
         RelayStatus {
             flavor: self.inner.flavor,
             phase: st.phase.clone().unwrap_or(RelayPhase::Starting),
             restarts: st.restarts,
+            failures: st.failures,
             last_exit: st.last_exit.clone(),
             probe: st.probe.clone(),
             run_dir: self.inner.run_dir.clone(),

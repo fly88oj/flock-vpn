@@ -463,6 +463,63 @@ async fn original_spec_uses_caller_toml_verbatim() {
     relay.stop().await.expect("stop 收尾");
 }
 
+/// failures 稳定复位（对照 connector 的 `Backoff::reset`「成功即归零」语义）：
+/// 子进程一次存活超过最大退避时长（`RestartPolicy::max` 兼任稳定窗口）⇒ failures
+/// 归零。桩 lifetime(500ms) > max(150ms)：第一次退出后 failures=1，第二段运行稳定
+/// 超过 max 后必须**可见归零**——否则长期服务端偶发数次 crash 后，每次重启都会
+/// 顶格 max（生产默认 60s）空窗。
+#[tokio::test]
+async fn failures_reset_after_stable_run_exceeds_max_backoff() {
+    common::prewarm_stub();
+    let dir = test_dir("stablereset");
+    let ini = panel_ini_with_stub(&dir, "mode = crash\nlifetime_ms = 500");
+
+    let mut policy = fast_restart_policy();
+    policy.initial = Duration::from_millis(40);
+    policy.max = Duration::from_millis(150); // 稳定窗口（< lifetime ⇒ 每轮都可复位）
+    let sup = supervisor("stablereset", policy, HealthPolicy::default());
+    let relay = sup
+        .start(RelaySpec::ChmlFrp {
+            mode: ChmlFrpMode::ConfigFile(ini),
+        })
+        .await
+        .expect("假桩规格应可启动");
+
+    // 先证明确实进过失败纪元（failures ≥ 1），再见 Running 中归零——「归零」才是
+    // 复位而非「从未计数」。
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_failure_episode = false;
+    loop {
+        let s = relay.health();
+        if s.failures >= 1 {
+            saw_failure_episode = true;
+        }
+        if saw_failure_episode
+            && s.restarts >= 1
+            && matches!(s.phase, RelayPhase::Running { .. })
+            && s.failures == 0
+        {
+            break; // 稳定运行超过 max ⇒ failures 已归零
+        }
+        assert!(
+            Instant::now() < deadline,
+            "稳定运行超过 max 后 failures 未归零: restarts={} failures={} phase={:?}",
+            s.restarts,
+            s.failures,
+            s.phase
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let status = relay.stop().await.expect("stop 收尾");
+    assert_eq!(
+        status.phase,
+        RelayPhase::Stopped {
+            reason: StopReason::Manual
+        }
+    );
+}
+
 /// `RestartPolicy::delay_for` 的纯函数面：指数增长 + 封顶。
 #[test]
 fn restart_policy_delay_curve() {
