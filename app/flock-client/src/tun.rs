@@ -111,7 +111,19 @@ impl TunDevice for TunRsDevice {
     }
 
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.dev.recv(buf)
+        // Windows（wintun）：tun-rs 的 recv 是**阻塞**语义（无跨平台非阻塞开关，
+        // set_nonblocking 仅 unix）——阻塞读会让读泵线程卡在 recv 内，TunSession::drop
+        // 的 stop 位在无流量时永远得不到检查（两泵退出承诺失效，见 TunIo::session）。
+        // 改 try_recv 轮询（tun-rs 仅 Windows 提供该 API）：无包 ⇒ WouldBlock，
+        // 走读泵的 POLL 间隔节流。Unix 维持非阻塞 recv（open 时已 set_nonblocking）。
+        #[cfg(windows)]
+        {
+            self.dev.try_recv(buf)
+        }
+        #[cfg(not(windows))]
+        {
+            self.dev.recv(buf)
+        }
     }
 
     fn write(&self, buf: &[u8]) -> io::Result<usize> {
@@ -215,11 +227,13 @@ impl TunDevice for MockTunDevice {
 const POLL: Duration = Duration::from_millis(5);
 /// 单通道在途包数（背压：TUN 读快于会话写时阻塞读泵而非丢包/膨胀）。
 const CHAN_CAP: usize = 1024;
+/// 读泵缓冲（循环复用）：按 IP 包上限一次分配——按 MTU+余量裁剪会在部署改 MTU/
+/// 异常大包时静默截断；复用消除「每包 64KiB 分配」（投递副本按实际长度精确分配）。
+const READ_BUF_LEN: usize = 65535;
 
 /// 常驻 TUN 异步句柄：设备跨会话存活；每会话 [`TunIo::session`] 取一对通道。
 pub struct TunIo {
     dev: Arc<dyn TunDevice>,
-    stop: AtomicBool,
     name: String,
 }
 
@@ -238,7 +252,7 @@ impl TunIo {
     /// 由共享设备装配（测试持 `Arc<MockTunDevice>` 双句柄时用）。
     pub fn from_arc(dev: Arc<dyn TunDevice>) -> Self {
         let name = dev.name();
-        TunIo { dev, stop: AtomicBool::new(false), name }
+        TunIo { dev, name }
     }
 
     /// 接口名。
@@ -264,23 +278,28 @@ impl TunIo {
             let stop = session_stop.clone();
             std::thread::Builder::new()
                 .name("tun-read".into())
-                .spawn(move || loop {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let mut buf = vec![0u8; 65535];
-                    match dev.read(&mut buf) {
-                        Ok(0) => {}
-                        Ok(n) => {
-                            buf.truncate(n);
-                            if read_tx.blocking_send(buf).is_err() {
-                                break; // 会话通道已拆
+                .spawn(move || {
+                    // 读缓冲循环复用（READ_BUF_LEN 注记）：每包不再新分配 64KiB；
+                    // 投递副本按实际读长精确分配。
+                    let mut buf = vec![0u8; READ_BUF_LEN];
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        match dev.read(&mut buf) {
+                            // Ok(0)：设备侧「暂无数据」的零长读——按轮询间隔节流，
+                            // 不得裸转（否则无包时 100% CPU 自旋）。
+                            Ok(0) => std::thread::sleep(POLL),
+                            Ok(n) => {
+                                if read_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                                    break; // 会话通道已拆
+                                }
                             }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(POLL);
+                            }
+                            Err(_) => break, // 设备关闭/故障
                         }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(POLL);
-                        }
-                        Err(_) => break, // 设备关闭/故障
                     }
                 })
                 .expect("spawn tun-read");
@@ -308,7 +327,6 @@ impl TunIo {
 
     /// 全局停机：关设备（读/写泵随设备报错退出；进程退出路径）。
     pub fn shutdown(&self) {
-        self.stop.store(true, Ordering::Relaxed);
         let _ = self.dev.close();
     }
 }
