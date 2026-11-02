@@ -135,12 +135,39 @@ fn default_raft_bind() -> SocketAddr {
     "0.0.0.0:9500".parse().expect("const addr")
 }
 
+/// loopback 判定：127.0.0.0/8 全段（IPv4 回环是整段 A 类）或 ::1。
+fn is_loopback(a: &SocketAddr) -> bool {
+    match a {
+        SocketAddr::V4(v4) => v4.ip().is_loopback(),
+        SocketAddr::V6(v6) => v6.ip().is_loopback(),
+    }
+}
+
 impl ServerConfig {
-    /// 解析 server.toml。
+    /// 解析 server.toml（解析后即做加载校验——评审项 3/4：非法配置拒绝起服）。
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let text =
             std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+        let cfg: Self =
+            toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// 加载校验（评审项 3/4）：不合法配置在此拒绝（拒绝起服），而非带病运行。
+    pub fn validate(&self) -> Result<(), String> {
+        // 评审项 3：admin 端点（及其 +1 派生的集群引导端点）必须 loopback——
+        // 它是无认证的进程内单写者入口（§3.11「127.0.0.1 绑定 = 认证边界」）。
+        // 需要远程运维的意图应走 SSH 隧道/反向代理（在错误信息中说明），而非放宽绑定。
+        if !is_loopback(&self.admin_bind) {
+            return Err(format!(
+                "admin_bind {} 非 loopback：admin/集群引导端点是无认证的本机管理入口，\
+                 绑定到非回环地址即对全网开放——拒绝起服。远程运维请走 SSH 隧道\
+                 （ssh -L 9444:127.0.0.1:9444 …）或带认证的反向代理。",
+                self.admin_bind
+            ));
+        }
+        Ok(())
     }
 
     /// 解析为 ListenerMode（缺省 direct；frp 需 `[frp]` 段）。
@@ -217,5 +244,37 @@ serverPort = 7000
         };
         assert!(plan.original_toml.contains("serverAddr"));
         assert_eq!(plan.run_base, PathBuf::from("/tmp/s/frpc-run"));
+    }
+
+    /// 评审项 3：admin/集群引导端点必须 loopback——非 loopback 拒绝起服且错误说明
+    /// SSH 隧道/反代替代；127.0.0.0/8 全段与 ::1 放行。
+    #[test]
+    fn admin_bind_must_be_loopback() {
+        fn cfg_with_admin(admin: &str) -> ServerConfig {
+            let text = format!(
+                "state_dir = \"/tmp/s\"\nadvertise_endpoint = \"127.0.0.1:9443\"\nadmin_bind = \"{admin}\""
+            );
+            toml::from_str(&text).unwrap()
+        }
+        // loopback 全段放行（127.x.y.z 与 ::1）。
+        for ok in ["127.0.0.1:9444", "127.3.2.1:9444", "[::1]:9444"] {
+            let cfg = cfg_with_admin(ok);
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{ok} 应放行: {e}"));
+        }
+        // 非 loopback 拒绝——错误必须说明远程运维走 SSH 隧道/反代。
+        for bad in [
+            "0.0.0.0:9444",
+            "10.1.2.3:9444",
+            "[::]:9444",
+            "[fe80::1]:9444",
+        ] {
+            let err = cfg_with_admin(bad).validate().unwrap_err();
+            assert!(err.contains("loopback"), "{bad} 拒: {err}");
+            assert!(
+                err.contains("SSH") || err.contains("反代") || err.contains("反向代理"),
+                "错误需说明替代通道: {err}"
+            );
+        }
     }
 }
