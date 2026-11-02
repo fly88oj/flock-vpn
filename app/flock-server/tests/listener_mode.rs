@@ -9,7 +9,7 @@
 
 mod common;
 
-use flock_server::config::ServerConfig;
+use flock_server::config::{FrpRelayPlan, ListenerMode, ServerConfig};
 use flock_server::server::{self, RunningListener, ServerCore};
 
 fn cfg_for(mode: &str, state_dir: &std::path::Path) -> ServerConfig {
@@ -27,7 +27,10 @@ fn cfg_for(mode: &str, state_dir: &std::path::Path) -> ServerConfig {
         tun_name: "tun0".into(),
         vip: "100.64.0.1".parse().unwrap(),
         frp: Some(flock_server::config::FrpSection {
+            flavor: "original".into(),
             original_toml: "serverAddr = \"frps\"\nserverPort = 7000\n".into(),
+            chmlfrp_ini: None,
+            user_token_auto: None,
             frpc_bin: state_dir.join("fake-frpc"),
             run_base: Some(state_dir.join("frpc-run")),
         }),
@@ -105,6 +108,131 @@ async fn frp_mode_engages_supervisor_and_fails_fast_without_binary() {
         .join("frpc.toml");
     let text = std::fs::read_to_string(&embedded).expect("embedded frpc.toml");
     assert!(text.contains("serverAddr"), "内嵌 TOML 落盘");
+}
+
+/// 评审项 14：ChmlFrp 装配接线——配置解析 → RelaySpec 构造。
+/// ① `[frp] flavor = "chmlfrp"` + 面板导出 ini 路径 ⇒ 缺省 ChmlFrpMode::ConfigFile；
+/// ② 显式 `[frp.user_token_auto]` opt-in ⇒ UserTokenAuto 模式（ini 可省）；
+/// ③ Original 兼容不破（flavor 缺省 + original_toml）。
+#[tokio::test]
+async fn chmlfrp_config_parses_to_relay_spec() {
+    // ① 缺省 ConfigFile 模式。
+    let cfg: ServerConfig = toml::from_str(
+        r#"
+        state_dir = "/tmp/s"
+        advertise_endpoint = "127.0.0.1:27500"
+        mode = "frp"
+        [frp]
+        flavor = "chmlfrp"
+        chmlfrp_ini = "/etc/flock/chmlfrp-panel.ini"
+    "#,
+    )
+    .unwrap();
+    let ListenerMode::Frp { plan, .. } = cfg.listener_mode().unwrap() else {
+        panic!("frp mode")
+    };
+    let flock_server::config::FrpRelayPlan::ChmlFrp {
+        ini,
+        user_token_auto,
+    } = &plan.relay
+    else {
+        panic!("chmlfrp relay plan: {:?}", plan.relay)
+    };
+    assert_eq!(
+        ini.as_deref(),
+        Some("/etc/flock/chmlfrp-panel.ini".as_ref())
+    );
+    assert!(user_token_auto.is_none(), "缺省 ConfigFile 模式");
+    assert!(
+        matches!(
+            flock_server::frp::chmlfrp_spec_for_test(ini, user_token_auto),
+            flock_frpc::RelaySpec::ChmlFrp {
+                mode: flock_frpc::ChmlFrpMode::ConfigFile(_),
+            }
+        ),
+        "RelaySpec::ChmlFrp + ConfigFile"
+    );
+
+    // ② UserTokenAuto 显式 opt-in。
+    let cfg2: ServerConfig = toml::from_str(
+        r#"
+        state_dir = "/tmp/s"
+        advertise_endpoint = "127.0.0.1:27500"
+        mode = "frp"
+        [frp]
+        flavor = "chmlfrp"
+        [frp.user_token_auto]
+        usertoken = "tok-1"
+        tunnel_id = 42
+    "#,
+    )
+    .unwrap();
+    let ListenerMode::Frp { plan, .. } = cfg2.listener_mode().unwrap() else {
+        panic!("frp mode 2")
+    };
+    let flock_server::config::FrpRelayPlan::ChmlFrp {
+        ini,
+        user_token_auto,
+    } = &plan.relay
+    else {
+        panic!("chmlfrp relay plan 2")
+    };
+    assert!(ini.is_none(), "UserTokenAuto 模式 ini 可省");
+    let uta = user_token_auto.as_ref().expect("opt-in 解析");
+    assert_eq!(uta.usertoken, "tok-1");
+    assert_eq!(uta.tunnel_id, 42);
+    let spec = flock_server::frp::chmlfrp_spec_for_test(ini, user_token_auto);
+    match &spec {
+        flock_frpc::RelaySpec::ChmlFrp {
+            mode:
+                flock_frpc::ChmlFrpMode::UserTokenAuto {
+                    usertoken,
+                    tunnel_id,
+                },
+        } => {
+            assert_eq!(usertoken, "tok-1");
+            assert_eq!(*tunnel_id, 42);
+        }
+        other => panic!("RelaySpec::ChmlFrp + UserTokenAuto: {other:?}"),
+    }
+
+    // ③ Original 兼容不破（flavor 缺省即 original）。
+    let cfg3: ServerConfig = toml::from_str(
+        r#"
+        state_dir = "/tmp/s"
+        advertise_endpoint = "127.0.0.1:27500"
+        mode = "frp"
+        [frp]
+        original_toml = """
+serverAddr = "frps"
+serverPort = 7000
+"""
+    "#,
+    )
+    .unwrap();
+    let ListenerMode::Frp { plan, .. } = cfg3.listener_mode().unwrap() else {
+        panic!("frp mode 3")
+    };
+    assert!(
+        matches!(
+            &plan.relay,
+            flock_server::config::FrpRelayPlan::Original { toml } if toml.contains("serverAddr")
+        ),
+        "Original 兼容不破（缺省 flavor）"
+    );
+    // 校验负路径：chmlfrp 无 ini 且无 opt-in ⇒ 拒。
+    let cfg4: ServerConfig = toml::from_str(
+        r#"
+        state_dir = "/tmp/s"
+        advertise_endpoint = "127.0.0.1:27500"
+        mode = "frp"
+        [frp]
+        flavor = "chmlfrp"
+    "#,
+    )
+    .unwrap();
+    let err = cfg4.listener_mode().unwrap_err();
+    assert!(err.contains("chmlfrp_ini"), "缺配置错误可诊断: {err}");
 }
 
 /// 评审项 7：并发会话上限——`max_sessions = 1` 时第二条入连被接受后立即礼貌关闭

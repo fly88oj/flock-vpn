@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use flock_frpc::supervisor::{RelayPhase, Supervisor, SupervisorConfig};
 use flock_frpc::{
-    FrpcBinaries, FrpcBinary, ManagedRelay, RelayFlavor, RelaySpec, CHMLFRP_PINNED_VERSION,
-    ORIGINAL_PINNED_VERSION,
+    ChmlFrpMode, FrpcBinaries, FrpcBinary, ManagedRelay, RelayFlavor, RelaySpec,
+    CHMLFRP_PINNED_VERSION, ORIGINAL_PINNED_VERSION,
 };
 use tokio::net::TcpListener;
 
@@ -93,7 +93,38 @@ impl Managed {
     }
 }
 
-/// Frp 模式启动：bind 本地监听 + 内嵌 TOML 落盘 + Supervisor 托管原版 frpc。
+/// [`chmlfrp_spec_of`] 的测试暴露面（tests/listener_mode 的「配置解析 → RelaySpec
+/// 构造」断言，评审项 14）。
+pub fn chmlfrp_spec_for_test(
+    ini: &Option<std::path::PathBuf>,
+    user_token_auto: &Option<crate::config::UserTokenAuto>,
+) -> RelaySpec {
+    chmlfrp_spec_of(ini, user_token_auto)
+}
+
+/// config 层 ChmlFrp 参数 → flock-frpc `RelaySpec::ChmlFrp`（评审项 14：ChmlFrp
+/// 装配接线；纯函数——测试断言面）。缺省 `ConfigFile(ini)`，显式 `user_token_auto`
+/// opt-in 才走 `UserTokenAuto`（R20 风险已在上游 flock-frpc 文档化）。
+fn chmlfrp_spec_of(
+    ini: &Option<std::path::PathBuf>,
+    user_token_auto: &Option<crate::config::UserTokenAuto>,
+) -> RelaySpec {
+    RelaySpec::ChmlFrp {
+        mode: match user_token_auto {
+            None => ChmlFrpMode::ConfigFile(
+                ini.clone()
+                    .expect("config 层已校验：无 user_token_auto 时 chmlfrp_ini 必填"),
+            ),
+            Some(uta) => ChmlFrpMode::UserTokenAuto {
+                usertoken: uta.usertoken.clone(),
+                tunnel_id: uta.tunnel_id,
+            },
+        },
+    }
+}
+
+/// Frp 模式启动：bind 本地监听 + （Original 时）内嵌 TOML 落盘 + Supervisor 托管
+/// 对应栈代的 frpc（评审项 14：Original / ChmlFrp 双栈代分派）。
 ///
 /// 内嵌 TOML 写到 `run_base/embedded/frpc.toml`（Supervisor 对该文件只读，§3.9）。
 pub async fn start(plan: FrpPlan, bind: SocketAddr) -> Result<(TcpListener, Managed), String> {
@@ -103,33 +134,61 @@ pub async fn start(plan: FrpPlan, bind: SocketAddr) -> Result<(TcpListener, Mana
 
     std::fs::create_dir_all(&plan.run_base)
         .map_err(|e| format!("frp run dir {}: {e}", plan.run_base.display()))?;
-    let toml_path = plan.run_base.join("embedded").join("frpc.toml");
-    // frpc.toml 可含服务端 token/凭证 ⇒ 0600 落盘（评审项 1；创建即收紧）。
-    crate::write_private_file(&toml_path, plan.original_toml.as_bytes())
-        .map_err(|e| format!("write {}: {e}", toml_path.display()))?;
-
-    // 双栈声明（flock-frpc 的 FrpcBinaries 需两栈齐备；Original 路径只校验 original 侧，
-    // chmlfrp 槽位在此模式恒不触碰——见 flock-frpc spec.rs validate_spec 的 match 分派）。
-    let bins = FrpcBinaries {
-        original: FrpcBinary {
-            path: plan.frpc_bin.clone(),
-            flavor: RelayFlavor::Original,
-            decl_version: ORIGINAL_PINNED_VERSION.to_string(),
-        },
-        chmlfrp: FrpcBinary {
-            path: plan.run_base.join("chmlfrpc-unused"),
-            flavor: RelayFlavor::ChmlFrp,
-            decl_version: CHMLFRP_PINNED_VERSION.to_string(),
-        },
+    // 双栈声明（flock-frpc 的 FrpcBinaries 需两栈齐备；只有 plan.relay 对应的栈代会被
+    // 校验/使用，另一槽位恒不触碰——见 flock-frpc spec.rs validate_spec 的 match 分派）。
+    let (spec, bins) = match &plan.relay {
+        crate::config::FrpRelayPlan::Original { toml } => {
+            let toml_path = plan.run_base.join("embedded").join("frpc.toml");
+            // frpc.toml 可含服务端 token/凭证 ⇒ 0600 落盘（评审项 1；创建即收紧）。
+            crate::write_private_file(&toml_path, toml.as_bytes())
+                .map_err(|e| format!("write {}: {e}", toml_path.display()))?;
+            (
+                RelaySpec::Original { toml: toml_path },
+                FrpcBinaries {
+                    original: FrpcBinary {
+                        path: plan.frpc_bin.clone(),
+                        flavor: RelayFlavor::Original,
+                        decl_version: ORIGINAL_PINNED_VERSION.to_string(),
+                    },
+                    chmlfrp: unused_bin(&plan.run_base, RelayFlavor::ChmlFrp),
+                },
+            )
+        }
+        crate::config::FrpRelayPlan::ChmlFrp {
+            ini,
+            user_token_auto,
+        } => (
+            chmlfrp_spec_of(ini, user_token_auto),
+            FrpcBinaries {
+                original: unused_bin(&plan.run_base, RelayFlavor::Original),
+                chmlfrp: FrpcBinary {
+                    path: plan.frpc_bin.clone(),
+                    flavor: RelayFlavor::ChmlFrp,
+                    decl_version: CHMLFRP_PINNED_VERSION.to_string(),
+                },
+            },
+        ),
     };
     let mut cfg = SupervisorConfig::new(bins);
     cfg.run_base = plan.run_base.clone();
     let supervisor = Supervisor::new(cfg);
     let relay = supervisor
-        .start(RelaySpec::Original { toml: toml_path })
+        .start(spec)
         .await
         .map_err(|e| format!("frpc supervisor: {e}"))?;
     Ok((listener, Managed { relay }))
+}
+
+/// 未使用栈代的占位二进制声明（该槽位不参与校验/启动——R9 矩阵按 spec 分派）。
+fn unused_bin(run_base: &Path, flavor: RelayFlavor) -> FrpcBinary {
+    FrpcBinary {
+        path: run_base.join(match flavor {
+            RelayFlavor::ChmlFrp => "chmlfrpc-unused",
+            RelayFlavor::Original => "frpc-unused",
+        }),
+        flavor,
+        decl_version: flavor.pinned_version().to_string(),
+    }
 }
 
 /// Frp 模式启动期自检（测试用：Supervisor 确实接管、run 目录已生成）。

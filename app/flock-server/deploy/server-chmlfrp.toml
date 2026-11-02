@@ -1,0 +1,40 @@
+# server.toml —— Frp 模式 · ChmlFrp 栈代示例（评审项 14；docs/design.md §2.1/§3.9）。
+#
+# 与 server-frp.toml（原版栈）的差异仅在 [frp] 段：
+# - flavor = "chmlfrp"：走 ChmlFrp 面板节点（ChmlFrp-0.51.2_251023 定版 frpc）；
+# - chmlfrp_ini：面板「隧道管理→配置文件」导出的 frpc.ini 落机路径（缺省 ConfigFile
+#   模式——frpc -c <ini>，面板参数字节级透传，仅注入 admin 探测字段）；
+# - frpc_bin 指向 ChmlFrp 定版 frpc 二进制（R9 版本矩阵：chmlfrp 栈代 × ChmlFrp 定版）。
+#
+# 复制到 /etc/flock/server.toml 并按部署改 advertise/extra（= 面板隧道的用户口）。
+# 注：示例放 app/flock-server/deploy/（本批次文件修改面限定；仓库根 deploy/ 的镜像
+# 归档由运维侧按需同步）。
+
+state_dir = "/var/lib/flock"
+mode = "frp"
+bind = "0.0.0.0:9443"
+admin_bind = "127.0.0.1:9444"
+
+# 客户端可见端点 = ChmlFrp 面板隧道的用户口（host:port 与面板一致）。
+advertise_endpoint = "chml.example.net:27500"
+extra_endpoints = ["chml.example.net:27501"]
+dir_version = 1
+ticket_ttl_secs = 60
+max_sessions = 1024
+
+[frp]
+flavor = "chmlfrp"
+# 面板导出的 frpc.ini（运维从面板「隧道管理→配置文件」粘贴落机；服务端只读）。
+chmlfrp_ini = "/etc/flock/chmlfrp-panel.ini"
+# ChmlFrp 定版 frpc 二进制（R9 矩阵：与 chmlfrp 栈代配对，禁交叉原版）。
+frpc_bin = "/usr/local/bin/chmlfrpc"
+
+# —— 可选：UserTokenAuto 显式 opt-in（默认不启用）——
+# R20 风险（启用前必读，flock-frpc spec.rs 同文）：
+# - 面板 usertoken 为全权凭据，自举经 InsecureSkipVerify 的 HTTPS 拉取（可被中间人
+#   截获）；token 进入子进程命令行（同机 ps 可读）；拉取配置对托管层不透明。
+# 组织/多用户机器不要启用；个人机器确认接受风险后取消注释：
+#
+# [frp.user_token_auto]
+# usertoken = "<面板 usertoken——勿入版本库>"
+# tunnel_id = 123456

@@ -18,13 +18,43 @@ use crate::ticket::TICKET_TTL_SECS;
 /// frp 模式的装配计划（config 层自有类型；flock-frpc 类型不出现在此层）。
 #[derive(Debug, Clone)]
 pub struct FrpPlan {
-    /// 原版 frpc TOML（v0.71.1 方言）**内嵌全文**——server.toml `[frp] original_toml`；
-    /// 启动时写出到 state 目录再以 `RelaySpec::Original{toml}` 注册（走真实产品路径）。
-    pub original_toml: String,
-    /// 原版 frpc 二进制路径（v0.71.1 定版；R9 矩阵锁在 flock-frpc 内执行）。
+    /// 中继规格（config 层自有形态；`frp.rs` 据此构造 flock-frpc 的 `RelaySpec`）。
+    pub relay: FrpRelayPlan,
+    /// frpc 二进制路径（对应 `relay` 栈代；R9 版本矩阵锁在 flock-frpc 内执行）。
     pub frpc_bin: PathBuf,
     /// Supervisor run 目录基点（托管配置/日志落点）。
     pub run_base: PathBuf,
+}
+
+/// `[frp]` 的中继栈代（评审项 14：ChmlFrp 装配层接线——config 层自有形态，
+/// 不引用 flock-frpc 类型）。
+#[derive(Debug, Clone)]
+pub enum FrpRelayPlan {
+    /// 原版 frpc（v0.71.1 定版）：TOML（v0.71.1 方言）**内嵌全文**——启动时写出到
+    /// state 目录再以 `RelaySpec::Original{toml}` 注册（走真实产品路径，兼容不破）。
+    Original { toml: String },
+    /// ChmlFrp 节点（`ChmlFrp-0.51.2_251023` 定版）。缺省 [`ChmlFrpMode::ConfigFile`]
+    /// 语义：面板「隧道管理→配置文件」导出的 frpc.ini 路径（字节级透传，仅注入
+    /// admin 探测字段）；`user_token_auto` 显式 opt-in 才走 `-u/-p` 自举（R20 风险
+    /// 见 [`UserTokenAuto`] 文档）。
+    ChmlFrp {
+        ini: Option<PathBuf>,
+        user_token_auto: Option<UserTokenAuto>,
+    },
+}
+
+/// `[frp] mode = "chmlfrp"` 的 `user_token_auto` opt-in（评审项 14）。
+///
+/// **R20 风险（opt-in 前必读）**：面板 usertoken 是全权凭据，自举走
+/// InsecureSkipVerify 的 HTTPS 拉取（中间人可截获全权 token）、token 进入子进程
+/// 命令行（同机 `ps` 可读）、拉取配置对托管层不透明（探活只剩进程状态面）——
+/// 组织/多用户机器不要启用；缺省 ConfigFile 模式无这些暴露。
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserTokenAuto {
+    /// 面板 usertoken（**凭据**：面板全权；勿入日志/版本库）。
+    pub usertoken: String,
+    /// 隧道数字 ID（面板「隧道管理」可见）。
+    pub tunnel_id: u64,
 }
 
 /// 接入端点形态（§3.11 接缝枚字的 config 层形态；运行时句柄见 `server::RunningListener`）。
@@ -99,9 +129,21 @@ pub struct SyncSection {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FrpSection {
-    /// 原版 frpc TOML 全文（内嵌注册，§7-M2「server 内嵌 frpc」）。
+    /// 中继栈代：`original`（缺省）| `chmlfrp`（评审项 14：ChmlFrp 面板节点）。
+    #[serde(default = "default_frp_flavor")]
+    pub flavor: String,
+    /// 原版 frpc TOML 全文（内嵌注册，§7-M2「server 内嵌 frpc」；flavor=original 必填）。
+    #[serde(default)]
     pub original_toml: String,
-    /// frpc 二进制路径（缺省 /usr/local/bin/frpc——deploy 镜像内位置）。
+    /// ChmlFrp：面板导出的 frpc.ini 路径（flavor=chmlfrp 的缺省 ConfigFile 模式必填）。
+    #[serde(default)]
+    pub chmlfrp_ini: Option<PathBuf>,
+    /// ChmlFrp `UserTokenAuto` 显式 opt-in（R20 风险见 [`UserTokenAuto`]；给此项则
+    /// 覆盖 ConfigFile 模式，`chmlfrp_ini` 可省）。
+    #[serde(default)]
+    pub user_token_auto: Option<UserTokenAuto>,
+    /// frpc 二进制路径（缺省 /usr/local/bin/frpc——deploy 镜像内位置；chmlfrp 栈代
+    /// 应指向 ChmlFrp 定版 frpc 二进制）。
     #[serde(default = "default_frpc_bin")]
     pub frpc_bin: PathBuf,
     /// run 目录基点（缺省 state_dir/frpc-run）。
@@ -131,6 +173,9 @@ fn default_tun_name() -> String {
 }
 fn default_frpc_bin() -> PathBuf {
     PathBuf::from("/usr/local/bin/frpc")
+}
+fn default_frp_flavor() -> String {
+    "original".into()
 }
 fn default_vip() -> std::net::Ipv4Addr {
     crate::dataplane::SERVER_VIP
@@ -196,11 +241,52 @@ impl ServerConfig {
                 let frp = self
                     .frp
                     .as_ref()
-                    .ok_or("listener.mode = \"frp\" 需要 [frp] 段（original_toml 内嵌注册）")?;
+                    .ok_or("listener.mode = \"frp\" 需要 [frp] 段")?;
+                // 评审项 14：[frp].flavor 分派（original 缺省 / chmlfrp），config 层
+                // 校验必填项后产出 FrpRelayPlan；RelaySpec 构造在 frp.rs（类型隔离）。
+                let relay = match frp.flavor.as_str() {
+                    "" | "original" => {
+                        if frp.original_toml.trim().is_empty() {
+                            return Err(
+                                "[frp] flavor = \"original\" 需要 original_toml 内嵌全文".into()
+                            );
+                        }
+                        FrpRelayPlan::Original {
+                            toml: frp.original_toml.clone(),
+                        }
+                    }
+                    "chmlfrp" => match (&frp.user_token_auto, &frp.chmlfrp_ini) {
+                        (Some(uta), _) => {
+                            if uta.usertoken.trim().is_empty() {
+                                return Err("[frp] user_token_auto.usertoken 为空".into());
+                            }
+                            if uta.tunnel_id == 0 {
+                                return Err("[frp] user_token_auto.tunnel_id 为 0".into());
+                            }
+                            FrpRelayPlan::ChmlFrp {
+                                ini: frp.chmlfrp_ini.clone(),
+                                user_token_auto: Some(uta.clone()),
+                            }
+                        }
+                        (None, Some(ini)) => FrpRelayPlan::ChmlFrp {
+                            ini: Some(ini.clone()),
+                            user_token_auto: None,
+                        },
+                        (None, None) => {
+                            return Err("[frp] flavor = \"chmlfrp\" 需要 chmlfrp_ini（面板导出的 \
+                                 frpc.ini 路径；缺省 ConfigFile 模式）或显式 \
+                                 [frp.user_token_auto] opt-in"
+                                .into())
+                        }
+                    },
+                    other => {
+                        return Err(format!("[frp] flavor 未知：{other:?}（original|chmlfrp）"))
+                    }
+                };
                 Ok(ListenerMode::Frp {
                     bind: self.bind,
                     plan: FrpPlan {
-                        original_toml: frp.original_toml.clone(),
+                        relay,
                         frpc_bin: frp.frpc_bin.clone(),
                         run_base: frp
                             .run_base
@@ -261,7 +347,10 @@ serverPort = 7000
         let ListenerMode::Frp { plan, .. } = cfg3.listener_mode().unwrap() else {
             panic!("frp mode");
         };
-        assert!(plan.original_toml.contains("serverAddr"));
+        match &plan.relay {
+            FrpRelayPlan::Original { toml } => assert!(toml.contains("serverAddr")),
+            other => panic!("缺省 flavor = original: {other:?}"),
+        }
         assert_eq!(plan.run_base, PathBuf::from("/tmp/s/frpc-run"));
     }
 
