@@ -683,13 +683,19 @@ a12() {
     out1="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux replayed_record 2>&1)"
     out2="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux forge 2>&1)"
     printf '%s\n' "$out1$out2" | grep -E 'test .*(replay|forge)' | sed 's/^/    /'
-    local n_ok n_all
-    n_ok="$(printf '%s\n' "$out1$out2" | grep -c 'test result: ok')"
-    n_all="$(printf '%s\n' "$out1$out2" | grep -c 'test result:')"
-    if [ "$n_ok" = "2" ] && [ "$n_all" = "2" ]; then
-        record PASS A12 "重放拒+计数、伪造 ≤N 存活/100 次断链 复跑通过（2/2 套）"
+    # 判据必须是**真执行**（A8 纪律，同 a8()）：只数 `test result: ok` 会把「过滤器
+    # 无匹配」的空跑（0 passed 同样带 ok 行）记成 PASS。两次复跑各断言：具名测试
+    # `... ok` 行 + `test result: ok. N passed` 且 N≥1。注：`forge` 过滤器同时命中
+    # forge_limit_breaks_link_at_100 与 forged_records_below_limit_keep_link——两个
+    # 具名都得 ok。测试不存在/更名 ⇒ 在此 FAIL。
+    if printf '%s\n' "$out1" | grep -q 'test replayed_record_rejected_and_counted ... ok' \
+        && printf '%s\n' "$out1" | grep -qE 'test result: ok\. [1-9][0-9]* passed' \
+        && printf '%s\n' "$out2" | grep -q 'test forge_limit_breaks_link_at_100 ... ok' \
+        && printf '%s\n' "$out2" | grep -q 'test forged_records_below_limit_keep_link ... ok' \
+        && printf '%s\n' "$out2" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
+        record PASS A12 "重放拒+计数（replayed_record_rejected_and_counted）、伪造 ≤N 存活 + 100 次断链（forge 两用例）复跑真执行通过"
     else
-        record FAIL A12 "复跑未全绿（$n_ok/$n_all）"
+        record FAIL A12 "复跑未全绿或未真执行（判据：两个 replay/forge 具名 ok + 各 ≥1 passed；见上）"
     fi
 }
 
@@ -914,7 +920,8 @@ FOOTNOTES=$(cat <<'FN'
    完成——NOT_HERE→location_query 路径未被触发时如实记录；该路径由 flock-sync tests/forward
    单测覆盖。
 3. A8/A11/A12 为设计指定的单测复跑入口（A8：session_mux #[ignore] 档 100 流×60s，以 --ignored
-   真执行——判据要求具名测试 ok 且 ≥1 passed，空跑不得记 PASS；A11：compress 档；A12：replay/forge）。
+   真执行——判据要求具名测试 ok 且 ≥1 passed，空跑不得记 PASS；A11：compress 档；A12：replay/forge
+   ——判据同 A8 纪律：每轮复跑均须具名测试 ok + ≥1 passed，空跑/过滤器无匹配即 FAIL）。
 4. 实测暴露并修复的三处产品缺陷：redb vote 编解码不对称（tests/store_reopen 回归）；长寿命
    会话租约蒸发（lease_refresh_loop TTL/3 续期）；互连全局锁跨网络 await + 无拨号预算（锁外
    拨号 + TcpFabric 3s 预算）。
