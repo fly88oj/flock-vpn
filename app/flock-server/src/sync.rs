@@ -232,7 +232,11 @@ async fn wait_bundle(path: &std::path::Path) -> Result<Vec<u8>, String> {
     }
 }
 
-/// ServerCore（等集群就绪：Bootstrap 的票据根 + SetOprf 在本节点 apply）。
+/// ServerCore（等集群就绪：Bootstrap + 本服务器的 OPRF 封装在本节点 apply）。
+///
+/// 只重试 transient 错误（[`crate::server::SYNC_NOT_READY_PREFIX`] 起头——封装尚未
+/// 复制到位）；永久错误（评审项 2：wrap 解封失败 = 本机 hybrid 私钥与封装不匹配，
+/// 重试无意义）立即上抛。
 async fn wait_cluster_ready(
     cfg: ServerConfig,
     ident: Arc<ServerIdentity>,
@@ -242,15 +246,19 @@ async fn wait_cluster_ready(
     loop {
         match ServerCore::open_sync(cfg.clone(), ident.clone(), node.clone()).await {
             Ok(core) => return Ok(core),
-            Err(e) if std::time::Instant::now() < deadline => {
-                eprintln!("flock-server: 集群未就绪（{e}）——2s 后重试");
+            Err(e)
+                if e.starts_with(crate::server::SYNC_NOT_READY_PREFIX)
+                    && std::time::Instant::now() < deadline =>
+            {
+                eprintln!("flock-server: {e}——2s 后重试");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
-            Err(e) => {
+            Err(e) if e.starts_with(crate::server::SYNC_NOT_READY_PREFIX) => {
                 return Err(format!(
-                    "集群 600s 内未就绪（Bootstrap/SetOprf 未 apply）: {e}"
+                    "集群 600s 内未就绪（Bootstrap/本机 OPRF 封装未 apply）: {e}"
                 ))
             }
+            Err(e) => return Err(e), // 永久错误（解封失败等）——立即上抛
         }
     }
 }

@@ -145,6 +145,48 @@ impl flock_sync::hooks::SyncHooks for ServerSyncHooks {
     }
 }
 
+// ============================================================================
+// OPRF key 逐服务器封装（评审项 2：design §2.4「加密封装到各服务器混合公钥」）
+// ============================================================================
+
+/// `open_sync` transient 错误前缀（sync.rs 的就绪重试循环据此区分「未就绪可重试」
+/// 与「永久错误立即上抛」）。
+#[cfg(feature = "multi-primary")]
+pub const SYNC_NOT_READY_PREFIX: &str = "集群未就绪：";
+
+/// 把 OPRF key（b64 ServerSetup）以 envelope v2 密封到一台服务器的混合公钥。
+///
+/// 产物即 `AdminOp::Rewrap { server_id, wrapped }` 的 `wrapped`——Raft 状态机只存
+/// 封装字节（明文不出现在任何持久层）；收件人服务器的 `server_keys` 登记与
+/// rewrap 提交均需集群根密钥签名（§4-3 红线：被入侵的单台无法自授/重封）。
+#[cfg(feature = "multi-primary")]
+pub fn seal_oprf_wrap(
+    oprf_b64: &str,
+    recipient: &flock_protocol::kem::HybridPubkey,
+) -> Result<Vec<u8>, String> {
+    let mut sealed = Vec::new();
+    flock_protocol::envelope::seal_v2(
+        recipient,
+        std::io::Cursor::new(oprf_b64.as_bytes()),
+        &mut sealed,
+    )
+    .map_err(|e| format!("envelope seal: {e}"))?;
+    Ok(sealed)
+}
+
+/// [`seal_oprf_wrap`] 的逆：本机 hybrid sk 解封取出 OPRF b64（仅内存使用）。
+/// 错误 = 收件人不匹配/封装损坏/明文非 UTF-8——对服务器即「OPAQUE 不可用」。
+#[cfg(feature = "multi-primary")]
+pub fn open_oprf_wrap(
+    sk: &flock_protocol::kem::HybridKeypair,
+    wrapped: &[u8],
+) -> Result<String, String> {
+    let mut plain = Vec::new();
+    flock_protocol::envelope::open_v2(sk, std::io::Cursor::new(wrapped), &mut plain)
+        .map_err(|e| format!("envelope open: {e}"))?;
+    String::from_utf8(plain).map_err(|_| "oprf 明文非 UTF-8".to_string())
+}
+
 /// 服务端核心（装配期构建；Arc 共享给 accept/admin 任务）。
 pub struct ServerCore {
     pub cfg: ServerConfig,
@@ -315,29 +357,59 @@ impl ServerCore {
     /// - 目录 = `session::respond` 注入 [`flock_sync::SyncNode::device_directory`]
     ///   （两级读：记录缓存 + epoch + apply-lag 熔断降级线性一致读，§4）；
     /// - 票据根 = Raft 状态内（Bootstrap 落库）；
-    /// - OPRF key = Raft 内共享（SetOprf 根签登记——跨节点登录，§2.4）；
+    /// - OPRF key = **逐服务器封装在 Raft 状态内**（§2.4「加密封装到各服务器混合
+    ///   公钥」——envelope v2 seal 到每台在册服务器，状态机只存 wraps（AdminOp::
+    ///   Rewrap）；本机启动时用自己的 hybrid sk 解封进内存，解封失败 ⇒ OPAQUE 不可
+    ///   用并明确报错，评审项 2）；
     /// - 吊销/租约冲突经 [`flock_sync::hooks::SyncHooks`] 在 apply 现场杀本地会话（§2.2）。
     ///
-    /// 前置：集群已 Bootstrap（ticket_root + SetOprf 就位）——init-cluster/enroll 流程或
-    /// 装配方（tests/multi_primary.rs）完成；等待窗口 15s。
+    /// 前置：集群已 Bootstrap + ServerKeys 登记 + 本服务器的 Rewrap 落库——
+    /// `cluster-bootstrap`（根密钥侧）或装配方（tests/multi_primary.rs）完成。
     #[cfg(feature = "multi-primary")]
     pub async fn open_sync(
         cfg: ServerConfig,
         ident: Arc<ServerIdentity>,
         node: Arc<flock_sync::SyncNode>,
     ) -> Result<Arc<Self>, String> {
-        // 等 Bootstrap + SetOprf 复制到位（本节点 apply 即可见——本地读）。能力经
-        // SyncNode 白名单方法（评审项 13：不再直捣 sm() 内部句柄）。
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let oprf_b64 = loop {
-            if let Some(o) = node.oprf_b64() {
-                break o;
+        Self::open_sync_with_wait(cfg, ident, node, std::time::Duration::from_secs(15)).await
+    }
+
+    /// [`ServerCore::open_sync`] 的可调等待窗变体（测试用短窗验证「无 wrap 明确失败」；
+    /// 错误约定：transient 错误以 [`SYNC_NOT_READY_PREFIX`] 起头——sync.rs 的重试循环
+    /// 只重试该类，永久错误（wrap 解封失败等）立即上抛）。
+    #[cfg(feature = "multi-primary")]
+    pub async fn open_sync_with_wait(
+        cfg: ServerConfig,
+        ident: Arc<ServerIdentity>,
+        node: Arc<flock_sync::SyncNode>,
+        wait: std::time::Duration,
+    ) -> Result<Arc<Self>, String> {
+        // 本机 node_id（wrap 的键 = node_id_of(server_id)——与 ServerKeys/Rewrap 同键）。
+        let my_node = flock_sync::node::node_id_of(&ident.server_id);
+        // 等本服务器的 OPRF 封装在本节点 apply（Bootstrap → ServerKeys → Rewrap 的提交
+        // 序 ⇒ wrap 可见蕴含 Bootstrap/票据根就位）。能力经 SyncNode 白名单方法
+        // （评审项 13）。
+        let deadline = std::time::Instant::now() + wait;
+        let wrapped = loop {
+            if let Some(w) = node.local_wrap(my_node) {
+                break w;
             }
             if std::time::Instant::now() >= deadline {
-                return Err("集群未就绪：15s 内未见 Bootstrap/SetOprf 在本节点 apply".into());
+                return Err(format!(
+                    "{SYNC_NOT_READY_PREFIX}{wait:?} 内未见本服务器（node {my_node}）的 \
+                     OPRF 封装（AdminOp::Rewrap 未在本节点 apply——cluster-bootstrap 需以 \
+                     ServerKeys 登记各服务器混合公钥并逐台 rewrap）"
+                ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
+        // 用本机 hybrid sk 解封（评审项 2：明文只在内存——不落 Raft 状态/状态库）。
+        let oprf_b64 = open_oprf_wrap(&ident.static_hybrid, &wrapped).map_err(|e| {
+            format!(
+                "OPRF 封装解封失败（本机 hybrid 私钥与 wrap 不匹配或封装损坏）——\
+                 OPAQUE 不可用: {e}"
+            )
+        })?;
         let oprf = flock_protocol::pake::server_setup_load(&oprf_b64)
             .map_err(|e| format!("集群 OPRF key: {e}"))?;
         let sessions = Arc::new(LiveSessions::default());
@@ -738,4 +810,51 @@ pub async fn run(
 /// 签名便利：根密钥对任意字节签名（邀请/目录扩展用；测试亦可断言）。
 pub fn root_sign(root: &SigningKey, bytes: &[u8]) -> [u8; 64] {
     root.sign(bytes).to_bytes()
+}
+
+#[cfg(all(test, feature = "multi-primary"))]
+mod tests {
+    use super::*;
+
+    /// 评审项 2：OPRF 逐服务器封装——密封产物不含明文（Raft 状态里的 wraps 读不出
+    /// b64 明文）；正确收件人解封还原；错误收件人（无对应 wrap 的服务器）明确失败。
+    #[test]
+    fn oprf_wrap_sealed_not_plaintext_and_recipient_bound() {
+        let recipient = HybridKeypair::generate(&mut flock_protocol::rand::rngs::OsRng);
+        let other = HybridKeypair::generate(&mut flock_protocol::rand::rngs::OsRng);
+        let oprf_b64 =
+            flock_protocol::pake::server_setup_new(&mut flock_protocol::rand::rngs::OsRng);
+
+        let wrapped = seal_oprf_wrap(&oprf_b64, &recipient.public()).expect("seal");
+        // 密封存储不可读出明文：明文 b64 的任意长子串都不出现在封装字节里。
+        let probe = &oprf_b64[oprf_b64.len() / 2..];
+        assert!(
+            !wrapped.windows(probe.len()).any(|w| w == probe.as_bytes()),
+            "封装字节不得包含明文片段"
+        );
+        assert_eq!(
+            wrapped[0],
+            flock_protocol::envelope::V2_VER,
+            "envelope v2 头"
+        );
+        // 收件人解封还原（往返）。
+        assert_eq!(
+            open_oprf_wrap(&recipient, &wrapped).expect("open"),
+            oprf_b64,
+            "正确收件人解封还原 OPRF b64"
+        );
+        // 非收件人明确失败（无对应 wrap 的服务器 ⇒ OPAQUE 不可用路径）。
+        let err = open_oprf_wrap(&other, &wrapped).expect_err("wrong recipient");
+        assert!(
+            err.contains("envelope open"),
+            "错误需可归因（envelope 认证失败）: {err}"
+        );
+        // 损坏封装明确失败。
+        let mut tampered = wrapped.clone();
+        let n = tampered.len();
+        tampered[n - 1] ^= 1;
+        assert!(open_oprf_wrap(&recipient, &tampered).is_err(), "篡改拒");
+        // server_setup_load 接受解封产物（真实 OPRF 语义闭环）。
+        assert!(flock_protocol::pake::server_setup_load(&oprf_b64).is_ok());
+    }
 }

@@ -58,6 +58,32 @@ struct Node3 {
 }
 
 async fn build_cluster() -> Node3 {
+    let c3 = build_cluster_bare().await;
+    // OPRF 逐服务器封装（评审项 2）：ServerKeys 根签登记各服务器混合公钥 → 每台
+    // envelope v2 seal 一份 Rewrap——状态机只存 wraps，不再明文 SetOprf（§2.4 跨
+    // 节点登录语义不变）。
+    let oprf_b64 = server_setup_new(&mut rand::rngs::OsRng);
+    let leader = wait_leader(&c3.nodes).await;
+    submit_wrapped_oprf(&leader, &c3.root, &c3.idents, &oprf_b64).await;
+    // 密封存储不可读出明文（线格式断言）：全网明文 OPRF 字段为空；状态摘要只有
+    // wraps（3 台各一份）。
+    for n in &c3.nodes {
+        assert!(n.oprf_b64().is_none(), "明文 OPRF 不得入 Raft 状态");
+    }
+    let view = c3.nodes[0]
+        .read_linearizable(flock_sync::proto::ReadQuery::State)
+        .await
+        .expect("state view");
+    let flock_sync::proto::ReadView::State(v) = view else {
+        panic!("state view shape: {view:?}")
+    };
+    assert_eq!(v.wraps.len(), 3, "每台服务器一份封装（rewrap）");
+    c3
+}
+
+/// 3 节点集群装配到 Bootstrap 为止（OPRF 封装提交由调用方决定子集——评审项 2 的
+/// 「无 wrap 服务器失败 / rewrap 后可解封」用例）。
+async fn build_cluster_bare() -> Node3 {
     let root = ed25519_dalek::SigningKey::from_bytes(&rand::random::<[u8; 32]>());
     let cluster_id = flock_protocol::session::ClusterId(rand::random());
     let voters: Vec<NodeId> = vec![1, 2, 3];
@@ -98,7 +124,7 @@ async fn build_cluster() -> Node3 {
         recorders.push(rec);
     }
 
-    // Bootstrap（票据根进 Raft，§4）+ SetOprf（共享 OPRF——跨节点登录，§2.4）。
+    // Bootstrap（票据根进 Raft，§4）。
     let leader = wait_leader(&nodes).await;
     let ticket_root: [u8; 32] = rand::random();
     let boot = leader
@@ -113,27 +139,6 @@ async fn build_cluster() -> Node3 {
         matches!(boot, flock_sync::proto::SyncResponse::Ok),
         "bootstrap: {boot:?}"
     );
-    let oprf_b64 = server_setup_new(&mut rand::rngs::OsRng);
-    let oprf_op = flock_sync::proto::AdminOp::Rewrap {
-        server_id: 0,
-        wrapped: oprf_b64.as_bytes().to_vec(),
-    };
-    let _ = oprf_op; // （SetOprf 走独立构造，非 AdminOp——见下）
-    let set_oprf = SyncRequest::SetOprf(flock_sync::proto::RootSigned {
-        op: oprf_b64.clone(),
-        sig: {
-            use ed25519_dalek::Signer as _;
-            let mut canon = b"flock-sync/set-oprf/v1".to_vec();
-            canon.extend_from_slice(&(oprf_b64.len() as u32).to_le_bytes());
-            canon.extend_from_slice(oprf_b64.as_bytes());
-            root.sign(&canon).to_bytes()
-        },
-    });
-    let resp = leader.write(set_oprf).await.expect("set oprf");
-    assert!(
-        matches!(resp, flock_sync::proto::SyncResponse::Ok),
-        "set_oprf: {resp:?}"
-    );
 
     Node3 {
         root,
@@ -143,6 +148,52 @@ async fn build_cluster() -> Node3 {
         directory,
         recorders,
         _tmp: tmp,
+    }
+}
+
+/// ServerKeys + 逐服务器 Rewrap 提交（build_cluster 与 rewrap 补交测试共用）。
+/// 断言：状态摘要只含 wraps（3 台各一份）且全网明文 oprf 字段为空（评审项 2 的
+/// 「密封存储不可读出明文」在线格式断言）。
+async fn submit_wrapped_oprf(
+    leader: &Arc<SyncNode>,
+    root: &ed25519_dalek::SigningKey,
+    idents: &[Arc<flock_protocol::session::ServerIdentity>],
+    oprf_b64: &str,
+) {
+    let entries: Vec<flock_sync::proto::ServerKeyEntry> = idents
+        .iter()
+        .map(|i| flock_sync::proto::ServerKeyEntry {
+            server_id: flock_sync::node::node_id_of(&i.server_id),
+            identity_pub: *i.identity.verifying_key().as_bytes(),
+            hybrid_pub: i.static_hybrid.public().to_bytes().to_vec(),
+        })
+        .collect();
+    let resp = leader
+        .write(SyncRequest::server_keys_signed(root, entries))
+        .await
+        .expect("server keys");
+    assert!(
+        matches!(
+            resp,
+            flock_sync::proto::SyncResponse::ServerKeys { servers } if servers == idents.len()
+        ),
+        "server_keys: {resp:?}"
+    );
+    for ident in idents {
+        let node_id = flock_sync::node::node_id_of(&ident.server_id);
+        let wrapped = flock_server::server::seal_oprf_wrap(oprf_b64, &ident.static_hybrid.public())
+            .expect("seal");
+        let resp = leader
+            .write(SyncRequest::rewrap_signed(root, node_id, wrapped))
+            .await
+            .expect("rewrap");
+        assert!(
+            matches!(
+                resp,
+                flock_sync::proto::SyncResponse::Admin(flock_sync::proto::AdminAck::Rewrap { .. })
+            ),
+            "rewrap: {resp:?}"
+        );
     }
 }
 
@@ -174,11 +225,25 @@ async fn serve_on(c3: &Node3, idx: usize, extra_endpoints: Vec<String>) -> SyncS
     std::mem::forget(tmp);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = l.local_addr().unwrap().to_string();
-    let cfg = ServerConfig {
+    let cfg = sync_server_cfg(state_dir, endpoint.clone(), extra_endpoints);
+    let core = ServerCore::open_sync(cfg, c3.idents[idx].clone(), c3.nodes[idx].clone())
+        .await
+        .expect("open_sync");
+    tokio::spawn(core.clone().serve_listener(l));
+    SyncServer { core, endpoint }
+}
+
+/// serve_on / open_sync 直测共用的 ServerConfig（装配经 open_sync，不走配置文件路径）。
+fn sync_server_cfg(
+    state_dir: std::path::PathBuf,
+    advertise_endpoint: String,
+    extra_endpoints: Vec<String>,
+) -> ServerConfig {
+    ServerConfig {
         state_dir,
         bind: "127.0.0.1:9443".parse().unwrap(),
         mode: "direct".into(),
-        advertise_endpoint: endpoint.clone(),
+        advertise_endpoint,
         extra_endpoints,
         dir_version: 1,
         ticket_ttl_secs: 60,
@@ -187,13 +252,8 @@ async fn serve_on(c3: &Node3, idx: usize, extra_endpoints: Vec<String>) -> SyncS
         tun_name: "tun0".into(),
         vip: "100.64.0.1".parse().unwrap(),
         frp: None,
-        sync: None, // 装配经 open_sync（进程内），不走配置文件路径
-    };
-    let core = ServerCore::open_sync(cfg, c3.idents[idx].clone(), c3.nodes[idx].clone())
-        .await
-        .expect("open_sync");
-    tokio::spawn(core.clone().serve_listener(l));
-    SyncServer { core, endpoint }
+        sync: None,
+    }
 }
 
 /// 客户端 pin：以根签目录条目为身份锚，**拨号地址换成 TCP 监听口**（目录内
@@ -711,4 +771,108 @@ async fn three_node_cluster_forward_and_revocation() {
             .verify_pinned(&c3.cluster_id, &c3.root.verifying_key()),
         PinVerdict::Match
     );
+}
+
+// ============================================================================
+// 评审项 2：OPRF 逐服务器封装的就绪语义（无 wrap 明确失败 / rewrap 后新服务器可解封）
+// ============================================================================
+
+/// ① 只给节点 1/2 封装：节点 3 的 `open_sync` 在短窗内明确失败（错误点名「OPRF 封装」，
+///    属 transient 类——sync.rs 的就绪重试只认该类）；
+/// ② 补交节点 3 的 rewrap 后：`open_sync` 成功（本机 hybrid sk 解封进内存——OPAQUE
+///    可用，core.oprf 即解封产物）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
+    let c3 = build_cluster_bare().await;
+    let oprf_b64 = server_setup_new(&mut rand::rngs::OsRng);
+    let leader = wait_leader(&c3.nodes).await;
+    // 只封装节点 1/2（idents[0]/[1]——node 1/2；节点 3 无 wrap）。
+    submit_wrapped_oprf(&leader, &c3.root, &c3.idents[..2].to_vec(), &oprf_b64).await;
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let state_dir = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let cfg = sync_server_cfg(state_dir, "node-3.test:9443".into(), vec![]);
+
+    // ① 无对应 wrap 的服务器：短窗（300ms）后明确失败——错误点名 OPRF 封装缺失。
+    let err = match ServerCore::open_sync_with_wait(
+        cfg.clone(),
+        c3.idents[2].clone(),
+        c3.nodes[2].clone(),
+        Duration::from_millis(300),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("节点 3 无 wrap ⇒ open_sync 必须明确失败"),
+    };
+    assert!(
+        err.contains("OPRF 封装"),
+        "错误需点名 OPRF 封装缺失（可诊断）: {err}"
+    );
+    assert!(
+        err.starts_with(flock_server::server::SYNC_NOT_READY_PREFIX),
+        "未达封装属 transient（就绪重试语义）: {err}"
+    );
+    // 对照：有 wrap 的节点 1 同窗成功。
+    let tmp1 = tempfile::tempdir().expect("tmp");
+    let cfg1 = sync_server_cfg(tmp1.path().to_path_buf(), "node-1.test:9443".into(), vec![]);
+    std::mem::forget(tmp1);
+    ServerCore::open_sync_with_wait(
+        cfg1,
+        c3.idents[0].clone(),
+        c3.nodes[0].clone(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("节点 1 有 wrap ⇒ open_sync 成功");
+
+    // ② rewrap 后新服务器可解封：新服务器准入 = ServerKeys 全量重登（根签，含节点 3
+    // 的混合公钥——状态机 server_keys 是整体替换语义）→ 补交节点 3 的封装（根签
+    // Rewrap）→ open_sync 成功。
+    let node3_id = flock_sync::node::node_id_of(&c3.idents[2].server_id);
+    let entries: Vec<flock_sync::proto::ServerKeyEntry> = c3
+        .idents
+        .iter()
+        .map(|i| flock_sync::proto::ServerKeyEntry {
+            server_id: flock_sync::node::node_id_of(&i.server_id),
+            identity_pub: *i.identity.verifying_key().as_bytes(),
+            hybrid_pub: i.static_hybrid.public().to_bytes().to_vec(),
+        })
+        .collect();
+    let resp = leader
+        .write(SyncRequest::server_keys_signed(&c3.root, entries))
+        .await
+        .expect("server keys full");
+    assert!(
+        matches!(
+            resp,
+            flock_sync::proto::SyncResponse::ServerKeys { servers: 3 }
+        ),
+        "server_keys full: {resp:?}"
+    );
+    let wrapped =
+        flock_server::server::seal_oprf_wrap(&oprf_b64, &c3.idents[2].static_hybrid.public())
+            .expect("seal");
+    let resp = leader
+        .write(SyncRequest::rewrap_signed(&c3.root, node3_id, wrapped))
+        .await
+        .expect("rewrap node3");
+    assert!(
+        matches!(
+            resp,
+            flock_sync::proto::SyncResponse::Admin(flock_sync::proto::AdminAck::Rewrap { .. })
+        ),
+        "rewrap: {resp:?}"
+    );
+    let core = ServerCore::open_sync_with_wait(
+        cfg,
+        c3.idents[2].clone(),
+        c3.nodes[2].clone(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("rewrap 补交后节点 3 可解封（OPAQUE 可用）");
+    // 解封语义闭环：登录路径用的就是这个 OPRF（PwBegin/Login 的服务端 setup）。
+    let _ = &core.oprf;
 }

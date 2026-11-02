@@ -380,7 +380,6 @@ fn run_cli() -> Result<(), String> {
                 }
                 #[cfg(feature = "multi-primary")]
                 {
-                    use flock_protocol::ed25519_dalek::{Signature, Signer, Verifier};
                     let root = load_root_seed(&root_seed)?;
                     // 票据密钥根：32B 随机（提交后全网共享；Bootstrap 幂等 ⇒ 重跑不换根）。
                     let ticket_root: [u8; 32] = flock_protocol::rand::random();
@@ -396,33 +395,52 @@ fn run_cli() -> Result<(), String> {
                     let bundle = flock_server::bundle::NodeBundle::from_bytes(&bytes)
                         .ok_or("捆绑文件解码失败")?;
                     let cluster_id = bundle.verify()?;
+                    let dir = bundle.directory()?;
                     let boot = flock_sync::proto::SyncRequest::bootstrap_signed(
                         &root,
                         cluster_id.0,
                         ticket_root,
                     );
-                    // SetOprf：共享 OPRF key（本进程生成；根签后全网可验——§2.4）。
+                    // OPRF key（本进程生成）：**逐服务器封装提交**（评审项 2：design §2.4
+                    // 「加密封装到各服务器混合公钥」——不再明文 SetOprf 入 Raft 状态）。
+                    // ① ServerKeys（根签）：登记每台在册服务器的混合公钥（rewrap 的前置）。
+                    // ② AdminOp::Rewrap（根签）：对每台以 envelope v2 seal 一份——状态机
+                    //    只存 wraps，各服务器启动时用自己的 hybrid sk 解封。
                     let oprf_b64 = flock_protocol::pake::server_setup_new(
                         &mut flock_protocol::rand::rngs::OsRng,
                     );
-                    let l_oprf: &[u8] = b"flock-sync/set-oprf/v1";
-                    let mut canon = Vec::with_capacity(l_oprf.len() + 4 + oprf_b64.len());
-                    canon.extend_from_slice(l_oprf);
-                    canon.extend_from_slice(&(oprf_b64.len() as u32).to_le_bytes());
-                    canon.extend_from_slice(oprf_b64.as_bytes());
-                    let set_oprf =
-                        flock_sync::proto::SyncRequest::SetOprf(flock_sync::proto::RootSigned {
-                            op: oprf_b64,
-                            sig: root.sign(&canon).to_bytes(),
-                        });
-                    // 自验（root_pub 对 canonical 验签——防端点错配直接提交废签名）。
-                    let root_pub = root.verifying_key();
-                    if let flock_sync::proto::SyncRequest::SetOprf(rs) = &set_oprf {
-                        debug_assert!(root_pub
-                            .verify(&canon, &Signature::from_bytes(&rs.sig))
-                            .is_ok());
-                    }
-                    for req in [boot, set_oprf] {
+                    let entries: Vec<flock_sync::proto::ServerKeyEntry> = dir
+                        .servers
+                        .iter()
+                        .map(|e| flock_sync::proto::ServerKeyEntry {
+                            server_id: flock_sync::node::node_id_of(&e.server_id),
+                            identity_pub: *e.identity_pub.as_bytes(),
+                            hybrid_pub: e.static_hybrid_pub.to_bytes().to_vec(),
+                        })
+                        .collect();
+                    let n_servers = entries.len();
+                    let server_keys =
+                        flock_sync::proto::SyncRequest::server_keys_signed(&root, entries);
+                    let rewrap_reqs: Result<Vec<flock_sync::proto::SyncRequest>, String> = dir
+                        .servers
+                        .iter()
+                        .map(|e| {
+                            let node_id = flock_sync::node::node_id_of(&e.server_id);
+                            flock_server::server::seal_oprf_wrap(&oprf_b64, &e.static_hybrid_pub)
+                                .map(|wrapped| {
+                                    flock_sync::proto::SyncRequest::rewrap_signed(
+                                        &root, node_id, wrapped,
+                                    )
+                                })
+                                .map_err(|err| format!("seal OPRF 封装（node {node_id}）: {err}"))
+                        })
+                        .collect();
+                    let rewrap_reqs = rewrap_reqs?;
+                    let mut reqs = Vec::with_capacity(2 + n_servers);
+                    reqs.push(boot);
+                    reqs.push(server_keys);
+                    reqs.extend(rewrap_reqs);
+                    for req in reqs {
                         // admin（就绪后）优先；未就绪（Bootstrap 尚未 apply ⇒ admin 未起）
                         // 回退到集群引导端点（admin 端口 +1，§6.2 编排序）。
                         let resp = match client(
@@ -457,7 +475,10 @@ fn run_cli() -> Result<(), String> {
                             _ => return Err("admin 响应形态不符".into()),
                         }
                     }
-                    println!("cluster-bootstrap ok（ticket_root+oprf 已提交；幂等可重跑）");
+                    println!(
+                        "cluster-bootstrap ok（ticket_root + ServerKeys + {n_servers} 台 OPRF \
+                         逐服务器封装已提交；状态机只存 wraps；幂等可重跑）"
+                    );
                     Ok(())
                 }
             }

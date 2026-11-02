@@ -583,19 +583,14 @@ impl SyncNode {
         prev
     }
 
-    /// Raft 句柄（membership 管理/快照触发等装配面）。
+    /// Raft 句柄（**仅 `test-util` 档**：本 crate 集成测试以外部 crate 视角用
+    /// `.raft().metrics()` 断言成员收敛——tests/cluster、tests/admission 等）。
     ///
-    /// 可见性收敛（评审项 13）：生产构建 `pub(crate)`——外部消费方（flock-server 等）
-    /// 不得直接持裸 Raft 句柄，所需能力以下方白名单方法暴露（[`SyncNode::membership_voters`]/
-    /// [`SyncNode::raft_state`] 等）。`test-util` 档保留 `pub` 形态：本 crate 集成测试
-    /// （tests/cluster、tests/admission 等）以外部 crate 视角使用 `.raft().metrics()`
-    /// 断言成员收敛，无法使用 `pub(crate)`。
+    /// 可见性收敛（评审项 13）：生产构建不存在裸 Raft 访问器——外部消费方
+    /// （flock-server 等）所需能力经白名单方法（[`SyncNode::membership_voters`]/
+    /// [`SyncNode::raft_state`] 等）；crate 内部直接持 `inner.raft`。
     #[cfg(feature = "test-util")]
     pub fn raft(&self) -> &Raft<SyncConfig> {
-        &self.inner.raft
-    }
-    #[cfg(not(feature = "test-util"))]
-    pub(crate) fn raft(&self) -> &Raft<SyncConfig> {
         &self.inner.raft
     }
 
