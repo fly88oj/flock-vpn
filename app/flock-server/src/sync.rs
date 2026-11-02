@@ -61,13 +61,15 @@ pub async fn run_raft(
         let (id, addr) = flock_sync::tcp::parse_peer_entry(entry)?;
         peers.insert(id, addr);
     }
-    let fabric =
-        flock_sync::TcpFabric::bind(sync.raft_bind, peers)
-            .await
-            .map_err(|e| format!("raft fabric bind {}: {e}", sync.raft_bind))?;
+    let fabric = flock_sync::TcpFabric::bind(sync.raft_bind, peers)
+        .await
+        .map_err(|e| format!("raft fabric bind {}: {e}", sync.raft_bind))?;
     eprintln!(
         "flock-server: raft fabric listening on {}",
-        fabric.local_addr().map(|a| a.to_string()).unwrap_or_default()
+        fabric
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default()
     );
 
     // 3. 装配 SyncNode（voters = 根签目录全体；同配置多节点并发 initialize 安全）。
@@ -100,8 +102,9 @@ pub async fn run_raft(
         tokio::spawn(async move {
             #[cfg(unix)]
             {
-                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler");
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("SIGTERM handler");
                 tokio::select! {
                     _ = term.recv() => {}
                     _ = tokio::signal::ctrl_c() => {}
@@ -181,12 +184,12 @@ async fn handle_bootstrap_conn(
     let req: crate::admin::AdminRequest =
         postcard::from_bytes(&buf).map_err(|e| std::io::Error::other(e.to_string()))?;
     let resp = match req {
-        crate::admin::AdminRequest::SignedWrite { req } => {
-            match node.write(req).await {
-                Ok(r) => crate::admin::AdminResponse::WriteReceipt { text: format!("{r:?}") },
-                Err(e) => crate::admin::AdminResponse::Err { msg: e.to_string() },
-            }
-        }
+        crate::admin::AdminRequest::SignedWrite { req } => match node.write(req).await {
+            Ok(r) => crate::admin::AdminResponse::WriteReceipt {
+                text: format!("{r:?}"),
+            },
+            Err(e) => crate::admin::AdminResponse::Err { msg: e.to_string() },
+        },
         crate::admin::AdminRequest::Stats => {
             // 就绪前面：leader/epoch（本机视图）——编排查活用。
             let mut lines = Vec::new();
@@ -244,7 +247,9 @@ async fn wait_cluster_ready(
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             Err(e) => {
-                return Err(format!("集群 600s 内未就绪（Bootstrap/SetOprf 未 apply）: {e}"))
+                return Err(format!(
+                    "集群 600s 内未就绪（Bootstrap/SetOprf 未 apply）: {e}"
+                ))
             }
         }
     }
@@ -270,7 +275,9 @@ pub async fn wire_local_peer(core: &Arc<ServerCore>, node: &Arc<flock_sync::Sync
             });
             // 设备句柄存活持有（接口随句柄存续）。
             std::mem::forget(tun);
-            eprintln!("flock-server: local peer wired vip={vip}（dst=本机 VIP 入内核 + 回程进 mesh）");
+            eprintln!(
+                "flock-server: local peer wired vip={vip}（dst=本机 VIP 入内核 + 回程进 mesh）"
+            );
         }
         None => {
             eprintln!("flock-server: 无 tun——本机 VIP 投递降级（跨服转发面不受影响）")

@@ -68,15 +68,31 @@ pub enum AdminRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AdminResponse {
-    Invite { invite_b64: String },
-    Redeemed { device_id: [u8; 32], vip: [u8; 4] },
-    DeviceAdded { device_id: [u8; 32], vip: [u8; 4] },
-    Revoked { epoch: u64 },
+    Invite {
+        invite_b64: String,
+    },
+    Redeemed {
+        device_id: [u8; 32],
+        vip: [u8; 4],
+    },
+    DeviceAdded {
+        device_id: [u8; 32],
+        vip: [u8; 4],
+    },
+    Revoked {
+        epoch: u64,
+    },
     /// Stats 的行式键值（`key=value` 每行一对；脚本 grep 面）。
-    StatsText { lines: Vec<String> },
+    StatsText {
+        lines: Vec<String>,
+    },
     /// SignedWrite 的回执（Debug 文本形态——`Ok`/`Error(..)` 的可读化）。
-    WriteReceipt { text: String },
-    Err { msg: String },
+    WriteReceipt {
+        text: String,
+    },
+    Err {
+        msg: String,
+    },
 }
 
 fn b64_encode(b: &[u8]) -> String {
@@ -189,7 +205,9 @@ async fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
         AdminRequest::SignedWrite { req } => {
             use crate::netstate::NetError;
             match core.net.write_sync(req).await {
-                Ok(resp) => AdminResponse::WriteReceipt { text: format!("{resp:?}") },
+                Ok(resp) => AdminResponse::WriteReceipt {
+                    text: format!("{resp:?}"),
+                },
                 Err(NetError::InvalidState(m)) if m.starts_with("sync:") => {
                     // SyncError 串（NoLeader/ForwardToLeader 等）——保留原文。
                     AdminResponse::Err { msg: m }
@@ -206,14 +224,15 @@ async fn stats_lines(core: &ServerCore) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(format!("epoch={}", core.net.epoch().await));
     lines.push(format!("sessions_online={}", core.sessions.device_count()));
-    lines.push(format!(
-        "tun_vip={}",
-        core.cfg.vip
-    ));
+    lines.push(format!("tun_vip={}", core.cfg.vip));
     #[cfg(feature = "multi-primary")]
     if let Some(node) = &core.sync {
         lines.push(format!("node_id={}", node.id()));
-        let leader = node.current_leader().await.map(|l| l.to_string()).unwrap_or_default();
+        let leader = node
+            .current_leader()
+            .await
+            .map(|l| l.to_string())
+            .unwrap_or_default();
         lines.push(format!("leader={leader}"));
         lines.push(format!("breaker_open={}", node.breaker_open()));
         let f = node.forward().stats();
@@ -233,11 +252,16 @@ async fn stats_lines(core: &ServerCore) -> Vec<String> {
         lines.push(format!("fwd_hop_dropped={}", f.hop_dropped));
         lines.push(format!("lease_entries={}", node.lease().live_len()));
         let (d_ok, d_err, r_ok, r_err) = node.interconnect_diag();
-        lines.push(format!("ic_dial_ok={d_ok} ic_dial_err={d_err} ic_rpc_ok={r_ok} ic_rpc_err={r_err}"));
+        lines.push(format!(
+            "ic_dial_ok={d_ok} ic_dial_err={d_err} ic_rpc_ok={r_ok} ic_rpc_err={r_err}"
+        ));
         let d = node.dir().stats();
         lines.push(format!("dir_cache_hits={}", d.cache_hits));
         lines.push(format!("dir_linearizable_reads={}", d.linearizable_reads));
-        lines.push(format!("rejected_handshakes={}", node.rejected_handshakes()));
+        lines.push(format!(
+            "rejected_handshakes={}",
+            node.rejected_handshakes()
+        ));
     }
     lines
 }

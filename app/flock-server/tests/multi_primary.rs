@@ -24,14 +24,14 @@ use flock_protocol::session::{
 use flock_protocol::sig::UserKey;
 use flock_protocol::trust::{InviteFile, PinStore, PinVerdict};
 use flock_protocol::{ed25519_dalek, rand};
-use flock_sync::hooks::HookRecorder;
-use flock_sync::proto::{NodeId, SyncRequest};
-use flock_sync::testutil::MemoryFabric;
-use flock_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
 use flock_server::config::ServerConfig;
 use flock_server::netstate::RedeemRequest;
 use flock_server::server::ServerCore;
 use flock_server::ticket::TicketWire;
+use flock_sync::hooks::HookRecorder;
+use flock_sync::proto::{NodeId, SyncRequest};
+use flock_sync::testutil::MemoryFabric;
+use flock_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
 
 /// RTT = 2×5ms（内存织物；§7-M4 的 100ms 校准档属 flock-sync 自身测试）。
 const FABRIC_DELAY: Duration = Duration::from_millis(5);
@@ -471,10 +471,7 @@ async fn three_node_cluster_forward_and_revocation() {
         })
         .await;
     assert!(
-        matches!(
-            out_b,
-            Err(flock_server::netstate::RedeemError::AlreadyUsed)
-        ),
+        matches!(out_b, Err(flock_server::netstate::RedeemError::AlreadyUsed)),
         "同 invite_id 二次兑换拒（Raft 状态机内查重）：{out_b:?}"
     );
     // B 的独立邀请。

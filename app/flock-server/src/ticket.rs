@@ -281,7 +281,9 @@ impl TicketAuthority {
                         flock_sync::ticket::TicketError::StaleEpoch { .. } => {
                             TicketReason::StaleEpoch
                         }
-                        flock_sync::ticket::TicketError::WrongDevice => TicketReason::DeviceMismatch,
+                        flock_sync::ticket::TicketError::WrongDevice => {
+                            TicketReason::DeviceMismatch
+                        }
                     })?;
                 // 设备态（吊销/禁用 ⇒ 拒）——与 Local 序第 4 步对齐。
                 match lookup(session_device) {

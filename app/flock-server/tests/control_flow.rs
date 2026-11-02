@@ -12,6 +12,7 @@
 
 mod common;
 
+use common::{connect, pin_from_invite, pin_with_root, CtrlClient, TestServer};
 use flock_protocol::pake::login_start;
 use flock_protocol::rand;
 use flock_protocol::session::{
@@ -22,7 +23,6 @@ use flock_protocol::sig as sr_sig;
 use flock_protocol::sig::UserKey;
 use flock_protocol::trust::{confirm_tofu_and_pin, InviteFile, PinStore, PinVerdict};
 use flock_server::control::{client_login_finish_anchored, CtrlError, CtrlResponse, DeviceOp};
-use common::{connect, pin_from_invite, pin_with_root, CtrlClient, TestServer};
 
 fn now() -> i64 {
     flock_protocol::trust::now_unix() as i64

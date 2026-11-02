@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
-use flock_protocol::mux::{send_packet, PacketChannel, Stream};
 use flock_client::dataplane::{FrameBuf, READ_CHUNK};
+use flock_protocol::mux::{send_packet, PacketChannel, Stream};
 use futures::io::AsyncRead as _;
 use tokio::sync::mpsc;
 

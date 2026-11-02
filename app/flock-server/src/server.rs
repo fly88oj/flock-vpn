@@ -96,10 +96,7 @@ impl LiveSessions {
 
     /// 在线设备数（M5 断言面：admin stats 的 sessions_online）。
     pub fn device_count(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("live sessions poisoned")
-            .len()
+        self.inner.lock().expect("live sessions poisoned").len()
     }
 }
 

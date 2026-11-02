@@ -23,6 +23,7 @@
 //! 控制流 = 隧道内首条 yamux 流（客户端 `open_stream(Prio::Control)`；服务端按流 id=1
 //! 分派）。每条消息 = `[u32 LE len][postcard CtrlRequest/CtrlResponse]`。
 
+use ed25519_dalek::{Signature, Verifier};
 use flock_protocol::opaque_ke;
 use flock_protocol::pake::{
     anchor_sign, login_finish_anchored, server_login_finish, server_login_start, server_reg_start,
@@ -32,7 +33,6 @@ use flock_protocol::rand;
 use flock_protocol::session::DeviceId;
 use flock_protocol::sig;
 use flock_protocol::{ed25519_dalek, x25519_dalek};
-use ed25519_dalek::{Signature, Verifier};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::NetBackend;
