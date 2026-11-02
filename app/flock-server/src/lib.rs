@@ -6,8 +6,8 @@
 //!
 //! 模块（§3.11 接缝图）：
 //! - [`config`]：server.toml + `ListenerMode`（**Direct 缺省**，§2.1 硬约束）；
-//! - [`netstate`]：NetState trait（与 M4 flock-sync 对齐）+ redb 单机实现（邀请一次性/
-//!   VIP 单调不复用/epoch 传播）；
+//! - [`netstate`]：redb 单机状态机（邀请一次性/VIP 单调不复用/epoch 传播；行类型与
+//!   flock-sync proto.rs 同源——评审项 12 去重）；
 //! - [`ticket`]：会话票据（TTL/epoch）+ nonce 记账（§2.2 契约序的票据侧）；
 //! - [`control`]：控制流消息（postcard）+ [`control::CtrlGuard`]（票据强制契约：
 //!   票据 → SR-SIG1 → nonce 记账，顺序有测试断言）；

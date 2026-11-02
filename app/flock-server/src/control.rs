@@ -916,7 +916,7 @@ const _: fn([u8; 32]) -> x25519_dalek::PublicKey = x25519_dalek::PublicKey::from
 mod tests {
     use super::*;
     use crate::backend::NetBackend;
-    use crate::netstate::{DeviceStatus, NetState as _, StateStore};
+    use crate::netstate::{DeviceStatus, StateStore};
     use crate::ticket::{TicketIssuer, TicketWire};
     use flock_protocol::session::{DeviceRecord, LookupVerdict};
     use flock_protocol::x25519_dalek::PublicKey;

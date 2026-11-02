@@ -19,8 +19,7 @@ use flock_protocol::session::{DeviceId, LookupVerdict};
 use futures::future::BoxFuture;
 
 use crate::netstate::{
-    DeviceRow, DeviceStatus, NetError, NetState as _, RedeemError, RedeemOutcome, RedeemRequest,
-    StateStore,
+    DeviceRow, DeviceStatus, NetError, RedeemError, RedeemOutcome, RedeemRequest, StateStore,
 };
 
 #[cfg(feature = "multi-primary")]
@@ -64,7 +63,7 @@ impl NetBackend {
                 .read_linearizable(flock_sync::proto::ReadQuery::DeviceRow(id.0))
                 .await
             {
-                Ok(sync_proto::ReadView::Device(Some(row))) => Some(row.into()),
+                Ok(sync_proto::ReadView::Device(Some(row))) => Some(row),
                 _ => None,
             },
         }
@@ -83,7 +82,7 @@ impl NetBackend {
                 {
                     Ok(sync_proto::ReadView::Devices(rows)) => rows
                         .into_iter()
-                        .map(|(id, row)| (DeviceId(id), row.into()))
+                        .map(|(id, row)| (DeviceId(id), row))
                         .collect(),
                     _ => Vec::new(),
                 }
@@ -110,7 +109,7 @@ impl NetBackend {
                     })
                     .await?;
                 match resp {
-                    sync_proto::SyncResponse::Device(row) => Ok(row.into()),
+                    sync_proto::SyncResponse::Device(row) => Ok(row),
                     sync_proto::SyncResponse::Error(e) => Err(net_err(&e)),
                     _ => Err(NetError::Internal("unexpected register response".into())),
                 }
@@ -401,29 +400,8 @@ mod adapter {
     }
 }
 
-// —— 行类型转换（flock-sync 行 → 服务器 netstate 行；语义同构，§3.10 接口对齐）——
-#[cfg(feature = "multi-primary")]
-mod conv {
-    use crate::netstate::{DeviceRow, DeviceStatus};
-    use flock_sync::proto;
-
-    impl From<proto::DeviceRow> for DeviceRow {
-        fn from(r: proto::DeviceRow) -> Self {
-            DeviceRow {
-                owner: r.owner,
-                device_x25519: r.device_x25519,
-                device_ed25519: r.device_ed25519,
-                vip: r.vip,
-                status: match r.status {
-                    proto::DeviceStatus::Active => DeviceStatus::Active,
-                    proto::DeviceStatus::Disabled => DeviceStatus::Disabled,
-                    proto::DeviceStatus::Revoked => DeviceStatus::Revoked,
-                },
-                since_epoch: r.since_epoch,
-            }
-        }
-    }
-}
+// （评审项 12：原 `mod conv` 的 flock-sync 行 → 服务器行 From 转换黏合层删除——
+// netstate.rs 的行类型已直接再导出自 flock_sync::proto，两臂同一类型。）
 
 // —— StateError → 服务器错误面映射 ——
 

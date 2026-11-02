@@ -1,15 +1,14 @@
 //! 单服 NetState：注册表/邀请/VIP 分配的强一致本地状态机（docs/design.md §3.11 / §7-M2）。
 //!
-//! **接口与 M4 `flock-sync` 对齐**（§3.10 `NetState::{register_device, revoke, allocate_ip,
-//! redeem_invite, revoke_invite, …}`）：本模块定义 [`NetState`] trait，redb 单机版
-//! [`StateStore`] 为 M2 唯一实现；M4 落地时 openraft 状态机实现同一 trait，装配点零改动。
-//! 语义纪律（§2.1/§1.3.3f，M4 同样成立）：
+//! **行类型与 `flock-sync` proto.rs 同源**（评审项 12 去重）：`DeviceRow`/`DeviceStatus`/
+//! `UserRow` 以 flock-sync 的定义为唯一权威（Raft 状态机快照/线格式同源），本模块再导出；
+//! 语义纪律（§2.1/§1.3.3f，两形态同样成立）：
 //!
 //! - **VIP 100.64.0.0/10 池单调分配**：`100.64.0.1` 保留给服务器自身，从 `.2` 起单调递增，
 //!   **禁用不删除、IP 不复用**（innernet 先例，§2.1）——回收靠高位水位线永不动。
 //! - **邀请一次性**：`redeem_invite` = 查重（used ⇒ 拒）+ 吊销检查 + expiry 检查 →
-//!   同一事务内标记 used + 建用户/设备 + 分 VIP（§1.3.3f「邀请一生」；M2 的单机事务 =
-//!   M4 Raft 状态机内的原子提交）。
+//!   同一事务内标记 used + 建用户/设备 + 分 VIP（§1.3.3f「邀请一生」；单机事务 =
+//!   Raft 状态机内的原子提交）。
 //! - **吊销推进全局 revocation_epoch**（§2.2 吊销传播界）：每次 revoke/disable 单调 +1，
 //!   票据层以「票据 epoch < 当前 epoch 即拒」消费它。
 //! - redb 单文件嵌入、单写者（服务进程独占写；CLI/管理操作经 admin 端点进入本进程，
@@ -25,6 +24,11 @@ use flock_protocol::{ed25519_dalek, x25519_dalek};
 use futures::future::BoxFuture;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use sha2::{Digest, Sha256};
+
+// 行类型去重（评审项 12）：删除本模块的同名本地定义，改用 flock-sync proto.rs 的
+// 唯一权威定义——单服 redb 编解码与多主 Raft 状态机从此共享同一行类型，backend.rs
+// 的 From 转换黏合层随之删除。
+pub use flock_sync::proto::{DeviceRow, DeviceStatus, UserRow};
 
 /// 设备表：DeviceId(32B) → DeviceRow。
 const DEVICES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("devices");
@@ -43,54 +47,8 @@ pub const VIP_FIRST: u32 = u32::from_be_bytes([100, 64, 0, 2]);
 /// 池末（/10 段的最后一个可用地址）。
 pub const VIP_LAST: u32 = u32::from_be_bytes([100, 127, 255, 254]);
 
-/// 设备状态（禁用不删除：行保留、VIP 不回收，§2.1）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeviceStatus {
-    Active,
-    Disabled,
-    Revoked,
-}
-
-impl DeviceStatus {
-    fn code(self) -> u8 {
-        match self {
-            DeviceStatus::Active => 1,
-            DeviceStatus::Disabled => 2,
-            DeviceStatus::Revoked => 3,
-        }
-    }
-
-    fn from_code(c: u8) -> Option<Self> {
-        match c {
-            1 => Some(DeviceStatus::Active),
-            2 => Some(DeviceStatus::Disabled),
-            3 => Some(DeviceStatus::Revoked),
-            _ => None,
-        }
-    }
-}
-
-/// 注册表设备行（§2.2 设备 = (DeviceId, owner, VIP, 静态公钥集, status)）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceRow {
-    pub owner: String,
-    pub device_x25519: [u8; 32],
-    pub device_ed25519: [u8; 32],
-    pub vip: [u8; 4],
-    pub status: DeviceStatus,
-    /// 状态判定（禁用/吊销）生效的 revocation_epoch。
-    pub since_epoch: u64,
-}
-
-/// 用户行：OPAQUE 注册记录（账号口令）+ SR-SIG1 用户公钥集。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UserRow {
-    pub opaque_record: Option<String>,
-    pub opaque_profile: u16,
-    pub sr_sig_pubs: Vec<[u8; 32]>,
-}
-
-/// 邀请行（一次性凭据，§1.3.3f）。
+/// 邀请行（一次性凭据，§1.3.3f；本地行——flock-sync 的 InviteRow 为线格式镜像，
+/// 单服库内编码由本模块自持）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InviteStatus {
     Valid,
@@ -191,47 +149,11 @@ impl std::fmt::Display for NetError {
     }
 }
 
-/// NetState：注册表/邀请/VIP 的强一致写读面（§3.10 接口对齐；M4 = 同 trait 的 Raft 实现）。
-pub trait NetState: Send + Sync + 'static {
-    /// 注册设备（分配 VIP，单调不复用）。
-    fn register_device(
-        &self,
-        owner: &str,
-        x25519: [u8; 32],
-        ed25519: [u8; 32],
-    ) -> Result<DeviceRow, NetError>;
-    /// 吊销设备：状态置 Revoked（行保留、VIP 不回收）+ 全局 revocation_epoch +1（§2.2）。
-    fn revoke(&self, id: &DeviceId) -> Result<u64, NetError>;
-    /// 禁用设备（不删除；epoch 同步推进，票据随之失效）。
-    fn disable(&self, id: &DeviceId) -> Result<u64, NetError>;
-    /// 重新启用（仅 Disabled → Active；Revoked 终态不可逆）。
-    fn enable(&self, id: &DeviceId) -> Result<(), NetError>;
-    /// 目录三态查询（session::DeviceDirectory 的数据源）。
-    fn lookup(&self, id: &DeviceId) -> LookupVerdict;
-    /// 注册表行查询（断言/管理面）。
-    fn device_row(&self, id: &DeviceId) -> Option<DeviceRow>;
-    /// owner 名下全部设备。
-    fn devices_of(&self, owner: &str) -> Vec<(DeviceId, DeviceRow)>;
-    /// VIP 分配（单调水位；不回收）。
-    fn allocate_ip(&self) -> Result<Ipv4Addr, NetError>;
-    /// 邀请兑换（查重+吊销+expiry → 建用户/设备+分 VIP，单事务）。
-    fn redeem_invite(&self, req: RedeemRequest<'_>) -> Result<RedeemOutcome, RedeemError>;
-    /// 吊销未兑换邀请。
-    fn revoke_invite(&self, invite_id: &[u8; 16]) -> Result<(), NetError>;
-    /// 当前全局 revocation_epoch。
-    fn epoch(&self) -> u64;
-    // —— 用户面（OPAQUE 记录 + SR-SIG1 公钥集）——
-    /// 设置口令记录（仅未设置时；改密走登录态，M2 外）。
-    fn set_password(&self, user: &str, record_b64: &str, profile: u16) -> Result<(), NetError>;
-    /// 取口令记录。
-    fn password(&self, user: &str) -> Option<(String, u16)>;
-    /// 登记 SR-SIG1 用户公钥（key-bind 路径）。
-    fn add_user_sig_key(&self, user: &str, pub32: [u8; 32]) -> Result<(), NetError>;
-    /// SR-SIG1 验签公钥集。
-    fn user_sig_pubs(&self, user: &str) -> Vec<VerifyingKey>;
-    /// bind_token 一次性消费（§2.4 线性一致查重；false = 已用过）。
-    fn consume_bind_token(&self, token: &[u8; 16]) -> bool;
-}
+// 注（评审项 12 三面去重）：M2 时代的 `pub trait NetState` 已删除——多主形态的
+// 写读经 `backend::NetBackend`（真实接缝：Single = 本模块 StateStore 固有方法的
+// 同步直调；Sync = Raft 提交/线性一致读），单实现 trait 只剩「以 trait 形状对齐
+// 两形态」的 ceremonial 价值，反而要求调用方 `NetState as _` 引入间接。方法全部
+// 收敛为下方 `impl StateStore` 固有方法；行类型再导出自 flock-sync proto.rs。
 
 // ============================================================================
 // 行编解码（定长手动编解码：字段的字节级布局即存储契约）
@@ -636,8 +558,14 @@ impl StateStore {
     }
 }
 
-impl NetState for StateStore {
-    fn register_device(
+// ============================================================================
+// StateStore 固有写读面（原 `impl NetState for StateStore`——trait 删除后收敛为
+// 固有方法，评审项 12；语义/签名不变）
+// ============================================================================
+
+impl StateStore {
+    /// 注册设备（分配 VIP，单调不复用）。
+    pub fn register_device(
         &self,
         owner: &str,
         x25519: [u8; 32],
@@ -684,21 +612,21 @@ impl NetState for StateStore {
         Ok(out)
     }
 
-    fn revoke(&self, id: &DeviceId) -> Result<u64, NetError> {
+    pub fn revoke(&self, id: &DeviceId) -> Result<u64, NetError> {
         self.set_device_status(id, DeviceStatus::Revoked)
             .map(|(_, epoch)| epoch)
     }
 
-    fn disable(&self, id: &DeviceId) -> Result<u64, NetError> {
+    pub fn disable(&self, id: &DeviceId) -> Result<u64, NetError> {
         self.set_device_status(id, DeviceStatus::Disabled)
             .map(|(_, epoch)| epoch)
     }
 
-    fn enable(&self, id: &DeviceId) -> Result<(), NetError> {
+    pub fn enable(&self, id: &DeviceId) -> Result<(), NetError> {
         self.set_device_status(id, DeviceStatus::Active).map(|_| ())
     }
 
-    fn lookup(&self, id: &DeviceId) -> LookupVerdict {
+    pub fn lookup(&self, id: &DeviceId) -> LookupVerdict {
         match self.device_row(id) {
             Some(row) => match row.status {
                 DeviceStatus::Active => {
@@ -725,14 +653,14 @@ impl NetState for StateStore {
         }
     }
 
-    fn device_row(&self, id: &DeviceId) -> Option<DeviceRow> {
+    pub fn device_row(&self, id: &DeviceId) -> Option<DeviceRow> {
         let txn = self.db.begin_read().ok()?;
         let t = txn.open_table(DEVICES).ok()?;
         let raw = t.get(id.0.as_slice()).ok()??;
         decode_device(raw.value())
     }
 
-    fn devices_of(&self, owner: &str) -> Vec<(DeviceId, DeviceRow)> {
+    pub fn devices_of(&self, owner: &str) -> Vec<(DeviceId, DeviceRow)> {
         let mut out = Vec::new();
         let Ok(txn) = self.db.begin_read() else {
             return out;
@@ -755,7 +683,7 @@ impl NetState for StateStore {
         out
     }
 
-    fn allocate_ip(&self) -> Result<Ipv4Addr, NetError> {
+    pub fn allocate_ip(&self) -> Result<Ipv4Addr, NetError> {
         let txn = self.db.begin_write().map_err(int_err)?;
         let out = {
             let mut meta = txn.open_table(META).map_err(int_err)?;
@@ -771,7 +699,7 @@ impl NetState for StateStore {
         Ok(out)
     }
 
-    fn redeem_invite(&self, req: RedeemRequest<'_>) -> Result<RedeemOutcome, RedeemError> {
+    pub fn redeem_invite(&self, req: RedeemRequest<'_>) -> Result<RedeemOutcome, RedeemError> {
         let device_id: [u8; 32] = Sha256::digest(req.device_ed25519).into();
         // 根签名/结构校验 + 本集群身份钉死，先于任何状态触碰。
         let invite = flock_protocol::trust::InviteFile::from_bytes(req.invite_bytes)
@@ -789,7 +717,7 @@ impl NetState for StateStore {
         self.redeem_tx(invite.invite_id, req, device_id)
     }
 
-    fn revoke_invite(&self, invite_id: &[u8; 16]) -> Result<(), NetError> {
+    pub fn revoke_invite(&self, invite_id: &[u8; 16]) -> Result<(), NetError> {
         let txn = self.db.begin_write().map_err(int_err)?;
         {
             let mut t = txn.open_table(INVITES).map_err(int_err)?;
@@ -813,13 +741,13 @@ impl NetState for StateStore {
         Ok(())
     }
 
-    fn epoch(&self) -> u64 {
+    pub fn epoch(&self) -> u64 {
         self.meta_get("epoch")
             .and_then(|v| v.try_into().ok().map(u64::from_be_bytes))
             .unwrap_or(0)
     }
 
-    fn set_password(&self, user: &str, record_b64: &str, profile: u16) -> Result<(), NetError> {
+    pub fn set_password(&self, user: &str, record_b64: &str, profile: u16) -> Result<(), NetError> {
         let txn = self.db.begin_write().map_err(int_err)?;
         {
             let mut users = txn.open_table(USERS).map_err(int_err)?;
@@ -845,7 +773,7 @@ impl NetState for StateStore {
         Ok(())
     }
 
-    fn password(&self, user: &str) -> Option<(String, u16)> {
+    pub fn password(&self, user: &str) -> Option<(String, u16)> {
         let txn = self.db.begin_read().ok()?;
         let t = txn.open_table(USERS).ok()?;
         let raw = t.get(user).ok()??;
@@ -853,7 +781,7 @@ impl NetState for StateStore {
         row.opaque_record.map(|r| (r, row.opaque_profile))
     }
 
-    fn add_user_sig_key(&self, user: &str, pub32: [u8; 32]) -> Result<(), NetError> {
+    pub fn add_user_sig_key(&self, user: &str, pub32: [u8; 32]) -> Result<(), NetError> {
         let txn = self.db.begin_write().map_err(int_err)?;
         {
             let mut users = txn.open_table(USERS).map_err(int_err)?;
@@ -877,7 +805,7 @@ impl NetState for StateStore {
         Ok(())
     }
 
-    fn user_sig_pubs(&self, user: &str) -> Vec<VerifyingKey> {
+    pub fn user_sig_pubs(&self, user: &str) -> Vec<VerifyingKey> {
         let Ok(txn) = self.db.begin_read() else {
             return Vec::new();
         };
@@ -896,7 +824,7 @@ impl NetState for StateStore {
             .collect()
     }
 
-    fn consume_bind_token(&self, token: &[u8; 16]) -> bool {
+    pub fn consume_bind_token(&self, token: &[u8; 16]) -> bool {
         let Ok(txn) = self.db.begin_write() else {
             return false;
         };
@@ -920,7 +848,7 @@ pub struct DirAdapter(pub Arc<StateStore>);
 
 impl flock_protocol::session::DeviceDirectory for DirAdapter {
     fn lookup(&self, id: &DeviceId) -> BoxFuture<'static, LookupVerdict> {
-        let v = NetState::lookup(&*self.0, id);
+        let v = self.0.lookup(id);
         Box::pin(async move { v })
     }
 }

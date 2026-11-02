@@ -10,8 +10,10 @@ description = "Flock VPN 服务端装配（单服形态）：TCP :9443 E2E 会�
 flock-protocol = { path = "../../crates/flock-protocol", features = ["anchor"] }
 flock-frpc = { path = "../../crates/flock-frpc" }
 # M4 多主同步（§3.10/§4）：Raft 状态机 + 两级读目录 + 租约/转发承载 + Raft 内票据根。
-# 可选档（feature `multi-primary`）——单服部署（m2/m2-direct 形态）默认构建零依赖面。
-flock-sync = { path = "../../crates/flock-sync", optional = true }
+# 行类型（DeviceRow/DeviceStatus/UserRow，评审项 12 去重）为唯一权威定义——非 optional
+# 依赖；多主**装配面**（NetBackend::Sync/sync.rs/Raft 票据根）仍由 feature
+# `multi-primary` 门控，单服部署的行为不变。
+flock-sync = { path = "../../crates/flock-sync" }
 # M3 数据面（§2.2 服务端自身也是 peer / §3.11「对上挂 tun 适配器」）：复用客户端 crate 的
 # TunDevice/route/TunIo 接缝（§3.12 接缝落位客户端 crate，本 crate 是其第二个消费者）。
 flock-client = { path = "../flock-client" }
@@ -32,7 +34,8 @@ socket2 = "0.6"
 [features]
 default = []
 # 多主装配（§2.2/§3.11 M4 批次）：NetBackend::Sync / Raft 票据根 / FRWD 转发面。
-multi-primary = ["dep:flock-sync"]
+# （flock-sync 本体自评审项 12 起为常驻依赖——行类型去重；feature 只门控装配面。）
+multi-primary = []
 
 [dev-dependencies]
 # 集成测试（tests/control_flow.rs 全链 in-process；tests/multi_primary.rs 3 节点内存
