@@ -191,10 +191,9 @@ fn unused_bin(run_base: &Path, flavor: RelayFlavor) -> FrpcBinary {
     }
 }
 
-/// Frp 模式启动期自检（测试用：Supervisor 确实接管、run 目录已生成）。
-pub fn run_dir_exists(run_base: &Path) -> bool {
-    run_base.is_dir()
-}
+// （评审项 15：零引用死项 run_dir_exists 已删——启动期自检由 tests/listener_mode.rs
+// 的「run 目录/内嵌 TOML 落盘」断言承担；`Managed` 包装保留：评审项 11 的健康
+// 监控即经其 health()。）
 
 #[cfg(test)]
 mod tests {

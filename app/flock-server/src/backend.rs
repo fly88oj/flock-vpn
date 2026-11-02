@@ -16,7 +16,6 @@
 
 use flock_protocol::ed25519_dalek::VerifyingKey;
 use flock_protocol::session::{DeviceId, LookupVerdict};
-use futures::future::BoxFuture;
 
 use crate::netstate::{
     DeviceRow, DeviceStatus, NetError, RedeemError, RedeemOutcome, RedeemRequest, StateStore,
@@ -452,11 +451,4 @@ fn redeem_err(e: &flock_sync::proto::StateError) -> crate::netstate::RedeemError
         StateError::NotBootstrapped => RedeemError::Internal("cluster not bootstrapped".into()),
         other => RedeemError::Internal(format!("state: {other}")),
     }
-}
-
-// 供 async fn in trait 位置的后端引用（保持 BoxFuture 接缝的编译期断言。
-// 单服形态的同步 NetState trait 不变；此处仅声明本门面未来若下沉为 trait 时的形状）。
-#[allow(dead_code)]
-fn _boxfuture_witness(f: BoxFuture<'static, u64>) -> BoxFuture<'static, u64> {
-    f
 }
