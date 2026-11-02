@@ -584,8 +584,35 @@ impl SyncNode {
     }
 
     /// Raft 句柄（membership 管理/快照触发等装配面）。
+    ///
+    /// 可见性收敛（评审项 13）：生产构建 `pub(crate)`——外部消费方（flock-server 等）
+    /// 不得直接持裸 Raft 句柄，所需能力以下方白名单方法暴露（[`SyncNode::membership_voters`]/
+    /// [`SyncNode::raft_state`] 等）。`test-util` 档保留 `pub` 形态：本 crate 集成测试
+    /// （tests/cluster、tests/admission 等）以外部 crate 视角使用 `.raft().metrics()`
+    /// 断言成员收敛，无法使用 `pub(crate)`。
+    #[cfg(feature = "test-util")]
     pub fn raft(&self) -> &Raft<SyncConfig> {
         &self.inner.raft
+    }
+    #[cfg(not(feature = "test-util"))]
+    pub(crate) fn raft(&self) -> &Raft<SyncConfig> {
+        &self.inner.raft
+    }
+
+    /// openraft 真实 membership 的 voter 集（白名单查询——外部对账用，替代裸句柄）。
+    pub fn membership_voters(&self) -> std::collections::BTreeSet<NodeId> {
+        self.inner
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .voter_ids()
+            .collect()
+    }
+
+    /// Raft metrics 摘要：本节点 server state（Leader/Follower/Candidate/Learner）。
+    pub fn raft_state(&self) -> openraft::ServerState {
+        self.inner.raft.metrics().borrow().state
     }
 
     /// 本机入群凭证公开部分（ServerEntry——server_keys/rewrap 封装目标等用）。
@@ -792,9 +819,35 @@ impl SyncNode {
         self.inner.lease.location_query(device, &fanout).await
     }
 
-    /// SM 核（测试观察面：lag 注入器等）。
+    /// SM 核（**仅 `test-util` 档**：本 crate 集成测试的观察面——lag 注入器
+    /// （tests/cluster 的 apply-lag 熔断用例）/VIP 反查断言等。评审项 13 收敛：
+    /// 生产构建不存在裸 SM 访问器——外部（flock-server）所需能力经下方白名单
+    /// 方法（register_hook/oprf_b64/local_wrap）获得，不再直捣状态机核。
+    #[cfg(feature = "test-util")]
     pub fn sm(&self) -> &Arc<SmCore> {
         &self.inner.sm
+    }
+
+    /// 注册 apply/租约钩子（[`SyncNodeBuilder::hook`] 的 build 后等价物——装配层
+    /// （flock-server `open_sync`）在节点构建后才具备 hooks 所需的 sessions/node
+    /// 句柄，无法全部前置到 builder；评审项 13 白名单方法）。
+    pub fn register_hook(&self, h: Arc<dyn SyncHooks>) {
+        self.inner.sm.register_hook(h);
+    }
+
+    /// 集群共享 OPRF key（b64；本地已 apply 视图，未登记 ⇒ None）。
+    /// （评审项 13：原 `sm().oprf_b64()` 的白名单形态。）
+    pub fn oprf_b64(&self) -> Option<String> {
+        self.inner.sm.oprf_b64()
+    }
+
+    /// 本机已 apply 视图内某服务器的 secrets-rewrap 封装副本（OPRF 封装面：
+    /// 各服务器启动时取自己的 wrap 用本机 hybrid sk 解封；None = 该服务器的
+    /// 封装尚未在本节点 apply）。
+    pub fn local_wrap(&self, server_id: NodeId) -> Option<Vec<u8>> {
+        self.inner
+            .sm
+            .with_data(|d| d.wraps.get(&server_id).cloned())
     }
 
     /// 停机（Raft 关闭；互连织物由外部管理）。

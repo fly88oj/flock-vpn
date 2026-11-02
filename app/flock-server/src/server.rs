@@ -326,10 +326,11 @@ impl ServerCore {
         ident: Arc<ServerIdentity>,
         node: Arc<flock_sync::SyncNode>,
     ) -> Result<Arc<Self>, String> {
-        // 等 Bootstrap + SetOprf 复制到位（本节点 apply 即可见——本地读）。
+        // 等 Bootstrap + SetOprf 复制到位（本节点 apply 即可见——本地读）。能力经
+        // SyncNode 白名单方法（评审项 13：不再直捣 sm() 内部句柄）。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let oprf_b64 = loop {
-            if let Some(o) = node.sm().oprf_b64() {
+            if let Some(o) = node.oprf_b64() {
                 break o;
             }
             if std::time::Instant::now() >= deadline {
@@ -340,7 +341,7 @@ impl ServerCore {
         let oprf = flock_protocol::pake::server_setup_load(&oprf_b64)
             .map_err(|e| format!("集群 OPRF key: {e}"))?;
         let sessions = Arc::new(LiveSessions::default());
-        node.sm().register_hook(Arc::new(ServerSyncHooks {
+        node.register_hook(Arc::new(ServerSyncHooks {
             sessions: sessions.clone(),
             node: node.clone(),
         }));

@@ -679,11 +679,11 @@ async fn three_node_cluster_forward_and_revocation() {
 
     // 既有会话被杀（apply 回调 → SyncHooks → LiveSessions.kill）。
     let deadline = Instant::now() + A6_BUDGET;
-    while c3.nodes[0].sm().epoch() == 0 && Instant::now() < deadline {
+    while c3.nodes[0].local_epoch() == 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        c3.nodes[0].sm().epoch() >= 1,
+        c3.nodes[0].local_epoch() >= 1,
         "revocation_epoch 已推进（apply）"
     );
     assert_eq!(
