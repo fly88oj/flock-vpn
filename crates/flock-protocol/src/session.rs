@@ -64,6 +64,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot, watch};
 use x25519_dalek::{PublicKey as XPub, StaticSecret};
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::kem::{self, bridge, Fingerprint, HybridKeypair, HybridPubkey};
 use crate::mux::{MuxIo, PacketChannel, Prio, Stream};
@@ -978,16 +979,22 @@ fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], okm: &mut [u8]) {
     hk.expand(info, okm).expect("HKDF-SHA256 output length valid");
 }
 
-fn k1_from_shares(x_ss: &[u8], ml_ss: &[u8]) -> [u8; 32] {
-    let mut ikm = Vec::with_capacity(x_ss.len() + ml_ss.len());
+/// 握手 k1 合流（ikm = x25519_ss ‖ ml_kem_ss，`Zeroizing` 包裹 Drop 清零；
+/// 返回值 k1 同为 Zeroizing——调用方即握手 k1/k_enc 的秘密材料纪律，§1.3.3c）。
+fn k1_from_shares(x_ss: &[u8], ml_ss: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(x_ss.len() + ml_ss.len()));
     ikm.extend_from_slice(x_ss);
     ikm.extend_from_slice(ml_ss);
-    let mut k1 = [0u8; 32];
-    hkdf_sha256(&[], &ikm, L_I1_K1, &mut k1);
+    let mut k1 = Zeroizing::new([0u8; 32]);
+    hkdf_sha256(&[], &ikm[..], L_I1_K1, &mut k1[..]);
     k1
 }
 
 /// 握手最终密钥组（§1.3.3c 记录层初始密钥）。
+///
+/// 全字段为密钥材料：`ZeroizeOnDrop`——结构体 Drop 时全部清零（§1.3.3c 清零承诺；
+/// 派生进 Core 的方向密钥由 [`DirKeys`] 的清零纪律接管）。
+#[derive(zeroize::ZeroizeOnDrop)]
 struct TrafficKeys {
     c2s: [u8; 32],
     s2c: [u8; 32],
@@ -997,13 +1004,13 @@ struct TrafficKeys {
 }
 
 fn derive_traffic(k1: &[u8; 32], ee: &[u8], th: &[u8; 32], chosen: AeadChoice) -> TrafficKeys {
-    let mut ikm = Vec::with_capacity(64);
+    let mut ikm = Zeroizing::new(Vec::with_capacity(64));
     ikm.extend_from_slice(k1);
     ikm.extend_from_slice(ee);
-    let mut okm = [0u8; 160];
+    let mut okm = Zeroizing::new([0u8; 160]);
     let mut info = L_TRAFFIC.to_vec();
     info.push(chosen.code());
-    hkdf_sha256(th, &ikm, &info, &mut okm);
+    hkdf_sha256(th, &ikm[..], &info, &mut okm[..]);
     let sub = |r: std::ops::Range<usize>| okm[r].try_into().expect("32B slice");
     TrafficKeys {
         c2s: sub(0..32),
@@ -1192,9 +1199,21 @@ enum Role {
     Server,
 }
 
+/// 方向密钥组（记录密码 + 计数器 + 密钥原材料）。
+///
+/// 清零纪律（§1.3.3c）：`key` 保留 32B 原材料副本以随本结构体生命期确定性清零
+/// （`Drop` 显式抹零；cipher 内的扩展密钥表属上游 crate 内部无法触达——原材料
+/// 不残留是本层可达的清零面）。rekey 轮换被替换的旧 [`DirKeys`] 随之清零。
 struct DirKeys {
     cipher: Box<dyn RecordCipher + Send>,
     counter: u64,
+    key: [u8; 32],
+}
+
+impl Drop for DirKeys {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 struct PendingRekey {
@@ -1229,6 +1248,25 @@ struct Inner {
     peer_server: Option<ServerId>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // 会话核心拆解：rekey_seed 显式清零（§1.3.3c）；方向密钥原材料随
+        // send/recv/retained_recv 的 DirKeys::Drop 清零。
+        self.rekey_seed.zeroize();
+    }
+}
+
+/// 硬拒绝（[`CloseReason::RejectAfter`]）/伪造断链（[`CloseReason::ForgeLimit`]）的
+/// 显式密钥清零（设计 §1.3.3c「reject_after 触发即清零密钥」承诺）：关闭置位后
+/// 立即抹除密钥材料——不再等待 Core 拆解（Drop 兜底之外的显式路径；关闭后
+/// seal/open 均先查 closed，无残余密钥消费者）。
+fn zeroize_keys_on_close(inner: &mut Inner) {
+    inner.rekey_seed.zeroize();
+    inner.send.key.zeroize();
+    inner.recv.key.zeroize();
+    inner.retained_recv = None; // 旧接收密钥（DirKeys::Drop 清零）
+}
+
 /// 会话核心（握手后由各泵共享）。
 pub(crate) struct Core {
     cfg: TunnelConfig,
@@ -1254,8 +1292,8 @@ impl Core {
                 epoch: 0,
                 epoch_start: now,
                 aead,
-                send: DirKeys { cipher: make_cipher(aead, &send_key), counter: 0 },
-                recv: DirKeys { cipher: make_cipher(aead, &recv_key), counter: 0 },
+                send: DirKeys { cipher: make_cipher(aead, &send_key), counter: 0, key: send_key },
+                recv: DirKeys { cipher: make_cipher(aead, &recv_key), counter: 0, key: recv_key },
                 retained_recv: None,
                 rekey_seed: tk.rekey_seed,
                 pending: None,
@@ -1321,6 +1359,7 @@ impl Core {
         if inner.send.counter >= cfg.reject_after.0 {
             let reason = CloseReason::RejectAfter;
             inner.closed = Some(reason);
+            zeroize_keys_on_close(inner); // §1.3.3c：reject_after 触发即清零密钥
             return Err(SessionError::Closed(reason));
         }
         let ct = inner.send.cipher.seal(inner.send.counter, &[rtype], payload);
@@ -1373,6 +1412,7 @@ impl Core {
         if inner.forge_attempts >= self.cfg.forge_limit as u64 {
             let reason = CloseReason::ForgeLimit;
             inner.closed = Some(reason);
+            zeroize_keys_on_close(&mut inner); // 断链纪律（P0-2）：达限即清零密钥
             let _ = self.closed_tx.send(true);
             return Err(SessionError::Closed(reason));
         }
@@ -1393,6 +1433,7 @@ impl Core {
             || inner.send.counter >= cfg.reject_after.0
         {
             inner.closed = Some(CloseReason::RejectAfter);
+            zeroize_keys_on_close(&mut inner); // §1.3.3c：reject_after 触发即清零密钥
             let _ = self.closed_tx.send(true);
             return out;
         }
@@ -1511,11 +1552,12 @@ impl Core {
         h.update(eph_pub);
         h.update(ct);
         let th: [u8; 32] = h.finalize().into();
-        let mut ikm = Vec::with_capacity(64);
+        // ikm/okm = 密钥材料（ss 与方向密钥的来源）：Zeroizing 包裹，Drop 清零（§1.3.3c）。
+        let mut ikm = Zeroizing::new(Vec::with_capacity(64));
         ikm.extend_from_slice(ss.as_bytes());
         ikm.extend_from_slice(&th);
-        let mut okm = [0u8; 96];
-        hkdf_sha256(&inner.rekey_seed, &ikm, L_REKEY_TRAFFIC, &mut okm);
+        let mut okm = Zeroizing::new([0u8; 96]);
+        hkdf_sha256(&inner.rekey_seed, &ikm[..], L_REKEY_TRAFFIC, &mut okm[..]);
         let init_key: [u8; 32] = okm[0..32].try_into().expect("32B");
         let resp_key: [u8; 32] = okm[32..64].try_into().expect("32B");
 
@@ -1524,10 +1566,10 @@ impl Core {
         let (send_key, recv_key) = if we_are_initiator { (init_key, resp_key) } else { (resp_key, init_key) };
         let old_recv = std::mem::replace(
             &mut inner.recv,
-            DirKeys { cipher: make_cipher(aead, &recv_key), counter: 0 },
+            DirKeys { cipher: make_cipher(aead, &recv_key), counter: 0, key: recv_key },
         );
-        inner.send = DirKeys { cipher: make_cipher(aead, &send_key), counter: 0 };
-        inner.retained_recv = Some(old_recv); // 在途旧记录宽限
+        inner.send = DirKeys { cipher: make_cipher(aead, &send_key), counter: 0, key: send_key };
+        inner.retained_recv = Some(old_recv); // 在途旧记录宽限（旧 DirKeys 的 key 随其 Drop 清零）
         inner.rekey_seed = okm[64..96].try_into().expect("32B");
         inner.epoch = epoch + 1;
         inner.epoch_start = now;
@@ -1967,8 +2009,9 @@ where
         return Err(SessionError::Handshake("non-contributory server key"));
     }
     let k1 = k1_from_shares(x_ss.as_bytes(), ml_ss.as_slice());
-    let mut k_enc = [0u8; 32];
-    hkdf_sha256(&[], &k1, L_I1_ENC, &mut k_enc);
+    // k1/k_enc = 握手密钥材料：Zeroizing 包裹，Drop 清零（§1.3.3c）。
+    let mut k_enc = Zeroizing::new([0u8; 32]);
+    hkdf_sha256(&[], &k1[..], L_I1_ENC, &mut k_enc[..]);
 
     // 2) I1：算法集 = 本端偏好序；期望身份 = pin 的 entry.identity_pub
     let aead_list = cfg.aead.encode();
@@ -2260,8 +2303,9 @@ where
         return Err(SessionError::Handshake("non-contributory e"));
     }
     let k1 = k1_from_shares(x_ss.as_bytes(), ml_ss.as_slice());
-    let mut k_enc = [0u8; 32];
-    hkdf_sha256(&[], &k1, L_I1_ENC, &mut k_enc);
+    // k1/k_enc = 握手密钥材料：Zeroizing 包裹，Drop 清零（§1.3.3c）。
+    let mut k_enc = Zeroizing::new([0u8; 32]);
+    hkdf_sha256(&[], &k1[..], L_I1_ENC, &mut k_enc[..]);
 
     // 解密设备身份载荷（AAD = I1 已发字段前缀）
     let aad_len = 1 + msg.aead_list.len() + 32 + 32 + kem::ML_KEM_CT_LEN;
@@ -2271,7 +2315,7 @@ where
     let mut pt = enc_body.to_vec();
     use aes_gcm::aead::inout::InOutBuf;
     use aes_gcm::aead::{AeadCore, AeadInOut, KeyInit as _};
-    let cipher = aes_gcm::Aes256Gcm::new(&aes_gcm::Key::<aes_gcm::Aes256Gcm>::from(k_enc));
+    let cipher = aes_gcm::Aes256Gcm::new(&aes_gcm::Key::<aes_gcm::Aes256Gcm>::from(*k_enc));
     let ok = cipher
         .decrypt_inout_detached(
             &aes_gcm::Nonce::<<aes_gcm::Aes256Gcm as AeadCore>::NonceSize>::from(msg.nonce),

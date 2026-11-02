@@ -33,6 +33,10 @@ yamux = { workspace = true }
 chacha20poly1305 = { workspace = true }
 aes-gcm-siv = { workspace = true }
 futures = { workspace = true}
+# 密钥材料确定性清零（设计 §1.3.3c「reject_after 触发即清零密钥」承诺）：
+# TrafficKeys/DirKeys/SealedShared、握手 k1/k_enc 与 KEM combine 的 ikm。
+# 版本直接钉（本批次不动 workspace 依赖收口面）。
+zeroize = "1.9"
 
 # wasm32：tokio net 不支持该目标（tokio Cargo.toml 将 socket2 限定非 wasm）；
 # session/mux 库代码只用 io-util/time/sync/rt/macros。原生构建仍走 workspace 全量（含 net）。

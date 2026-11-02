@@ -23,6 +23,7 @@ use ml_kem::{
 };
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use zeroize::Zeroize as _;
 
 /// rand_core 0.10（ml-kem / x25519-dalek 3.0 的 RNG 代际）。仅库内桥接用，非公开 API 面。
 use rand_core as rc010;
@@ -70,13 +71,29 @@ impl std::error::Error for KemError {}
 
 /// 混合共享密钥（HKDF-SHA256 合流后的 32B OKM）。
 /// 可直接作 AES-256 钥匙（信封 v2 即此用法，§1.3.3b）。
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// 秘密材料纪律（§1.3.3c 清零承诺）：**不实现 `Copy`**（防按值复制扩散密钥字节的
+/// 无意路径，按引用传递/显式 `clone` 不受影响）；Drop 时显式清零
+/// （[`zeroize::Zeroize`]，与 [`SealedShared::zeroize`] 同一实现）。
+#[derive(Clone, PartialEq, Eq)]
 pub struct SealedShared([u8; SHARED_LEN]);
 
 impl SealedShared {
     /// 原始 32B（调用方负责用途域分离；跨用途派生请另走 HKDF）。
     pub fn as_bytes(&self) -> &[u8; SHARED_LEN] {
         &self.0
+    }
+}
+
+impl zeroize::Zeroize for SealedShared {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Drop for SealedShared {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
@@ -309,12 +326,13 @@ pub fn fingerprint(pk: &HybridPubkey) -> Fingerprint {
 }
 
 /// HKDF-SHA256 合流：ikm = x25519_ss ‖ ml_kem_ss（顺序固定，§1.3.3a）。
+/// ikm 是双份共享秘密的拼接——`Zeroizing` 包裹，Drop 时清零（§1.3.3c 密钥纪律）。
 fn combine(x_ss: &[u8], ml_ss: &[u8]) -> SealedShared {
     use hkdf::Hkdf;
-    let mut ikm = Vec::with_capacity(x_ss.len() + ml_ss.len());
+    let mut ikm = zeroize::Zeroizing::new(Vec::with_capacity(x_ss.len() + ml_ss.len()));
     ikm.extend_from_slice(x_ss);
     ikm.extend_from_slice(ml_ss);
-    let hk = Hkdf::<Sha256>::new(None, &ikm);
+    let hk = Hkdf::<Sha256>::new(None, &ikm[..]);
     let mut okm = [0u8; SHARED_LEN];
     hk.expand(HKDF_INFO, &mut okm).expect("32B OKM 恒合法");
     SealedShared(okm)
@@ -432,5 +450,21 @@ mod tests {
         let (ss, ct) = encapsulate(&sk_a.public(), &mut OsRng);
         let ss_b = decapsulate(&sk_b, &ct).expect("隐式拒绝伪随机钥匙");
         assert_ne!(ss.as_bytes(), ss_b.as_bytes(), "第三方无法得到同一共享密钥");
+    }
+
+    /// 清零纪律（§1.3.3c）：SealedShared 显式 zeroize 后 32B 全零（Drop 路径同一实现）。
+    #[test]
+    fn sealed_shared_zeroize_clears_material() {
+        let sk = keypair();
+        let (mut ss, _ct) = encapsulate(&sk.public(), &mut OsRng);
+        assert!(
+            ss.as_bytes().iter().any(|&b| b != 0),
+            "前置：封装产物非全零（否则断言空转）"
+        );
+        zeroize::Zeroize::zeroize(&mut ss);
+        assert!(
+            ss.as_bytes().iter().all(|&b| b == 0),
+            "zeroize 必须覆盖全部 32B 共享密钥材料"
+        );
     }
 }
