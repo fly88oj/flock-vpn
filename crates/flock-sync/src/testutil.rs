@@ -43,21 +43,33 @@ async fn pump(
 
 /// 双向延迟桥：`x ↔ y` 每方向 sleep `delay` 再转发；**任一侧关闭（EOF）⇒ 双向拆除**
 /// （仿真 TCP 单侧 close 的 FIN 传播——否则对端永远等不到 EOF，坏握手会挂死）。
-async fn delayed_bridge(x: DuplexStream, y: DuplexStream, delay: Duration) {
+/// 返回两泵的 AbortHandle（登记进两端 NodeSlot——`cut` 时可斩断已建立的连接，
+/// 仿真完全分区：仅拒新拨号不足以让缓存会话失联）。
+fn spawn_bridge(
+    x: DuplexStream,
+    y: DuplexStream,
+    delay: Duration,
+) -> [tokio::task::AbortHandle; 2] {
     let (xr, xw) = tokio::io::split(x);
     let (yr, yw) = tokio::io::split(y);
     let mut x2y = tokio::spawn(pump(xr, yw, delay));
     let mut y2x = tokio::spawn(pump(yr, xw, delay));
-    tokio::select! {
-        _ = &mut x2y => { y2x.abort(); }
-        _ = &mut y2x => { x2y.abort(); }
-    }
+    let handles = [x2y.abort_handle(), y2x.abort_handle()];
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut x2y => { y2x.abort(); }
+            _ = &mut y2x => { x2y.abort(); }
+        }
+    });
+    handles
 }
 
 /// 节点接入槽（公开可见性承载 FabricRegistry 类型别名）。
 pub struct NodeSlot {
     tx: mpsc::Sender<PeerIo>,
     alive: bool,
+    /// 本节点为端点的已建立桥（拨号方与被拨方各登记一份）——`cut` 时全部斩断。
+    bridges: Vec<[tokio::task::AbortHandle; 2]>,
 }
 
 /// 节点注册表（全部节点共享）。
@@ -81,9 +93,14 @@ impl MemoryFabric {
     /// 建节点织物并注册。`delay` = 单向传播延迟（RTT = 2×delay）；`buf` = duplex 缓冲。
     pub fn new(me: ServerId, reg: &FabricRegistry, delay: Duration, buf: usize) -> Arc<Self> {
         let (tx, rx) = mpsc::channel::<PeerIo>(64);
-        reg.lock()
-            .expect("fabric reg")
-            .insert(me.0, NodeSlot { tx, alive: true });
+        reg.lock().expect("fabric reg").insert(
+            me.0,
+            NodeSlot {
+                tx,
+                alive: true,
+                bridges: Vec::new(),
+            },
+        );
         Arc::new(MemoryFabric {
             me,
             reg: reg.clone(),
@@ -93,10 +110,16 @@ impl MemoryFabric {
         })
     }
 
-    /// 节点下线（dial 拒绝；在途 accept 队列保留至耗尽——kill leader 用例）。
+    /// 节点下线（完全分区形态：dial 拒绝 + **斩断已建立的桥**——缓存 E2E 会话随连接
+    /// 消亡，观察流消失；在途 accept 队列保留至耗尽——kill leader 用例）。
     pub fn cut(reg: &FabricRegistry, id: &ServerId) {
         if let Some(slot) = reg.lock().expect("fabric reg").get_mut(&id.0) {
             slot.alive = false;
+            for pair in slot.bridges.drain(..) {
+                for h in pair {
+                    h.abort();
+                }
+            }
         }
     }
 
@@ -116,30 +139,45 @@ impl MemoryFabric {
 impl Fabric for MemoryFabric {
     fn dial(&self, target: &ServerId) -> BoxFuture<'static, io::Result<PeerIo>> {
         let reg = self.reg.clone();
+        let me = self.me;
         let target = *target;
         let delay = self.delay;
         let buf = self.buf;
         async move {
-            let tx = {
-                let mut reg = reg.lock().expect("fabric reg");
-                let slot = reg.get_mut(&target.0).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::ConnectionRefused, "no such node")
-                })?;
-                if !slot.alive {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        "node down",
-                    ));
-                }
-                slot.tx.clone()
-            };
             // 双 duplex + 延迟桥：dialer 持 d1a、acceptor 得 d2a，桥接 d1b↔d2b。
             let (dial_io, d1b) = tokio::io::duplex(buf);
             let (acc_io, d2b) = tokio::io::duplex(buf);
+            let handles = spawn_bridge(d1b, d2b, delay);
+            let tx = {
+                let mut reg = reg.lock().expect("fabric reg");
+                let tx = {
+                    // 本端也被切断 ⇒ 出向同样拒（完全分区 = 双向阻断——被切节点既收不到
+                    // 入连也拨不出去，单向放行会让 fail-closed 断言失真）。
+                    let self_alive = reg.get(&me.0).is_some_and(|s| s.alive);
+                    let slot = reg.get_mut(&target.0).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::ConnectionRefused, "no such node")
+                    })?;
+                    if !slot.alive || !self_alive {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "node down",
+                        ));
+                    }
+                    slot.tx.clone()
+                };
+                // 桥登记进两端（cut 任一端即斩断——完全分区语义）。
+                let mine_copy = [handles[0].clone(), handles[1].clone()];
+                if let Some(slot) = reg.get_mut(&target.0) {
+                    slot.bridges.push(handles);
+                }
+                if let Some(mine) = reg.get_mut(&me.0) {
+                    mine.bridges.push(mine_copy);
+                }
+                tx
+            };
             tx.send(Box::new(acc_io) as PeerIo).await.map_err(|_| {
                 io::Error::new(io::ErrorKind::ConnectionRefused, "accept queue gone")
             })?;
-            tokio::spawn(delayed_bridge(d1b, d2b, delay));
             Ok(Box::new(dial_io) as PeerIo)
         }
         .boxed()

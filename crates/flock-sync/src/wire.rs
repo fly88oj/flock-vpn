@@ -15,6 +15,8 @@
 //! **apply-lag 熔断**：分发器在收到 AppendEntries 时观察 `leader_commit`（openraft 携带
 //! leader 全局提交点），配合本机 SM 的 applied index，落后超过阈值（2s = A6 时序预算）
 //! 即 [`LagMonitor::breaker_open`]——本地缓存路径停用、降级线性一致读（§4/R24）。
+//! 完全分区（观察流消失）由「心跳静默」维度覆盖：距上一帧观察超过
+//! max(lag_threshold, election_timeout) 同样开熔断（`LagMonitor` 文档）。
 
 use std::collections::BTreeMap;
 use std::io;
@@ -78,36 +80,70 @@ pub fn sid_of(node: NodeId) -> flock_protocol::session::ServerId {
 // apply-lag 熔断监控（§4 读与缓存 / R24）
 // ============================================================================
 
-/// follower 侧 apply 滞后监控：心跳/AppendEntries 携带的 leader commit index 与本地
-/// applied index 之差持续超过 `threshold` ⇒ 熔断打开（停用本地缓存、降级线性一致读）。
+/// follower 侧 apply 滞后监控——两个维度，任一触发即熔断打开（停用本地缓存、降级
+/// 线性一致读）：
+///
+/// 1. **apply-lag**：心跳/AppendEntries 携带的 leader commit index 与本地 applied index
+///    之差持续超过 `threshold`（A6 时序预算 2s）；
+/// 2. **心跳静默**：距上一帧 AppendEntries/心跳观察超过 `max(threshold,
+///    election_timeout)`。完全分区下 `leader_commit` 冻结且等于本地 applied——「未落后」
+///    是盲区（leader 可能已提交吊销而本机看不见），观察流本身消失才是可靠信号。
+///    从未观察过的节点（启动后未入网/被隔离的原 leader）自监控构造时刻起算。
+///
+/// 静默的代价披露：稳定 leader 不收 AppendEntries，其自身熔断会因静默常开——语义安全
+/// （降级路径 = leader 本机 `ensure_linearizable`，结果与缓存一致），代价是 leader 侧
+/// 缓存不生效（R18 的风暴吸收由 follower 承担）。分区恢复首帧观察到 `leader_commit >
+/// applied` 时，pending 窗起点回溯到静默起点（恢复即已超窗，立即熔断，不重新计时）。
 pub struct LagMonitor {
     threshold: Duration,
+    /// 静默上限 = max(threshold, election_timeout)。
+    silence_limit: Duration,
     applied: Arc<AtomicU64>,
     st: Mutex<MonitorSt>,
 }
 
-#[derive(Default)]
 struct MonitorSt {
     leader_commit: u64,
     pending_since: Option<Instant>,
+    /// 最近一次收到 AppendEntries/心跳观察的时刻（构造时刻起算）。
+    last_obs: Instant,
     open: bool,
 }
 
 impl LagMonitor {
-    /// `applied` = SM 维护的已 apply 最高 index（`SmCore`）。
-    pub fn new(threshold: Duration, applied: Arc<AtomicU64>) -> Arc<Self> {
+    /// `applied` = SM 维护的已 apply 最高 index（`SmCore`）；`election_timeout` =
+    /// 本机选举超时上限（静默判定第二维——小于它即选举窗口内，不构成失联证据）。
+    pub fn new(
+        threshold: Duration,
+        election_timeout: Duration,
+        applied: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         Arc::new(LagMonitor {
             threshold,
+            silence_limit: threshold.max(election_timeout),
             applied,
-            st: Mutex::new(MonitorSt::default()),
+            st: Mutex::new(MonitorSt {
+                leader_commit: 0,
+                pending_since: None,
+                last_obs: Instant::now(),
+                open: false,
+            }),
         })
     }
 
     /// 分发器观察 leader commit index（AppendEntries 携带）。
     pub fn observe_leader_commit(&self, idx: u64) {
         let mut st = self.st.lock().expect("lag monitor");
+        let prev_obs = st.last_obs;
+        st.last_obs = Instant::now();
         if idx > st.leader_commit {
             st.leader_commit = idx;
+        }
+        let applied = self.applied.load(Ordering::SeqCst);
+        // 回溯：观察到落后时，pending 窗起点不晚于上一帧观察时刻（静默起点）——
+        // 分区期间攒下的落后在恢复首帧即视为已超窗。
+        if st.leader_commit > applied {
+            st.pending_since = Some(st.pending_since.unwrap_or(prev_obs).min(prev_obs));
         }
         self.recompute(&mut st);
     }
@@ -125,6 +161,13 @@ impl LagMonitor {
     }
 
     fn recompute(&self, st: &mut MonitorSt) {
+        // 维度二：心跳静默——完全分区（观察流消失）即开熔断。静默期不开 pending 窗
+        // （无从比较）；恢复首帧的回溯由 observe_leader_commit 完成。
+        if st.last_obs.elapsed() > self.silence_limit {
+            st.open = true;
+            return;
+        }
+        // 维度一：apply-lag。
         let applied = self.applied.load(Ordering::SeqCst);
         if st.leader_commit > applied {
             match st.pending_since {
@@ -787,7 +830,11 @@ mod tests {
     #[tokio::test]
     async fn lag_monitor_opens_after_threshold_and_closes_on_catchup() {
         let applied = Arc::new(AtomicU64::new(10));
-        let mon = LagMonitor::new(Duration::from_millis(100), applied.clone());
+        let mon = LagMonitor::new(
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            applied.clone(),
+        );
         mon.observe_leader_commit(12);
         assert!(!mon.breaker_open(), "刚观察到落后不立即熔断");
         assert_eq!(mon.leader_commit(), 12);
@@ -799,14 +846,51 @@ mod tests {
         assert!(!mon.breaker_open(), "追平后熔断关闭");
     }
 
+    /// 心跳静默维度：长时间无任何 AppendEntries/心跳观察（完全分区）⇒ 熔断开启。
+    ///
+    /// 旧断言（lag_monitor_not_open_without_observation）把「分区不熔断」固化成了错误
+    /// 特性：完全分区下 `leader_commit` 冻结且等于本地 applied，判「未落后」是盲区
+    /// ——分区期间吊销挡不住缓存路径放行（§4/R24）。本断言修正为正确语义：观察流
+    /// 消失本身即失联证据，静默超过 max(threshold, election_timeout) 即开熔断。
     #[tokio::test]
-    async fn lag_monitor_not_open_without_observation() {
+    async fn lag_monitor_opens_on_heartbeat_silence() {
         let applied = Arc::new(AtomicU64::new(5));
-        let mon = LagMonitor::new(Duration::from_millis(50), applied);
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        assert!(
-            !mon.breaker_open(),
-            "未观察到 leader commit（如分区）不误开"
+        // silence_limit = max(50ms, 100ms) = 100ms。
+        let mon = LagMonitor::new(
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            applied,
         );
+        assert!(!mon.breaker_open(), "构造时刻起算，静默未超限不开");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(mon.breaker_open(), "长时间无观察（完全分区）⇒ 熔断开启");
+    }
+
+    /// 分区恢复：静默开熔断后，首帧观察到 leader_commit >> applied 时立即保持开启
+    /// （pending_since 回溯到静默起点，不重新计时），追平后才关闭。
+    #[tokio::test]
+    async fn lag_monitor_recovery_backdates_pending_window() {
+        let applied = Arc::new(AtomicU64::new(10));
+        let mon = LagMonitor::new(
+            Duration::from_millis(100),
+            Duration::from_millis(150),
+            applied.clone(),
+        );
+        mon.observe_leader_commit(10);
+        assert!(!mon.breaker_open(), "健康（无落后）");
+        // 完全分区 200ms > silence_limit(150ms) ⇒ 熔断。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(mon.breaker_open(), "静默开熔断");
+        // 分区恢复首帧：leader 已远走（commit 30 >> applied 10）⇒ 立即仍开
+        // （pending 窗回溯到静默起点，elapsed 200ms > threshold 100ms）。
+        mon.observe_leader_commit(30);
+        assert!(
+            mon.breaker_open(),
+            "恢复首帧观察到大幅落后 ⇒ 立即保持开启（不重新计时）"
+        );
+        // 追平 ⇒ 关闭。
+        applied.store(30, Ordering::SeqCst);
+        mon.observe_leader_commit(30);
+        assert!(!mon.breaker_open(), "追平后熔断关闭");
     }
 }

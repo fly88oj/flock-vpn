@@ -8,7 +8,8 @@
 //! 5. server_keys→rewrap 往返（envelope v2 封装 → 状态机落库 → 目标服务器开封）；
 //! 6. revoke 提交后各节点 apply 回调 epoch 前进 + 杀会话钩子 ≤2s；
 //! 7. **apply-lag 熔断**——follower 落后 5s 期间注入吊销 ⇒ 拒用缓存（降级线性一致读）
-//!    且新握手被拒（§4 陈旧读边界 / R24）；
+//!    且新握手被拒（§4 陈旧读边界 / R24）；7b. **完全分区**——切断（含已建立会话）后
+//!    吊销仍被拦（心跳静默熔断 + fail-closed），恢复后追平方可见；
 //! 8. 票据密钥根在 Raft 内：A 签 B 验，吊销后全网失效（epoch）。
 //!
 //! RTT 注入 = 每方向 50ms 线路延迟（§7-M4 100ms 校准）；节点故障 = MemoryFabric::cut。
@@ -61,10 +62,17 @@ struct Cluster {
 
 impl Cluster {
     async fn new() -> Cluster {
+        Cluster::new_tuned(|_| {}).await
+    }
+
+    /// 按调参构建（完全分区负向用例缩短写/读转发预算——fail-closed 断言不拖满 12s）。
+    async fn new_tuned(tune: impl FnOnce(&mut SyncSettings)) -> Cluster {
         let root = SigningKey::from_bytes(&[7u8; 32]);
         let cluster_id = ClusterId([9u8; 16]);
         let reg = MemoryFabric::registry();
         let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut settings = SyncSettings::default();
+        tune(&mut settings);
 
         // 根签目录（入群凭证公开部分——互连双向认证的材料源）。
         let mut idents = Vec::new();
@@ -87,7 +95,7 @@ impl Cluster {
             let fabric = MemoryFabric::new(ident.server_id, &reg, RTT_HALF, 2 * 1024 * 1024);
             let rec = HookRecorder::new();
             let node = SyncNodeBuilder::new(
-                SyncSettings::default(),
+                settings.clone(),
                 ident.clone(),
                 directory.clone(),
                 fabric,
@@ -654,6 +662,90 @@ async fn apply_lag_breaker_rejects_cache_and_new_handshake() {
     }
     assert!(!lagger.breaker_open(), "追平后熔断恢复");
     assert_eq!(lagger.local_epoch(), 1, "滞后节点最终 apply（epoch 前进）");
+}
+
+// ============================================================================
+// 7b. 完全分区负向用例：切断后吊销仍被拦，缓存拒用（心跳静默维度）
+// ============================================================================
+
+/// 完全分区（cut = 拒新拨号 + 斩断已建立的 E2E 会话桥——观察流消失）期间，leader 侧
+/// 提交的吊销不得经被切断节点的本地缓存放行：静默超 max(lag_threshold, election_timeout)
+/// ⇒ 熔断打开 ⇒ 缓存拒用；分区下线性一致读不可达 ⇒ fail-closed（NotFound ⇒ 拒握手，
+/// 绝不回落陈旧 Active）。分区恢复后回溯语义：恢复首帧即仍开（pending 回溯），apply
+/// 追平方关闭且吊销可见。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_partition_breaker_blocks_revoked_cache_until_rejoin() {
+    let cluster = Cluster::new_tuned(|s| s.forward_deadline = Duration::from_secs(3)).await;
+    bootstrap(&cluster, 0).await;
+    let (leader_idx, _) = cluster.leader().await;
+    let writer = (leader_idx + 1) % 3;
+    let cut_idx = (leader_idx + 2) % 3;
+    let cut_node = &cluster.nodes[cut_idx];
+    let cut_id = cut_node.id();
+
+    // 注册设备（真实 Ed25519 公钥）并在将被切断的 follower 上预热缓存（Active）。
+    let dev = SigningKey::from_bytes(&[6u8; 32]);
+    let dev_pub = *dev.verifying_key().as_bytes();
+    let resp = must_write(
+        &cluster.nodes[writer],
+        SyncRequest::RegisterDevice {
+            owner: "eve".into(),
+            x25519: [6; 32],
+            ed25519: dev_pub,
+        },
+    )
+    .await;
+    assert!(matches!(resp, SyncResponse::Device(_)));
+    let id = dev_id(&dev_pub);
+    let v = cut_node.dir().lookup_async(id).await;
+    assert!(matches!(v, LookupVerdict::Active(_)), "预热: {v:?}");
+    let v = cut_node.dir().lookup_async(id).await;
+    assert!(matches!(v, LookupVerdict::Active(_)), "缓存命中: {v:?}");
+    assert!(cut_node.dir().stats().cache_hits >= 1);
+
+    // —— 完全分区：切断 follower（新拨号拒绝 + 已建立会话桥斩断）——
+    MemoryFabric::cut(&cluster.reg, &sid(cut_id));
+
+    // 分区期间其余两节点（仍有 quorum）提交吊销。
+    must_write(&cluster.nodes[writer], SyncRequest::Revoke { device: id.0 }).await;
+
+    // 心跳静默 > max(2s, 3s) ⇒ 熔断打开（leader_commit 冻结 == applied 的盲区由此覆盖）。
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !cut_node.breaker_open() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(cut_node.breaker_open(), "完全分区（无任何观察）⇒ 静默熔断");
+
+    // 吊销仍被拦：缓存拒用（cache_hits 不前进）+ 分区下线性一致读不可达 ⇒ fail-closed
+    // （NotFound ⇒ 拒握手——绝不放行陈旧的 Active）。
+    let before = cut_node.dir().stats();
+    let v = cut_node.dir().lookup_async(id).await;
+    let after = cut_node.dir().stats();
+    assert!(
+        matches!(v, LookupVerdict::NotFound),
+        "分区节点 fail-closed（非陈旧 Active）: {v:?}"
+    );
+    assert_eq!(after.cache_hits, before.cache_hits, "熔断期拒用本地缓存");
+    assert!(
+        after.breaker_degraded > before.breaker_degraded,
+        "熔断路径计数前进"
+    );
+
+    // —— 分区恢复：uncut（斩断过的连接需重拨——互连自动重建）——
+    MemoryFabric::uncut(&cluster.reg, &sid(cut_id));
+    // 回溯语义：恢复首帧观察到 leader_commit >> applied ⇒ 立即仍开；apply 追平后关闭。
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while cut_node.breaker_open() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!cut_node.breaker_open(), "恢复追平后熔断关闭");
+    // 追平 ⇒ epoch 前进 ⇒ 缓存失效 ⇒ 线性一致读给出 Revoked（吊销最终可见）。
+    let v = cut_node.dir().lookup_async(id).await;
+    assert!(
+        matches!(v, LookupVerdict::Revoked { .. }),
+        "恢复后吊销可见: {v:?}"
+    );
+    assert_eq!(cut_node.local_epoch(), 1, "被切断节点最终 apply");
 }
 
 // ============================================================================

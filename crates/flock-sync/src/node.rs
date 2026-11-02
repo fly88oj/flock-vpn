@@ -170,7 +170,11 @@ impl SyncNodeBuilder {
         .await
         .map_err(|e| SyncError::Raft(format!("raft start: {e}")))?;
 
-        let lag = LagMonitor::new(self.settings.lag_threshold, sm.applied_counter());
+        let lag = LagMonitor::new(
+            self.settings.lag_threshold,
+            Duration::from_millis(self.settings.election_max_ms),
+            sm.applied_counter(),
+        );
         let lease = LeaseTable::new(self.node_id, self.settings.lease_ttl, sm.shared_hooks());
         let directory = Arc::new(
             Directory::new(self.ident.root_pub, &self.directory)

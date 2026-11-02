@@ -165,7 +165,13 @@ mod tests {
     }
 
     fn monitor() -> Arc<LagMonitor> {
-        LagMonitor::new(Duration::from_millis(50), Arc::new(AtomicU64::new(0)))
+        // 静默上限 = max(50ms, 200ms) = 200ms：本组测试关注熔断降级路径，
+        // 构造后立即查询（静默 ~0）不受静默维度干扰。
+        LagMonitor::new(
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+            Arc::new(AtomicU64::new(0)),
+        )
     }
 
     #[tokio::test]
@@ -210,7 +216,12 @@ mod tests {
         });
         let (_tx, rx) = watch::channel(0u64);
         let applied = Arc::new(AtomicU64::new(0));
-        let lag = LagMonitor::new(Duration::from_millis(30), applied.clone());
+        // 静默上限 = max(30ms, 500ms) = 500ms > 测试窗（60ms）：熔断只由 apply-lag 触发。
+        let lag = LagMonitor::new(
+            Duration::from_millis(30),
+            Duration::from_millis(500),
+            applied.clone(),
+        );
         let dir = SyncDirectory::new(reader.clone(), lag.clone(), rx);
         let id = DeviceId([3; 32]);
         assert!(matches!(
