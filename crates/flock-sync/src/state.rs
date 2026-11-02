@@ -70,6 +70,12 @@ pub struct NetStateData {
     pub vip_next: u32,
     pub config_version: u64,
     pub devices: BTreeMap<[u8; 32], DeviceRow>,
+    /// VIP → 设备反查索引（`devices` 的**派生数据**，不序列化——快照/重放后由
+    /// [`NetStateData::reindex_vips`] 重建，apply 注册路径增量维护）。每包转发热路径
+    /// （`sm::SmCore::device_by_vip`）从 O(N) 全表扫描降为 O(log N)——VIP 水位单调
+    /// 不复用 ⇒ 索引单射。
+    #[serde(skip, default)]
+    pub vip_index: BTreeMap<[u8; 4], [u8; 32]>,
     pub users: BTreeMap<String, UserRow>,
     pub invites: BTreeMap<[u8; 16], InviteRow>,
     pub bind_tokens: BTreeSet<[u8; 16]>,
@@ -119,6 +125,21 @@ impl NetStateData {
     /// 当前全局 revocation_epoch。
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// 全量重建 VIP 反查索引（恢复/快照安装/一致性自检用；幂等）。
+    pub fn reindex_vips(&mut self) {
+        self.vip_index = self
+            .devices
+            .iter()
+            .map(|(dev, row)| (row.vip, *dev))
+            .collect();
+    }
+
+    /// 按 VIP 反查设备（每包转发热路径——索引 O(log N)）。VIP 水位单调不复用 ⇒ 命中
+    /// 唯一。NetState 只存静态注册信息——不含当前位置。
+    pub fn device_by_vip(&self, vip: &[u8; 4]) -> Option<[u8; 32]> {
+        self.vip_index.get(vip).copied()
     }
 
     /// 集群共享 OPRF key（b64；未登记 ⇒ None）。
@@ -358,6 +379,7 @@ impl NetStateData {
             since_epoch: 0,
         };
         self.devices.insert(device_id, row.clone());
+        self.vip_index.insert(vip, device_id);
         ApplyOutcome::ok(SyncResponse::Device(row))
     }
 
@@ -453,6 +475,7 @@ impl NetStateData {
                 since_epoch: 0,
             },
         );
+        self.vip_index.insert(vip, device_id);
         // 同一状态转移内标记 used（查重与标记间无窗口——Raft 单次提交）。
         self.invites.insert(
             invite_id,
@@ -814,9 +837,59 @@ mod tests {
             None,
         );
         let bytes = d.to_bytes();
-        let back = NetStateData::from_bytes(&bytes).expect("roundtrip");
+        let mut back = NetStateData::from_bytes(&bytes).expect("roundtrip");
         assert_eq!(back.devices.len(), 1);
         assert_eq!(back.epoch, d.epoch);
         assert_eq!(back.ticket_root, d.ticket_root);
+        // VIP 索引不序列化（派生数据）——重建后与原状态一致。
+        assert!(back.vip_index.is_empty(), "索引不进快照字节");
+        back.reindex_vips();
+        assert_eq!(back.vip_index, d.vip_index, "重建后索引一致");
+    }
+
+    /// VIP 反查索引一致性：apply 维护（注册/兑换/吊销后行保留不删除）+ 全量重建
+    /// 幂等 + 查询结果与全表扫描等价。
+    #[test]
+    fn vip_index_consistency_across_apply_and_rebuild() {
+        let root = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
+        let mut d = bootstrapped(&root);
+        // 注册 3 台 + 吊销 1 台（禁用不删除：行与 VIP 均保留 ⇒ 索引条目保留）。
+        for i in 1u8..=3 {
+            let out = d
+                .apply(
+                    &SyncRequest::RegisterDevice {
+                        owner: format!("u{i}"),
+                        x25519: [i; 32],
+                        ed25519: [i; 32],
+                    },
+                    None,
+                )
+                .resp;
+            assert!(matches!(out, SyncResponse::Device(_)));
+        }
+        let revoked_dev: [u8; 32] = Sha256::digest([2u8; 32]).into();
+        d.apply(
+            &SyncRequest::Revoke {
+                device: revoked_dev,
+            },
+            None,
+        );
+        // 一致性：索引 ↔ devices 全表扫描（对每个 VIP 查询结果等价；条目数相等）。
+        let expect: Vec<([u8; 4], [u8; 32])> =
+            d.devices.iter().map(|(dev, row)| (row.vip, *dev)).collect();
+        assert_eq!(d.vip_index.len(), d.devices.len(), "吊销不删行 ⇒ 索引不缩");
+        for (vip, dev) in &expect {
+            assert_eq!(d.device_by_vip(vip), Some(*dev), "索引查询 = 全表扫描");
+        }
+        // 未分配 VIP ⇒ None。
+        assert_eq!(d.device_by_vip(&[127, 0, 0, 1]), None);
+        // 全量重建幂等且与增量维护结果一致。
+        let incremental = d.vip_index.clone();
+        d.reindex_vips();
+        assert_eq!(d.vip_index, incremental, "重建 == 增量维护");
+        // 序列化→反序列化→重建也一致（快照恢复路径）。
+        let mut back = NetStateData::from_bytes(&d.to_bytes()).expect("roundtrip");
+        back.reindex_vips();
+        assert_eq!(back.vip_index, incremental, "快照往返后重建一致");
     }
 }

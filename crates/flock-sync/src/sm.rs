@@ -101,9 +101,11 @@ impl SmCore {
     /// 以既有 redb 库与初始状态构造（`pinned_root` = 本机钉扎根，可 None）。
     pub fn new(
         db: Arc<Database>,
-        data: NetStateData,
+        mut data: NetStateData,
         pinned_root: Option<ed25519_dalek::VerifyingKey>,
     ) -> Arc<Self> {
+        // VIP 反查索引是派生数据（不序列化）：任何来源（空库/快照恢复）进场即重建。
+        data.reindex_vips();
         let epoch = data.epoch;
         let applied = data.last_applied.map(|l| l.index).unwrap_or(0);
         let (epoch_tx, _) = watch::channel(epoch);
@@ -184,14 +186,10 @@ impl SmCore {
         self.with_data(|d| d.devices.get(device).map(|r| r.vip))
     }
 
-    /// 按 VIP 反查设备（目标归属解析；NetState 只存静态注册信息——不含当前位置）。
+    /// 按 VIP 反查设备（目标归属解析；每包转发热路径——`NetStateData` 的 VIP 索引，
+    /// O(log N)；NetState 只存静态注册信息——不含当前位置）。
     pub fn device_by_vip(&self, vip: &[u8; 4]) -> Option<[u8; 32]> {
-        self.with_data(|d| {
-            d.devices
-                .iter()
-                .find(|(_, r)| &r.vip == vip)
-                .map(|(id, _)| *id)
-        })
+        self.with_data(|d| d.device_by_vip(vip))
     }
 
     /// 执行一批日志的 apply（核心转移 + 钩子触发 + watch 推进）。
@@ -364,6 +362,8 @@ impl openraft::storage::RaftStateMachine<SyncConfig> for RedbStateMachine {
         let mut data = bundle.data;
         data.last_applied = meta.last_log_id;
         data.last_membership = meta.last_membership.clone();
+        // 索引是派生数据（快照字节不含）——整体替换状态时同步重建。
+        data.reindex_vips();
         let epoch = data.epoch;
         let applied = meta.last_log_id.map(|l| l.index).unwrap_or(0);
         {
@@ -499,12 +499,21 @@ mod tests {
             .await;
         let snap = c.build_and_persist_snapshot();
         assert_eq!(snap.meta.last_log_id.map(|l| l.index), Some(2));
+        // 热路径索引：注册后即查得（apply 增量维护）。
+        let dev: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest([1u8; 32]).into()
+        };
+        let vip = c.vip_of(&dev).expect("vip");
+        assert_eq!(c.device_by_vip(&vip), Some(dev), "apply 后索引即查得");
         // 新核从库内快照恢复。
         let c2 = SmCore::restore_or_empty(db, None);
         assert_eq!(c2.epoch(), c.epoch());
         assert_eq!(c2.applied_index(), 2);
         assert!(c2.with_data(|d| d.devices.len() == 1));
         assert_eq!(c2.ticket_root(), Some([9; 32]), "票据密钥根随快照恢复");
+        // 恢复路径重建索引（索引不序列化——派生数据）。
+        assert_eq!(c2.device_by_vip(&vip), Some(dev), "快照恢复后索引重建");
     }
 
     fn entry(idx: u64, req: SyncRequest) -> Entry<SyncConfig> {
