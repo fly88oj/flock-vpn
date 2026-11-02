@@ -225,6 +225,19 @@ async fn stats_lines(core: &ServerCore) -> Vec<String> {
     lines.push(format!("epoch={}", core.net.epoch().await));
     lines.push(format!("sessions_online={}", core.sessions.device_count()));
     lines.push(format!("tun_vip={}", core.cfg.vip));
+    // 评审项 9/10：nonce 超限告警计数 + 源 VIP 失配（全局累计与 per-session 达限拆链数）。
+    lines.push(format!(
+        "nonce_overflow_rejects={}",
+        core.guard.nonces.overflow_rejects()
+    ));
+    lines.push(format!(
+        "src_vip_mismatches={}",
+        crate::dataplane::src_vip_mismatches()
+    ));
+    lines.push(format!(
+        "src_vip_mismatch_kills={}",
+        crate::dataplane::src_vip_mismatch_kills()
+    ));
     #[cfg(feature = "multi-primary")]
     if let Some(node) = &core.sync {
         lines.push(format!("node_id={}", node.id()));

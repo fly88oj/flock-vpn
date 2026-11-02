@@ -47,7 +47,38 @@ pub fn src_vip_mismatches() -> u64 {
     SRC_MISMATCH.load(Ordering::Relaxed)
 }
 
+/// 因 per-session 源 VIP 失配达限被拆的会话通道数（评审项 10 的 admin stats 面）。
+pub fn src_vip_mismatch_kills() -> u64 {
+    SRC_MISMATCH_KILLS.load(Ordering::Relaxed)
+}
+
 static SRC_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static SRC_MISMATCH_KILLS: AtomicU64 = AtomicU64::new(0);
+
+/// per-session 源 VIP 失配上限（评审项 10）：达限即拆该会话通道（客户端观察通道
+/// EOF → 退避重连；持续伪造源的会话不再永久存活于「丢包+计数」的静默兜底）。
+const SRC_MISMATCH_SESSION_LIMIT: u32 = 100;
+
+/// 每会话源 VIP 失配计数器（serve_stream 内联使用；拆出便于上限语义单测）。
+#[derive(Default)]
+struct SrcMismatchCounter {
+    count: u32,
+}
+
+impl SrcMismatchCounter {
+    /// 记一次失配（全局计数同步累加）。返回 true ⇒ 达 [`SRC_MISMATCH_SESSION_LIMIT`]，
+    /// 调用方应拆会话通道。
+    fn on_mismatch(&mut self) -> bool {
+        self.count += 1;
+        SRC_MISMATCH.fetch_add(1, Ordering::Relaxed);
+        if self.count >= SRC_MISMATCH_SESSION_LIMIT {
+            SRC_MISMATCH_KILLS.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// IPv4 包源/目标地址（版本/IHL 校验后取 12..16 / 16..20）。非 IPv4/太短 ⇒ None。
 fn ipv4_src_dst(pkt: &[u8]) -> Option<([u8; 4], [u8; 4])> {
@@ -258,9 +289,10 @@ impl PeerRouter {
         let mut stream = stream;
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(1024);
         let gen = self.sessions.register(vip, out_tx);
+        let mut src_mismatch = SrcMismatchCounter::default();
         let mut frames = FrameBuf::new();
         let mut chunk = vec![0u8; READ_CHUNK];
-        loop {
+        'tunnel: loop {
             // 已缓冲完整帧：第 0 步源 VIP 校验（§2.2）→ 内核注入 / 失配丢+计数。
             while let Some(pkt) = frames.take_frame() {
                 match ipv4_src_dst(&pkt) {
@@ -270,9 +302,16 @@ impl PeerRouter {
                             return;
                         }
                     }
-                    // 失配/非 IPv4：丢包 + 计数（R22：不静默放行也不断链——计数供告警面）。
+                    // 失配/非 IPv4：丢包 + 计数（R22：不静默放行）。评审项 10：per-session
+                    // 失配计数 ≥100 即拆该会话通道（持续源伪造不再仅靠计数告警兜底）。
                     _ => {
-                        SRC_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                        if src_mismatch.on_mismatch() {
+                            eprintln!(
+                                "flock-server: 源 VIP 失配 {} 次 ≥ {}——拆会话通道 vip={vip:?}",
+                                src_mismatch.count, SRC_MISMATCH_SESSION_LIMIT
+                            );
+                            break 'tunnel;
+                        }
                     }
                 }
             }
@@ -433,6 +472,10 @@ pub async fn serve_stream_sync(node: Arc<flock_sync::SyncNode>, device: [u8; 32]
 mod tests {
     use super::*;
 
+    /// SRC_MISMATCH/SRC_MISMATCH_KILLS 是进程级静态——触达它们的服务端 e2e 测试
+    /// 间以此锁串行（否则并行测试互踩彼此的精确计数断言）。
+    static MISMATCH_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn ipv4_src_dst_parses_and_rejects() {
         let mut pkt = vec![0u8; 20];
@@ -452,6 +495,33 @@ mod tests {
         // 降级路径标志位（FIN 语义的端到端行为由 m3 容器反向覆盖：有 tun ⇒ is_up）。
         let router = PeerRouter::none();
         assert!(!router.is_up());
+    }
+
+    /// 评审项 10：per-session 源 VIP 失配上限——前 99 次仅丢包+全局计数，第
+    /// [`SRC_MISMATCH_SESSION_LIMIT`] 次返回拆链信号并累计 kills。
+    #[test]
+    fn src_mismatch_counter_kills_at_limit() {
+        let _g = MISMATCH_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mism_before = src_vip_mismatches();
+        let kills_before = src_vip_mismatch_kills();
+        let mut c = SrcMismatchCounter::default();
+        for i in 1..SRC_MISMATCH_SESSION_LIMIT {
+            assert!(!c.on_mismatch(), "第 {i} 次不拆");
+        }
+        assert_eq!(src_vip_mismatch_kills(), kills_before, "未达限不计数拆链");
+        assert!(
+            c.on_mismatch(),
+            "第 {} 次达限 ⇒ 拆",
+            SRC_MISMATCH_SESSION_LIMIT
+        );
+        assert_eq!(
+            src_vip_mismatches(),
+            mism_before + SRC_MISMATCH_SESSION_LIMIT as u64,
+            "全局失配计数逐次累加"
+        );
+        assert_eq!(src_vip_mismatch_kills(), kills_before + 1, "拆链计数 +1");
     }
 
     /// 回归（bug：serve_stream 退出无条件 remove）：同 VIP 重注册后，旧代会话退出
@@ -497,6 +567,9 @@ mod tests {
     ///    不得删除新登记——新流下行必须照常（旧代码下该设备下行黑洞）。
     #[tokio::test]
     async fn serve_stream_inbound_check_outbound_and_reregistration_race() {
+        let _g = MISMATCH_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use flock_protocol::session::{
             respond, ClusterId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, ServerId,
             ServerIdentity, TunnelConfig,
@@ -616,6 +689,103 @@ mod tests {
         assert_eq!(down2, ip_pkt(vip, 5));
 
         let _ = tokio::time::timeout(Duration::from_secs(3), t2).await;
+        drop(srv);
+    }
+
+    /// 评审项 10：per-session 源 VIP 失配达限（100）⇒ 拆会话通道（客户端观察通道
+    /// EOF）+ kills 计数递增——持续伪造源的会话不再永久存活于「丢包+计数」兜底。
+    #[tokio::test]
+    async fn serve_stream_killed_after_100_src_vip_mismatches() {
+        let _g = MISMATCH_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        use flock_protocol::session::{
+            respond, ClusterId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, ServerId,
+            ServerIdentity, TunnelConfig,
+        };
+        use flock_protocol::trust::ClusterDirectory;
+        use std::time::Duration;
+
+        let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let identity = ServerIdentity::enroll(&root, ClusterId([7; 16]), ServerId([1; 16]), "t:1");
+        let directory =
+            ClusterDirectory::issue(&root, identity.cluster_id, 1, vec![identity.entry.clone()]);
+        let device = DeviceStaticKeys::generate();
+        let mut dir = InMemoryDirectory::new();
+        dir.register(DeviceRecord {
+            device_x25519: device.x25519_public(),
+            device_ed25519: device.ed25519_public(),
+        });
+        let pin = flock_protocol::session::ServerPin {
+            cluster_id: directory.cluster_id,
+            cluster_root_pub: root.verifying_key(),
+            entry: directory.servers[0].clone(),
+        };
+
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Stream>(8);
+        let srv = tokio::spawn(async move {
+            let t = respond(b, &identity, dir, TunnelConfig::default())
+                .await
+                .expect("respond");
+            while let Some(s) = t.accept_stream().await {
+                if stream_tx.send(s).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let tunnel = flock_protocol::session::initiate(a, &device, &pin, TunnelConfig::default())
+            .await
+            .expect("initiate");
+
+        let (kernel_tx, _kernel_rx) = mpsc::channel::<Vec<u8>>(64);
+        let router = PeerRouter::with_kernel_tx(kernel_tx);
+        let vip = [100u8, 64, 0, 2];
+        let kills_before = src_vip_mismatch_kills();
+
+        // 控制占位 + 数据通道物化（惰性 SYN：首帧触发服务端 accept）。物化用**合法**
+        // src VIP 包（不进失配计数）。
+        let _hold = tunnel
+            .open_stream(flock_protocol::mux::Prio::Control)
+            .await
+            .unwrap();
+        let mut ch = tunnel.open_packet_channel().await.unwrap();
+        let ip_pkt = |src: [u8; 4], tag: u8| -> Vec<u8> {
+            let mut p = vec![0x45u8, 0, 0, tag];
+            p.resize(20, 0);
+            p[12..16].copy_from_slice(&src);
+            p[16..20].copy_from_slice(&[100, 64, 0, 1]);
+            p
+        };
+        ch.send(&ip_pkt(vip, 1)).await.unwrap();
+        let s = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+            .await
+            .expect("stream materialize")
+            .unwrap();
+        let r = router.clone();
+        let task = tokio::spawn(async move { r.serve_stream(vip, s).await });
+
+        // 连发 100 个失配包：第 100 个达限 ⇒ 服务端拆通道（客户端 recv 观察 EOF/错误；
+        // 拆链后残余 send 报 WriteZero 即停止发送——拆链本身即是目标）。
+        let bad = ip_pkt([9, 9, 9, 9], 2);
+        for _ in 0..SRC_MISMATCH_SESSION_LIMIT {
+            if ch.send(&bad).await.is_err() {
+                break; // 通道已被服务端拆除（早于发满 100 个——计数在服务端侧已先行）
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let closed = tokio::time::timeout_at(deadline.into(), async {
+            loop {
+                if ch.recv().await.is_err() {
+                    break true; // 通道关闭（EOF/错误）= 服务端拆链的客户端观察
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(closed, "失配达限后客户端通道必须观察到关闭");
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert_eq!(src_vip_mismatch_kills(), kills_before + 1, "拆链计数 +1");
         drop(srv);
     }
 }
