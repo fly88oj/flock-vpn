@@ -170,11 +170,6 @@ impl ClusterDirectory {
         self.servers.iter().find(|e| &e.server_id == server_id)
     }
 
-    /// 按中转端点（frps host:port）查端点材料。
-    pub fn find_by_endpoint(&self, relay_endpoint: &str) -> Option<&ServerEntry> {
-        self.servers.iter().find(|e| e.relay_endpoint == relay_endpoint)
-    }
-
     fn encode(&self, out: &mut Vec<u8>) {
         out.push(DIRECTORY_VERSION);
         out.extend_from_slice(&self.cluster_id.0);
