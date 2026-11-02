@@ -48,6 +48,9 @@ pub enum ClientError {
     Io(io::Error),
     Session(flock_protocol::session::SessionError),
     Trust(TrustError),
+    /// 拨号超时（TCP connect + 握手整体超出 [`DIAL_TIMEOUT`]；R1 黑洞等静默对端）。
+    /// 携带目标端点。
+    DialTimeout(String),
     /// 状态目录/配置问题（消息自带上下文）。
     State(String),
 }
@@ -58,12 +61,24 @@ impl std::fmt::Display for ClientError {
             ClientError::Io(e) => write!(f, "client: io: {e}"),
             ClientError::Session(e) => write!(f, "client: session: {e}"),
             ClientError::Trust(e) => write!(f, "client: trust: {e}"),
+            ClientError::DialTimeout(ep) => {
+                write!(f, "client: 拨号超时（connect+握手 > {DIAL_TIMEOUT:?}）: {ep}")
+            }
             ClientError::State(m) => write!(f, "client: {m}"),
         }
     }
 }
 
-impl std::error::Error for ClientError {}
+impl std::error::Error for ClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ClientError::Io(e) => Some(e),
+            ClientError::Session(e) => Some(e),
+            ClientError::Trust(e) => Some(e),
+            ClientError::DialTimeout(_) | ClientError::State(_) => None,
+        }
+    }
+}
 
 impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
@@ -322,12 +337,29 @@ impl EndpointRing {
 // 拨号与守护循环
 // ============================================================================
 
-/// 单次拨号：TCP（带超时）→ `session::initiate`（1-RTT，已钉扎形态）。
+/// 单次拨号：TCP connect + `session::initiate`（1-RTT，已钉扎形态）**整体**受
+/// [`DIAL_TIMEOUT`] 约束——R1 黑洞（TCP 通、握手不答）时超时换下一端点轮询，
+/// supervise 不因无超时的 `initiate` 永久挂死。
 pub async fn dial(pin: &ServerPin, device: &DeviceStaticKeys, cfg: TunnelConfig) -> Result<Tunnel, ClientError> {
-    let io = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&pin.entry.relay_endpoint))
-        .await
-        .map_err(|_| ClientError::State(format!("拨号超时 {}", pin.entry.relay_endpoint)))??;
-    initiate(io, device, pin, cfg).await.map_err(ClientError::Session)
+    dial_with_timeout(pin, device, cfg, DIAL_TIMEOUT).await
+}
+
+/// [`dial`] 的可注入超时档（测试用短超时复现「TCP 通、R1 永不到达」的黑洞形态）。
+pub async fn dial_with_timeout(
+    pin: &ServerPin,
+    device: &DeviceStaticKeys,
+    cfg: TunnelConfig,
+    timeout: Duration,
+) -> Result<Tunnel, ClientError> {
+    tokio::time::timeout(
+        timeout,
+        async {
+            let io = TcpStream::connect(&pin.entry.relay_endpoint).await?;
+            initiate(io, device, pin, cfg).await.map_err(ClientError::Session)
+        },
+    )
+    .await
+    .map_err(|_| ClientError::DialTimeout(pin.entry.relay_endpoint.clone()))?
 }
 
 /// 守护循环事件（日志/断言面：A9 的「检测进入重连」由 [`ConnEvent::SessionEnded`] 携
@@ -537,6 +569,51 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(mock.written().len() >= n, "写侧未达 {n}（现 {}）", mock.written().len());
+    }
+
+    /// 回归（评审确认缺陷）：TCP 通、R1 永不到达（黑洞对端）时 dial 不得永久挂死——
+    /// connect + initiate 整体受超时约束，返回 [`ClientError::DialTimeout`]（旧形态
+    /// DIAL_TIMEOUT 只包 connect，`initiate` 无超时 ⇒ supervise 挂死）。
+    #[tokio::test]
+    async fn dial_times_out_when_r1_never_arrives() {
+        use flock_protocol::session::{ClusterId, ServerEntry, ServerId};
+
+        // 黑洞对端：accept 后持有连接但零字节（R1 永不到达）。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ep = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+
+        let identity = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let entry = ServerEntry {
+            server_id: ServerId([9; 16]),
+            relay_endpoint: ep.clone(),
+            identity_pub: identity.verifying_key(),
+            static_hybrid_pub: flock_protocol::kem::HybridKeypair::generate(&mut rand::rngs::OsRng)
+                .public(),
+        };
+        let pin = ServerPin {
+            cluster_id: ClusterId([7; 16]),
+            cluster_root_pub: flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32])
+                .verifying_key(),
+            entry,
+        };
+        let device = DeviceStaticKeys::generate();
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            dial_with_timeout(&pin, &device, TunnelConfig::default(), Duration::from_millis(300)),
+        )
+        .await
+        .expect("dial 必须按时返回（黑洞对端也不得挂死）");
+        match res {
+            Err(ClientError::DialTimeout(ep_got)) => assert_eq!(ep_got, ep),
+            other => panic!("期望 DialTimeout，得 {other:?}"),
+        }
     }
 
     #[test]
