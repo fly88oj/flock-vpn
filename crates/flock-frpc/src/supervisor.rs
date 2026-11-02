@@ -280,6 +280,12 @@ impl Supervisor {
         })
     }
 
+    /// 分配每路中继的 run 目录（flavor-pid-nanos-seq 唯一）。
+    ///
+    /// 保留策略：`stop()` **不清理** run 目录——诊断面（托管配置副本/桩 marker/
+    /// 日志）在进程死后仍需可查；同一路中继的多次重启（退避重拉）复用同一
+    /// run_dir，frpc.ini 副本**覆盖写**（内容确定性，覆盖无信息损失）；跨中继
+    /// 目录名唯一、互不覆盖。积累的清理交给运维（run_base 属临时/托管分区）。
     fn alloc_run_dir(&self, flavor: RelayFlavor) -> PathBuf {
         let seq = self.relay_seq.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -314,6 +320,16 @@ impl Supervisor {
                     };
                     let managed_path = run_dir.join("frpc.ini");
                     std::fs::write(&managed_path, &managed)?;
+                    // 副本内嵌面板 token ⇒ 属主可读写即可（unix；umask 不可依赖——
+                    // 显式收紧 0644→0600。Windows 侧无该权限面，跳过）。
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            &managed_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        )?;
+                    }
                     let parsed = config::parse_ini(&managed).map_err(|e| {
                         FrpcError::Config(format!("托管副本不可解析（内部错误）: {e}"))
                     })?;
