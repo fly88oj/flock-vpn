@@ -114,7 +114,15 @@ fn b64(bytes: &[u8]) -> String {
     STANDARD_NO_PAD.encode(bytes)
 }
 
+/// 未认证 b64 入口的尺寸上限（64KiB）：OPAQUE 全部报文（ke1/ke2/ke3/m1/m2/record）
+/// 与 `opaque.key`/`pass.opaque` 落盘形态都远小于此——超限在 decode 分配前拒绝，
+/// 防大报文放大分配（ke1 等服务端入口是未认证攻击面）。
+const B64_INPUT_LIMIT: usize = 64 * 1024;
+
 fn unb64(s: &str) -> PakeResult<Vec<u8>> {
+    if s.len() > B64_INPUT_LIMIT {
+        return Err(format!("pake: b64 input {}B exceeds {B64_INPUT_LIMIT}B limit", s.len()).into());
+    }
     Ok(STANDARD_NO_PAD.decode(s.trim())?)
 }
 
@@ -617,6 +625,25 @@ mod tests {
     #[test]
     fn migrate_rejects_wrong_length() {
         assert!(server_setup_migrate_v3("AAAA").is_err(), "长度非 128B 必须拒绝");
+    }
+
+    // 未认证 b64 入口的 64KiB 上限：server_login_start/server_reg_start 等服务端入口
+    // 在 decode 分配前拒绝超大报文（OPAQUE 报文远小于此）。
+    #[test]
+    fn unb64_rejects_oversized_input() {
+        let mut rng = rand::rng();
+        let setup = server_setup_load(&server_setup_new(&mut rng)).unwrap();
+        let huge = "A".repeat(64 * 1024 + 1);
+        // ke1 入口（未认证服务端面）
+        assert!(
+            server_login_start(&mut rng, &setup, None, &huge, "alice").is_err(),
+            "超限 ke1 必须在 decode 前拒绝"
+        );
+        // m1 入口（未认证服务端面）
+        assert!(
+            server_reg_start(&setup, &huge, "alice").is_err(),
+            "超限 m1 必须在 decode 前拒绝"
+        );
     }
 
     // server_setup_b64 往返：new→b64→load 与 migrate_v3→b64→load 均逐字节还原
