@@ -529,6 +529,73 @@ mod tests {
         assert!(matches!(rx.poll_next_unpin(&mut cx), Poll::Ready(None)));
     }
 
+    /// 红形态对照（证明上述回归测试有牙）：与修复前 PacketRx 同构的实现——每次
+    /// poll 新建「两次 read_exact」的 recv future、Pending 即丢。同一分片到达输入下
+    /// 必然失步：帧头读半 ⇒ 丢弃，下一 poll 把 body 首字节当新帧头重组出错误帧。
+    struct OldFrameRx<R> {
+        r: R,
+    }
+
+    impl<R: AsyncRead + Unpin> FStream for OldFrameRx<R> {
+        type Item = io::Result<Vec<u8>>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let r = &mut self.get_mut().r;
+            let mut fut = std::pin::pin!(async {
+                let mut hdr = [0u8; 2];
+                futures::AsyncReadExt::read_exact(r, &mut hdr).await?;
+                let len = u16::from_le_bytes(hdr) as usize;
+                let mut pkt = vec![0u8; len];
+                futures::AsyncReadExt::read_exact(r, &mut pkt).await?;
+                Ok::<_, io::Error>(pkt)
+            });
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(pkt)) => Poll::Ready(Some(Ok(pkt))),
+                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    Poll::Ready(None)
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    #[test]
+    fn old_recreate_future_pattern_desyncs_on_split_arrival() {
+        use futures::StreamExt as _;
+        use futures::task::noop_waker;
+
+        let pkt: Vec<u8> = (0..40u8).collect();
+        let mut wire: Vec<u8> = Vec::new();
+        wire.extend_from_slice(&(pkt.len() as u16).to_le_bytes());
+        wire.extend_from_slice(&pkt);
+
+        let mut old = OldFrameRx {
+            r: TrickleReader { chunks: std::collections::VecDeque::new(), eof: false },
+        };
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        for &b in &wire {
+            old.r.chunks.push_back(vec![b]);
+            loop {
+                match old.poll_next_unpin(&mut cx) {
+                    Poll::Pending => break,
+                    Poll::Ready(Some(Ok(p))) => got.push(p),
+                    Poll::Ready(Some(Err(e))) => panic!("红形态对照不应报错: {e}"),
+                    Poll::Ready(None) => panic!("数据未尽即 EOF"),
+                }
+            }
+        }
+        // 失步实锤：同一输入下，旧形态产不出与线上一致的包序列（帧头半途被丢 ⇒
+        // 后续字节被重组成错误长度的帧）。
+        assert_ne!(
+            got,
+            vec![pkt.clone()],
+            "旧形态若能正确分帧，则缺陷不存在——此断言失败说明输入未覆盖分片路径"
+        );
+    }
+
     /// 回归（A9 排障实测）：写泵消失（会话拆除 ⇒ data_rx drop）后 send 立即 Err；
     /// yamux 在写错误后会重试 poll_write——已完成 future 必须已清出 `send_fut`，
     /// 否则复轮询以「async fn resumed after completion」panic（杀 mux 驱动任务，
