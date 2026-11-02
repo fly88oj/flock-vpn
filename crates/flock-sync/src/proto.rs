@@ -36,8 +36,9 @@ pub const VIP_LAST: u32 = u32::from_be_bytes([100, 127, 255, 254]);
 
 /// 管理操作签名域分离标签（canonical 字节前缀）。
 const L_ADMIN: &[u8] = b"flock-sync/admin/v1";
-/// server_keys 签名域分离标签。
-const L_SERVER_KEYS: &[u8] = b"ch-sync/server-keys/v1";
+/// server_keys 签名域分离标签（目录更名 ch-sync→flock-sync 的漏网点——未发布窗口
+/// 线上格式变更允许；状态机只存条目不存标签派生数据，签名/验签同源重算，无迁移面）。
+const L_SERVER_KEYS: &[u8] = b"flock-sync/server-keys/v1";
 /// Bootstrap 自证签名域分离标签。
 const L_BOOTSTRAP: &[u8] = b"flock-sync/bootstrap/v1";
 
