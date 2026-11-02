@@ -167,6 +167,17 @@ impl ServerConfig {
                 self.admin_bind
             ));
         }
+        // 评审项 4：票据 TTL 不得超过 flock-sync 的 TICKET_TTL_SECS(60s) 硬顶
+        // （§2.2 跨服重放窗 = min(±300s, TTL)——调大即放大重放面）。部署可调小
+        // （过期路径验收用），不可调大。
+        if self.ticket_ttl_secs > crate::ticket::TICKET_TTL_SECS {
+            return Err(format!(
+                "ticket_ttl_secs {} 超过硬顶 {}（§2.2 票据 TTL 60s 硬顶：调大放大跨服\
+                 重放窗；只可调小）",
+                self.ticket_ttl_secs,
+                crate::ticket::TICKET_TTL_SECS
+            ));
+        }
         Ok(())
     }
 
@@ -276,5 +287,25 @@ serverPort = 7000
                 "错误需说明替代通道: {err}"
             );
         }
+    }
+
+    /// 评审项 4：ticket_ttl_secs ≤ TICKET_TTL_SECS(60s)——超出拒绝起服；调小放行
+    /// （语义保留可调小：过期路径验收部署用）。
+    #[test]
+    fn ticket_ttl_upper_bound_enforced() {
+        fn cfg_with_ttl(ttl: u64) -> ServerConfig {
+            let text = format!(
+                "state_dir = \"/tmp/s\"\nadvertise_endpoint = \"127.0.0.1:9443\"\nticket_ttl_secs = {ttl}"
+            );
+            toml::from_str(&text).unwrap()
+        }
+        assert!(cfg_with_ttl(60).validate().is_ok(), "恰为硬顶 ⇒ 放行");
+        assert!(
+            cfg_with_ttl(6).validate().is_ok(),
+            "调小 ⇒ 放行（冒烟部署）"
+        );
+        let err = cfg_with_ttl(61).validate().unwrap_err();
+        assert!(err.contains("60"), "错误点名硬顶: {err}");
+        assert!(err.contains("只可调小"), "{err}");
     }
 }
