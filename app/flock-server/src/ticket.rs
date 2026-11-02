@@ -302,25 +302,58 @@ impl TicketAuthority {
 }
 
 /// 用户 → {nonce → ts}。窗口外条目在写入时惰性清理（§1.3.2 SIG_WINDOW_SECS=300）。
+///
+/// 上限纪律（评审项 9）：per-user 条目上限 [`NonceLedger::MAX_PER_USER`]（4096）——
+/// 伪造新鲜 nonce 的洪泛在窗口内也只能撑到上限，之后拒绝请求并计数告警
+/// （[`NonceLedger::overflow_rejects`]）；清理后为空的 user entry 即时移除（防
+/// 「曾经活跃的用户」条目永驻）。
 #[derive(Default)]
 pub struct NonceLedger {
     inner:
         std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, i64>>>,
+    /// 超限拒绝计数（告警面：admin stats / 日志）。
+    overflow_rejects: std::sync::atomic::AtomicU64,
 }
 
 impl NonceLedger {
+    /// per-user 条目上限（评审项 9：4096 ≫ ±300s 窗内合法请求速率的合理上界）。
+    pub const MAX_PER_USER: usize = 4096;
+
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 查重 + 入账（false = 重放）。仅在票据与签名校验**之后**调用（§2.2 契约序）。
+    /// 查重 + 入账（false = 重放或超限拒绝）。仅在票据与签名校验**之后**调用
+    /// （§2.2 契约序）。
     pub fn check_and_record(&self, user: &str, nonce: &str, ts: i64, now: i64) -> bool {
         const WINDOW: i64 = flock_protocol::SIG_WINDOW_SECS;
         let mut g = self.inner.lock().expect("nonce ledger poisoned");
         let entry = g.entry(user.to_string()).or_default();
         // 惰性清理：滑出 ±300s 窗的旧 nonce（重放窗之外本就由时间窗拒绝）。
         entry.retain(|_, t| (now - *t).abs() <= WINDOW);
+        // 清理后为空的 user entry 即时回收（评审项 9：不留「幽灵用户」条目）。
+        if entry.is_empty() {
+            g.remove(user);
+        }
+        let Some(entry) = g.get_mut(user) else {
+            // 刚回收（或本来就没有历史）且即将成为该 user 首条 ⇒ 直接入账。
+            g.insert(
+                user.to_string(),
+                std::iter::once((nonce.to_string(), ts)).collect(),
+            );
+            return true;
+        };
         if entry.contains_key(nonce) {
+            return false;
+        }
+        // per-user 上限：超限拒绝 + 告警计数（洪泛者不得无限膨胀 per-user 内存）。
+        if entry.len() >= Self::MAX_PER_USER {
+            self.overflow_rejects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "flock-server: nonce ledger per-user 上限拒绝（user={user}, cap={}）",
+                Self::MAX_PER_USER
+            );
             return false;
         }
         entry.insert(nonce.to_string(), ts);
@@ -335,6 +368,17 @@ impl NonceLedger {
             .get(user)
             .map(|m| m.contains_key(nonce))
             .unwrap_or(false)
+    }
+
+    /// 超限拒绝累计（告警计数面；admin stats 消费）。
+    pub fn overflow_rejects(&self) -> u64 {
+        self.overflow_rejects
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 当前 user entry 数（空 entry 已清理的断言面）。
+    pub fn user_entries(&self) -> usize {
+        self.inner.lock().expect("nonce ledger poisoned").len()
     }
 }
 
@@ -413,5 +457,38 @@ mod tests {
         assert!(l.check_and_record("u", "n1", 1400, 1401), "窗外条目被清理");
         assert!(!l.contains("u", "n2"), "n2 亦随清理滑出");
         let _ = DeviceStatus::Active; // 引用 netstate（同批模块联编可见性）
+    }
+
+    /// 评审项 9：per-user 条目上限（4096）——超限拒绝 + 告警计数；窗口滑出后条目
+    /// 惰性清理、空 user entry 即时回收（洪泛者在窗口内的内存占用被钉死在上限）。
+    #[test]
+    fn ledger_per_user_cap_and_aged_cleanup() {
+        let l = NonceLedger::new();
+        for i in 0..NonceLedger::MAX_PER_USER {
+            assert!(
+                l.check_and_record("flood", &format!("n{i:05}"), 1000, 1000),
+                "上限内第 {i} 条应入账"
+            );
+        }
+        assert_eq!(l.overflow_rejects(), 0);
+        // 超限：拒绝 + 计数（洪泛不得继续膨胀 per-user 内存）。
+        assert!(!l.check_and_record("flood", "over-1", 1000, 1000), "超限拒");
+        assert!(
+            !l.check_and_record("flood", "over-2", 1000, 1000),
+            "持续超限拒"
+        );
+        assert_eq!(l.overflow_rejects(), 2, "告警计数累计");
+        assert_eq!(l.user_entries(), 1, "单 user entry");
+        // ±300s 窗滑出 ⇒ 惰性清理腾空（含空 entry 回收路径），随后首条重新入账。
+        assert!(
+            l.check_and_record("flood", "fresh", 100_000, 100_000),
+            "窗滑出后重新可入账"
+        );
+        assert!(!l.contains("flood", "n00000"), "旧条目已随窗口清理");
+        assert!(!l.contains("flood", "over-1"), "超限拒绝的条目从未入账");
+        // 多用户互不影响：另一用户正常入账。
+        assert!(l.check_and_record("other", "n1", 100_000, 100_000));
+        assert_eq!(l.user_entries(), 2);
+        assert_eq!(l.overflow_rejects(), 2, "正常用户不计超限");
     }
 }
