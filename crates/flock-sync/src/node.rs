@@ -697,9 +697,29 @@ impl SyncNode {
         if matches!(resp, SyncResponse::Error(_)) {
             return Ok(resp);
         }
-        // 提升：以状态机记录的 voter 集（含新节点）做 ReplaceAllVoters。
-        let mut voters: std::collections::BTreeSet<NodeId> =
-            self.inner.sm.with_data(|d| d.voters.clone());
+        // 真实 membership（openraft metrics——Raft 实际共识的成员集）。
+        let real: std::collections::BTreeSet<NodeId> = self
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .voter_ids()
+            .collect();
+        let sm: std::collections::BTreeSet<NodeId> = self.inner.sm.with_data(|d| d.voters.clone());
+        let drift: Vec<NodeId> = real
+            .symmetric_difference(&sm)
+            .copied()
+            .filter(|id| *id != node_id)
+            .collect();
+        if !drift.is_empty() {
+            eprintln!(
+                "add_voter: SM voters 与 openraft membership 发散（{drift:?}）——\
+                 以真实 membership 为基准合并提升集"
+            );
+        }
+        let mut voters = real;
+        voters.extend(sm);
         voters.insert(self.inner.id);
         voters.insert(node_id);
         self.inner
