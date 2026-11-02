@@ -562,8 +562,8 @@ mod tests {
 
     #[test]
     fn old_recreate_future_pattern_desyncs_on_split_arrival() {
-        use futures::StreamExt as _;
         use futures::task::noop_waker;
+        use futures::StreamExt as _;
 
         let pkt: Vec<u8> = (0..40u8).collect();
         let mut wire: Vec<u8> = Vec::new();
@@ -571,7 +571,10 @@ mod tests {
         wire.extend_from_slice(&pkt);
 
         let mut old = OldFrameRx {
-            r: TrickleReader { chunks: std::collections::VecDeque::new(), eof: false },
+            r: TrickleReader {
+                chunks: std::collections::VecDeque::new(),
+                eof: false,
+            },
         };
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
