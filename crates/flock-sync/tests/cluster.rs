@@ -17,9 +17,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::SigningKey;
 use flock_protocol::session::{ClusterId, DeviceId, LookupVerdict, ServerId, ServerIdentity};
 use flock_protocol::trust::ClusterDirectory;
-use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
 use flock_sync::hooks::HookRecorder;

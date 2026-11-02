@@ -30,7 +30,11 @@ async fn store_reopen_recovers_vote_and_log() {
     // Vote 的裸字节形态（[term, node, committed]——无 Option 外壳）。
     let vote = openraft::Vote::<u64>::new(3, 2);
     let vote_bytes = postcard::to_allocvec(&vote).unwrap();
-    assert_eq!(vote_bytes, vec![3, 2, 0], "裸 Vote 编码（无 Option 判别字节）");
+    assert_eq!(
+        vote_bytes,
+        vec![3, 2, 0],
+        "裸 Vote 编码（无 Option 判别字节）"
+    );
 
     // —— 第一段：与 save_vote/append 相同的字节写入库 → 关库 ——
     {
@@ -77,10 +81,7 @@ async fn store_reopen_recovers_vote_and_log() {
 
         // 再来一轮 store 真入口（save_vote）+ 重开闭环。
         let mut store2 = RedbLogStore::from_db(db);
-        store2
-            .save_vote(&openraft::Vote::new(4, 1))
-            .await
-            .unwrap();
+        store2.save_vote(&openraft::Vote::new(4, 1)).await.unwrap();
         drop(store2);
         let db3 = Arc::new(redb::Database::create(&path).unwrap());
         let mut store3 = RedbLogStore::from_db(db3);

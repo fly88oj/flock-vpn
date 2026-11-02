@@ -69,7 +69,9 @@ impl Fabric for TcpFabric {
                 TcpStream::connect((host.as_str(), port)),
             )
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("dial {target} timeout")))??;
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, format!("dial {target} timeout"))
+            })??;
             let _ = io.set_nodelay(true);
             Ok(Box::new(io) as PeerIo)
         })
@@ -121,16 +123,25 @@ mod tests {
 
     #[test]
     fn parse_peer_entry_forms() {
-        assert_eq!(parse_peer_entry("3=raft-3:9500").unwrap(), (3, "raft-3:9500".into()));
+        assert_eq!(
+            parse_peer_entry("3=raft-3:9500").unwrap(),
+            (3, "raft-3:9500".into())
+        );
         assert_eq!(
             parse_peer_entry("1=172.29.0.10:9500").unwrap(),
             (1, "172.29.0.10:9500".into())
         );
         assert!(parse_peer_entry("raft-3:9500").is_err(), "缺 '=' ⇒ 拒");
-        assert!(parse_peer_entry("x=raft-3:9500").is_err(), "非数字节点号 ⇒ 拒");
+        assert!(
+            parse_peer_entry("x=raft-3:9500").is_err(),
+            "非数字节点号 ⇒ 拒"
+        );
         assert!(parse_peer_entry("3=raft-3").is_err(), "缺端口 ⇒ 拒");
         assert!(parse_peer_entry("3=:9500").is_err(), "host 为空 ⇒ 拒");
-        assert!(parse_peer_entry("3=raft-3:http").is_err(), "非数字端口 ⇒ 拒");
+        assert!(
+            parse_peer_entry("3=raft-3:http").is_err(),
+            "非数字端口 ⇒ 拒"
+        );
     }
 
     /// ServerId ↔ NodeId 映射与 wire::sid_of 往返一致（dial 寻址键）。

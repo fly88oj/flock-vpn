@@ -439,8 +439,8 @@ pub enum VerdictW {
 impl VerdictW {
     /// 转协议库判定（损坏公钥按不可信处理 → NotFound，fail-closed）。
     pub fn to_verdict(&self) -> flock_protocol::session::LookupVerdict {
-        use flock_protocol::session::{DeviceRecord, LookupVerdict};
         use ed25519_dalek::VerifyingKey;
+        use flock_protocol::session::{DeviceRecord, LookupVerdict};
         match self {
             VerdictW::NotFound => LookupVerdict::NotFound,
             VerdictW::Revoked { since_epoch } => LookupVerdict::Revoked {

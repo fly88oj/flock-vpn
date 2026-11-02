@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
-use flock_protocol::trust::ClusterDirectory;
 use ed25519_dalek::VerifyingKey;
+use flock_protocol::trust::ClusterDirectory;
 use serde::{Deserialize, Serialize};
 
 /// 目录服务错误。

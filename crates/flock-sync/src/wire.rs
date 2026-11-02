@@ -24,13 +24,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::VerifyingKey;
 use flock_protocol::mux::{Prio, Stream as MuxStream};
 use flock_protocol::session::{
     self, ClusterId, DeviceDirectory, DeviceId, DeviceRecord, DeviceStaticKeys, LookupVerdict,
     ServerEntry, ServerIdentity, ServerPin,
 };
 use flock_protocol::trust::ClusterDirectory;
-use ed25519_dalek::VerifyingKey;
 use futures::future::BoxFuture;
 use openraft::error::{RPCError, RaftError, RemoteError, Timeout, Unreachable};
 use openraft::raft::{

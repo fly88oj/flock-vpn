@@ -12,10 +12,10 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use common::{bootstrap, sid, TestCluster};
 use flock_protocol::session::{DeviceStaticKeys, ServerEntry, ServerPin, TunnelConfig};
 use flock_protocol::trust::ClusterDirectory;
 use flock_sync::wire::Fabric;
-use common::{bootstrap, sid, TestCluster};
 
 use flock_sync::proto::{
     AdminAck, NodeId, ReadQuery, ReadView, ServerKeyEntry, StateError, SyncRequest, SyncResponse,
