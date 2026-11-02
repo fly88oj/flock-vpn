@@ -425,6 +425,15 @@ struct ConnCtx {
     pending_login: Option<Vec<u8>>,
 }
 
+/// 控制流空闲超时（评审项 8）：3×keepalive（30s）无任何帧即关闭该流。
+///
+/// 与会话层 PING/PONG 的关系：PING/PONG 走**记录层**（整条连接），不产生 yamux 流
+/// 帧本层可见——它维持的是隧道存活，**不维持**单条流的空闲豁免。控制流关闭后隧道
+/// 与数据通道不受影响；客户端需要控制业务时重开控制流即可（当前 M3 客户端的控制
+/// 流为静默占位、不发业务，被空闲关闭无功能影响）。
+const CTRL_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(3 * flock_protocol::session::KEEPALIVE.as_secs());
+
 /// 处理一条控制流直到 EOF/错误。返回 Err 仅表示 IO 层失败（业务错误走 CtrlResponse::Err）。
 pub async fn serve_control<S: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin>(
     core: &ServerCore,
@@ -436,9 +445,18 @@ pub async fn serve_control<S: futures::io::AsyncRead + futures::io::AsyncWrite +
         pending_login: None,
     };
     loop {
-        let req: CtrlRequest = match recv_ctrl_msg(io).await {
-            Ok(r) => r,
-            Err(_) => return Ok(()), // EOF/坏帧：控制流结束
+        // 空闲超时（评审项 8）：3×keepalive 无任何入站帧 ⇒ 优雅结束控制流。
+        let req: CtrlRequest = match tokio::time::timeout(CTRL_IDLE_TIMEOUT, recv_ctrl_msg(io))
+            .await
+        {
+            Ok(r) => match r {
+                Ok(r) => r,
+                Err(_) => return Ok(()), // EOF/坏帧：控制流结束
+            },
+            Err(_) => {
+                eprintln!("flock-server: control stream idle > {CTRL_IDLE_TIMEOUT:?} — closing");
+                return Ok(());
+            }
         };
         let resp = dispatch(core, &mut ctx, req).await;
         send_ctrl_msg(io, &resp).await?;

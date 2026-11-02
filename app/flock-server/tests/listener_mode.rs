@@ -150,3 +150,33 @@ async fn session_cap_politely_closes_excess_connection() {
     assert!(still.is_err(), "持许可的首连不应被关闭");
     task.abort();
 }
+
+/// 评审项 8：握手超时归类拒绝——沉默连接（不发 I0/I1）在 10s 预算后被服务端关闭
+/// （读侧观察到 EOF），不再无限占住会话许可。
+#[tokio::test]
+async fn silent_connection_closed_by_handshake_timeout() {
+    use tokio::io::AsyncReadExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = cfg_for("direct", dir.path());
+    let (core, _) = ServerCore::open_or_init(cfg).unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let task = tokio::spawn(core.serve_listener(l));
+
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 8];
+    // 10s 预算 + 余量：EOF 应在 (10s, 15s] 内到达（早于 10s = 未等预算即关，迟到 = 无超时）。
+    let t0 = std::time::Instant::now();
+    let n = tokio::time::timeout(std::time::Duration::from_secs(15), c.read(&mut buf))
+        .await
+        .expect("15s 内必须观察到关闭")
+        .expect("read");
+    assert_eq!(n, 0, "EOF（礼貌关闭）");
+    let dt = t0.elapsed();
+    assert!(
+        dt >= std::time::Duration::from_secs(10),
+        "关闭不早于握手预算（{dt:?}）"
+    );
+    task.abort();
+}

@@ -41,6 +41,21 @@ mod keys {
     pub const TICKET_SEED: &str = "ticket_seed";
 }
 
+/// 会话层 keepalive（记录层 PING/PONG 周期；flock-protocol session::KEEPALIVE = 10s）。
+const KEEPALIVE: std::time::Duration = flock_protocol::session::KEEPALIVE;
+/// E2E 握手预算（评审项 8）：超时归类拒绝。
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// TCP keepalive（尽力而为——失败仅少一层死链探测，不影响功能）。
+fn set_tcp_keepalive(io: &TcpStream) {
+    let sock = socket2::SockRef::from(io);
+    let ka = socket2::TcpKeepalive::new().with_time(KEEPALIVE);
+    // 探测间隔对齐会话层 keepalive（10s）；探测次数用内核缺省。
+    #[cfg(any(unix, windows))]
+    let ka = ka.with_interval(KEEPALIVE);
+    let _ = sock.set_tcp_keepalive(&ka);
+}
+
 /// 每设备本地会话表（吊销即杀，§2.2 apply 回调语义的单机对应物）。
 ///
 /// kill 经 `watch` 广播（保留状态，注册/通知竞态下不丢事件）；会话任务在
@@ -427,27 +442,44 @@ impl ServerCore {
     /// initiate 后先 `open_stream(Prio::Control)`——排序契约见 flock-client
     /// connector）；余流 = 数据面包通道（[`PeerRouter::serve_stream`]）。
     pub async fn serve_conn(self: Arc<Self>, io: TcpStream) {
+        // TCP keepalive（评审项 8）：接受连接即设置——间隔对齐会话层 keepalive
+        // （10s）。会话层的 PING/PONG 只能发现「双方都在发」的静默；对端整机死机/
+        // NAT 表项过期场景下，本端记录层发送不报错、对端无回包，需 TCP keepalive
+        // 让内核在 3×interval 无 ACK 时报错拆链，死链才不至于占住会话槽位。
+        set_tcp_keepalive(&io);
         // respond 的目录注入分派：Single = redb 适配器；Sync = flock-sync 两级读
         // （缓存 + epoch + apply-lag 熔断降级线性一致读，§4——本批次的接入点）。
-        let handshake = match &self.net {
-            NetBackend::Single(store) => {
-                respond(
-                    io,
-                    &self.identity,
-                    DirAdapter(store.clone()),
-                    TunnelConfig::default(),
-                )
-                .await
+        // 外包 10s 握手预算（评审项 8）：超时归类拒绝——半开的沉默连接不得占用
+        // 会话许可与线程面（与协议拒绝同一日志/行为面）。
+        let handshake = match tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            match &self.net {
+                NetBackend::Single(store) => {
+                    respond(
+                        io,
+                        &self.identity,
+                        DirAdapter(store.clone()),
+                        TunnelConfig::default(),
+                    )
+                    .await
+                }
+                #[cfg(feature = "multi-primary")]
+                NetBackend::Sync(s) => {
+                    respond(
+                        io,
+                        &self.identity,
+                        s.node.device_directory(),
+                        TunnelConfig::default(),
+                    )
+                    .await
+                }
             }
-            #[cfg(feature = "multi-primary")]
-            NetBackend::Sync(s) => {
-                respond(
-                    io,
-                    &self.identity,
-                    s.node.device_directory(),
-                    TunnelConfig::default(),
-                )
-                .await
+        })
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => {
+                eprintln!("flock-server: handshake rejected: timeout (> {HANDSHAKE_TIMEOUT:?})");
+                return;
             }
         };
         let tunnel = match handshake {

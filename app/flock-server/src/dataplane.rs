@@ -42,6 +42,15 @@ use flock_client::tun::TunSpec;
 /// 服务器自身 VIP（§2.2「服务端自身也是 peer，VIP 100.64.0.1」；netstate 分配从 .2 起）。
 pub const SERVER_VIP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
 
+/// 数据通道空闲超时（评审项 8）：3×keepalive（30s）无任何帧——**任一方向**（入站
+/// 包或出站投递都重置窗口）——即关闭该通道。
+///
+/// 与会话层 PING/PONG 的关系：PING/PONG 走记录层（整条连接），不产生 yamux 流帧，
+/// 因而**不豁免**单条数据通道的空闲判定。通道被关闭后客户端按需重开（重连/新通道）；
+/// 会话本身的静默死链由记录层 3×keepalive 判定 + TCP keepalive（评审项 8）兜底。
+const STREAM_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(3 * flock_protocol::session::KEEPALIVE.as_secs());
+
 /// 源 VIP 校验失配累计（断言/告警面；§2.2「丢包 + 计数」）。
 pub fn src_vip_mismatches() -> u64 {
     SRC_MISMATCH.load(Ordering::Relaxed)
@@ -315,20 +324,33 @@ impl PeerRouter {
                     }
                 }
             }
-            // 单步等待（无跨 poll 状态：out_rx.poll_recv + 单次 poll_read）。
-            let step = std::future::poll_fn(|cx| {
-                match out_rx.poll_recv(cx) {
-                    Poll::Ready(out) => return Poll::Ready(Step::Outbound(out)),
-                    Poll::Pending => {}
+            // 单步等待（无跨 poll 状态：out_rx.poll_recv + 单次 poll_read），外包空闲
+            // 超时（评审项 8）：3×keepalive 无任何帧（任一方向）即关闭该通道。
+            let step = match tokio::time::timeout(
+                STREAM_IDLE_TIMEOUT,
+                std::future::poll_fn(|cx| {
+                    match out_rx.poll_recv(cx) {
+                        Poll::Ready(out) => return Poll::Ready(Step::Outbound(out)),
+                        Poll::Pending => {}
+                    }
+                    match pin!(&mut stream).poll_read(cx, &mut chunk) {
+                        Poll::Ready(Ok(0)) => Poll::Ready(Step::InEof),
+                        Poll::Ready(Ok(n)) => Poll::Ready(Step::InBytes(n)),
+                        Poll::Ready(Err(_)) => Poll::Ready(Step::InErr),
+                        Poll::Pending => Poll::Pending,
+                    }
+                }),
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!(
+                        "flock-server: data stream idle > {STREAM_IDLE_TIMEOUT:?} — closing vip={vip:?}"
+                    );
+                    break;
                 }
-                match pin!(&mut stream).poll_read(cx, &mut chunk) {
-                    Poll::Ready(Ok(0)) => Poll::Ready(Step::InEof),
-                    Poll::Ready(Ok(n)) => Poll::Ready(Step::InBytes(n)),
-                    Poll::Ready(Err(_)) => Poll::Ready(Step::InErr),
-                    Poll::Pending => Poll::Pending,
-                }
-            })
-            .await;
+            };
             match step {
                 Step::Outbound(Some(pkt)) => {
                     if send_packet(&mut stream, &pkt).await.is_err() {
@@ -436,19 +458,33 @@ pub async fn serve_stream_sync(node: Arc<flock_sync::SyncNode>, device: [u8; 32]
         while let Some(pkt) = frames.take_frame() {
             let _ = node.ingest_packet(&device, &pkt).await;
         }
-        let step = std::future::poll_fn(|cx| {
-            match out_rx.poll_recv(cx) {
-                Poll::Ready(out) => return Poll::Ready(Step::Outbound(out)),
-                Poll::Pending => {}
+        // 单步等待外包空闲超时（评审项 8）：3×keepalive 无任何帧（任一方向）即关闭
+        // 该通道（会话层 PING/PONG 走记录层、不豁免单条流——同 serve_stream 注记）。
+        let step = match tokio::time::timeout(
+            STREAM_IDLE_TIMEOUT,
+            std::future::poll_fn(|cx| {
+                match out_rx.poll_recv(cx) {
+                    Poll::Ready(out) => return Poll::Ready(Step::Outbound(out)),
+                    Poll::Pending => {}
+                }
+                match pin!(&mut stream).poll_read(cx, &mut chunk) {
+                    Poll::Ready(Ok(0)) => Poll::Ready(Step::InEof),
+                    Poll::Ready(Ok(n)) => Poll::Ready(Step::InBytes(n)),
+                    Poll::Ready(Err(_)) => Poll::Ready(Step::InErr),
+                    Poll::Pending => Poll::Pending,
+                }
+            }),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!(
+                    "flock-server: sync data stream idle > {STREAM_IDLE_TIMEOUT:?} — closing device={device:?}"
+                );
+                break;
             }
-            match pin!(&mut stream).poll_read(cx, &mut chunk) {
-                Poll::Ready(Ok(0)) => Poll::Ready(Step::InEof),
-                Poll::Ready(Ok(n)) => Poll::Ready(Step::InBytes(n)),
-                Poll::Ready(Err(_)) => Poll::Ready(Step::InErr),
-                Poll::Pending => Poll::Pending,
-            }
-        })
-        .await;
+        };
         match step {
             Step::Outbound(Some(pkt)) => {
                 if send_packet(&mut stream, &pkt).await.is_err() {
