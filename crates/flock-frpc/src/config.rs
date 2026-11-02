@@ -97,12 +97,31 @@ pub fn parse_ini(text: &str) -> Result<ParsedIni, FrpcError> {
 
 /// ChmlFrp frpc.ini 的 admin 探测字段（v0.51.2 `[common]`：admin_addr/admin_port/
 /// admin_user/admin_pwd；admin_port=0/缺省即禁用 admin 监听）。
+///
+/// `user`/`password` 将按 `k = v` 直拼进 `[common]`（见 [`augment_chmlfrp_admin`]），
+/// 须过 [`validate_ini_scalar`] 注入防御；`addr`/`port` 为 `IpAddr`/`u16`，Display
+/// 形态天然不含控制字符与方括号，无需校验。
 #[derive(Clone, Debug)]
 pub struct AdminCommon {
     pub addr: IpAddr,
     pub port: u16,
     pub user: String,
     pub password: String,
+}
+
+/// INI 键/值注入防御：拒绝控制字符（含换行/`\0`/`\t`）与 `[`/`]`。
+///
+/// v0.51.2 的 `k = v` 方言**没有引号/转义面**（值即到行尾的裸串）——对照原版 TOML 侧
+/// [`OriginalTomlConfig::render`] 经 [`toml_str`] 的转义纪律：TOML 有转义面可以承载
+/// 任意字符，INI 没有 ⇒ 能拼出 `[新节]` 行或额外键值行的字符一律**拒绝即错误**，
+/// 不静默改写（值含换行/`[`/`]` 即可往托管 frpc.ini 注入任意节）。
+fn validate_ini_scalar(what: &str, s: &str) -> Result<(), FrpcError> {
+    if let Some(bad) = s.chars().find(|&c| c.is_control() || c == '[' || c == ']') {
+        return Err(FrpcError::Config(format!(
+            "INI {what} 含禁止字符 {bad:?}（控制字符与 [ ] ——k = v 直拼方言无转义面，防节注入）"
+        )));
+    }
+    Ok(())
 }
 
 /// **R12 红线变换**：向面板 frpc.ini 的 `[common]` 注入/覆盖 admin 字段，其余一切逐字节保留。
@@ -115,6 +134,10 @@ pub struct AdminCommon {
 ///
 /// 输出写到托管 run 目录的副本上执行；面板源文件本身不动。
 pub fn augment_chmlfrp_admin(src: &str, admin: &AdminCommon) -> Result<String, FrpcError> {
+    // 注入防御先行：admin 值按 `k = v` 直拼（含原位覆盖与节尾补齐两条路径），
+    // 带换行/`[`/`]`/控制字符的凭据可拼出新节——拒绝即错误，不落任何字节。
+    validate_ini_scalar("admin_user 值", &admin.user)?;
+    validate_ini_scalar("admin_pwd 值", &admin.password)?;
     const ADMIN_KEYS: [&str; 4] = ["admin_addr", "admin_port", "admin_user", "admin_pwd"];
     let admin_vals = [
         admin.addr.to_string(),
@@ -217,13 +240,19 @@ impl ChmlFrpIniConfig {
     }
 
     /// 追加/覆盖 `[common]` 字段（如 `user`/`token`/`tls_enable`/admin 四键）。
-    pub fn common(mut self, key: &str, value: impl Into<String>) -> Self {
+    ///
+    /// key/value 须过 [`validate_ini_scalar`]：INI 直拼方言无转义面（对照 TOML 侧
+    /// [`OriginalTomlConfig::render`] 的 `toml_str` 纪律——那边转义、这边拒绝），
+    /// 含控制字符/换行/`[`/`]` 的输入可注入新节 ⇒ 返回错误。
+    pub fn common(mut self, key: &str, value: impl Into<String>) -> Result<Self, FrpcError> {
         let value = value.into();
+        validate_ini_scalar("common 键", key)?;
+        validate_ini_scalar("common 值", &value)?;
         match self.common.iter_mut().find(|(k, _)| k == key) {
             Some((_, v)) => *v = value,
             None => self.common.push((key.to_string(), value)),
         }
-        self
+        Ok(self)
     }
 
     /// 追加 tcp proxy 节（字段序 = 面板样本形态：type/local_ip/local_port/remote_port）。
@@ -606,6 +635,55 @@ mod tests {
             password: "b".into(),
         };
         assert!(augment_chmlfrp_admin(panel, &admin).is_err());
+    }
+
+    /// 注入企图必须被拒：admin 值按 `k = v` 直拼进 `[common]`，带换行/`[`/`]`/
+    /// 控制字符的凭据可拼出新节（对照 TOML 侧 toml_str 的转义纪律——INI 无转义面，
+    /// 只能拒绝）。
+    #[test]
+    fn augment_rejects_admin_values_that_could_inject_sections() {
+        let over = |user: &str, password: &str| AdminCommon {
+            addr: "127.0.0.1".parse().unwrap(),
+            port: 7400,
+            user: user.into(),
+            password: password.into(),
+        };
+        // 值伪造新节 + 键值行（换行注入）
+        assert!(
+            augment_chmlfrp_admin(PANEL_SAMPLE, &over("u\n[shadow]\ntoken = pwned", "pw")).is_err()
+        );
+        assert!(
+            augment_chmlfrp_admin(PANEL_SAMPLE, &over("admin", "p\n[shadow]\ntoken = pwned"))
+                .is_err()
+        );
+        // 方括号（可扰动节头解析）
+        assert!(augment_chmlfrp_admin(PANEL_SAMPLE, &over("adm[in", "pw")).is_err());
+        assert!(augment_chmlfrp_admin(PANEL_SAMPLE, &over("admin", "p]w")).is_err());
+        // 控制字符（\t/\0——换行的近亲，同拒）
+        assert!(augment_chmlfrp_admin(PANEL_SAMPLE, &over("ad\tmin", "pw")).is_err());
+        assert!(augment_chmlfrp_admin(PANEL_SAMPLE, &over("admin", "p\0w")).is_err());
+        // 合法凭据不受影响（回归）
+        assert!(augment_chmlfrp_admin(PANEL_SAMPLE, &over("admin", "p@ss word-9!")).is_ok());
+    }
+
+    /// 结构化生成器同纪律：`common()` 的 key/value 含换行/方括号/控制字符即错误
+    /// （render 直拼 `k = v`，无转义面）。
+    #[test]
+    fn structured_common_rejects_injection_attempts() {
+        let base = || ChmlFrpIniConfig::new("node.example", 7000);
+        // 键带换行 + 节头
+        assert!(base().common("k\n[shadow]", "v").is_err());
+        // 值伪造新节 + 后续键值
+        assert!(base().common("token", "v\n[shadow]\nserver_addr = evil").is_err());
+        // 方括号（键/值均拒）
+        assert!(base().common("[k]", "v").is_err());
+        assert!(base().common("k", "a]b").is_err());
+        // 控制字符
+        assert!(base().common("k", "v\u{7}").is_err());
+        assert!(base().common("k\u{b}", "v").is_err());
+        // 合法键值不受影响（回归）
+        assert!(base().common("user", "token-6e447a2e28fdb4d0").is_ok());
+        assert!(base().common("tls_enable", "true").is_ok());
     }
 
     #[test]

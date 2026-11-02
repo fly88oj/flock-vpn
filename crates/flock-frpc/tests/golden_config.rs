@@ -69,11 +69,15 @@ fn chmlfrp_ini_generator_matches_sample_field_by_field() {
 
 #[test]
 fn chmlfrp_ini_generator_extends_common_without_touching_proxy_layout() {
-    // 托管层真实用法：common 加 admin/凭据档，proxy 节保持样本形态。
+    // 托管层真实用法：common 加 admin/凭据档，proxy 节保持样本形态
+    // （common 现返回 Result——注入防御，合法输入 expect 通过）。
     let rendered = ChmlFrpIniConfig::new("node.example.net", 7000)
         .common("user", "token-6e447a2e28fdb4d0")
+        .expect("合法 common 键值")
         .common("token", "panel-token")
+        .expect("合法 common 键值")
         .common("tls_enable", "true")
+        .expect("合法 common 键值")
         .tcp_proxy("ssh", "127.0.0.1", 22, 6000)
         .render();
     let parsed = parse_ini(&rendered).unwrap();
