@@ -206,7 +206,17 @@ impl SyncNodeBuilder {
 
         // 成员初始化（同配置多节点并发 initialize 安全——openraft 契约）。
         if !self.members.is_empty() {
-            let _ = raft.initialize(self.members.clone()).await;
+            if let Err(e) = raft.initialize(self.members.clone()).await {
+                // NotAllowed = 集群已有日志/成员（他节点先初始化或本机重启再入）——正常
+                // 收敛路径，静默放行；其余错误（NotInMembers 等）记日志：初成员集装配
+                // 故障必须可观测，静默吞掉会让「带病启动」无迹可循。
+                if !matches!(
+                    e,
+                    RaftError::APIError(openraft::error::InitializeError::NotAllowed(_))
+                ) {
+                    eprintln!("raft initialize failed: {e}");
+                }
+            }
         }
 
         // 转发面互连接缝（FRWD 流 + location_query 扇出）。

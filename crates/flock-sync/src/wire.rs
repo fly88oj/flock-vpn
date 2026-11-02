@@ -220,22 +220,8 @@ impl DeviceDirectory for PeerDirectory {
     }
 }
 
-/// 一条到对端的已认证互连会话（Tunnel；Drop 即终止）。
-struct Pipe {
-    tunnel: session::Tunnel,
-}
-
-impl Drop for Pipe {
-    fn drop(&mut self) {}
-}
-
-impl Pipe {
-    async fn open_stream(&self) -> io::Result<MuxStream> {
-        self.tunnel.open_stream(Prio::Control).await
-    }
-}
-
-/// 互连管理器：缓存到各对端的 E2E 会话，按 RPC 开流；应答侧 `serve_loop` 收会话/收流。
+/// 互连管理器：缓存到各对端的 E2E 会话（`session::Tunnel` 直存——旧 `Pipe` 空包装
+/// 已删），按 RPC 开流；应答侧 `serve_loop` 收会话/收流。
 pub struct Interconnect {
     ident: Arc<ServerIdentity>,
     /// 本机作为发起方的「设备」材料 = 身份 Ed25519 + 静态混合 X25519（与入群凭证同源）。
@@ -244,7 +230,7 @@ pub struct Interconnect {
     root_pub: VerifyingKey,
     nodes: Arc<std::sync::RwLock<BTreeMap<NodeId, ServerEntry>>>,
     fabric: Arc<dyn Fabric>,
-    pipes: tokio::sync::Mutex<BTreeMap<NodeId, Arc<Pipe>>>,
+    pipes: tokio::sync::Mutex<BTreeMap<NodeId, Arc<session::Tunnel>>>,
     /// 每对端 RPC 门闩（同一互连会话至多一条在途 RPC——mux 驱动单待开流 +
     /// yamux ACK 积压按流计，串行化后每条 RPC 完整走完生命周期，不互相拆台）。
     gates: std::sync::Mutex<BTreeMap<NodeId, Arc<tokio::sync::Mutex<()>>>>,
@@ -350,7 +336,7 @@ impl Interconnect {
             })
     }
 
-    async fn connect_pipe(&self, peer: NodeId) -> io::Result<Arc<Pipe>> {
+    async fn connect_pipe(&self, peer: NodeId) -> io::Result<Arc<session::Tunnel>> {
         let entry = self.peer_entry(peer)?;
         let io = match self.fabric.dial(&entry.server_id).await {
             Ok(io) => {
@@ -375,7 +361,7 @@ impl Interconnect {
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "interconnect handshake timeout"))?
         .map_err(|e| io::Error::other(format!("interconnect handshake: {e}")))?;
-        Ok(Arc::new(Pipe { tunnel }))
+        Ok(Arc::new(tunnel))
     }
 
     /// 到对端开一条 RPC 流（缓存会话优先；失效重建一次）。
@@ -386,17 +372,17 @@ impl Interconnect {
     /// 开流/拨号/握手，回锁只做查插（竞态双连无害——后写者胜）。
     async fn open_stream(&self, peer: NodeId) -> io::Result<MuxStream> {
         let cached = self.pipes.lock().await.get(&peer).cloned();
-        if let Some(pipe) = cached {
-            match pipe.open_stream().await {
+        if let Some(tunnel) = cached {
+            match tunnel.open_stream(Prio::Control).await {
                 Ok(s) => return Ok(s),
                 Err(_) => {
                     self.pipes.lock().await.remove(&peer);
                 }
             }
         }
-        let pipe = self.connect_pipe(peer).await?;
-        let s = pipe.open_stream().await?;
-        self.pipes.lock().await.insert(peer, pipe.clone());
+        let tunnel = self.connect_pipe(peer).await?;
+        let s = tunnel.open_stream(Prio::Control).await?;
+        self.pipes.lock().await.insert(peer, tunnel.clone());
         Ok(s)
     }
 

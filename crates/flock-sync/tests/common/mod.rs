@@ -4,12 +4,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::SigningKey;
 use flock_protocol::session::{ClusterId, ServerEntry, ServerId, ServerIdentity};
 use flock_protocol::trust::ClusterDirectory;
-use ed25519_dalek::SigningKey;
 
 use flock_sync::hooks::HookRecorder;
-use flock_sync::proto::{NodeId, ReadQuery, ReadView, SyncRequest, SyncResponse};
+use flock_sync::proto::{NodeId, SyncRequest, SyncResponse};
 use flock_sync::testutil::{FabricRegistry, MemoryFabric};
 use flock_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
 
@@ -147,30 +147,6 @@ impl TestCluster {
 
     pub fn node_of(&self, id: NodeId) -> &SyncNode {
         self.nodes.iter().find(|n| n.id() == id).expect("node")
-    }
-
-    /// 等指定节点线性一致读出目标状态（快照同步/复制收敛断言用）。
-    pub async fn wait_state(
-        &self,
-        idx: usize,
-        check: impl Fn(&ReadView) -> bool,
-        budget: Duration,
-        what: &str,
-    ) -> ReadView {
-        let deadline = Instant::now() + budget;
-        loop {
-            if let Ok(v) = self.nodes[idx].read_linearizable(ReadQuery::State).await {
-                if check(&v) {
-                    return v;
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "等待 {what} 超时（{}s）",
-                budget.as_secs()
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
     }
 }
 

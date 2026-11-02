@@ -75,12 +75,17 @@ impl std::fmt::Debug for HookRegistry {
 }
 
 /// 测试记录器（cluster 断言用：epoch 前进 + 杀会话钩子时序）。
+///
+/// 仅测试面（`test-util` feature 门控——不入生产默认档；集成测试与 flock-server 的
+/// 测试 dev-dependency 均启用该 feature）。
+#[cfg(feature = "test-util")]
 #[derive(Debug, Default)]
 pub struct HookRecorder {
     pub revocations: Mutex<Vec<RevocationEvent>>,
     pub evictions: Mutex<Vec<[u8; 32]>>,
 }
 
+#[cfg(feature = "test-util")]
 impl HookRecorder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -103,6 +108,7 @@ impl HookRecorder {
     }
 }
 
+#[cfg(feature = "test-util")]
 impl SyncHooks for HookRecorder {
     fn on_revocation_applied(&self, ev: RevocationEvent) {
         self.revocations.lock().expect("revocations").push(ev);

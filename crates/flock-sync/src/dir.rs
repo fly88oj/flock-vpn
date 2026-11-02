@@ -109,11 +109,6 @@ impl SyncDirectory {
             }
         }
     }
-
-    /// 强制失效缓存（管理面/装配层用）。
-    pub fn invalidate(&self) {
-        self.cache.lock().expect("dir cache").clear();
-    }
 }
 
 /// DeviceDirectory 接缝句柄（session::respond 注入形态）。

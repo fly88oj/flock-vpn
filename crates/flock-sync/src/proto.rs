@@ -276,13 +276,6 @@ impl SyncRequest {
         SyncRequest::AdminOp(RootSigned { op, sig })
     }
 
-    /// 便捷构造：根密钥签名的 revoke_invite 管理操作。
-    pub fn revoke_invite_signed(root: &ed25519_dalek::SigningKey, invite_id: [u8; 16]) -> Self {
-        let op = AdminOp::RevokeInvite { invite_id };
-        let sig = root.sign(&admin_canonical(&op)).to_bytes();
-        SyncRequest::AdminOp(RootSigned { op, sig })
-    }
-
     /// 便捷构造：根密钥签名的 server_keys 管理操作。
     pub fn server_keys_signed(
         root: &ed25519_dalek::SigningKey,
