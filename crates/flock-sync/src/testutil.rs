@@ -188,9 +188,11 @@ impl Fabric for MemoryFabric {
         async move {
             // tokio Mutex：guard 可跨 await（单 serve_loop 消费者，无争用）。
             let mut rx = rx.lock().await;
+            // 关闭形态 = NotConnected（wire::is_fabric_closed 的约定信号：
+            // 注册表消亡/全部拨号端拆除——serve_loop 据此退出而非按瞬时错误重试）。
             rx.recv()
                 .await
-                .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "fabric closed"))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "fabric closed"))
         }
         .boxed()
     }

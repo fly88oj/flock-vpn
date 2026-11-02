@@ -253,6 +253,8 @@ pub struct Interconnect {
     pub rpc_timeout: Duration,
     /// 应答侧握手拒绝计数（无凭证/坏握手——对发起端表现为不透明的连接终止）。
     rejected_handshakes: AtomicU64,
+    /// 应答侧 accept 瞬时错误计数（退避后继续——入连服务不因单次故障退出）。
+    accept_errors: AtomicU64,
     /// 互连诊断计数（M5 排障面：拨号/RPC 成败）。
     pub(crate) diag_dial_ok: AtomicU64,
     pub(crate) diag_dial_err: AtomicU64,
@@ -296,6 +298,7 @@ impl Interconnect {
             session_cfg: session::TunnelConfig::default(),
             rpc_timeout: Duration::from_secs(5),
             rejected_handshakes: AtomicU64::new(0),
+            accept_errors: AtomicU64::new(0),
             diag_dial_ok: AtomicU64::new(0),
             diag_dial_err: AtomicU64::new(0),
             diag_rpc_ok: AtomicU64::new(0),
@@ -326,6 +329,11 @@ impl Interconnect {
     /// 应答侧握手拒绝计数（无凭证/伪造凭证——admission 断言面）。
     pub fn rejected_handshakes(&self) -> u64 {
         self.rejected_handshakes.load(Ordering::Relaxed)
+    }
+
+    /// 应答侧 accept 瞬时错误计数（诊断面——入连服务韧性可观测）。
+    pub fn accept_errors(&self) -> u64 {
+        self.accept_errors.load(Ordering::Relaxed)
     }
 
     fn peer_entry(&self, peer: NodeId) -> io::Result<ServerEntry> {
@@ -461,16 +469,29 @@ impl Interconnect {
     }
 
     /// 应答侧主循环：收入连 → 服务器-服务器 profile 应答（无凭证即拒）→ 逐流分发。
+    ///
+    /// **韧性纪律**：accept 的瞬时错误（WouldBlock/ConnAborted/EMFILE 等——文件描述符
+    /// 耗尽、连接建立中途复位之类）只计数 + 指数退避后继续——单次入连故障不得永久
+    /// 杀死入连服务（旧实现任意 Err 即退出，Raft 复制/快照随之全断）。唯一退出条件 =
+    /// 织物显式关闭（[`is_fabric_closed`]）。
     pub async fn serve_loop(self: Arc<Self>, target: RpcTarget) {
+        let mut backoff = Duration::from_millis(10);
         loop {
             let io = match self.fabric.accept().await {
                 Ok(io) => io,
-                Err(_) => {
-                    // 织物关闭（节点停机）——退出服务循环。
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    return;
+                Err(e) => {
+                    if is_fabric_closed(&e) {
+                        // 织物显式关闭（监听端拆除/内存织物通道消亡）——退出服务循环。
+                        return;
+                    }
+                    self.accept_errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("interconnect: accept transient error: {e}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                    continue;
                 }
             };
+            backoff = Duration::from_millis(10);
             let this = self.clone();
             let target = target.clone();
             tokio::spawn(async move {
@@ -501,6 +522,15 @@ impl Interconnect {
             }
         }
     }
+}
+
+/// accept 错误是否为「织物显式关闭」（`serve_loop` 的唯一合法退出条件）。
+///
+/// 约定：内存织物关闭通道 ⇒ `NotConnected`（testutil）；TCP 监听端无显式关闭路径
+/// （监听生命周期 = 织物 = 进程）——其余一切错误（WouldBlock/ConnAborted/EMFILE 等，
+/// 含未来的未知种类）一律按瞬时处理：退避后继续。
+fn is_fabric_closed(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotConnected
 }
 
 /// 单流处理：一请求一响应。
@@ -892,5 +922,32 @@ mod tests {
         applied.store(30, Ordering::SeqCst);
         mon.observe_leader_commit(30);
         assert!(!mon.breaker_open(), "追平后熔断关闭");
+    }
+
+    /// accept 错误分类：仅 NotConnected（织物显式关闭约定）退出服务循环；
+    /// WouldBlock/ConnAborted/EMFILE 等瞬时错误一律退避重试（serve_loop 不死）。
+    #[test]
+    fn accept_error_classification() {
+        assert!(
+            is_fabric_closed(&io::Error::new(
+                io::ErrorKind::NotConnected,
+                "fabric closed"
+            )),
+            "NotConnected = 织物关闭（唯一退出条件）"
+        );
+        assert!(!is_fabric_closed(&io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "x"
+        )));
+        assert!(!is_fabric_closed(&io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "x"
+        )));
+        assert!(!is_fabric_closed(&io::Error::new(
+            io::ErrorKind::Interrupted,
+            "x"
+        )));
+        assert!(!is_fabric_closed(&io::Error::from_raw_os_error(23))); // EMFILE
+        assert!(!is_fabric_closed(&io::Error::from_raw_os_error(24))); // ENFILE
     }
 }
