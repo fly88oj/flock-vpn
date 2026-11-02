@@ -415,6 +415,10 @@ impl Interconnect {
     }
 
     /// 一次 RPC 往返（门闩内：开流 → 帧请求 → 帧响应；超时/IO 错误逐出会话重建）。
+    ///
+    /// **门闩排队预算**：获取门闩同样受 `timeout` 约束（openraft 传 `hard_ttl`）——
+    /// 慢快照占住门闩期间，后续心跳/RPC 不得无限排队（排队时间计入总预算，超时按
+    /// [`WireCallError::TimedOut`] 返回，交给 openraft 走重试，而非排队到天荒地老）。
     pub async fn call(
         &self,
         peer: NodeId,
@@ -422,7 +426,17 @@ impl Interconnect {
         timeout: Duration,
     ) -> Result<WireResp, WireCallError> {
         let gate = self.gate_of(peer);
-        let _guard = gate.lock().await;
+        let t0 = Instant::now();
+        let _guard = match tokio::time::timeout(timeout, gate.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.diag_rpc_err.fetch_add(1, Ordering::Relaxed);
+                eprintln!("interconnect: rpc to {peer} queued on gate over {timeout:?}");
+                return Err(WireCallError::TimedOut);
+            }
+        };
+        // 排队耗时从 RPC 预算中扣除（总往返不超调用方给的预算）。
+        let rpc_budget = timeout.saturating_sub(t0.elapsed());
         let mut stream = match self.open_stream(peer).await {
             Ok(s) => s,
             Err(e) => {
@@ -437,7 +451,7 @@ impl Interconnect {
             postcard::from_bytes::<WireResp>(&resp)
                 .map_err(|e| io::Error::other(format!("decode: {e}")))
         };
-        match tokio::time::timeout(timeout, fut).await {
+        match tokio::time::timeout(rpc_budget, fut).await {
             Ok(Ok(resp)) => {
                 self.diag_rpc_ok.fetch_add(1, Ordering::Relaxed);
                 Ok(resp)
@@ -451,7 +465,7 @@ impl Interconnect {
             }
             Err(_) => {
                 self.diag_rpc_err.fetch_add(1, Ordering::Relaxed);
-                eprintln!("interconnect: rpc to {peer} timed out ({timeout:?})");
+                eprintln!("interconnect: rpc to {peer} timed out ({rpc_budget:?})");
                 self.evict(peer).await;
                 Err(WireCallError::TimedOut)
             }
