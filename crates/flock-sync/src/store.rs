@@ -185,46 +185,62 @@ impl RaftLogStorage<SyncConfig> for RedbLogStore {
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), openraft::StorageError<u64>> {
-        let txn = self.write_txn()?;
-        {
-            let mut table = txn.open_table(LOG).map_err(storage_err)?;
-            let from = log_id.index;
-            let keys: Vec<u64> = table
-                .range(from..)
-                .map_err(storage_err)?
-                .flatten()
-                .map(|(k, _)| k.value())
-                .collect();
-            for k in keys {
-                table.remove(k).map_err(storage_err)?;
-            }
-        }
-        txn.commit().map_err(storage_err)
+        remove_range(&self.db, log_id.index.., None)
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), openraft::StorageError<u64>> {
-        let txn = self.write_txn()?;
-        {
-            let mut table = txn.open_table(LOG).map_err(storage_err)?;
-            let upto = log_id.index;
-            let keys: Vec<u64> = table
-                .range(..=upto)
+        remove_range(&self.db, ..=log_id.index, Some(log_id))
+    }
+}
+
+/// 每批删除的 key 上限（分批收集-删除：旧实现的 collect-then-remove 把整段日志 index
+/// 一次性物化进内存 + 单事务内逐 key 删——大日志下内存尖峰与长事务；每批独立事务，
+/// 批间崩溃留下残余 key 幂等安全（下次重删同区间））。
+const REMOVE_BATCH: usize = 10_000;
+
+/// 分批删除日志区间。`purged` 非空 = purge 语义：`last_purged` 水位只在**末批**（不足
+/// 一整批 = 区间已删净）同事务落盘——先推水位后删净的反向形态不出现（那会让
+/// get_log_state 声称已压实而 key 仍在）。前批已删的 key 不再命中 range，循环自然推进。
+#[allow(clippy::result_large_err)] // Err 载荷 = openraft StorageError（224B）——与文件内既有豁免同因
+fn remove_range<R: RangeBounds<u64> + Clone>(
+    db: &Arc<Database>,
+    range: R,
+    purged: Option<LogId<u64>>,
+) -> Result<(), openraft::StorageError<u64>> {
+    loop {
+        let txn = db.begin_write().map_err(storage_err)?;
+        let batch: Vec<u64> = {
+            let table = txn.open_table(LOG).map_err(storage_err)?;
+            table
+                .range(range.clone())
                 .map_err(storage_err)?
                 .flatten()
                 .map(|(k, _)| k.value())
-                .collect();
-            for k in keys {
+                .take(REMOVE_BATCH)
+                .collect()
+        };
+        let last = batch.len() < REMOVE_BATCH;
+        {
+            let mut table = txn.open_table(LOG).map_err(storage_err)?;
+            for k in &batch {
                 table.remove(k).map_err(storage_err)?;
             }
-            let mut kv = txn.open_table(KV).map_err(storage_err)?;
-            kv.insert(
-                "last_purged",
-                postcard::to_allocvec(&Some(log_id))
-                    .map_err(storage_err)?
-                    .as_slice(),
-            )
-            .map_err(storage_err)?;
+            if last {
+                if let Some(p) = purged {
+                    let mut kv = txn.open_table(KV).map_err(storage_err)?;
+                    kv.insert(
+                        "last_purged",
+                        postcard::to_allocvec(&Some(p))
+                            .map_err(storage_err)?
+                            .as_slice(),
+                    )
+                    .map_err(storage_err)?;
+                }
+            }
         }
-        txn.commit().map_err(storage_err)
+        txn.commit().map_err(storage_err)?;
+        if last {
+            return Ok(());
+        }
     }
 }

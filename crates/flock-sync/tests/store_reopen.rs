@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use flock_sync::store::RedbLogStore;
 use flock_sync::SyncConfig;
-use openraft::storage::RaftLogStorage as _;
+use openraft::storage::{RaftLogReader as _, RaftLogStorage as _};
 
 const KV: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("flock_sync_kv");
 const LOG: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("flock_sync_log");
@@ -90,4 +90,66 @@ async fn store_reopen_recovers_vote_and_log() {
             "save_vote → 重启 → read_vote 闭环"
         );
     }
+}
+
+/// 分批删除（truncate/purge 每批 ≤10000 key）：跨批边界的大区间删净 + purge 只在
+/// 末批落 `last_purged` 水位（get_log_state 可观测）。
+#[tokio::test]
+async fn store_purge_truncate_across_batch_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(redb::Database::create(dir.path().join("batch.redb")).unwrap());
+    RedbLogStore::init_tables(&db).unwrap();
+
+    // 10005 条 Blank 日志（> 一批 10000 ⇒ 至少两批）；`LogFlushed` 回调是 openraft
+    // 内部类型（pub(crate) 构造），此处与上文同法直写 LOG 表。
+    let n: u64 = 10_005;
+    {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut log = txn.open_table(LOG).unwrap();
+            for i in 1..=n {
+                let e = openraft::Entry::<SyncConfig> {
+                    log_id: lid(i),
+                    payload: openraft::EntryPayload::Blank,
+                };
+                log.insert(i, postcard::to_allocvec(&e).unwrap().as_slice())
+                    .unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    let mut store = RedbLogStore::from_db(db);
+    assert_eq!(
+        store.get_log_state().await.unwrap().last_log_id,
+        Some(lid(n))
+    );
+
+    // purge 1..=10003（两整批 + 3 条）：全段删净后水位 = 10003（末批同事务落盘）。
+    store.purge(lid(n - 2)).await.unwrap();
+    let st = store.get_log_state().await.unwrap();
+    assert_eq!(
+        st.last_purged_log_id,
+        Some(lid(n - 2)),
+        "分批删净后 last_purged 落末批事务"
+    );
+    assert_eq!(st.last_log_id, Some(lid(n)), "剩余尾部日志完好");
+    let left: Vec<_> = store
+        .try_get_log_entries((n - 2)..=n)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.log_id.index)
+        .collect();
+    assert_eq!(left, vec![n - 1, n], "区间内残余仅未 purge 部分");
+
+    // truncate 尾部（同构复核：小段一批内删净）——自 10005 起截，剩 10004 一条。
+    store.truncate(lid(n)).await.unwrap();
+    let st = store.get_log_state().await.unwrap();
+    assert_eq!(st.last_log_id, Some(lid(n - 1)), "truncate 后末条 = 10004");
+    assert_eq!(
+        st.last_purged_log_id,
+        Some(lid(n - 2)),
+        "truncate 不动 purge 水位"
+    );
 }

@@ -371,7 +371,16 @@ impl openraft::storage::RaftStateMachine<SyncConfig> for RedbStateMachine {
             *d = data;
         }
         self.core.applied_index.store(applied, Ordering::SeqCst);
-        let _ = self.core.epoch_tx.send(epoch);
+        // 与 apply 路径对齐：单调推进（send 会无条件覆盖——快照 epoch 低于当前 watch
+        // 值的异常形态不得回退观察者）。
+        let _ = self.core.epoch_tx.send_if_modified(|cur| {
+            if *cur < epoch {
+                *cur = epoch;
+                true
+            } else {
+                false
+            }
+        });
         // 安装即持久（下次重启直接从快照恢复）。
         let re_bundle = SnapBundle {
             meta: meta.clone(),
