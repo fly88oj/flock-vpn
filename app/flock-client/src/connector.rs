@@ -161,6 +161,14 @@ impl ClientState {
                 ))
             }
         };
+        // 状态一致性告警（显式，不静默）：有 directory.bin 但该集群的 pins 丢失
+        //（pins.bin 残缺/未随目录同步）⇒ pin_for 恒 None，supervise 全端点退避空转。
+        if pins.pinned_root(&directory.cluster_id).is_none() {
+            eprintln!(
+                "flock-client: 告警：directory.bin 存在但集群 {} 无钉扎（pins.bin 丢失或未同步）——重跑 `flock-client invite <file>` 修复",
+                hex::encode(directory.cluster_id.0)
+            );
+        }
         Ok(ClientState { device, pins, directory })
     }
 
@@ -395,7 +403,10 @@ pub async fn supervise(
             continue;
         };
         let Some(pin) = state.pin_for(&endpoint) else {
-            eprintln!("flock-client: 端点 {endpoint} 无接入材料/未钉扎，跳过");
+            // 退避而非忙转（原形态 100% CPU 空转）：无钉扎是持续态（目录在、pins 缺——
+            // 见 ClientState::load 的一致性告警），按端点重查节律 5s 后再试。
+            eprintln!("flock-client: 端点 {endpoint} 无接入材料/未钉扎，5s 后重查");
+            tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         };
         let attempt = backoff.attempt + 1;
