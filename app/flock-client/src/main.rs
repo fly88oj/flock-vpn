@@ -214,20 +214,77 @@ fn cli_err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// 端点覆盖：仅接受目录内端点（材料必须匹配，§1.3.3f 端点↔材料同签）。
+/// 端点覆盖：仅接受目录内端点（材料必须匹配，§1.3.3f 端点↔材料同签）；重复项
+/// 告警并去重（保首次出现序——不去重会让 EndpointRing 轮询重复拨同一端点）。
 fn override_endpoints(mut state: ClientState, eps: &[String]) -> Result<ClientState, String> {
     let known = state.endpoints();
+    let mut seen: Vec<String> = Vec::new();
     for ep in eps {
         if !known.contains(ep) {
             return Err(format!("覆盖端点 {ep} 不在根签目录内（端点↔材料同签，拒绝未签名端点）"));
         }
+        if seen.contains(ep) {
+            eprintln!("flock-client: 配置告警：覆盖端点列表重复项 {ep}（已去重，保留首次出现序）");
+        } else {
+            seen.push(ep.clone());
+        }
     }
     let mut servers = Vec::new();
-    for ep in eps {
+    for ep in &seen {
         if let Some(e) = state.directory.servers.iter().find(|s| &s.relay_endpoint == ep) {
             servers.push(e.clone());
         }
     }
     state.directory.servers = servers;
     Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flock_client::connector::ClientState;
+    use flock_protocol::session::{ClusterId, ServerEntry, ServerId};
+    use flock_protocol::trust::{ClusterDirectory, PinStore};
+
+    fn state_with(endpoints: &[&str]) -> ClientState {
+        let mut servers = Vec::new();
+        for (i, ep) in endpoints.iter().enumerate() {
+            let identity =
+                flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[i as u8 + 1; 32]);
+            servers.push(ServerEntry {
+                server_id: ServerId([i as u8 + 1; 16]),
+                relay_endpoint: (*ep).to_string(),
+                identity_pub: identity.verifying_key(),
+                static_hybrid_pub: flock_protocol::kem::HybridKeypair::generate(
+                    &mut flock_protocol::rand::rngs::OsRng,
+                )
+                .public(),
+            });
+        }
+        let directory = ClusterDirectory {
+            cluster_id: ClusterId([7; 16]),
+            dir_version: 1,
+            servers,
+            root_sig: flock_protocol::ed25519_dalek::Signature::from_bytes(&[0; 64]),
+        };
+        ClientState {
+            device: flock_protocol::session::DeviceStaticKeys::generate(),
+            pins: PinStore::new(),
+            directory,
+        }
+    }
+
+    /// 覆盖端点去重（保序）+ 未签名端点拒绝（§1.3.3f 原语义不回归）。
+    #[test]
+    fn override_endpoints_dedups_repeats_and_keeps_gate() {
+        let state = state_with(&["a:1", "b:2", "c:3"]);
+        // 重复项：去重保首现序。
+        let eps = vec!["b:2".to_string(), "a:1".to_string(), "b:2".to_string()];
+        let out = override_endpoints(state, &eps).expect("合法覆盖");
+        assert_eq!(out.endpoints(), vec!["b:2".to_string(), "a:1".to_string()]);
+        // 未签名端点仍拒。
+        let state2 = state_with(&["a:1"]);
+        let bad = vec!["evil:9".to_string()];
+        assert!(override_endpoints(state2, &bad).is_err(), "未签名端点必须拒绝");
+    }
 }
