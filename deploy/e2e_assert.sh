@@ -98,6 +98,13 @@ log() { printf '\n== %s ==\n' "$*"; }
 ec() { compose exec -T "client-$1" "${@:2}"; }          # exec client-N
 es_() { compose exec -T "server-$1" "${@:2}"; }         # exec server-N
 
+# A10 的 iperf3 JSON 解析依赖宿主 python：python3 优先、python 兜底；均缺 ⇒ A10 如实
+# FAIL（失败方向安全——绝不因工具缺失把断言记 PASS）。
+PY_BIN=""
+if command -v python3 >/dev/null 2>&1; then PY_BIN=python3
+elif command -v python >/dev/null 2>&1; then PY_BIN=python
+fi
+
 # —— 观测面助手 ——
 stat_of() { es_ "$1" flock-server --config /etc/flock/server.toml stats 2>/dev/null; }
 conn_count() { compose logs "client-$1" 2>/dev/null | grep -c '已连接'; }
@@ -595,12 +602,16 @@ a9() {
 
 a10() {
     log "A10 rekey 无感：iperf3 300s + client-1 epoch 日志（epoch≥2、逐秒区间非零）"
+    if [ -z "$PY_BIN" ]; then
+        record FAIL A10 "宿主缺 python3/python，无法解析 iperf3 JSON（安装任一后重跑；不因工具缺失记 PASS）"
+        return
+    fi
     iperf_server a "$VIP_A"
     local base_epoch out epochs min_mbps
     base_epoch="$(compose logs client-1 2>/dev/null | grep -c 'rekey epoch=' || true)"
     out="$(ec 1 iperf3 -c "$VIP_A" -t 300 --json 2>&1)"
     epochs=$(( $(compose logs client-1 2>/dev/null | grep -c 'rekey epoch=' || true) - base_epoch ))
-    min_mbps="$(printf '%s\n' "$out" | python -c '
+    min_mbps="$(printf '%s\n' "$out" | "$PY_BIN" -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
