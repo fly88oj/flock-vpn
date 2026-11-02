@@ -46,6 +46,9 @@ pub const HYBRID_SK_LEN: usize = X25519_PUB_LEN + 64;
 /// HKDF info 标签：域分离（换算法/换组合规则必须换标签）。
 const HKDF_INFO: &[u8] = b"flock-protocol/hybrid-kem/x25519+ml-kem-768/v1";
 
+/// seed_material 的 z 重派生标签（域分离：z 仅用于 FIPS 203 隐式拒绝伪钥）。
+const L_SEED_Z: &[u8] = b"flock-protocol/hybrid-kem/seed-z/v1";
+
 /// KEM 错误：公钥/密文反序列化或校验失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KemError {
@@ -155,13 +158,54 @@ impl HybridKeypair {
 
     /// 静态 X25519 私钥引用。session 握手的 split 模式（§1.3.3c：X25519(e,s_srv) 与
     /// ML-KEM ct 分列）需要单独取 X25519 份额做 DH，故开放只读访问。
+    ///
+    /// **将收敛**（flock-sync 迁移的后续阶段）：split 模式的取用面将统一到
+    /// [`HybridKeypair::seed_material`]/[`HybridKeypair::from_seed_material`] 与
+    /// 握手内部化；本访问器在此期间保持 `pub` 不动以保兼容过渡。
     pub fn x25519_secret(&self) -> &StaticSecret {
         &self.x25519
     }
 
-    /// ML-KEM-768 解封装钥引用（同上，split 模式直取）。
+    /// ML-KEM-768 解封装钥引用（同上，split 模式直取；**将收敛**——见
+    /// [`HybridKeypair::x25519_secret`] 的收敛注记）。
     pub fn ml_kem_decapsulation(&self) -> &DecapsulationKey<MlKem768> {
         &self.ml_kem
+    }
+
+    /// split 模式种子材料（64B = X25519 私钥 32B ‖ ML-KEM d 32B）。
+    ///
+    /// **split 模式专用**（§1.3.3c：握手按 X25519(e,s_srv) 与 ML-KEM ct 分列使用
+    /// 服务器静态混合钥）：flock-sync 的静态密钥分发/迁移以本 64B 为载体（完整 96B
+    /// 私钥序列化仍是 [`HybridKeypair::to_bytes`]——含 ML-KEM z 的全量形态）。
+    ///
+    /// 往返语义：[`HybridKeypair::from_seed_material`] 消费本产物得到**等效**密钥对——
+    /// 公钥逐字节一致、合法密文解封逐字节一致；ML-KEM 的 z（FIPS 203 中仅参与隐式
+    /// 拒绝伪钥，不进公钥与合法解封路径）由种子确定性重派生，与原钥的随机 z 不同。
+    pub fn seed_material(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&self.x25519.to_bytes());
+        let ml = self.ml_kem.to_bytes(); // 64B = d‖z
+        out[32..].copy_from_slice(&ml[..32]);
+        out
+    }
+
+    /// [`HybridKeypair::seed_material`] 的逆（等效密钥对语义见其文档）。确定性：
+    /// 同种子恒重建同一密钥对。
+    pub fn from_seed_material(seed: &[u8; 64]) -> Self {
+        let x: [u8; 32] = seed[..32].try_into().expect("64B seed split");
+        let d: [u8; 32] = seed[32..].try_into().expect("64B seed split");
+        // z 确定性重派生（域分离标签）：合法路径（公钥、合法密文解封）完全由 d 决定。
+        let mut h = Sha256::new();
+        h.update(L_SEED_Z);
+        h.update(seed);
+        let z: [u8; 32] = h.finalize().into();
+        let mut ml_seed = [0u8; 64];
+        ml_seed[..32].copy_from_slice(&d);
+        ml_seed[32..].copy_from_slice(&z);
+        HybridKeypair {
+            x25519: StaticSecret::from(x),
+            ml_kem: DecapsulationKey::from_seed(ml_seed.into()),
+        }
     }
 }
 
@@ -466,5 +510,39 @@ mod tests {
             ss.as_bytes().iter().all(|&b| b == 0),
             "zeroize 必须覆盖全部 32B 共享密钥材料"
         );
+    }
+
+    /// seed_material 往返（split 模式专用，flock-sync 迁移载体）：等效密钥对——
+    /// 公钥逐字节一致、合法密文解封一致；重建确定性；不同种子不同公钥。
+    #[test]
+    fn seed_material_roundtrip_equivalent_and_deterministic() {
+        let sk = keypair();
+        let seed = sk.seed_material();
+        let sk2 = HybridKeypair::from_seed_material(&seed);
+        assert_eq!(
+            sk2.public().to_bytes(),
+            sk.public().to_bytes(),
+            "等效：公钥逐字节一致"
+        );
+        let (ss1, ct) = encapsulate(&sk.public(), &mut OsRng);
+        let ss2 = decapsulate(&sk2, &ct).expect("等效钥可解封");
+        assert_eq!(ss1.as_bytes(), ss2.as_bytes(), "等效：合法密文解封一致");
+
+        // 确定性：同种子重建两次公钥一致。
+        let sk3 = HybridKeypair::from_seed_material(&seed);
+        assert_eq!(sk3.public().to_bytes(), sk2.public().to_bytes());
+
+        // 不同种子 ⇒ 不同公钥（翻转中段字节位：X25519 标量钳位会抹掉首字节低 3 位，
+        // 翻 bit0 会被钳位吞掉——选取必然存活的字节位）。
+        let mut other = seed;
+        other[10] ^= 0x01;
+        assert_ne!(
+            HybridKeypair::from_seed_material(&other).public().to_bytes(),
+            sk2.public().to_bytes()
+        );
+
+        // 96B to_bytes/from_bytes 仍是全量无损序列化（与 64B 种子载体并存）。
+        let full = HybridKeypair::from_bytes(&sk.to_bytes()).expect("全量序列化");
+        assert_eq!(full.public().to_bytes(), sk.public().to_bytes());
     }
 }
