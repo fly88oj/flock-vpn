@@ -566,14 +566,15 @@ impl ServerCore {
     }
 }
 
-/// 运行中的监听端点（Direct 分支零 flock-frpc 类型；Frp 分支持托管句柄）。
+/// 运行中的监听端点（Direct 分支零 flock-frpc 类型；Frp 分支持托管句柄——Arc 使
+/// 健康监控任务与装配方共享存亡，评审项 11）。
 pub enum RunningListener {
     Direct {
         local: SocketAddr,
     },
     Frp {
         local: SocketAddr,
-        managed: crate::frp::Managed,
+        managed: Arc<crate::frp::Managed>,
     },
 }
 
@@ -627,6 +628,9 @@ pub async fn run(
             let (listener, managed) = crate::frp::start(plan, bind)
                 .await
                 .map_err(|e| format!("frp: {e}"))?;
+            // 低频健康监控（评审项 11）：10s 轮询 RelayStatus——不健康/恢复均留痕+计数。
+            let managed = Arc::new(managed);
+            managed.spawn_health_monitor();
             let local = listener
                 .local_addr()
                 .map_err(|e| format!("local_addr: {e}"))?;

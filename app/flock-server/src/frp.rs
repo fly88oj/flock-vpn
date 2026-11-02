@@ -7,8 +7,11 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
-use flock_frpc::supervisor::{Supervisor, SupervisorConfig};
+use flock_frpc::supervisor::{RelayPhase, Supervisor, SupervisorConfig};
 use flock_frpc::{
     FrpcBinaries, FrpcBinary, ManagedRelay, RelayFlavor, RelaySpec, CHMLFRP_PINNED_VERSION,
     ORIGINAL_PINNED_VERSION,
@@ -16,6 +19,27 @@ use flock_frpc::{
 use tokio::net::TcpListener;
 
 use crate::config::FrpPlan;
+
+/// 健康监控轮询间隔（评审项 11：低频 10s——对齐会话层 keepalive 节奏；RelayStatus
+/// 读取是内存快照，无子进程开销）。
+const HEALTH_POLL: Duration = Duration::from_secs(10);
+
+/// 健康事件计数（admin stats 消费面）。
+static RELAY_UNHEALTHY_EVENTS: AtomicU64 = AtomicU64::new(0);
+static RELAY_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
+/// 健康监控事件计数快照 `(unhealthy_events, recoveries)`（admin stats）。
+pub fn relay_health_events() -> (u64, u64) {
+    (
+        RELAY_UNHEALTHY_EVENTS.load(Ordering::Relaxed),
+        RELAY_RECOVERIES.load(Ordering::Relaxed),
+    )
+}
+
+/// phase ⇒ 健康判定（Running = 健康；Starting/Backoff/Stopped = 不健康）。
+fn phase_healthy(phase: &RelayPhase) -> bool {
+    matches!(phase, RelayPhase::Running { .. })
+}
 
 /// Frp 模式的运行时句柄（包装 flock-frpc 类型；Drop 即托管拆除）。
 pub struct Managed {
@@ -26,6 +50,41 @@ impl Managed {
     /// 托管健康快照（诊断面）。
     pub fn health(&self) -> flock_frpc::RelayStatus {
         self.relay.health()
+    }
+
+    /// 低频健康监控（评审项 11）：每 [`HEALTH_POLL`] 轮询一次 [`Managed::health`]，
+    /// 健康态迁移（健康→不健康 / 不健康→健康）eprintln 留痕并计数——不健康事件
+    /// 与恢复均进 admin stats（[`relay_health_events`]）。任务随 Arc<Managed> 存亡。
+    pub fn spawn_health_monitor(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let managed = self.clone();
+        tokio::spawn(async move {
+            let mut prev: Option<bool> = None;
+            let mut tick = tokio::time::interval(HEALTH_POLL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let st = managed.health();
+                let healthy = phase_healthy(&st.phase);
+                match (prev, healthy) {
+                    (Some(false), true) => {
+                        RELAY_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "flock-server: frp relay 恢复（phase={:?} restarts={}）",
+                            st.phase, st.restarts
+                        );
+                    }
+                    (Some(true), false) => {
+                        RELAY_UNHEALTHY_EVENTS.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "flock-server: frp relay 不健康（phase={:?} failures={} last_exit={:?}）",
+                            st.phase, st.failures, st.last_exit
+                        );
+                    }
+                    _ => {}
+                }
+                prev = Some(healthy);
+            }
+        })
     }
 
     /// 显式停止（Drop 亦会停——`kill_on_drop` 语义由 flock-frpc 保证）。
@@ -76,4 +135,25 @@ pub async fn start(plan: FrpPlan, bind: SocketAddr) -> Result<(TcpListener, Mana
 /// Frp 模式启动期自检（测试用：Supervisor 确实接管、run 目录已生成）。
 pub fn run_dir_exists(run_base: &Path) -> bool {
     run_base.is_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 评审项 11：phase ⇒ 健康判定——Running 健康；Starting/Backoff/Stopped 不健康
+    /// （Supervisor 的退避重试期按不健康上报，admin stats/日志面据此告警）。
+    #[test]
+    fn phase_health_classification() {
+        use std::time::Duration as D;
+        assert!(phase_healthy(&RelayPhase::Running { pid: 42 }));
+        assert!(!phase_healthy(&RelayPhase::Starting));
+        assert!(!phase_healthy(&RelayPhase::Backoff {
+            restarts: 3,
+            next_restart_in: D::from_secs(2),
+        }));
+        assert!(!phase_healthy(&RelayPhase::Stopped {
+            reason: flock_frpc::StopReason::Manual,
+        }));
+    }
 }

@@ -238,6 +238,11 @@ async fn stats_lines(core: &ServerCore) -> Vec<String> {
         "src_vip_mismatch_kills={}",
         crate::dataplane::src_vip_mismatch_kills()
     ));
+    // 评审项 11：Frp 中继健康事件（不健康/恢复——Frp 模式起服后非零有意义；Direct
+    // 模式恒 0）。
+    let (unhealthy, recovered) = crate::frp::relay_health_events();
+    lines.push(format!("frp_relay_unhealthy_events={unhealthy}"));
+    lines.push(format!("frp_relay_recovered={recovered}"));
     #[cfg(feature = "multi-primary")]
     if let Some(node) = &core.sync {
         lines.push(format!("node_id={}", node.id()));
