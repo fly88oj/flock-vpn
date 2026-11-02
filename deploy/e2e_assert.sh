@@ -796,16 +796,19 @@ a14() {
 # A15：租约陈旧容错（client-2 迁移到 frps-a 端点重启，≤35s 恢复）
 # ============================================================================
 
-write_client2_endpoints() {
-    ec 2 sh -c "printf '%s\n' 'state_dir = \"/var/lib/flock\"' '' 'tun_name = \"tun0\"' 'mtu = 1280' '' 'endpoints = [\"$1\", \"frps-b:23001\", \"172.28.0.22:9443\"]' > /etc/flock/client.toml" \
-        && printf '    client-2 endpoints 首位 = %s\n' "$1"
+write_client2_endpoints() { # write_client2_endpoints <first> <relay-fallback>
+    # 第二端点必须显式传入：恢复序（首位 frps-b）若沿用硬编码 frps-b 会把重复端点写进
+    # rw bind mount（deploy/client-e2e-2.toml 落盘 ["frps-b","frps-b",direct]——093838a
+    # 修过的同源形态被每轮 a15 复发；中继故障时 client-2 将直跳 Direct 而非 frps-a）。
+    ec 2 sh -c "printf '%s\n' 'state_dir = \"/var/lib/flock\"' '' 'tun_name = \"tun0\"' 'mtu = 1280' '' 'endpoints = [\"$1\", \"$2\", \"172.28.0.22:9443\"]' > /etc/flock/client.toml" \
+        && printf '    client-2 endpoints = [%s, %s, direct]\n' "$1" "$2"
 }
 
 a15() {
     log "A15 租约陈旧容错：client-2 迁到 frps-a 端点重启 ⇒ client-1→client-2 ≤${A15_DEADLINE}s 恢复"
     local base_redir
     base_redir="$(stat_of a | sed -n 's/^fwd_locate_redirected=//p')"
-    write_client2_endpoints "frps-a:23000"
+    write_client2_endpoints "frps-a:23000" "frps-b:23001"
     compose restart client-2 >/dev/null 2>&1
     local t0=$SECONDS recovered="" migrated=""
     while [ $SECONDS -lt $((t0 + A15_DEADLINE)) ]; do
@@ -819,7 +822,7 @@ a15() {
     printf '    迁移=%s 恢复 dt=%ss；locate_redirected（server-a）: %s → %s\n' \
         "${migrated:-0}" "$dt" "$base_redir" "$redir_after"
 
-    write_client2_endpoints "frps-b:23001"
+    write_client2_endpoints "frps-b:23001" "frps-a:23000"
     local cbase2; cbase2="$(conn_count 2)"
     compose restart client-2 >/dev/null 2>&1
     wait_new_conn 2 "frps-b:23001" 60 "$cbase2" || echo "A15 恢复：client-2 未回 frps-b"
