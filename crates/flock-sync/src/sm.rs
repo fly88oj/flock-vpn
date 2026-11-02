@@ -290,7 +290,12 @@ fn persist_snapshot(db: &Arc<Database>, bytes: &[u8]) {
             return;
         }
     }
-    // 快照持久化失败不致命：日志在，重启可重放（openraft 启动重放语义）。
+    // 三次重试皆败：不致命（日志在，重启可重放——openraft 启动重放语义），但必须
+    // 可观测（静默失败会让「快照存在」假设悄悄失真——snapshot_and_purge 据此决策）。
+    eprintln!(
+        "sm: snapshot persist failed after 3 attempts ({} bytes) — 日志仍在，重启走重放",
+        bytes.len()
+    );
 }
 
 fn read_snapshot(db: &Arc<Database>) -> Option<SnapBundle> {

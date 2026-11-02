@@ -616,8 +616,16 @@ impl SyncNode {
     }
 
     /// 快照触发 + 日志压实（准入流水用：迫使新 learner 走快照同步路径）。
+    ///
+    /// **压实前置条件**：快照确认落盘且覆盖 `applied` 才 purge——快照未在预算内确认
+    /// 即返回 [`SyncError::Raft`] 并**跳过 purge**（压实未落盘快照之下的日志 = 重启后
+    /// 状态丢失；openraft 的 `get_snapshot` 可能返回旧快照，故校验其边界 ≥ applied）。
     pub async fn snapshot_and_purge(&self) -> Result<u64, SyncError> {
         let applied = self.inner.sm.applied_index();
+        if applied == 0 {
+            // 空日志无谓压实（也无状态可丢）。
+            return Ok(0);
+        }
         self.inner
             .raft
             .trigger()
@@ -625,34 +633,46 @@ impl SyncNode {
             .await
             .map_err(|e| SyncError::Raft(format!("trigger snapshot: {e}")))?;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if self
+        let confirmed = loop {
+            let snap_idx = self
                 .inner
                 .raft
                 .get_snapshot()
                 .await
                 .ok()
                 .flatten()
-                .is_some()
-            {
-                break;
+                .and_then(|s| s.meta.last_log_id.map(|l| l.index));
+            if snap_idx.is_some_and(|i| i >= applied) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        if !confirmed {
+            return Err(SyncError::Raft(format!(
+                "snapshot covering index {applied} not confirmed within 5s; purge skipped"
+            )));
         }
-        if applied > 0 {
-            self.inner
-                .raft
-                .trigger()
-                .purge_log(applied)
-                .await
-                .map_err(|e| SyncError::Raft(format!("purge: {e}")))?;
-        }
+        self.inner
+            .raft
+            .trigger()
+            .purge_log(applied)
+            .await
+            .map_err(|e| SyncError::Raft(format!("purge: {e}")))?;
         Ok(applied)
     }
 
     /// add_voter 管理操作（§4-3）：先经 Raft 状态机提交根签 AdminOp::AddVoter（验签后
     /// 记录 voters + config_version），再执行 openraft 成员提升（joint 共识）。
     /// 状态机拒绝（无根签名/未引导）⇒ 不提升，原样返回拒绝响应。
+    ///
+    /// **提升前对账**：状态机 voters 与 openraft 真实 membership（`raft.metrics()`）是
+    /// 两个真相源，可能发散（错过的成员日志/部分完成的提升）。差异（超出本次新增的
+    /// node_id）时告警，并以**真实 membership 为基准合并**（并集——状态机已提交的
+    /// admin 准入不丢，openraft 已有的 voter 不误删；旧实现只看状态机副本，
+    /// 发散时会静默丢 voter 或复活死节点）。
     pub async fn add_voter_signed(
         &self,
         root: &ed25519_dalek::SigningKey,
