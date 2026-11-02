@@ -105,8 +105,10 @@ pub enum ChmlFrpMode {
 
 /// 定版 frpc 二进制声明（R9 矩阵的二进制侧标识）。
 ///
-/// `decl_version` 是**运维声明**的版本（应与 `<bin> --version` 输出一致；可用
-/// [`FrpcBinary::probe_version`] 实测核对）。声明≠定版即被 [`check_version_matrix`] 拒绝。
+/// `decl_version` 是**运维声明**的版本（应与 `<bin> --version` 输出一致）。声明≠定版
+/// 即被 [`check_version_matrix`] 拒绝；「实测 `--version` ↔ 声明」的进程级核对是
+/// 测试面纪律（tests/matrix.rs 的测试内 helper 承担，不占生产启动路径——多一次
+/// 子进程往返，生产恒不开）。
 #[derive(Clone, Debug)]
 pub struct FrpcBinary {
     /// 二进制路径。
@@ -115,54 +117,6 @@ pub struct FrpcBinary {
     pub flavor: RelayFlavor,
     /// 声明版本串（`--version` 输出形态）。
     pub decl_version: String,
-}
-
-impl FrpcBinary {
-    /// 运行 `<bin> --version` 实测版本（首行 trim）。
-    ///
-    /// ChmlFrp `version.Full()` / 原版 `version.Full()` 均打印单行版本串
-    /// （root.go:127-129、frp-src 惯例）。启动期核对可用它抓「路径挂错二进制」。
-    pub async fn probe_version(&self) -> Result<String, FrpcError> {
-        let out = tokio::process::Command::new(&self.path)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await
-            .map_err(|e| {
-                FrpcError::Spawn(format!("--version 探测失败 {}: {e}", self.path.display()))
-            })?;
-        if !out.status.success() {
-            return Err(FrpcError::VersionProbe(format!(
-                "--version 退出码 {:?}",
-                out.status.code()
-            )));
-        }
-        let first = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if first.is_empty() {
-            return Err(FrpcError::VersionProbe("--version 输出为空".into()));
-        }
-        Ok(first)
-    }
-
-    /// 实测版本与声明一致 + 声明过矩阵（启动期完整核对）。
-    pub async fn verify_declared(&self) -> Result<(), FrpcError> {
-        let actual = self.probe_version().await?;
-        if actual != self.decl_version {
-            return Err(FrpcError::Matrix(format!(
-                "二进制实测版本 {actual:?} 与声明 {:?} 不一致（{}）",
-                self.decl_version,
-                self.path.display()
-            )));
-        }
-        check_version_matrix(self.flavor, &self.decl_version, self)
-    }
 }
 
 /// R9 版本矩阵锁：spec 栈代 ⇔ frpc 二进制栈代 ⇔ 定版版本，禁交叉。
@@ -281,8 +235,6 @@ pub enum FrpcError {
     Spec(String),
     /// R9 版本矩阵违例（交叉/非定版）。
     Matrix(String),
-    /// `--version` 探测失败。
-    VersionProbe(String),
     /// 子进程 spawn 失败（二进制缺失/不可执行等）。
     Spawn(String),
     /// 配置生成/解析失败（golden 守门对象，frp-compat §4-R8/R12）。
@@ -296,7 +248,6 @@ impl fmt::Display for FrpcError {
         match self {
             FrpcError::Spec(m) => write!(f, "frpc spec 校验失败: {m}"),
             FrpcError::Matrix(m) => write!(f, "frpc 版本矩阵: {m}"),
-            FrpcError::VersionProbe(m) => write!(f, "frpc 版本探测: {m}"),
             FrpcError::Spawn(m) => write!(f, "frpc 子进程: {m}"),
             FrpcError::Config(m) => write!(f, "frpc 配置: {m}"),
             FrpcError::Io(e) => write!(f, "frpc IO: {e}"),

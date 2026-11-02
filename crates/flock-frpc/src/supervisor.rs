@@ -102,8 +102,6 @@ pub struct SupervisorConfig {
     pub health: HealthPolicy,
     /// 每路中继的 run 目录基点（托管配置副本/日志落点；默认系统临时目录）。
     pub run_base: PathBuf,
-    /// 启动期执行 `--version` 实测核对二进制声明（默认关：多一次子进程往返）。
-    pub verify_version_at_start: bool,
 }
 
 impl SupervisorConfig {
@@ -113,7 +111,6 @@ impl SupervisorConfig {
             restart: RestartPolicy::default(),
             health: HealthPolicy::default(),
             run_base: std::env::temp_dir().join("flock-frpc"),
-            verify_version_at_start: false,
         }
     }
 }
@@ -219,9 +216,6 @@ impl Supervisor {
     pub async fn start(&self, spec: RelaySpec) -> Result<ManagedRelay, FrpcError> {
         let validated = validate_spec(&spec, &self.cfg.bins)?;
 
-        if self.cfg.verify_version_at_start {
-            validated.bin.verify_declared().await?;
-        }
         if !validated.bin.path.is_file() {
             return Err(FrpcError::Spawn(format!(
                 "frpc 二进制不存在: {}",

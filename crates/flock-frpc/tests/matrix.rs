@@ -7,7 +7,10 @@
 //! 单测形态；端到端 R1 冒烟留 M5）。
 //!
 //! 进程级核对（`--version` 实测 ↔ 声明）也在本组：矩阵的「声明面」由
-//! `FrpcBinary::decl_version` 承担，声明面与二进制实测不符在启动期即拒。
+//! `FrpcBinary::decl_version` 承担，声明面与二进制实测不符必须被拒。该核对路径
+//! 已从生产 API 裁撤（`SupervisorConfig::verify_version_at_start` 生产恒 false、
+//! `probe_version`/`verify_declared` 无生产调用方），以**测试内 helper** 形态存续
+//! ——生产行为不变，纪律仍被测试固化。
 
 mod common;
 
@@ -16,7 +19,7 @@ use std::path::PathBuf;
 use flock_frpc::supervisor::SupervisorConfig;
 use flock_frpc::{
     check_version_matrix, ChmlFrpMode, FrpcBinaries, FrpcBinary, FrpcError, RelayFlavor,
-    RelayPhase, RelaySpec, StopReason, Supervisor, CHMLFRP_PINNED_VERSION, ORIGINAL_PINNED_VERSION,
+    RelaySpec, Supervisor, CHMLFRP_PINNED_VERSION, ORIGINAL_PINNED_VERSION,
 };
 
 const STUB: &str = env!("CARGO_BIN_EXE_frpc_stub");
@@ -49,16 +52,55 @@ fn original_spec() -> RelaySpec {
     }
 }
 
-fn temp_run_base(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "flock-frpc-test-matrix-{tag}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+// ---------------------------------------------------------------------------
+// `--version` 实测核对（测试内 helper——原 FrpcBinary::probe_version/
+// verify_declared 生产路径已裁撤，语义原样保留在测试面）
+// ---------------------------------------------------------------------------
+
+/// 运行 `<bin> --version` 实测版本（首行 trim）。
+///
+/// ChmlFrp `version.Full()` / 原版 `version.Full()` 均打印单行版本串
+/// （root.go:127-129、frp-src 惯例）。可用它抓「路径挂错二进制」。
+async fn probe_version(bin: &FrpcBinary) -> Result<String, FrpcError> {
+    let out = tokio::process::Command::new(&bin.path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| {
+            FrpcError::Spawn(format!("--version 探测失败 {}: {e}", bin.path.display()))
+        })?;
+    if !out.status.success() {
+        return Err(FrpcError::Spawn(format!(
+            "--version 退出码 {:?}",
+            out.status.code()
+        )));
+    }
+    let first = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if first.is_empty() {
+        return Err(FrpcError::Spawn("--version 输出为空".into()));
+    }
+    Ok(first)
+}
+
+/// 实测版本与声明一致 + 声明过矩阵（完整核对）。
+async fn verify_declared(bin: &FrpcBinary) -> Result<(), FrpcError> {
+    let actual = probe_version(bin).await?;
+    if actual != bin.decl_version {
+        return Err(FrpcError::Matrix(format!(
+            "二进制实测版本 {actual:?} 与声明 {:?} 不一致（{}）",
+            bin.decl_version,
+            bin.path.display()
+        )));
+    }
+    check_version_matrix(bin.flavor, &bin.decl_version, bin)
 }
 
 /// 纯函数面：4 组合只有对角线过（R9 矩阵冒烟的单测固化）。
@@ -146,7 +188,8 @@ async fn supervisor_start_rejects_unpinned_decl() {
     start_expect_matrix_error(&sup, chmlfrp_spec()).await;
 }
 
-/// `--version` 实测核对：声明与二进制实际打印不一致 → 拒（抓「路径挂错二进制」）。
+/// `--version` 实测核对（测试内 helper）：声明与二进制实际打印不一致 → 拒
+/// （抓「路径挂错二进制」）。
 #[tokio::test]
 async fn version_probe_cross_checks_declared_version() {
     common::prewarm_stub();
@@ -155,45 +198,14 @@ async fn version_probe_cross_checks_declared_version() {
     std::env::set_var("FRPC_STUB_VERSION", CHMLFRP_PINNED_VERSION);
 
     let ok = bin(RelayFlavor::ChmlFrp, CHMLFRP_PINNED_VERSION);
-    let probed = ok.probe_version().await.expect("--version 探测成功");
+    let probed = probe_version(&ok).await.expect("--version 探测成功");
     assert_eq!(probed, CHMLFRP_PINNED_VERSION);
-    ok.verify_declared().await.expect("实测=声明=定版 → 放行");
+    verify_declared(&ok).await.expect("实测=声明=定版 → 放行");
 
     // 实测 ChmlFrp 定版串、声明成 0.71.1 → 拒（版本漂移）
     let drifted = bin(RelayFlavor::ChmlFrp, ORIGINAL_PINNED_VERSION);
-    let err = drifted
-        .verify_declared()
+    let err = verify_declared(&drifted)
         .await
         .expect_err("声明与实测不一致必须被拒");
     assert!(matches!(err, FrpcError::Matrix(_)), "{err}");
-
-    // verify_version_at_start=true：核对通过则正常起（stub 忽略 -c 自退，验证点在
-    // start() 不因核对失败而拒、且核对通过路径可用）
-    let bins = FrpcBinaries {
-        chmlfrp: bin(RelayFlavor::ChmlFrp, CHMLFRP_PINNED_VERSION),
-        original: bin(RelayFlavor::Original, ORIGINAL_PINNED_VERSION),
-    };
-    let mut cfg = SupervisorConfig::new(bins);
-    cfg.verify_version_at_start = true;
-    cfg.run_base = temp_run_base("version-ok");
-    let sup = Supervisor::new(cfg);
-    let relay = sup.start(chmlfrp_spec()).await.expect("核对通过应正常启动");
-    let status = relay.stop().await.expect("stop 收尾");
-    assert_eq!(
-        status.phase,
-        RelayPhase::Stopped {
-            reason: StopReason::Manual
-        }
-    );
-
-    // 声明漂移 + 启动期核对 → start 即拒
-    let bins = FrpcBinaries {
-        chmlfrp: bin(RelayFlavor::ChmlFrp, "ChmlFrp-0.51.3_260101"),
-        original: bin(RelayFlavor::Original, ORIGINAL_PINNED_VERSION),
-    };
-    let mut cfg = SupervisorConfig::new(bins);
-    cfg.verify_version_at_start = true;
-    cfg.run_base = temp_run_base("version-drift");
-    let sup = Supervisor::new(cfg);
-    start_expect_matrix_error(&sup, chmlfrp_spec()).await;
 }
