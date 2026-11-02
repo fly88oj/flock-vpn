@@ -603,7 +603,17 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                 .await
             {
                 Ok(row) => {
-                    let _ = net.add_user_sig_key(&user, sr_sig_pub).await;
+                    // SR-SIG1 公钥登记失败必须可见（评审项 6：禁止无痕成功）——设备行
+                    // 已建但用户验签公钥缺失 ⇒ 后续全部 SR-SIG1 状态变更将 SigBad。
+                    // 返回明确错误 + 日志留痕（响应面无告警字段，不改线格式——客户端
+                    // 可凭 bind_token 未消费的语义重试其他账号路径）。
+                    if let Err(e) = net.add_user_sig_key(&user, sr_sig_pub).await {
+                        eprintln!(
+                            "flock-server: key-bind: 设备已注册但 SR-SIG1 公钥登记失败\
+                             （user={user}）: {e}"
+                        );
+                        return err(CtrlError::Internal);
+                    }
                     CtrlResponse::KeyBound {
                         device_id: DeviceId::from_ed25519(&vk).0,
                         vip: row.vip,
