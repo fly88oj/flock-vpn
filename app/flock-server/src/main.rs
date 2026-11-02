@@ -131,7 +131,10 @@ fn parse_args() -> Result<Cli, String> {
                 return Err("init-cluster --voters 需要 --out DIR".into());
             }
             if let Some(n) = voters {
-                let eps = endpoints.as_deref().map(|s| s.split(',').count()).unwrap_or(0);
+                let eps = endpoints
+                    .as_deref()
+                    .map(|s| s.split(',').count())
+                    .unwrap_or(0);
                 if eps != n {
                     return Err(format!(
                         "init-cluster --endpoints 需与 --voters 同数（{eps} != {n}；逗号分隔，按 voter 序）"
@@ -180,9 +183,7 @@ fn parse_args() -> Result<Cli, String> {
                 match k.as_str() {
                     "--root-seed" => root_seed = Some(v),
                     "--bundle" => bundle = Some(v),
-                    "--ttl-secs" => {
-                        ttl_secs = v.parse().map_err(|e| format!("ttl: {e}"))?
-                    }
+                    "--ttl-secs" => ttl_secs = v.parse().map_err(|e| format!("ttl: {e}"))?,
                     other => return Err(format!("cluster-invite: 未知参数 {other:?}")),
                 }
             }
@@ -326,22 +327,21 @@ fn run_cli() -> Result<(), String> {
                     });
                     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
                     // 根密钥种子：仅此一份（运维离线保管；bundle 只含 root_pub——§4-3 红线）。
-                    std::fs::write(
-                        std::path::Path::new(&out).join("root.seed"),
-                        hex::encode(m.root.to_bytes()),
+                    // 0600 落盘（评审项 1：秘密文件创建即收紧，无「先写后收紧」窗口）。
+                    flock_server::write_private_file(
+                        &std::path::Path::new(&out).join("root.seed"),
+                        hex::encode(m.root.to_bytes()).as_bytes(),
                     )
                     .map_err(|e| e.to_string())?;
                     for i in 0..n {
                         let path = std::path::Path::new(&out).join(format!("node-{i}.bundle"));
-                        std::fs::write(&path, m.bundle(i).to_bytes())
+                        // 捆绑含本机身份/hybrid 种子 ⇒ 同按秘密文件 0600 落盘。
+                        flock_server::write_private_file(&path, &m.bundle(i).to_bytes())
                             .map_err(|e| format!("{}: {e}", path.display()))?;
                     }
                     println!("cluster_id={}", hex::encode(m.cluster_id.0));
                     println!("voters={n}");
-                    println!(
-                        "endpoints={}",
-                        eps.join(",")
-                    );
+                    println!("endpoints={}", eps.join(","));
                     println!("out={out}（root.seed 保密；node-*.bundle 分发各机 + enroll）");
                     return Ok(());
                 }
@@ -360,8 +360,8 @@ fn run_cli() -> Result<(), String> {
                 let cid = b.verify()?;
                 let ident = b.identity()?;
                 let dst = cfg.state_dir.join("bundle.bin");
-                std::fs::create_dir_all(&cfg.state_dir).map_err(|e| e.to_string())?;
-                std::fs::write(&dst, &bytes).map_err(|e| e.to_string())?;
+                // 捆绑含本机身份/hybrid 种子 ⇒ 0600 落盘（评审项 1）。
+                flock_server::write_private_file(&dst, &bytes).map_err(|e| e.to_string())?;
                 println!("cluster_id={}", hex::encode(cid.0));
                 println!("server_id={}", hex::encode(ident.server_id.0));
                 println!("bundle={}", dst.display());
@@ -402,20 +402,25 @@ fn run_cli() -> Result<(), String> {
                         ticket_root,
                     );
                     // SetOprf：共享 OPRF key（本进程生成；根签后全网可验——§2.4）。
-                    let oprf_b64 = flock_protocol::pake::server_setup_new(&mut flock_protocol::rand::rngs::OsRng);
+                    let oprf_b64 = flock_protocol::pake::server_setup_new(
+                        &mut flock_protocol::rand::rngs::OsRng,
+                    );
                     let l_oprf: &[u8] = b"flock-sync/set-oprf/v1";
                     let mut canon = Vec::with_capacity(l_oprf.len() + 4 + oprf_b64.len());
                     canon.extend_from_slice(l_oprf);
                     canon.extend_from_slice(&(oprf_b64.len() as u32).to_le_bytes());
                     canon.extend_from_slice(oprf_b64.as_bytes());
-                    let set_oprf = flock_sync::proto::SyncRequest::SetOprf(flock_sync::proto::RootSigned {
-                        op: oprf_b64,
-                        sig: root.sign(&canon).to_bytes(),
-                    });
+                    let set_oprf =
+                        flock_sync::proto::SyncRequest::SetOprf(flock_sync::proto::RootSigned {
+                            op: oprf_b64,
+                            sig: root.sign(&canon).to_bytes(),
+                        });
                     // 自验（root_pub 对 canonical 验签——防端点错配直接提交废签名）。
                     let root_pub = root.verifying_key();
                     if let flock_sync::proto::SyncRequest::SetOprf(rs) = &set_oprf {
-                        debug_assert!(root_pub.verify(&canon, &Signature::from_bytes(&rs.sig)).is_ok());
+                        debug_assert!(root_pub
+                            .verify(&canon, &Signature::from_bytes(&rs.sig))
+                            .is_ok());
                     }
                     for req in [boot, set_oprf] {
                         // admin（就绪后）优先；未就绪（Bootstrap 尚未 apply ⇒ admin 未起）
@@ -471,8 +476,7 @@ fn run_cli() -> Result<(), String> {
                 #[cfg(feature = "multi-primary")]
                 {
                     let root = load_root_seed(&root_seed)?;
-                    let bytes =
-                        std::fs::read(&bundle).map_err(|e| format!("读 {bundle}: {e}"))?;
+                    let bytes = std::fs::read(&bundle).map_err(|e| format!("读 {bundle}: {e}"))?;
                     let b = flock_server::bundle::NodeBundle::from_bytes(&bytes)
                         .ok_or("捆绑文件解码失败")?;
                     let cluster_id = b.verify()?;
@@ -484,14 +488,26 @@ fn run_cli() -> Result<(), String> {
                         expiry_unix: expiry,
                     };
                     // admin 优先；未就绪回退集群引导端点（同 cluster-bootstrap）。
-                    let resp = match client(cfg.admin_bind, AdminRequest::SignedWrite { req: record }).await {
-                        Ok(r) => r,
-                        Err(_) => {
-                            let mut boot_bind = cfg.admin_bind;
-                            boot_bind.set_port(cfg.admin_bind.port() + 1);
-                            client(boot_bind, AdminRequest::SignedWrite { req: flock_sync::proto::SyncRequest::RecordInvite { invite_id, expiry_unix: expiry } }).await?
-                        }
-                    };
+                    let resp =
+                        match client(cfg.admin_bind, AdminRequest::SignedWrite { req: record })
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => {
+                                let mut boot_bind = cfg.admin_bind;
+                                boot_bind.set_port(cfg.admin_bind.port() + 1);
+                                client(
+                                    boot_bind,
+                                    AdminRequest::SignedWrite {
+                                        req: flock_sync::proto::SyncRequest::RecordInvite {
+                                            invite_id,
+                                            expiry_unix: expiry,
+                                        },
+                                    },
+                                )
+                                .await?
+                            }
+                        };
                     match resp {
                         AdminResponse::WriteReceipt { text } => println!("{text}"),
                         AdminResponse::Err { msg } => {

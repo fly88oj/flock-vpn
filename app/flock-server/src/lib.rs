@@ -24,6 +24,48 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::Path;
+
+/// 秘密文件 0600 落盘（评审项 1：root.seed / node-*.bundle / bundle.bin / frpc.toml）。
+///
+/// 姿势与 flock-protocol `trust::write_private_file` 一致：unix 下以
+/// `OpenOptions::mode(0o600)` **创建**——文件诞生即 0600，不存在「先写后收紧」的
+/// 权限窗口；覆盖已存在文件的偏宽旧权限时事后收紧。Windows 原生无 POSIX 权限位，
+/// 退化为常规写。
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        // 覆盖已存在文件可能偏宽的旧权限（创建路径本身无窗口）。
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
+        std::fs::write(path, bytes)
+    }
+}
+
 pub mod admin;
 pub mod backend;
 pub mod bundle;
@@ -36,3 +78,35 @@ pub mod server;
 #[cfg(feature = "multi-primary")]
 pub mod sync;
 pub mod ticket;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 评审项 1：秘密文件创建即 0600（unix 段——Windows 无 POSIX 权限位）。
+    #[cfg(unix)]
+    #[test]
+    fn private_file_created_with_0600_and_tightened_on_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let p = dir.path().join("root.seed");
+        write_private_file(&p, b"secret-hex").expect("write");
+        assert_eq!(
+            std::fs::metadata(&p).expect("meta").permissions().mode() & 0o777,
+            0o600,
+            "创建即 0600"
+        );
+        // 覆盖偏宽旧权限的已存在文件 ⇒ 事后收紧回 0600。
+        let p2 = dir.path().join("bundle.bin");
+        std::fs::write(&p2, b"x").expect("seed write");
+        std::fs::set_permissions(&p2, std::fs::Permissions::from_mode(0o644)).expect("widen");
+        write_private_file(&p2, b"secret").expect("overwrite");
+        assert_eq!(
+            std::fs::metadata(&p2).expect("meta").permissions().mode() & 0o777,
+            0o600,
+            "覆盖后收紧回 0600"
+        );
+        assert_eq!(std::fs::read(&p2).unwrap(), b"secret");
+    }
+}

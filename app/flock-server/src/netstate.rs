@@ -19,9 +19,9 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
 
+use ed25519_dalek::VerifyingKey;
 use flock_protocol::session::{DeviceId, DeviceRecord, LookupVerdict};
 use flock_protocol::{ed25519_dalek, x25519_dalek};
-use ed25519_dalek::VerifyingKey;
 use futures::future::BoxFuture;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use sha2::{Digest, Sha256};
@@ -429,6 +429,15 @@ impl StateStore {
         }
         let db = Database::create(path)
             .map_err(|e| NetError::Internal(format!("redb open {}: {e}", path.display())))?;
+        // 状态库含根密钥种子/OPRF key/OPAQUE 记录 ⇒ 创建后立即收紧 0600（评审项 1；
+        // redb::Database::create 无权限参数，只能事后 set_permissions——首次创建与
+        // 收紧之间无写入发生（表初始化在下方事务，Redb 文件权限偏宽窗口内零数据））。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| NetError::Internal(format!("chmod 0600 {}: {e}", path.display())))?;
+        }
         let txn = db
             .begin_write()
             .map_err(|e| NetError::Internal(format!("redb tx: {e}")))?;
@@ -923,10 +932,10 @@ impl flock_protocol::session::DeviceDirectory for DirAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use flock_protocol::session::{ClusterId, ServerEntry, ServerId};
     use flock_protocol::trust::InviteFile;
     use flock_protocol::{rand, sig::UserKey};
-    use ed25519_dalek::SigningKey;
 
     fn store() -> StateStore {
         let dir = tempfile::tempdir().expect("tmp");
@@ -1086,5 +1095,28 @@ mod tests {
         s.set_password("u", "rec", 0).unwrap();
         assert_eq!(s.password("u"), Some(("rec".into(), 0)));
         assert!(s.set_password("u", "rec2", 0).is_err(), "已设置不可重复设");
+    }
+
+    // 评审项 1：netstate.redb 创建即收紧 0600（unix 段——含根密钥种子/OPRF key 的
+    // 状态库不落偏宽权限）。
+    #[cfg(unix)]
+    #[test]
+    fn netstate_redb_created_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("netstate.redb");
+        let _s = StateStore::open(&path).expect("open");
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
+            0o600,
+            "netstate.redb 权限 0600"
+        );
+        // 重开（已存在文件）亦保持 0600。
+        let _s2 = StateStore::open(&path).expect("reopen");
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

@@ -45,10 +45,8 @@ pub async fn start(plan: FrpPlan, bind: SocketAddr) -> Result<(TcpListener, Mana
     std::fs::create_dir_all(&plan.run_base)
         .map_err(|e| format!("frp run dir {}: {e}", plan.run_base.display()))?;
     let toml_path = plan.run_base.join("embedded").join("frpc.toml");
-    if let Some(p) = toml_path.parent() {
-        std::fs::create_dir_all(p).map_err(|e| format!("frp embedded dir: {e}"))?;
-    }
-    std::fs::write(&toml_path, &plan.original_toml)
+    // frpc.toml 可含服务端 token/凭证 ⇒ 0600 落盘（评审项 1；创建即收紧）。
+    crate::write_private_file(&toml_path, plan.original_toml.as_bytes())
         .map_err(|e| format!("write {}: {e}", toml_path.display()))?;
 
     // 双栈声明（flock-frpc 的 FrpcBinaries 需两栈齐备；Original 路径只校验 original 侧，
