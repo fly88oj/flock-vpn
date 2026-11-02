@@ -16,11 +16,11 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 
-use flock_protocol::trust::InviteFile;
 use flock_client::config::ClientConfig;
 use flock_client::connector::{self, Backoff, ClientError, ClientState, ConnEvent};
 use flock_client::route::{self, RoutePlan};
 use flock_client::tun::{TunIo, TunSpec};
+use flock_protocol::trust::InviteFile;
 
 const USAGE: &str = "\
 flock-client [--config <client.toml>] [<subcommand>]
@@ -109,7 +109,11 @@ fn run_cli() -> Result<(), String> {
                     flock_protocol::session::DeviceId::from_ed25519(&device.ed25519_public()).0
                 )
             );
-            let _ = writeln!(out, "device-x={}", b64.encode(device.x25519_public().to_bytes()));
+            let _ = writeln!(
+                out,
+                "device-x={}",
+                b64.encode(device.x25519_public().to_bytes())
+            );
             let _ = writeln!(
                 out,
                 "device-ed={}",
@@ -121,8 +125,8 @@ fn run_cli() -> Result<(), String> {
             // state_dir 无 directory 时 bootstrap 会拒——invite 路径先读密钥生成（容缺目录）。
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| format!("读 {}: {e}", path.display()))?;
-            let bytes =
-                b64_decode_flex(&text).or_else(|_| std::fs::read(&path).map_err(|e| e.to_string()))?;
+            let bytes = b64_decode_flex(&text)
+                .or_else(|_| std::fs::read(&path).map_err(|e| e.to_string()))?;
             let invite = InviteFile::from_bytes(&bytes).map_err(|e| format!("邀请文件: {e}"))?;
             connector::ingest_invite(&cfg.state_dir, &invite)
                 .map(|_| ())
@@ -141,8 +145,13 @@ fn run_cli() -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             rt.block_on(async move {
                 let state = ClientState::load(&cfg.state_dir, true).map_err(|e| e.to_string())?;
-                let vip = state.resolve_vip(&cfg.state_dir, cfg.vip).map_err(|e| e.to_string())?;
-                let spec = TunSpec { name: cfg.tun_name.clone(), mtu: cfg.mtu };
+                let vip = state
+                    .resolve_vip(&cfg.state_dir, cfg.vip)
+                    .map_err(|e| e.to_string())?;
+                let spec = TunSpec {
+                    name: cfg.tun_name.clone(),
+                    mtu: cfg.mtu,
+                };
                 let tun = TunIo::open(&spec).map_err(|e| format!("tun: {e}"))?;
                 println!("tun: {} mtu={} vip={vip}", tun.name(), spec.mtu);
                 match route::apply(&RoutePlan::new(&cfg.tun_name, vip)).await {
@@ -167,11 +176,22 @@ fn run_cli() -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             rt.block_on(async move {
                 let state = ClientState::load(&cfg.state_dir, true).map_err(cli_err)?;
-                let vip = state.resolve_vip(&cfg.state_dir, cfg.vip).map_err(cli_err)?;
-                let spec = TunSpec { name: cfg.tun_name.clone(), mtu: cfg.mtu };
+                let vip = state
+                    .resolve_vip(&cfg.state_dir, cfg.vip)
+                    .map_err(cli_err)?;
+                let spec = TunSpec {
+                    name: cfg.tun_name.clone(),
+                    mtu: cfg.mtu,
+                };
                 let tun = TunIo::open(&spec).map_err(|e| cli_err(ClientError::from(e)))?;
-                eprintln!("flock-client: tun {} mtu={} vip={vip}", tun.name(), spec.mtu);
-                route::apply(&RoutePlan::new(&spec.name, vip)).await.map_err(|e| cli_err(ClientError::State(e.to_string())))?;
+                eprintln!(
+                    "flock-client: tun {} mtu={} vip={vip}",
+                    tun.name(),
+                    spec.mtu
+                );
+                route::apply(&RoutePlan::new(&spec.name, vip))
+                    .await
+                    .map_err(|e| cli_err(ClientError::State(e.to_string())))?;
                 eprintln!(
                     "flock-client: route {}/{} → {} + rp_filter=1",
                     route::VIP_POOL.0,
@@ -188,21 +208,27 @@ fn run_cli() -> Result<(), String> {
                     "flock-client: 守护启动（端点: {}）",
                     state.endpoints().join(", ")
                 );
-                connector::supervise(&state, &tun, flock_protocol::session::TunnelConfig::default(), Backoff::default(), |ev| {
-                    match ev {
-                        ConnEvent::Dialing { endpoint, attempt } => eprintln!(
-                            "flock-client: 拨号 {endpoint}（attempt {attempt}）"
-                        ),
+                connector::supervise(
+                    &state,
+                    &tun,
+                    flock_protocol::session::TunnelConfig::default(),
+                    Backoff::default(),
+                    |ev| match ev {
+                        ConnEvent::Dialing { endpoint, attempt } => {
+                            eprintln!("flock-client: 拨号 {endpoint}（attempt {attempt}）")
+                        }
                         ConnEvent::Connected { endpoint, server } => eprintln!(
                             "flock-client: 已连接 {endpoint}（server={}）",
                             hex::encode(server.0)
                         ),
                         ConnEvent::SessionEnded { endpoint, reason } => eprintln!(
                             "flock-client: 会话结束 {endpoint} reason={} → 进入重连",
-                            reason.map(|r| r.to_string()).unwrap_or_else(|| "none(io/fin)".into())
+                            reason
+                                .map(|r| r.to_string())
+                                .unwrap_or_else(|| "none(io/fin)".into())
                         ),
-                    }
-                })
+                    },
+                )
                 .await;
                 Ok(())
             })
@@ -221,7 +247,9 @@ fn override_endpoints(mut state: ClientState, eps: &[String]) -> Result<ClientSt
     let mut seen: Vec<String> = Vec::new();
     for ep in eps {
         if !known.contains(ep) {
-            return Err(format!("覆盖端点 {ep} 不在根签目录内（端点↔材料同签，拒绝未签名端点）"));
+            return Err(format!(
+                "覆盖端点 {ep} 不在根签目录内（端点↔材料同签，拒绝未签名端点）"
+            ));
         }
         if seen.contains(ep) {
             eprintln!("flock-client: 配置告警：覆盖端点列表重复项 {ep}（已去重，保留首次出现序）");
@@ -231,7 +259,12 @@ fn override_endpoints(mut state: ClientState, eps: &[String]) -> Result<ClientSt
     }
     let mut servers = Vec::new();
     for ep in &seen {
-        if let Some(e) = state.directory.servers.iter().find(|s| &s.relay_endpoint == ep) {
+        if let Some(e) = state
+            .directory
+            .servers
+            .iter()
+            .find(|s| &s.relay_endpoint == ep)
+        {
             servers.push(e.clone());
         }
     }
@@ -285,6 +318,9 @@ mod tests {
         // 未签名端点仍拒。
         let state2 = state_with(&["a:1"]);
         let bad = vec!["evil:9".to_string()];
-        assert!(override_endpoints(state2, &bad).is_err(), "未签名端点必须拒绝");
+        assert!(
+            override_endpoints(state2, &bad).is_err(),
+            "未签名端点必须拒绝"
+        );
     }
 }

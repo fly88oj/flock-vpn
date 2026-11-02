@@ -78,7 +78,10 @@ impl UserKey {
     pub fn from_seed_file(path: &std::path::Path) -> crate::compat::Result<Self> {
         let seed = std::fs::read(path)?;
         let seed: [u8; KEY_LEN] = seed.as_slice().try_into().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "seed file must be exactly 32 bytes")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "seed file must be exactly 32 bytes",
+            )
         })?;
         Ok(UserKey(SigningKey::from_bytes(&seed)))
     }
@@ -92,15 +95,20 @@ impl UserKey {
 
     /// `"ed25519:<base64(pubkey)>"`（base64 无 padding；showroom 逐字节同格式）。
     pub fn pub_string(&self) -> String {
-        format!("ed25519:{}", STANDARD_NO_PAD.encode(self.0.verifying_key().as_bytes()))
+        format!(
+            "ed25519:{}",
+            STANDARD_NO_PAD.encode(self.0.verifying_key().as_bytes())
+        )
     }
 
     /// 解析 `"ed25519:<base64(pubkey)>"`（showroom 同格式）。
     /// 错误类型 = `Box<dyn Error>`（§1.3.2 兼容面签名不变：showroom 原返回
     /// `Result<VerifyingKey>` 即 `Result<_, Box<dyn Error>>`）。
     pub fn from_pub_string(s: &str) -> crate::compat::Result<VerifyingKey> {
-        let raw = STANDARD_NO_PAD
-            .decode(s.strip_prefix("ed25519:").ok_or("missing ed25519: prefix")?)?;
+        let raw = STANDARD_NO_PAD.decode(
+            s.strip_prefix("ed25519:")
+                .ok_or("missing ed25519: prefix")?,
+        )?;
         let raw: [u8; KEY_LEN] = raw
             .as_slice()
             .try_into()
@@ -140,7 +148,15 @@ pub fn sign(
     now_unix: i64,
     nonce: &str,
 ) -> String {
-    sign_prehashed(user, key, method, path_with_query, &sha256_hex(body), now_unix, nonce)
+    sign_prehashed(
+        user,
+        key,
+        method,
+        path_with_query,
+        &sha256_hex(body),
+        now_unix,
+        nonce,
+    )
 }
 
 /// 预哈希签名：body 哈希由调用方算好（`sha256_hex` / `sha256_hex_stream`），与 [`sign`] 同格式
@@ -156,7 +172,10 @@ pub fn sign_prehashed(
 ) -> String {
     let canonical = build_canonical(user, ts, nonce, method, path_with_query, body_sha256_hex);
     let sig = key.0.sign(canonical.as_bytes()).to_bytes();
-    format!("SR-SIG1 {user}:{ts}:{nonce}:{}", URL_SAFE_NO_PAD.encode(sig))
+    format!(
+        "SR-SIG1 {user}:{ts}:{nonce}:{}",
+        URL_SAFE_NO_PAD.encode(sig)
+    )
 }
 
 /// 验签成功产物：命中身份与时间戳/nonce（nonce 查重由调用方按 `Verified.nonce` 自行完成，
@@ -197,7 +216,14 @@ pub fn verify(
     body: &[u8],
     now_unix: i64,
 ) -> Result<Verified, AuthError> {
-    verify_with_hash(auth_value, pubkeys, method, path_with_query, &sha256_hex(body), now_unix)
+    verify_with_hash(
+        auth_value,
+        pubkeys,
+        method,
+        path_with_query,
+        &sha256_hex(body),
+        now_unix,
+    )
 }
 
 /// 预计算哈希版验签：与 [`verify`] 完全同语义（格式 → ±300s → 任一登记公钥命中），
@@ -210,18 +236,22 @@ pub fn verify_with_hash(
     body_sha_hex: &str,
     now: i64,
 ) -> Result<Verified, AuthError> {
-    let rest = auth_value.strip_prefix("SR-SIG1 ").ok_or(AuthError::Format)?;
+    let rest = auth_value
+        .strip_prefix("SR-SIG1 ")
+        .ok_or(AuthError::Format)?;
     let mut parts = rest.splitn(4, ':');
-    let (user, ts, nonce, sig_b64) =
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-            _ => return Err(AuthError::Format),
-        };
+    let (user, ts, nonce, sig_b64) = match (parts.next(), parts.next(), parts.next(), parts.next())
+    {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => return Err(AuthError::Format),
+    };
     if user.is_empty() || nonce.is_empty() {
         return Err(AuthError::Format);
     }
     let ts: i64 = ts.parse().map_err(|_| AuthError::Format)?;
-    let raw = URL_SAFE_NO_PAD.decode(sig_b64).map_err(|_| AuthError::Format)?;
+    let raw = URL_SAFE_NO_PAD
+        .decode(sig_b64)
+        .map_err(|_| AuthError::Format)?;
     let sig_arr: [u8; 64] = raw.try_into().map_err(|_| AuthError::Format)?;
     let sig = Signature::from_bytes(&sig_arr);
     if (now - ts).abs() > SIG_WINDOW_SECS {
@@ -230,7 +260,11 @@ pub fn verify_with_hash(
     let canonical = build_canonical(user, ts, nonce, method, path_q, body_sha_hex);
     for vk in pubkeys {
         if vk.verify(canonical.as_bytes(), &sig).is_ok() {
-            return Ok(Verified { user: user.to_owned(), ts, nonce: nonce.to_owned() });
+            return Ok(Verified {
+                user: user.to_owned(),
+                ts,
+                nonce: nonce.to_owned(),
+            });
         }
     }
     Err(AuthError::BadSignature)
@@ -260,8 +294,7 @@ impl ProfileKey {
     fn verify_raw(&self, msg: &[u8], sig: &[u8]) -> Result<(), DispatchError> {
         match self {
             ProfileKey::Ed25519(vk) => {
-                let sig: [u8; 64] =
-                    sig.try_into().map_err(|_| DispatchError::BadSignature)?;
+                let sig: [u8; 64] = sig.try_into().map_err(|_| DispatchError::BadSignature)?;
                 vk.verify(msg, &Signature::from_bytes(&sig))
                     .map_err(|_| DispatchError::BadSignature)
             }
@@ -285,7 +318,9 @@ impl fmt::Display for DispatchError {
         f.write_str(match self {
             DispatchError::UnknownKid => "sig: kid not registered in profile",
             DispatchError::BadSignature => "E_AUTH: signature verification failed",
-            DispatchError::UnsupportedAlgorithm => "sig: algorithm slot not implemented (placeholder)",
+            DispatchError::UnsupportedAlgorithm => {
+                "sig: algorithm slot not implemented (placeholder)"
+            }
         })
     }
 }
@@ -343,8 +378,15 @@ mod tests {
         let k = UserKey::generate();
         let vk = [k.0.verifying_key()];
         for body in [b"{\"project\":\"demo\"}".as_slice(), b""] {
-            let auth =
-                sign("alice", &k, "POST", "/_api/publish", body, 1_000_000, "0123456789abcdef");
+            let auth = sign(
+                "alice",
+                &k,
+                "POST",
+                "/_api/publish",
+                body,
+                1_000_000,
+                "0123456789abcdef",
+            );
             let v = verify(&auth, &vk, "POST", "/_api/publish", body, 1_000_000).unwrap();
             assert_eq!(
                 (v.user.as_str(), v.ts, v.nonce.as_str()),
@@ -357,9 +399,24 @@ mod tests {
     #[test]
     fn tampered_body_rejected() {
         let k = UserKey::generate();
-        let auth = sign("alice", &k, "POST", "/_api/publish", b"body-0", 1_000_000, "0123456789abcdef");
+        let auth = sign(
+            "alice",
+            &k,
+            "POST",
+            "/_api/publish",
+            b"body-0",
+            1_000_000,
+            "0123456789abcdef",
+        );
         assert_eq!(
-            verify(&auth, &[k.0.verifying_key()], "POST", "/_api/publish", b"body-1", 1_000_000),
+            verify(
+                &auth,
+                &[k.0.verifying_key()],
+                "POST",
+                "/_api/publish",
+                b"body-1",
+                1_000_000
+            ),
             Err(AuthError::BadSignature)
         );
     }
@@ -369,7 +426,15 @@ mod tests {
     fn stale_ts_rejected() {
         let k = UserKey::generate();
         let vk = [k.0.verifying_key()];
-        let auth = sign("alice", &k, "POST", "/_api/publish", b"", 1_000_000, "0123456789abcdef");
+        let auth = sign(
+            "alice",
+            &k,
+            "POST",
+            "/_api/publish",
+            b"",
+            1_000_000,
+            "0123456789abcdef",
+        );
         for now in [1_000_000 + 301, 1_000_000 - 301] {
             assert_eq!(
                 verify(&auth, &vk, "POST", "/_api/publish", b"", now),
@@ -385,7 +450,15 @@ mod tests {
     #[test]
     fn wrong_key_and_multi_key() {
         let k = UserKey::generate();
-        let auth = sign("alice", &k, "GET", "/_api/logs?project=demo&tail=100", b"", 5, "aabbccddeeff0011");
+        let auth = sign(
+            "alice",
+            &k,
+            "GET",
+            "/_api/logs?project=demo&tail=100",
+            b"",
+            5,
+            "aabbccddeeff0011",
+        );
         let wrong = UserKey::generate();
         assert_eq!(
             verify(
@@ -423,7 +496,10 @@ mod tests {
         let auth = sign_prehashed("alice", &k, "POST", pq, &hash, 7, "aabb0011ccdd2233");
         let vk = [k.0.verifying_key()];
         let v = verify_with_hash(&auth, &vk, "POST", pq, &hash, 7).unwrap();
-        assert_eq!((v.user.as_str(), v.nonce.as_str()), ("alice", "aabb0011ccdd2233"));
+        assert_eq!(
+            (v.user.as_str(), v.nonce.as_str()),
+            ("alice", "aabb0011ccdd2233")
+        );
         assert_eq!(
             verify_with_hash(&auth, &vk, "POST", pq, &sha256_hex(b"other"), 7),
             Err(AuthError::BadSignature)
@@ -436,14 +512,28 @@ mod tests {
         let c = build_canonical("alice", 42, "deadbeef", "GET", "/x?y=1", &sha256_hex(b"z"));
         assert_eq!(
             c,
-            format!("SR-SIG1\nalice\n42\ndeadbeef\nGET\n/x?y=1\n{}", sha256_hex(b"z"))
+            format!(
+                "SR-SIG1\nalice\n42\ndeadbeef\nGET\n/x?y=1\n{}",
+                sha256_hex(b"z")
+            )
         );
         let k = UserKey::from_seed(&[7u8; 32]);
-        let auth = sign_prehashed("alice", &k, "GET", "/x?y=1", &sha256_hex(b"z"), 42, "deadbeef");
+        let auth = sign_prehashed(
+            "alice",
+            &k,
+            "GET",
+            "/x?y=1",
+            &sha256_hex(b"z"),
+            42,
+            "deadbeef",
+        );
         assert!(auth.starts_with("SR-SIG1 alice:42:deadbeef:"));
         let sig_b64 = auth.rsplit(':').next().unwrap();
         assert_eq!(sig_b64.len(), 86, "64B 签名 base64url 无 padding = 86 字符");
-        assert!(!sig_b64.contains(['+', '/', '=']), "base64url 无 padding 字符集");
+        assert!(
+            !sig_b64.contains(['+', '/', '=']),
+            "base64url 无 padding 字符集"
+        );
     }
 
     // 7. UserKey seed / pub_string 往返
@@ -478,21 +568,35 @@ mod tests {
 
         let mut p = KeyProfile::new();
         let kid = p.insert_ed25519(k.0.verifying_key());
-        assert_eq!(p.get(&kid).cloned(), Some(ProfileKey::Ed25519(k.0.verifying_key())));
-        p.verify_dispatch(&kid, msg, &sig).expect("登记钥匙验签通过");
-        assert_eq!(p.verify_dispatch("00000000", msg, &sig), Err(DispatchError::UnknownKid));
+        assert_eq!(
+            p.get(&kid).cloned(),
+            Some(ProfileKey::Ed25519(k.0.verifying_key()))
+        );
+        p.verify_dispatch(&kid, msg, &sig)
+            .expect("登记钥匙验签通过");
+        assert_eq!(
+            p.verify_dispatch("00000000", msg, &sig),
+            Err(DispatchError::UnknownKid)
+        );
 
         // 异 kid：另一把钥匙的签名在原 kid 下必须失败
         let k2 = UserKey::generate();
         let sig2 = k2.0.sign(msg).to_bytes();
-        assert_eq!(p.verify_dispatch(&kid, msg, &sig2), Err(DispatchError::BadSignature));
+        assert_eq!(
+            p.verify_dispatch(&kid, msg, &sig2),
+            Err(DispatchError::BadSignature)
+        );
         // 签名长度错 → BadSignature
-        assert_eq!(p.verify_dispatch(&kid, msg, b"short"), Err(DispatchError::BadSignature));
+        assert_eq!(
+            p.verify_dispatch(&kid, msg, b"short"),
+            Err(DispatchError::BadSignature)
+        );
 
         // 登记第二把：kids 幂等
         let kid2 = p.insert_ed25519(k2.0.verifying_key());
         assert_ne!(kid, kid2);
-        p.verify_dispatch(&kid2, msg, &sig2).expect("第二把钥匙按自己的 kid 通过");
+        p.verify_dispatch(&kid2, msg, &sig2)
+            .expect("第二把钥匙按自己的 kid 通过");
         p.insert_ed25519(k2.0.verifying_key());
         assert_eq!(p.kids().count(), 2, "同钥重复登记不重复占位");
     }
@@ -512,7 +616,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("id_ed25519");
         k.save_seed(&p).unwrap();
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let k2 = UserKey::from_seed_file(&p).unwrap();
         assert_eq!(k2.to_seed(), k.to_seed());
         assert_eq!(k2.pub_string(), k.pub_string());

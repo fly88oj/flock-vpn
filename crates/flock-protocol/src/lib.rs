@@ -26,7 +26,10 @@
 
 // wasm32 getrandom 桥（src/wasm_bridge.rs）需裸指针（getrandom custom 后端契约），
 // 其余目标维持 forbid(unsafe_code)（showroom-common lib.rs:4-5 同款豁免）。
-#![cfg_attr(not(all(feature = "wasm", target_arch = "wasm32")), forbid(unsafe_code))]
+#![cfg_attr(
+    not(all(feature = "wasm", target_arch = "wasm32")),
+    forbid(unsafe_code)
+)]
 
 pub mod compat;
 pub mod compress;
@@ -48,9 +51,9 @@ pub mod wasm_bridge;
 getrandom02::register_custom_getrandom!(wasm_bridge::custom_getrandom_02);
 
 // 兼容常量（§1.3.2 工具/常量面；showroom-common lib.rs:51-55 原值）
-pub use envelope::{KEY_LEN, NONCE_LEN, SEG, TAG_LEN};
 #[cfg(feature = "legacy")]
 pub use envelope::WRAP_LEN;
+pub use envelope::{KEY_LEN, NONCE_LEN, SEG, TAG_LEN};
 
 // 兼容工具（§1.3.2；showroom-common lib.rs:57-79 同语义）
 pub use sig::{nonce_hex, sha256_hex, sha256_hex_stream};
@@ -58,7 +61,7 @@ pub use sig::{nonce_hex, sha256_hex, sha256_hex_stream};
 // SR-SIG1 时间窗（§1.3.2；showroom-common lib.rs:48 原值）
 pub use sig::SIG_WINDOW_SECS;
 
-/// 版本收口再导出（§1.2）。
-pub use {aes_gcm, ed25519_dalek, ml_kem, opaque_ke, rand, x25519_dalek};
 #[cfg(feature = "legacy")]
 pub use rsa;
+/// 版本收口再导出（§1.2）。
+pub use {aes_gcm, ed25519_dalek, ml_kem, opaque_ke, rand, x25519_dalek};

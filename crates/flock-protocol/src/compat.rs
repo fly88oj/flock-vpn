@@ -65,7 +65,8 @@ pub mod names {
         !b.is_empty()
             && b.len() <= 31
             && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
-            && b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+            && b.iter()
+                .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
     }
 
     /// docker tag 规则：首字符 [A-Za-z0-9_]，其余 [A-Za-z0-9_.-]，总长 ≤128。
@@ -74,7 +75,8 @@ pub mod names {
         !b.is_empty()
             && b.len() <= 128
             && (b[0].is_ascii_alphanumeric() || b[0] == b'_')
-            && b.iter().all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+            && b.iter()
+                .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
     }
 
     pub const RESERVED: [&str; 4] = ["v2", "_api", "_bootstrap", "_console"];
@@ -84,14 +86,18 @@ pub mod names {
         if valid_aux(s) {
             Ok(())
         } else {
-            Err(format!("非法名字 '{s}'：须匹配 ^[a-z0-9][a-z0-9-]{{0,30}}$"))
+            Err(format!(
+                "非法名字 '{s}'：须匹配 ^[a-z0-9][a-z0-9-]{{0,30}}$"
+            ))
         }
     }
 
     /// project = §11 放宽正则 + 保留名。
     pub fn check_project(s: &str) -> Result<(), String> {
         if !valid_project(s) {
-            return Err(format!("非法 project '{s}'：须匹配 ^[a-zA-Z0-9][a-zA-Z0-9-]{{0,30}}$"));
+            return Err(format!(
+                "非法 project '{s}'：须匹配 ^[a-zA-Z0-9][a-zA-Z0-9-]{{0,30}}$"
+            ));
         }
         if RESERVED.contains(&s) {
             return Err(format!("project '{s}' 是保留名"));
@@ -103,14 +109,20 @@ pub mod names {
     pub fn random_project() -> String {
         use rand::distr::Alphanumeric;
         use rand::Rng;
-        rand::rng().sample_iter(Alphanumeric).take(8).map(char::from).collect()
+        rand::rng()
+            .sample_iter(Alphanumeric)
+            .take(8)
+            .map(char::from)
+            .collect()
     }
 
     pub fn check_tag(s: &str) -> Result<(), String> {
         if valid_tag(s) {
             Ok(())
         } else {
-            Err(format!("非法 tag '{s}'：首字符字母/数字/_，仅 [A-Za-z0-9_.-]，≤128 字符"))
+            Err(format!(
+                "非法 tag '{s}'：首字符字母/数字/_，仅 [A-Za-z0-9_.-]，≤128 字符"
+            ))
         }
     }
 }
@@ -131,7 +143,18 @@ mod tests {
         for r in names::RESERVED {
             assert!(names::check_project(r).is_err(), "project 保留名应拒: {r}");
         }
-        for bad in ["", "-a", "a_b", "a b", "a.b", "a/b", "中文", &_c(32), "_x", "-demo"] {
+        for bad in [
+            "",
+            "-a",
+            "a_b",
+            "a b",
+            "a.b",
+            "a/b",
+            "中文",
+            &_c(32),
+            "_x",
+            "-demo",
+        ] {
             assert!(names::check_project(bad).is_err(), "project 应拒: {bad}");
         }
         // 辅助名：旧小写正则（user 进 registry 路径，保持小写约束）
@@ -160,12 +183,22 @@ mod tests {
         for _ in 0..64 {
             let p = names::random_project();
             assert_eq!(p.len(), 8, "长度恒 8");
-            assert!(p.bytes().all(|b| b.is_ascii_alphanumeric()), "字符集 [a-zA-Z0-9]: {p}");
-            assert!(names::check_project(&p).is_ok(), "随机名必须通过 project 校验");
+            assert!(
+                p.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "字符集 [a-zA-Z0-9]: {p}"
+            );
+            assert!(
+                names::check_project(&p).is_ok(),
+                "随机名必须通过 project 校验"
+            );
             seen.insert(p);
         }
         // 62^8 空间，64 个样本必有相异对（碰撞概率 ~1e-11）
-        assert!(seen.len() > 1, "随机性：64 个样本出现 {}/64 个不同名字", seen.len());
+        assert!(
+            seen.len() > 1,
+            "随机性：64 个样本出现 {}/64 个不同名字",
+            seen.len()
+        );
     }
 
     // write_private：0600、内容、覆盖偏宽权限后收紧（unix 平台）
@@ -180,10 +213,16 @@ mod tests {
         let p = dir.join("priv.bin");
         write_private(&p, b"secret").unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"secret");
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
         write_private(&p, b"again").unwrap();
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         // 父目录惰性创建
         let nested = dir.join("a/b/c.txt");
         write_private(&nested, b"x").unwrap();

@@ -48,7 +48,10 @@ fn fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
 
 /// getrandom 0.3 custom 后端回调（符号名/签名按 backends/custom.rs 契约）。
 #[no_mangle]
-pub extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), getrandom::Error> {
+pub extern "Rust" fn __getrandom_v03_custom(
+    dest: *mut u8,
+    len: usize,
+) -> Result<(), getrandom::Error> {
     // SAFETY：getrandom 契约——dest 指向 len 字节可写缓冲且可能未初始化，
     // 本实现整段覆写（fill_bytes 全量写入），不读未初始化字节。
     let buf = unsafe { std::slice::from_raw_parts_mut(dest, len) };

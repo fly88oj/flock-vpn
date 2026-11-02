@@ -107,7 +107,10 @@ pub fn rwd(pw: &str, user: &str, profile: Profile) -> PakeResult<[u8; RWD_LEN]> 
 // —— 小工具 ——
 
 fn ids(user: &str) -> Identifiers<'_> {
-    Identifiers { client: Some(user.as_bytes()), server: Some(SERVER_ID) }
+    Identifiers {
+        client: Some(user.as_bytes()),
+        server: Some(SERVER_ID),
+    }
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -121,7 +124,11 @@ const B64_INPUT_LIMIT: usize = 64 * 1024;
 
 fn unb64(s: &str) -> PakeResult<Vec<u8>> {
     if s.len() > B64_INPUT_LIMIT {
-        return Err(format!("pake: b64 input {}B exceeds {B64_INPUT_LIMIT}B limit", s.len()).into());
+        return Err(format!(
+            "pake: b64 input {}B exceeds {B64_INPUT_LIMIT}B limit",
+            s.len()
+        )
+        .into());
     }
     Ok(STANDARD_NO_PAD.decode(s.trim())?)
 }
@@ -136,10 +143,14 @@ fn bridge08<R: rand::TryRngCore + ?Sized>(rng: &mut R) -> RngBridge08<'_, R> {
 
 impl<R: rand::TryRngCore + ?Sized> opaque_ke::rand::RngCore for RngBridge08<'_, R> {
     fn next_u32(&mut self) -> u32 {
-        self.0.try_next_u32().expect("flock-protocol: entropy source failed")
+        self.0
+            .try_next_u32()
+            .expect("flock-protocol: entropy source failed")
     }
     fn next_u64(&mut self) -> u64 {
-        self.0.try_next_u64().expect("flock-protocol: entropy source failed")
+        self.0
+            .try_next_u64()
+            .expect("flock-protocol: entropy source failed")
     }
     fn fill_bytes(&mut self, dst: &mut [u8]) {
         self.0
@@ -147,7 +158,9 @@ impl<R: rand::TryRngCore + ?Sized> opaque_ke::rand::RngCore for RngBridge08<'_, 
             .expect("flock-protocol: entropy source failed");
     }
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), opaque_ke::rand::Error> {
-        self.0.try_fill_bytes(dst).map_err(|_| opaque_ke::rand::Error::from(std::num::NonZeroU32::new(1).expect("nonzero")))
+        self.0.try_fill_bytes(dst).map_err(|_| {
+            opaque_ke::rand::Error::from(std::num::NonZeroU32::new(1).expect("nonzero"))
+        })
     }
 }
 
@@ -158,7 +171,11 @@ impl<R: rand::TryRngCore + ?Sized> opaque_ke::rand::CryptoRng for RngBridge08<'_
 
 /// 登录第一步：产出 ke1（发 `/_api/auth/login-begin`）与待 finish 的本地状态。
 /// rwd 用 [`Profile::default`]（showroom 兼容档）；高配档走 [`login_start_profile`]。
-pub fn login_start(rng: &mut impl CryptoRngCore, pw: &str, user: &str) -> PakeResult<(ClientLogin<Suite>, String)> {
+pub fn login_start(
+    rng: &mut impl CryptoRngCore,
+    pw: &str,
+    user: &str,
+) -> PakeResult<(ClientLogin<Suite>, String)> {
     login_start_profile(rng, pw, user, Profile::default())
 }
 
@@ -261,7 +278,10 @@ pub fn reg_finish_profile(
             &mut bridge08(rng),
             &r,
             m2,
-            ClientRegistrationFinishParameters { identifiers: ids(user), ksf: None },
+            ClientRegistrationFinishParameters {
+                identifiers: ids(user),
+                ksf: None,
+            },
         )
         .map_err(|e| format!("reg finish: {e}"))?;
     Ok(b64(&out.message.serialize()))
@@ -298,7 +318,11 @@ pub fn server_setup_migrate_v3(b64_key_3_0: &str) -> PakeResult<ServerSetup<Suit
     const SEED_LEN: usize = 64;
     const SK_LEN: usize = 32;
     if old.len() != SEED_LEN + SK_LEN + SK_LEN {
-        return Err(format!("bad opaque.key (3.0.0): expect 128 bytes, got {}", old.len()).into());
+        return Err(format!(
+            "bad opaque.key (3.0.0): expect 128 bytes, got {}",
+            old.len()
+        )
+        .into());
     }
     let fake_sk = &old[SEED_LEN + SK_LEN..];
     let fake_pk = PrivateKey::<opaque_ke::Ristretto255>::deserialize(fake_sk)
@@ -311,7 +335,11 @@ pub fn server_setup_migrate_v3(b64_key_3_0: &str) -> PakeResult<ServerSetup<Suit
 }
 
 /// 注册第二步（服务端）：m1 → m2。credential_identifier=user（OPRF 域分离）。
-pub fn server_reg_start(setup: &ServerSetup<Suite>, m1_b64: &str, user: &str) -> PakeResult<String> {
+pub fn server_reg_start(
+    setup: &ServerSetup<Suite>,
+    m1_b64: &str,
+    user: &str,
+) -> PakeResult<String> {
     let m1 = RegistrationRequest::<Suite>::deserialize(&unb64(m1_b64)?)
         .map_err(|e| format!("bad m1: {e}"))?;
     let out = ServerRegistration::<Suite>::start(setup, m1, user.as_bytes())
@@ -329,8 +357,10 @@ pub fn server_reg_canonical(record_b64: &str) -> PakeResult<String> {
 /// **3.0.0 布局不变**（4.0.0 CHANGELOG：ServerRegistration 直接 deserialize）——
 /// showroom 既有 `pass.opaque` 无迁移直接读入（M1 守门向量实证）。
 pub fn server_record_from_b64(record_b64: &str) -> PakeResult<ServerRegistration<Suite>> {
-    Ok(ServerRegistration::<Suite>::deserialize(&unb64(record_b64)?)
-        .map_err(|e| format!("bad pass.opaque: {e}"))?)
+    Ok(
+        ServerRegistration::<Suite>::deserialize(&unb64(record_b64)?)
+            .map_err(|e| format!("bad pass.opaque: {e}"))?,
+    )
 }
 
 /// 登录第二步（服务端）：ke1 → ke2 + 在途状态（内存保存，login-finish 消费）。
@@ -350,10 +380,16 @@ pub fn server_login_start(
         record.cloned(),
         ke1,
         user.as_bytes(),
-        ServerLoginParameters { context: None, identifiers: ids(user) },
+        ServerLoginParameters {
+            context: None,
+            identifiers: ids(user),
+        },
     )
     .map_err(|e| format!("server login start: {e}"))?;
-    Ok((b64(&out.message.serialize()), out.state.serialize().to_vec()))
+    Ok((
+        b64(&out.message.serialize()),
+        out.state.serialize().to_vec(),
+    ))
 }
 
 /// 登录第三步（服务端）：ke3 验证（MAC）；Err = 密码错误/伪造 → 调用方按 E_AUTH 同体 404。
@@ -363,7 +399,13 @@ pub fn server_login_finish(state_bytes: &[u8], ke3_b64: &str) -> PakeResult<()> 
     let ke3 = CredentialFinalization::<Suite>::deserialize(&unb64(ke3_b64)?)
         .map_err(|e| format!("bad ke3: {e}"))?;
     state
-        .finish(ke3, ServerLoginParameters { context: None, identifiers: Identifiers::default() })
+        .finish(
+            ke3,
+            ServerLoginParameters {
+                context: None,
+                identifiers: Identifiers::default(),
+            },
+        )
         .map_err(|e| format!("login finish (ke3 rejected): {e}"))?;
     Ok(())
 }
@@ -401,7 +443,8 @@ mod anchor {
         ke2_b64: &str,
         bind_token: &[u8; 16],
     ) -> Vec<u8> {
-        let mut v = Vec::with_capacity(ANCHOR_LABEL.len() + 16 + 4 + user.len() + ke2_b64.len() + 16);
+        let mut v =
+            Vec::with_capacity(ANCHOR_LABEL.len() + 16 + 4 + user.len() + ke2_b64.len() + 16);
         v.extend_from_slice(ANCHOR_LABEL);
         v.extend_from_slice(server_id);
         v.extend_from_slice(&(user.len() as u32).to_le_bytes());
@@ -419,7 +462,9 @@ mod anchor {
         ke2_b64: &str,
         bind_token: &[u8; 16],
     ) -> Signature {
-        server_identity.sign(&anchor_canonical_bytes(server_id, user, ke2_b64, bind_token))
+        server_identity.sign(&anchor_canonical_bytes(
+            server_id, user, ke2_b64, bind_token,
+        ))
     }
 
     /// 客户端侧 anchor 版 login-finish（§3.4 `login_finish_anchored`）：
@@ -458,7 +503,8 @@ mod anchor {
             let (cstate, m1) = reg_start(&mut rng, "bob", "bob").unwrap();
             let m2 = server_reg_start(&setup, &m1, "bob").unwrap();
             let record =
-                server_reg_canonical(&reg_finish(&mut rng, cstate, "bob", "bob", &m2).unwrap()).unwrap();
+                server_reg_canonical(&reg_finish(&mut rng, cstate, "bob", "bob", &m2).unwrap())
+                    .unwrap();
             let rec = server_record_from_b64(&record).unwrap();
 
             // 服务端身份（隧道层 ServerIdentity 的 identity 密钥）
@@ -505,8 +551,7 @@ mod anchor {
             let bind_token: [u8; 16] = rand::random();
 
             let (lstate, ke1) = login_start(&mut rng, "carol", "carol").unwrap();
-            let (ke2, _) =
-                server_login_start(&mut rng, &setup, Some(&rec), &ke1, "carol").unwrap();
+            let (ke2, _) = server_login_start(&mut rng, &setup, Some(&rec), &ke1, "carol").unwrap();
             let expect = AnchorExpectation {
                 server_id,
                 identity_pub: srv_sk.verifying_key(),
@@ -514,18 +559,16 @@ mod anchor {
             };
             // 攻击者密钥签的 anchor（伪服务器）⇒ 拒
             let forged = anchor_sign(&attacker, &server_id, "carol", &ke2, &bind_token);
-            assert!(
-                login_finish_anchored(
-                    lstate,
-                    "carol",
-                    "carol",
-                    &ke2,
-                    Profile::default(),
-                    &expect,
-                    &forged.to_bytes()
-                )
-                .is_err()
-            );
+            assert!(login_finish_anchored(
+                lstate,
+                "carol",
+                "carol",
+                &ke2,
+                Profile::default(),
+                &expect,
+                &forged.to_bytes()
+            )
+            .is_err());
         }
     }
 }
@@ -594,7 +637,11 @@ mod tests {
         let a2 = rwd("pw", "alice", Profile::Owasp19MiB).unwrap();
         assert_eq!(a1, a2, "同 profile 确定");
         let b = rwd("pw", "alice", Profile::Rfc9807High).unwrap();
-        assert_ne!(a1.to_vec(), b.to_vec(), "不同 profile 输出必不同（跨档漂移即登录失败）");
+        assert_ne!(
+            a1.to_vec(),
+            b.to_vec(),
+            "不同 profile 输出必不同（跨档漂移即登录失败）"
+        );
         // user 进盐：同密码不同账号派生不同
         let c = rwd("pw", "bob", Profile::Owasp19MiB).unwrap();
         assert_ne!(a1.to_vec(), c.to_vec());
@@ -608,14 +655,25 @@ mod tests {
     fn rfc9807_high_profile_end_to_end() {
         let mut rng = OsRng;
         let setup = server_setup_load(&server_setup_new(&mut rng)).unwrap();
-        let (cstate, m1) = reg_start_profile(&mut rng, "pw-high", "hank", Profile::Rfc9807High).unwrap();
+        let (cstate, m1) =
+            reg_start_profile(&mut rng, "pw-high", "hank", Profile::Rfc9807High).unwrap();
         let m2 = server_reg_start(&setup, &m1, "hank").unwrap();
-        let record_b64 =
-            reg_finish_profile(&mut rng, cstate, "pw-high", "hank", &m2, Profile::Rfc9807High).unwrap();
+        let record_b64 = reg_finish_profile(
+            &mut rng,
+            cstate,
+            "pw-high",
+            "hank",
+            &m2,
+            Profile::Rfc9807High,
+        )
+        .unwrap();
         let record = server_record_from_b64(&record_b64).unwrap();
-        let (lstate, ke1) = login_start_profile(&mut rng, "pw-high", "hank", Profile::Rfc9807High).unwrap();
-        let (ke2, sstate) = server_login_start(&mut rng, &setup, Some(&record), &ke1, "hank").unwrap();
-        let ke3 = login_finish_profile(lstate, "pw-high", "hank", &ke2, Profile::Rfc9807High).unwrap();
+        let (lstate, ke1) =
+            login_start_profile(&mut rng, "pw-high", "hank", Profile::Rfc9807High).unwrap();
+        let (ke2, sstate) =
+            server_login_start(&mut rng, &setup, Some(&record), &ke1, "hank").unwrap();
+        let ke3 =
+            login_finish_profile(lstate, "pw-high", "hank", &ke2, Profile::Rfc9807High).unwrap();
         assert!(server_login_finish(&sstate, &ke3).is_ok());
     }
 
@@ -624,7 +682,10 @@ mod tests {
     // 真正的判别靠登录失败；此处仅验证迁移对 3.0.0 布局可工作 → 互通测试覆盖）
     #[test]
     fn migrate_rejects_wrong_length() {
-        assert!(server_setup_migrate_v3("AAAA").is_err(), "长度非 128B 必须拒绝");
+        assert!(
+            server_setup_migrate_v3("AAAA").is_err(),
+            "长度非 128B 必须拒绝"
+        );
     }
 
     // 未认证 b64 入口的 64KiB 上限：server_login_start/server_reg_start 等服务端入口

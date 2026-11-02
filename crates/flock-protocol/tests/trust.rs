@@ -9,8 +9,8 @@
 use std::time::Duration;
 
 use flock_protocol::session::{
-    initiate, initiate_tofu, respond, DeviceRecord, DeviceStaticKeys, InMemoryDirectory,
-    ServerIdentity, ServerId, TunnelConfig, RT_I1,
+    initiate, initiate_tofu, respond, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, ServerId,
+    ServerIdentity, TunnelConfig, RT_I1,
 };
 use flock_protocol::trust::{
     confirm_tofu_and_pin, load_invite, save_invite, ClusterDirectory, InviteFile, PinStore,
@@ -26,7 +26,10 @@ fn duplex_pair() -> (DuplexStream, DuplexStream) {
 }
 
 /// 首帧窥探代理：记录客户端首个线上帧类型后双向透明转发。
-async fn first_frame_probe(client_side: DuplexStream, server_side: DuplexStream) -> tokio::sync::oneshot::Receiver<u8> {
+async fn first_frame_probe(
+    client_side: DuplexStream,
+    server_side: DuplexStream,
+) -> tokio::sync::oneshot::Receiver<u8> {
     let (mut c_rd, mut c_wr) = tokio::io::split(client_side);
     let (mut s_rd, mut s_wr) = tokio::io::split(server_side);
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -72,11 +75,19 @@ fn cluster_of(n: usize) -> Cluster {
         servers.push(s);
     }
     let directory = ClusterDirectory::issue(&root, cluster_id, 1, entries);
-    Cluster { root, servers, directory }
+    Cluster {
+        root,
+        servers,
+        directory,
+    }
 }
 
 /// 单端点 1-RTT 对拨：pin 来自目录条目；断言首帧 == I1 且数据回显可用。
-async fn endpoint_1rtt(cluster: &Cluster, idx: usize, device: &DeviceStaticKeys) -> flock_protocol::session::Tunnel {
+async fn endpoint_1rtt(
+    cluster: &Cluster,
+    idx: usize,
+    device: &DeviceStaticKeys,
+) -> flock_protocol::session::Tunnel {
     let entry = cluster.directory.servers[idx].clone();
     let server = &cluster.servers[idx];
 
@@ -94,16 +105,22 @@ async fn endpoint_1rtt(cluster: &Cluster, idx: usize, device: &DeviceStaticKeys)
         cluster_id: server.cluster_id,
         server_id: server.server_id,
         identity: SigningKey::from_bytes(&server.identity.to_bytes()),
-        static_hybrid: flock_protocol::kem::HybridKeypair::from_bytes(&server.static_hybrid.to_bytes()).expect("sk"),
+        static_hybrid: flock_protocol::kem::HybridKeypair::from_bytes(
+            &server.static_hybrid.to_bytes(),
+        )
+        .expect("sk"),
         entry: server.entry.clone(),
         root_pub: server.root_pub,
         entry_sig: server.entry_sig,
     };
     let srv = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), respond(server_io, &server_ident, dir, TunnelConfig::default()))
-            .await
-            .expect("respond timeout")
-            .expect("respond")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            respond(server_io, &server_ident, dir, TunnelConfig::default()),
+        )
+        .await
+        .expect("respond timeout")
+        .expect("respond")
     });
     let pin = flock_protocol::session::ServerPin {
         cluster_id: cluster.directory.cluster_id,
@@ -112,10 +129,13 @@ async fn endpoint_1rtt(cluster: &Cluster, idx: usize, device: &DeviceStaticKeys)
     };
     let dev = DeviceStaticKeys::from_bytes(&device.to_bytes());
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(client_io, &dev, &pin, TunnelConfig::default()))
-            .await
-            .expect("initiate timeout")
-            .expect("initiate")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(client_io, &dev, &pin, TunnelConfig::default()),
+        )
+        .await
+        .expect("initiate timeout")
+        .expect("initiate")
     });
     let client = cli.await.expect("cli task");
     let server_tunnel = srv.await.expect("srv task");
@@ -128,7 +148,10 @@ async fn endpoint_1rtt(cluster: &Cluster, idx: usize, device: &DeviceStaticKeys)
     assert_eq!(first, RT_I1, "端点 {idx}：任意端点均 1-RTT，I0 不得出现");
 
     // 守门断言 2：握手后数据面可用
-    let mut cs = client.open_stream(flock_protocol::mux::Prio::Normal).await.expect("open");
+    let mut cs = client
+        .open_stream(flock_protocol::mux::Prio::Normal)
+        .await
+        .expect("open");
     let msg = format!("endpoint-{idx}");
     cs.write_all(msg.as_bytes()).await.expect("write");
     let mut ss = tokio::time::timeout(Duration::from_secs(5), server_tunnel.accept_stream())
@@ -163,7 +186,10 @@ async fn invite_multi_endpoint_all_1rtt() {
     let loaded = load_invite(&path).expect("load");
     let _ = std::fs::remove_file(&path);
     assert_eq!(loaded.directory.servers.len(), 3);
-    assert!(loaded.verify_against(&cluster.root.verifying_key()), "对照签发根验签");
+    assert!(
+        loaded.verify_against(&cluster.root.verifying_key()),
+        "对照签发根验签"
+    );
 
     // 同一根下每个端点：从**目录条目**构造 pin，各自完成 1-RTT
     for i in 0..3 {
@@ -226,32 +252,45 @@ async fn tofu_bootstrap_lands_in_pinstore() {
         cluster_id: server.cluster_id,
         server_id: server.server_id,
         identity: SigningKey::from_bytes(&server.identity.to_bytes()),
-        static_hybrid: flock_protocol::kem::HybridKeypair::from_bytes(&server.static_hybrid.to_bytes()).expect("sk"),
+        static_hybrid: flock_protocol::kem::HybridKeypair::from_bytes(
+            &server.static_hybrid.to_bytes(),
+        )
+        .expect("sk"),
         entry: server.entry.clone(),
         root_pub: server.root_pub,
         entry_sig: server.entry_sig,
     };
     let srv = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), respond(b, &server_ident, dir, TunnelConfig::default()))
-            .await
-            .expect("timeout")
-            .expect("respond")
-    });
-    let boot = tokio::time::timeout(Duration::from_secs(10), initiate_tofu(a, device, TunnelConfig::default()))
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            respond(b, &server_ident, dir, TunnelConfig::default()),
+        )
         .await
         .expect("timeout")
-        .expect("bootstrap");
+        .expect("respond")
+    });
+    let boot = tokio::time::timeout(
+        Duration::from_secs(10),
+        initiate_tofu(a, device, TunnelConfig::default()),
+    )
+    .await
+    .expect("timeout")
+    .expect("bootstrap");
     let expected_fp = boot.root_fingerprint();
 
     let mut pins = PinStore::new();
-    let client = confirm_tofu_and_pin(boot, &mut pins).await.expect("confirm+pin");
+    let client = confirm_tofu_and_pin(boot, &mut pins)
+        .await
+        .expect("confirm+pin");
     assert_eq!(
         pins.verify_pinned(&cluster.directory.cluster_id, &cluster.root.verifying_key()),
         PinVerdict::Match,
         "TOFU 确认后根公钥已钉扎"
     );
     assert_eq!(
-        flock_protocol::session::fingerprint_ed25519(pins.pinned_root(&cluster.directory.cluster_id).unwrap()),
+        flock_protocol::session::fingerprint_ed25519(
+            pins.pinned_root(&cluster.directory.cluster_id).unwrap()
+        ),
         expected_fp,
         "钉扎的即展示指纹的本体"
     );

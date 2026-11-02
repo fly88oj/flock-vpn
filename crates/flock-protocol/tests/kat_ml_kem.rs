@@ -21,10 +21,10 @@
 mod kat_ml_kem_data;
 
 use flock_protocol::kem;
+use flock_protocol::ml_kem::ExpandedKeyEncoding;
 use flock_protocol::ml_kem::{
     ml_kem_768::MlKem768, Decapsulate, DecapsulationKey, EncapsulationKey, Key, KeyExport,
 };
-use flock_protocol::ml_kem::ExpandedKeyEncoding;
 
 /// keyGen：seed(d‖z) → ek 逐字节复现官方向量。
 #[test]
@@ -61,8 +61,16 @@ fn kat_encap_and_decap() {
         // encapsulate_deterministic 为官方 KAT 复跑的确定性入口（doc(hidden) 公共 API）
         let (ct, k) = ek.encapsulate_deterministic(&m.into());
         assert_eq!(ct.as_slice().len(), 1088, "tc{i}: ct 尺寸");
-        assert_eq!(hex::encode(ct.as_slice()), c_hex.to_ascii_lowercase(), "tc{i}: ct 复现");
-        assert_eq!(hex::encode(k.as_slice()), k_hex.to_ascii_lowercase(), "tc{i}: k 复现");
+        assert_eq!(
+            hex::encode(ct.as_slice()),
+            c_hex.to_ascii_lowercase(),
+            "tc{i}: ct 复现"
+        );
+        assert_eq!(
+            hex::encode(k.as_slice()),
+            k_hex.to_ascii_lowercase(),
+            "tc{i}: k 复现"
+        );
 
         // decap：展开形 dk（ACVP 记录形态）
         let dk_arr: [u8; 2400] = hex::decode(dk_hex).unwrap().try_into().unwrap();
@@ -71,7 +79,11 @@ fn kat_encap_and_decap() {
         )
         .unwrap();
         let k2 = dk.decapsulate(&ct);
-        assert_eq!(hex::encode(k2.as_slice()), k_hex.to_ascii_lowercase(), "tc{i}: decap k 复现");
+        assert_eq!(
+            hex::encode(k2.as_slice()),
+            k_hex.to_ascii_lowercase(),
+            "tc{i}: decap k 复现"
+        );
     }
 }
 
@@ -84,7 +96,10 @@ fn hybrid_sizes_match_kat() {
     assert_eq!(kem::HYBRID_PUB_LEN, 1216);
     assert_eq!(kem::HYBRID_CT_LEN, 1120);
     // 官方向量 ek 过混合公钥校验（X25519 侧填 32B 常量占位）
-    let ek_arr: [u8; 1184] = hex::decode(kat_ml_kem_data::ENCAP[0].0).unwrap().try_into().unwrap();
+    let ek_arr: [u8; 1184] = hex::decode(kat_ml_kem_data::ENCAP[0].0)
+        .unwrap()
+        .try_into()
+        .unwrap();
     let mut hybrid = [0u8; 1216];
     hybrid[32..].copy_from_slice(&ek_arr);
     kem::HybridPubkey::from_bytes(&hybrid).expect("官方 ek 必须通过 FIPS 203 校验");

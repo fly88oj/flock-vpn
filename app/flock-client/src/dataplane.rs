@@ -42,7 +42,9 @@ impl Default for FrameBuf {
 
 impl FrameBuf {
     pub fn new() -> Self {
-        FrameBuf { buf: Vec::with_capacity(2048) }
+        FrameBuf {
+            buf: Vec::with_capacity(2048),
+        }
     }
 
     pub fn extend(&mut self, bytes: &[u8]) {
@@ -132,7 +134,7 @@ pub(crate) mod testutil {
         ServerIdentity, TunnelConfig,
     };
     use flock_protocol::trust::ClusterDirectory;
-    use flock_protocol::{rand, mux::PacketChannel};
+    use flock_protocol::{mux::PacketChannel, rand};
 
     /// respond 侧真材料 + 设备注册表 + 每流回显 + 会话级 kill 开关。
     /// `chunked = true`：每个回显帧拆成「帧头 → 250ms 间隔 → 帧体」两段下发——
@@ -184,43 +186,47 @@ pub(crate) mod testutil {
         /// （客户端首流为控制流占位：无字节 ⇒ 回显任务静默等待，行为等价）。
         pub(crate) async fn serve(self: Arc<Self>, listener: tokio::net::TcpListener) {
             loop {
-                let Ok((io, _)) = listener.accept().await else { return };
+                let Ok((io, _)) = listener.accept().await else {
+                    return;
+                };
                 let conn_peer = self.clone();
-                let h = tokio::spawn(async move {
-                    let dir = conn_peer.devices.lock().unwrap().clone();
-                    let tunnel =
-                        match respond(io, &conn_peer.identity, dir, TunnelConfig::default()).await {
-                            Ok(t) => t,
-                            Err(_) => return,
-                        };
-                    while let Some(stream) = tunnel.accept_stream().await {
-                        let chunked = conn_peer.chunked;
-                        let mut ch = PacketChannel::from_stream(stream);
-                        tokio::spawn(async move {
-                            while let Ok(pkt) = ch.recv().await {
-                                if chunked {
-                                    // 拆帧回显：先发帧头，250ms 后发帧体。
-                                    let mut s = ch.into_stream();
-                                    if s
-                                        .write_all(&(pkt.len() as u16).to_le_bytes())
-                                        .await
-                                        .is_err()
-                                    {
+                let h =
+                    tokio::spawn(async move {
+                        let dir = conn_peer.devices.lock().unwrap().clone();
+                        let tunnel =
+                            match respond(io, &conn_peer.identity, dir, TunnelConfig::default())
+                                .await
+                            {
+                                Ok(t) => t,
+                                Err(_) => return,
+                            };
+                        while let Some(stream) = tunnel.accept_stream().await {
+                            let chunked = conn_peer.chunked;
+                            let mut ch = PacketChannel::from_stream(stream);
+                            tokio::spawn(async move {
+                                while let Ok(pkt) = ch.recv().await {
+                                    if chunked {
+                                        // 拆帧回显：先发帧头，250ms 后发帧体。
+                                        let mut s = ch.into_stream();
+                                        if s.write_all(&(pkt.len() as u16).to_le_bytes())
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(250))
+                                            .await;
+                                        if s.write_all(&pkt).await.is_err() {
+                                            break;
+                                        }
+                                        ch = PacketChannel::from_stream(s);
+                                    } else if ch.send(&pkt).await.is_err() {
                                         break;
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(250))
-                                        .await;
-                                    if s.write_all(&pkt).await.is_err() {
-                                        break;
-                                    }
-                                    ch = PacketChannel::from_stream(s);
-                                } else if ch.send(&pkt).await.is_err() {
-                                    break;
                                 }
-                            }
-                        });
-                    }
-                });
+                            });
+                        }
+                    });
                 self.conns.lock().unwrap().push(h);
             }
         }
@@ -271,7 +277,10 @@ mod tests {
         let tunnel = flock_protocol::session::initiate(io, &device, &pin, TunnelConfig::default())
             .await
             .expect("1-RTT initiate");
-        let _control_hold = tunnel.open_stream(flock_protocol::mux::Prio::Control).await.unwrap();
+        let _control_hold = tunnel
+            .open_stream(flock_protocol::mux::Prio::Control)
+            .await
+            .unwrap();
         let ch = tunnel.open_packet_channel().await.unwrap();
 
         // mock tun + 桥任务。
@@ -336,7 +345,10 @@ mod tests {
         let tunnel = flock_protocol::session::initiate(io, &device, &pin, TunnelConfig::default())
             .await
             .expect("1-RTT initiate");
-        let _control_hold = tunnel.open_stream(flock_protocol::mux::Prio::Control).await.unwrap();
+        let _control_hold = tunnel
+            .open_stream(flock_protocol::mux::Prio::Control)
+            .await
+            .unwrap();
         let ch = tunnel.open_packet_channel().await.unwrap();
 
         let mock = Arc::new(MockTunDevice::open(&TunSpec::default()).unwrap());
@@ -371,7 +383,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let got = mock.written();
-        assert_eq!(got.len(), expected.len(), "全部回显（无丢失/无重复）：{got:?}");
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "全部回显（无丢失/无重复）：{got:?}"
+        );
         assert_eq!(got, expected, "逐包逐字节完整且有序（下行帧流无失步）");
 
         tunnel.shutdown().await;
@@ -408,7 +424,9 @@ mod tests {
             };
             // 注：yamux SYN 惰性（首帧携带）——控制流占位无数据 ⇒ 首个被接受的流
             // 即包通道（与 M1 session_mux 的 PacketChannel 测试同语义）。
-            let Some(s) = t.accept_stream().await else { return };
+            let Some(s) = t.accept_stream().await else {
+                return;
+            };
             let mut ch = PacketChannel::from_stream(s);
             while let Ok(p) = ch.recv().await {
                 if ch.send(&p).await.is_err() {
@@ -439,9 +457,7 @@ mod tests {
     }
 
     /// 控制流占位打开（首流排序契约；返回持有句柄防止过早 Drop）。
-    async fn t_open_hold(
-        tunnel: &flock_protocol::session::Tunnel,
-    ) -> flock_protocol::mux::Stream {
+    async fn t_open_hold(tunnel: &flock_protocol::session::Tunnel) -> flock_protocol::mux::Stream {
         tunnel
             .open_stream(flock_protocol::mux::Prio::Control)
             .await

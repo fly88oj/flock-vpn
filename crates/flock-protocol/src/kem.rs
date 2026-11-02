@@ -121,7 +121,10 @@ impl HybridKeypair {
     pub fn generate(rng: &mut impl rand::TryCryptoRng) -> Self {
         let x = StaticSecret::random_from_rng(&mut bridge(rng));
         let dk = MlKem768::generate_keypair_from_rng(&mut bridge(rng)).0;
-        HybridKeypair { x25519: x, ml_kem: dk }
+        HybridKeypair {
+            x25519: x,
+            ml_kem: dk,
+        }
     }
 
     /// 由 [`HybridKeypair::to_bytes`] 的 96B 恢复。
@@ -233,8 +236,7 @@ impl HybridPubkey {
     pub fn from_bytes(bytes: &[u8; HYBRID_PUB_LEN]) -> Result<Self, KemError> {
         let (x, ek) = bytes.split_at(X25519_PUB_LEN);
         let ek_arr: [u8; ML_KEM_EK_LEN] = ek.try_into().expect("1216B split");
-        let key = Key::<EncapsulationKey<MlKem768>>::try_from(ek_arr.as_slice())
-            .expect("1184B ek");
+        let key = Key::<EncapsulationKey<MlKem768>>::try_from(ek_arr.as_slice()).expect("1184B ek");
         let ml_kem =
             EncapsulationKey::<MlKem768>::new(&key).map_err(|_| KemError::InvalidPubkey)?;
         // X25519 公钥任意 32B 均可（小阶点在 diffie_hellman 后由 was_contributory 兜底）
@@ -335,7 +337,10 @@ impl fmt::Debug for Fingerprint {
 /// 封装：对 `pk` 生成一次性共享密钥与混合密文（随机性全部来自 `rng`）。
 ///
 /// 一次性信封/握手共享的正确打开方式：每信封/每握手调用一次，`SealedShared` 用后即弃。
-pub fn encapsulate(pk: &HybridPubkey, rng: &mut impl rand::TryCryptoRng) -> (SealedShared, HybridCt) {
+pub fn encapsulate(
+    pk: &HybridPubkey,
+    rng: &mut impl rand::TryCryptoRng,
+) -> (SealedShared, HybridCt) {
     let eph = EphemeralSecret::random_from_rng(&mut bridge(rng));
     let eph_pub = PublicKey::from(&eph);
     let (ml_ct, ml_ss) = pk.ml_kem.encapsulate_with_rng(&mut bridge(rng));
@@ -395,10 +400,16 @@ impl<R: rand::TryRngCore + ?Sized> rc010::TryRng for RngBridge<'_, R> {
     type Error = Infallible;
 
     fn try_next_u32(&mut self) -> Result<u32, Infallible> {
-        Ok(self.0.try_next_u32().expect("flock-protocol: entropy source failed"))
+        Ok(self
+            .0
+            .try_next_u32()
+            .expect("flock-protocol: entropy source failed"))
     }
     fn try_next_u64(&mut self) -> Result<u64, Infallible> {
-        Ok(self.0.try_next_u64().expect("flock-protocol: entropy source failed"))
+        Ok(self
+            .0
+            .try_next_u64()
+            .expect("flock-protocol: entropy source failed"))
     }
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
         self.0
@@ -451,7 +462,11 @@ mod tests {
         );
         let sk = keypair();
         let good = HybridPubkey::from_bytes(&sk.public().to_bytes()).expect("valid pk");
-        assert_eq!(good.to_bytes(), sk.public().to_bytes(), "合法公钥往返逐字节一致");
+        assert_eq!(
+            good.to_bytes(),
+            sk.public().to_bytes(),
+            "合法公钥往返逐字节一致"
+        );
     }
 
     #[test]
@@ -483,7 +498,9 @@ mod tests {
         assert_eq!(fp1, fingerprint(&pk2), "公钥序列化往返后指纹不变");
         let s = fp1.to_string();
         assert_eq!(s.split(':').count(), 8, "8 组展示");
-        assert!(s.split(':').all(|g| g.len() == 8 && g.bytes().all(|b| b.is_ascii_hexdigit())));
+        assert!(s
+            .split(':')
+            .all(|g| g.len() == 8 && g.bytes().all(|b| b.is_ascii_hexdigit())));
         let sk3 = keypair();
         assert_ne!(fp1, fingerprint(&sk3.public()), "不同密钥指纹不同");
     }
@@ -537,7 +554,9 @@ mod tests {
         let mut other = seed;
         other[10] ^= 0x01;
         assert_ne!(
-            HybridKeypair::from_seed_material(&other).public().to_bytes(),
+            HybridKeypair::from_seed_material(&other)
+                .public()
+                .to_bytes(),
             sk2.public().to_bytes()
         );
 

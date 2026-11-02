@@ -26,18 +26,25 @@ fn v() -> serde_json::Value {
 #[test]
 fn opaque_3_0_0_record_login_under_4_0_1() {
     let j = v();
-    let (user, password) = (j["opaque"]["user"].as_str().unwrap(), j["opaque"]["password"].as_str().unwrap());
+    let (user, password) = (
+        j["opaque"]["user"].as_str().unwrap(),
+        j["opaque"]["password"].as_str().unwrap(),
+    );
     let setup_b64 = j["opaque"]["server_setup_b64"].as_str().unwrap();
     let record_b64 = j["opaque"]["record_b64"].as_str().unwrap();
     let rwd_hex = j["opaque"]["rwd_hex"].as_str().unwrap();
 
     // rwd profile 参数与 showroom 逐字节一致（P2-11：Profile::Owasp19MiB 兼容默认）
     let r = pake::rwd(password, user, pake::Profile::Owasp19MiB).unwrap();
-    assert_eq!(hex::encode(r), rwd_hex, "rwd(pw,user,Owasp19MiB) 必须与 showroom 3.0.0 一致");
+    assert_eq!(
+        hex::encode(r),
+        rwd_hex,
+        "rwd(pw,user,Owasp19MiB) 必须与 showroom 3.0.0 一致"
+    );
 
     // ServerSetup 3.0.0 → 4.0.1 迁移（dummy 段 sk→pk；OPRF seed/KE sk 保留）
-    let setup = pake::server_setup_migrate_v3(setup_b64)
-        .expect("3.0.0 opaque.key 必须可迁移（P1-6）");
+    let setup =
+        pake::server_setup_migrate_v3(setup_b64).expect("3.0.0 opaque.key 必须可迁移（P1-6）");
 
     // 3.0.0 注册记录直接读入（布局不变）
     let record = pake::server_record_from_b64(record_b64)
@@ -58,7 +65,8 @@ fn opaque_3_0_0_record_login_under_4_0_1() {
 fn opaque_3_0_0_record_wrong_password_rejected() {
     let j = v();
     let user = j["opaque"]["user"].as_str().unwrap();
-    let setup = pake::server_setup_migrate_v3(j["opaque"]["server_setup_b64"].as_str().unwrap()).unwrap();
+    let setup =
+        pake::server_setup_migrate_v3(j["opaque"]["server_setup_b64"].as_str().unwrap()).unwrap();
     let record = pake::server_record_from_b64(j["opaque"]["record_b64"].as_str().unwrap()).unwrap();
     let mut rng = OsRng;
     let (lstate, ke1) = pake::login_start(&mut rng, "wrong-password", user).unwrap();

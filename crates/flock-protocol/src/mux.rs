@@ -190,7 +190,6 @@ impl PacketChannel {
         self.stream
     }
 
-
     /// 发一个 IP 包：`[u16 len][pkt]`。
     pub async fn send(&mut self, pkt: &[u8]) -> io::Result<()> {
         send_packet(&mut self.stream, pkt).await
@@ -208,7 +207,9 @@ impl PacketChannel {
 
     /// 消费为包迭代流（§3.6 `recv_stream()`）：逐包产出，错误/EOF 终止。
     pub fn recv_stream(self) -> PacketRx {
-        PacketRx { framer: FrameRx::new(self.stream) }
+        PacketRx {
+            framer: FrameRx::new(self.stream),
+        }
     }
 }
 
@@ -228,7 +229,13 @@ pub(crate) struct FrameRx<R> {
 
 impl<R: AsyncRead + Unpin> FrameRx<R> {
     pub(crate) fn new(r: R) -> Self {
-        FrameRx { r, hdr: [0; 2], hdr_filled: 0, body: Vec::new(), body_filled: 0 }
+        FrameRx {
+            r,
+            hdr: [0; 2],
+            hdr_filled: 0,
+            body: Vec::new(),
+            body_filled: 0,
+        }
     }
 }
 
@@ -285,7 +292,8 @@ impl FStream for PacketRx {
 // —— 供 session 内部装配的 yamux 帧承载 IO（明文管道：记录层已加密/解密）——
 
 /// 在途 data 通道发送 future（tokio mpsc 无 poll 式 reserve，故存自引用 future）。
-type SendFut = Pin<Box<dyn Future<Output = Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>>> + Send>>;
+type SendFut =
+    Pin<Box<dyn Future<Output = Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>>> + Send>>;
 
 /// yamux 承载 IO：读端 = 读泵投递的已解密 DATA 记录；写端 = 待封装 payload 交写泵
 /// （封装在写泵唯一串行点执行，保证记录计数器顺序 = 实际上线顺序）。
@@ -303,7 +311,13 @@ impl MuxIo {
         plain_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) -> Self {
-        MuxIo { plain_rx, data_tx, rbuf: Vec::new(), send_fut: None, send_len: 0 }
+        MuxIo {
+            plain_rx,
+            data_tx,
+            rbuf: Vec::new(),
+            send_fut: None,
+            send_len: 0,
+        }
     }
 }
 
@@ -423,8 +437,8 @@ mod tests {
     /// 多次返回 Pending）必须完整分帧。
     #[test]
     fn packet_rx_frames_survive_split_arrival() {
-        use futures::StreamExt as _;
         use futures::task::noop_waker;
+        use futures::StreamExt as _;
 
         let pkt1: Vec<u8> = (0..40u8).collect();
         let pkt2: Vec<u8> = vec![0xA5; 5];
@@ -435,7 +449,10 @@ mod tests {
             wire.extend_from_slice(p);
         }
 
-        let reader = TrickleReader { chunks: std::collections::VecDeque::new(), eof: false };
+        let reader = TrickleReader {
+            chunks: std::collections::VecDeque::new(),
+            eof: false,
+        };
         let mut rx = FrameRx::new(reader);
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -466,8 +483,8 @@ mod tests {
     /// 下一帧紧随其后同块）——每块投递后 poll 至 Pending，半途状态跨 poll 保留。
     #[test]
     fn packet_rx_frames_survive_chunked_body_arrival() {
-        use futures::StreamExt as _;
         use futures::task::noop_waker;
+        use futures::StreamExt as _;
 
         let pkt1: Vec<u8> = (0..100u8).collect();
         let pkt2: Vec<u8> = vec![0x5A; 3];
@@ -482,15 +499,18 @@ mod tests {
             f
         };
 
-        let reader = TrickleReader { chunks: std::collections::VecDeque::new(), eof: false };
+        let reader = TrickleReader {
+            chunks: std::collections::VecDeque::new(),
+            eof: false,
+        };
         let mut rx = FrameRx::new(reader);
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
         let mut got: Vec<Vec<u8>> = Vec::new();
         let chunks = vec![
-            frame1[..2].to_vec(), // 帧 1 头（体未到 ⇒ Pending）
-            frame1[2..52].to_vec(), // 帧 1 体前半（半途 ⇒ Pending）
+            frame1[..2].to_vec(),                     // 帧 1 头（体未到 ⇒ Pending）
+            frame1[2..52].to_vec(),                   // 帧 1 体前半（半途 ⇒ Pending）
             [frame1[52..].to_vec(), frame2].concat(), // 帧 1 体后半 + 整帧 2 同块
         ];
         for c in chunks {

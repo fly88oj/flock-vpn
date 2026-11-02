@@ -150,7 +150,11 @@ pub fn seal_v2<W: Write>(
             break;
         }
     }
-    Ok(SealInfo { envelope_id, segments, total_bytes })
+    Ok(SealInfo {
+        envelope_id,
+        segments,
+        total_bytes,
+    })
 }
 
 /// v2 解封（流式，恒定内存）。返回写出明文总字节数；任何 ver/头长/段认证失败返回 Err（不 panic）。
@@ -168,7 +172,10 @@ pub fn open_v2(sk: &HybridKeypair, sealed: impl Read, mut out: impl Write) -> io
     if header[0] != V2_VER {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("envelope: unsupported version {} (expect {V2_VER})", header[0]),
+            format!(
+                "envelope: unsupported version {} (expect {V2_VER})",
+                header[0]
+            ),
         ));
     }
     let envelope_id: [u8; 16] = header[1..17].try_into().expect("1137B split");
@@ -187,7 +194,12 @@ pub fn open_v2(sk: &HybridKeypair, sealed: impl Read, mut out: impl Write) -> io
     match read_full(&mut r, &mut nonce)? {
         0 => return Ok(0), // 空信封：段边界上的干净 EOF
         NONCE_LEN => {}
-        _ => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "envelope: truncated nonce")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "envelope: truncated nonce",
+            ))
+        }
     }
     loop {
         let n = read_full(&mut r, &mut ct)?;
@@ -309,19 +321,23 @@ struct Rng06<'a, R: rand::TryRngCore + ?Sized>(&'a mut R);
 #[cfg(feature = "legacy")]
 impl<R: rand::TryRngCore + ?Sized> rsa::rand_core::RngCore for Rng06<'_, R> {
     fn next_u32(&mut self) -> u32 {
-        self.0.try_next_u32().expect("flock-protocol: entropy source failed")
+        self.0
+            .try_next_u32()
+            .expect("flock-protocol: entropy source failed")
     }
     fn next_u64(&mut self) -> u64 {
-        self.0.try_next_u64().expect("flock-protocol: entropy source failed")
+        self.0
+            .try_next_u64()
+            .expect("flock-protocol: entropy source failed")
     }
     fn fill_bytes(&mut self, dst: &mut [u8]) {
-        self.0.try_fill_bytes(dst).expect("flock-protocol: entropy source failed");
+        self.0
+            .try_fill_bytes(dst)
+            .expect("flock-protocol: entropy source failed");
     }
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
         self.0.try_fill_bytes(dst).map_err(|_| {
-            rsa::rand_core::Error::from(
-                std::num::NonZeroU32::new(1).expect("nonzero"),
-            )
+            rsa::rand_core::Error::from(std::num::NonZeroU32::new(1).expect("nonzero"))
         })
     }
 }
@@ -391,10 +407,7 @@ impl PlatformKeys {
     /// 生成 RSA-3072（模长 384B = v1 封装头长度契约）。
     pub fn generate() -> Self {
         let mut rng = rand::rng();
-        PlatformKeys(
-            rsa::RsaPrivateKey::new(&mut Rng06(&mut rng), 3072)
-                .expect("rsa-3072 keygen"),
-        )
+        PlatformKeys(rsa::RsaPrivateKey::new(&mut Rng06(&mut rng), 3072).expect("rsa-3072 keygen"))
     }
 
     /// 私钥（传给 [`open_v1_legacy`]；showroom 调用方亦经再导出的 rsa crate 从 PEM 自行构造）。
@@ -502,7 +515,10 @@ mod tests {
         assert_eq!(info.segments, 2);
         assert_eq!(sealed.len(), HDR + SEG * 2 + 2 * (NONCE_LEN + TAG_LEN));
         let mut out = Vec::new();
-        assert_eq!(open_v2(&sk, Cursor::new(sealed.as_slice()), &mut out).unwrap() as usize, SEG * 2);
+        assert_eq!(
+            open_v2(&sk, Cursor::new(sealed.as_slice()), &mut out).unwrap() as usize,
+            SEG * 2
+        );
         assert_eq!(out, plain);
     }
 
@@ -549,7 +565,7 @@ mod tests {
         let (sealed, info) = seal(&plain, &sk.public());
         assert_eq!(info.segments, 3);
         let blk = SEG + NONCE_LEN + TAG_LEN; // 每段线上块长（满段）
-        // 交换段 0 与段 1
+                                             // 交换段 0 与段 1
         let mut t = sealed.clone();
         let (a, b) = (HDR..HDR + blk, HDR + blk..HDR + 2 * blk);
         let sa: Vec<u8> = sealed[a.clone()].to_vec();
@@ -587,11 +603,15 @@ mod tests {
         let sk = keypair();
         let (env_a, info_a) = seal(&vec![1u8; SEG], &sk.public());
         let (env_b, _) = seal(&vec![2u8; SEG], &sk.public());
-        assert_ne!(info_a.envelope_id, {
-            let mut b = [0u8; 16];
-            b.copy_from_slice(&env_b[1..17]);
-            b
-        }, "两信封 id 必不同");
+        assert_ne!(
+            info_a.envelope_id,
+            {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&env_b[1..17]);
+                b
+            },
+            "两信封 id 必不同"
+        );
         let blk = SEG + NONCE_LEN + TAG_LEN;
         // 用 B 的段替换 A 的段（同收件人、同 seg_idx、同 is_final——只有 id 不同）
         let mut t = env_a.clone();
@@ -641,8 +661,8 @@ mod v1_tests {
         for len in [0usize, SEG, SEG * 2 + 1234] {
             let plain: Vec<u8> = (0..len as u32).map(|i| (i % 251) as u8).collect();
             let mut sealed = Vec::new();
-            let n = seal_v1_legacy(&p.public(), Cursor::new(plain.as_slice()), &mut sealed)
-                .unwrap();
+            let n =
+                seal_v1_legacy(&p.public(), Cursor::new(plain.as_slice()), &mut sealed).unwrap();
             let segs = len.div_ceil(SEG);
             assert_eq!(n as usize, WRAP_LEN + segs * (NONCE_LEN + TAG_LEN) + len);
             let mut out = Vec::new();

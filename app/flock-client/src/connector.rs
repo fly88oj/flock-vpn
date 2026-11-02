@@ -62,7 +62,10 @@ impl std::fmt::Display for ClientError {
             ClientError::Session(e) => write!(f, "client: session: {e}"),
             ClientError::Trust(e) => write!(f, "client: trust: {e}"),
             ClientError::DialTimeout(ep) => {
-                write!(f, "client: 拨号超时（connect+握手 > {DIAL_TIMEOUT:?}）: {ep}")
+                write!(
+                    f,
+                    "client: 拨号超时（connect+握手 > {DIAL_TIMEOUT:?}）: {ep}"
+                )
             }
             ClientError::State(m) => write!(f, "client: {m}"),
         }
@@ -126,14 +129,16 @@ impl ClientState {
         let keys_path = state_dir.join(DEVICE_KEYS);
         match std::fs::read(&keys_path) {
             Ok(b) => {
-                let arr: [u8; 64] =
-                    b.try_into().map_err(|_| ClientError::State("device.keys 期望 64B".into()))?;
+                let arr: [u8; 64] = b
+                    .try_into()
+                    .map_err(|_| ClientError::State("device.keys 期望 64B".into()))?;
                 Ok(DeviceStaticKeys::from_bytes(&arr))
             }
             Err(_) if create => {
                 let d = DeviceStaticKeys::generate();
-                std::fs::create_dir_all(state_dir)
-                    .map_err(|e| ClientError::State(format!("mkdir {}: {e}", state_dir.display())))?;
+                std::fs::create_dir_all(state_dir).map_err(|e| {
+                    ClientError::State(format!("mkdir {}: {e}", state_dir.display()))
+                })?;
                 write_keys(state_dir, &d)?;
                 Ok(d)
             }
@@ -169,7 +174,11 @@ impl ClientState {
                 hex::encode(directory.cluster_id.0)
             );
         }
-        Ok(ClientState { device, pins, directory })
+        Ok(ClientState {
+            device,
+            pins,
+            directory,
+        })
     }
 
     /// 落盘三件套。
@@ -199,7 +208,11 @@ impl ClientState {
     /// 目标端点的接入 pin（集群根 = 钉扎；未钉扎 ⇒ None，调用方先引导）。
     pub fn pin_for(&self, endpoint: &str) -> Option<ServerPin> {
         let root = self.pins.pinned_root(&self.directory.cluster_id)?;
-        let entry = self.directory.servers.iter().find(|e| e.relay_endpoint == endpoint)?;
+        let entry = self
+            .directory
+            .servers
+            .iter()
+            .find(|e| e.relay_endpoint == endpoint)?;
         Some(ServerPin {
             cluster_id: self.directory.cluster_id,
             cluster_root_pub: *root,
@@ -208,7 +221,11 @@ impl ClientState {
     }
 
     /// 本端 VIP（config 覆盖或 state 目录 `vip` 文件）。
-    pub fn resolve_vip(&self, state_dir: &Path, cfg_vip: Option<Ipv4Addr>) -> Result<Ipv4Addr, ClientError> {
+    pub fn resolve_vip(
+        &self,
+        state_dir: &Path,
+        cfg_vip: Option<Ipv4Addr>,
+    ) -> Result<Ipv4Addr, ClientError> {
         if let Some(v) = cfg_vip {
             return Ok(v);
         }
@@ -266,7 +283,11 @@ pub fn ingest_invite(state_dir: &Path, invite: &InviteFile) -> Result<ClientStat
     }
     pins.record_directory(&invite.cluster_root_pub, &invite.directory)
         .map_err(ClientError::Trust)?;
-    let state = ClientState { device, pins, directory: invite.directory.clone() };
+    let state = ClientState {
+        device,
+        pins,
+        directory: invite.directory.clone(),
+    };
     state.save(state_dir)?;
     Ok(state)
 }
@@ -285,13 +306,21 @@ pub struct Backoff {
 
 impl Default for Backoff {
     fn default() -> Self {
-        Backoff { base: BACKOFF_BASE, cap: BACKOFF_CAP, attempt: 0 }
+        Backoff {
+            base: BACKOFF_BASE,
+            cap: BACKOFF_CAP,
+            attempt: 0,
+        }
     }
 }
 
 impl Backoff {
     pub fn new(base: Duration, cap: Duration) -> Self {
-        Backoff { base, cap, attempt: 0 }
+        Backoff {
+            base,
+            cap,
+            attempt: 0,
+        }
     }
 
     /// 成功后归零。
@@ -348,7 +377,11 @@ impl EndpointRing {
 /// 单次拨号：TCP connect + `session::initiate`（1-RTT，已钉扎形态）**整体**受
 /// [`DIAL_TIMEOUT`] 约束——R1 黑洞（TCP 通、握手不答）时超时换下一端点轮询，
 /// supervise 不因无超时的 `initiate` 永久挂死。
-pub async fn dial(pin: &ServerPin, device: &DeviceStaticKeys, cfg: TunnelConfig) -> Result<Tunnel, ClientError> {
+pub async fn dial(
+    pin: &ServerPin,
+    device: &DeviceStaticKeys,
+    cfg: TunnelConfig,
+) -> Result<Tunnel, ClientError> {
     dial_with_timeout(pin, device, cfg, DIAL_TIMEOUT).await
 }
 
@@ -359,13 +392,12 @@ pub async fn dial_with_timeout(
     cfg: TunnelConfig,
     timeout: Duration,
 ) -> Result<Tunnel, ClientError> {
-    tokio::time::timeout(
-        timeout,
-        async {
-            let io = TcpStream::connect(&pin.entry.relay_endpoint).await?;
-            initiate(io, device, pin, cfg).await.map_err(ClientError::Session)
-        },
-    )
+    tokio::time::timeout(timeout, async {
+        let io = TcpStream::connect(&pin.entry.relay_endpoint).await?;
+        initiate(io, device, pin, cfg)
+            .await
+            .map_err(ClientError::Session)
+    })
     .await
     .map_err(|_| ClientError::DialTimeout(pin.entry.relay_endpoint.clone()))?
 }
@@ -379,9 +411,15 @@ pub enum ConnEvent {
     /// 正在尝试某端点（attempt 从 1 起）。
     Dialing { endpoint: String, attempt: u32 },
     /// 隧道建立（server = 对端服务器标识）。
-    Connected { endpoint: String, server: flock_protocol::session::ServerId },
+    Connected {
+        endpoint: String,
+        server: flock_protocol::session::ServerId,
+    },
     /// 数据面结束（reason = 会话层终止原因；None = 通道 IO 错误先于会话判定）。
-    SessionEnded { endpoint: String, reason: Option<CloseReason> },
+    SessionEnded {
+        endpoint: String,
+        reason: Option<CloseReason>,
+    },
 }
 
 /// 守护循环：拨号 → 隧道 → tun ↔ PacketChannel 数据面 → 结束即退避重连。
@@ -410,7 +448,10 @@ pub async fn supervise(
             continue;
         };
         let attempt = backoff.attempt + 1;
-        events(ConnEvent::Dialing { endpoint: endpoint.clone(), attempt });
+        events(ConnEvent::Dialing {
+            endpoint: endpoint.clone(),
+            attempt,
+        });
         match dial(&pin, &state.device, tunnel_cfg.clone()).await {
             Ok(tunnel) => {
                 // 首流 = 控制流（排序契约，见模块文档）：M3 不发控制业务，占位并**持有到
@@ -419,7 +460,10 @@ pub async fn supervise(
                 let control = match tunnel.open_stream(flock_protocol::mux::Prio::Control).await {
                     Ok(s) => s,
                     Err(_) => {
-                        events(ConnEvent::SessionEnded { endpoint: endpoint.clone(), reason: tunnel.stats().closed });
+                        events(ConnEvent::SessionEnded {
+                            endpoint: endpoint.clone(),
+                            reason: tunnel.stats().closed,
+                        });
                         tunnel.shutdown().await;
                         let d = backoff.next_jitter(rand::random::<f64>());
                         eprintln!("flock-client: {d:?} 后重连（控制流开失败）");
@@ -431,7 +475,10 @@ pub async fn supervise(
                     Ok(ch) => {
                         backoff.reset();
                         if let Some(server) = tunnel.peer_server_id() {
-                            events(ConnEvent::Connected { endpoint: endpoint.clone(), server });
+                            events(ConnEvent::Connected {
+                                endpoint: endpoint.clone(),
+                                server,
+                            });
                         }
                         // rekey 观测（A10）：订阅纪元 watch，每次推进上报（对数据面无感——
                         // bridge 与本任务并行）。
@@ -458,7 +505,10 @@ pub async fn supervise(
                         rekey_watcher.abort();
                         let reason = tunnel.stats().closed;
                         drop(control); // 控制流随会话结束（显式：先于 shutdown 的 FIN 次序）
-                        events(ConnEvent::SessionEnded { endpoint: endpoint.clone(), reason });
+                        events(ConnEvent::SessionEnded {
+                            endpoint: endpoint.clone(),
+                            reason,
+                        });
                         tunnel.shutdown().await;
                     }
                     Err(e) => {
@@ -472,10 +522,7 @@ pub async fn supervise(
             }
         }
         let d = backoff.next_jitter(rand::random::<f64>());
-        eprintln!(
-            "flock-client: {:?} 后重连（下一端点轮询）",
-            d
-        );
+        eprintln!("flock-client: {:?} 后重连（下一端点轮询）", d);
         tokio::time::sleep(d).await;
     }
 }
@@ -506,7 +553,11 @@ mod tests {
         peer.register(&device);
         let mut pins = PinStore::new();
         pins.pin(&peer.directory.cluster_id, &peer.root.verifying_key());
-        let state = ClientState { device, pins, directory: peer.directory.clone() };
+        let state = ClientState {
+            device,
+            pins,
+            directory: peer.directory.clone(),
+        };
 
         let mock = std::sync::Arc::new(MockTunDevice::open(&TunSpec::default()).unwrap());
         let tun = std::sync::Arc::new(TunIo::from_arc(mock.clone()));
@@ -520,20 +571,18 @@ mod tests {
                 TunnelConfig::default(),
                 Backoff::new(Duration::from_millis(80), Duration::from_millis(300)),
                 |ev| {
-                    let _ = ev_tx.send(
-                        match ev {
-                            ConnEvent::Dialing { endpoint, attempt } => {
-                                format!("dial {endpoint} #{attempt}")
-                            }
-                            ConnEvent::Connected { endpoint, server } => {
-                                format!("connected {endpoint} server-{:x?}", server.0.first())
-                            }
-                            ConnEvent::SessionEnded { endpoint, reason } => format!(
-                                "ended {endpoint} reason={}",
-                                reason.map(|r| r.to_string()).unwrap_or_else(|| "io".into())
-                            ),
-                        },
-                    );
+                    let _ = ev_tx.send(match ev {
+                        ConnEvent::Dialing { endpoint, attempt } => {
+                            format!("dial {endpoint} #{attempt}")
+                        }
+                        ConnEvent::Connected { endpoint, server } => {
+                            format!("connected {endpoint} server-{:x?}", server.0.first())
+                        }
+                        ConnEvent::SessionEnded { endpoint, reason } => format!(
+                            "ended {endpoint} reason={}",
+                            reason.map(|r| r.to_string()).unwrap_or_else(|| "io".into())
+                        ),
+                    });
                 },
             )
             .await;
@@ -579,7 +628,11 @@ mod tests {
         while mock.written().len() < n && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(mock.written().len() >= n, "写侧未达 {n}（现 {}）", mock.written().len());
+        assert!(
+            mock.written().len() >= n,
+            "写侧未达 {n}（现 {}）",
+            mock.written().len()
+        );
     }
 
     /// 回归（评审确认缺陷）：TCP 通、R1 永不到达（黑洞对端）时 dial 不得永久挂死——
@@ -617,7 +670,12 @@ mod tests {
 
         let res = tokio::time::timeout(
             Duration::from_secs(5),
-            dial_with_timeout(&pin, &device, TunnelConfig::default(), Duration::from_millis(300)),
+            dial_with_timeout(
+                &pin,
+                &device,
+                TunnelConfig::default(),
+                Duration::from_millis(300),
+            ),
         )
         .await
         .expect("dial 必须按时返回（黑洞对端也不得挂死）");
@@ -647,7 +705,8 @@ mod tests {
         // 抖动界：每一步 d ∈ [step, step·1.25]（step = 当步未抖动基数）。
         let mut b2 = Backoff::new(Duration::from_secs(5), Duration::from_secs(60));
         for k in 0..8u32 {
-            let step = Duration::from_secs(5u64.saturating_mul(1 << k.min(4))).min(Duration::from_secs(60));
+            let step = Duration::from_secs(5u64.saturating_mul(1 << k.min(4)))
+                .min(Duration::from_secs(60));
             let d = b2.next_jitter(0.999);
             assert!(
                 d >= step && d <= step.mul_f64(1.25 + 1e-9),
@@ -660,7 +719,11 @@ mod tests {
         let _ = b3.next_jitter(0.0);
         let _ = b3.next_jitter(0.0);
         b3.reset();
-        assert_eq!(b3.next_jitter(0.0), Duration::from_secs(5), "reset 后回到 5s 起步");
+        assert_eq!(
+            b3.next_jitter(0.0),
+            Duration::from_secs(5),
+            "reset 后回到 5s 起步"
+        );
     }
 
     #[test]
@@ -668,12 +731,19 @@ mod tests {
         let mut r = EndpointRing::new(vec!["a:1".into(), "b:2".into(), "a:1".into(), "c:3".into()]);
         assert_eq!(r.len(), 4); // 轮询不在此去重（目录端点集在 endpoints() 已去重）
         let got: Vec<String> = (0..5).map(|_| r.next_endpoint().unwrap()).collect();
-        assert_eq!(got, ["a:1", "b:2", "a:1", "c:3", "a:1"], "round-robin 轮询切换");
+        assert_eq!(
+            got,
+            ["a:1", "b:2", "a:1", "c:3", "a:1"],
+            "round-robin 轮询切换"
+        );
         let mut empty = EndpointRing::new(vec![]);
         assert!(empty.next_endpoint().is_none());
     }
 
-    fn invite_fixture(root: &flock_protocol::ed25519_dalek::SigningKey, ttl: u64) -> flock_protocol::trust::InviteFile {
+    fn invite_fixture(
+        root: &flock_protocol::ed25519_dalek::SigningKey,
+        ttl: u64,
+    ) -> flock_protocol::trust::InviteFile {
         use flock_protocol::session::{ClusterId, ServerEntry, ServerId};
         let identity = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
         let entry = ServerEntry {
@@ -725,7 +795,10 @@ mod tests {
             ..invite_fixture(&root, 3600)
         };
         assert!(
-            matches!(ingest_invite(dir.path(), &expired), Err(ClientError::Trust(_))),
+            matches!(
+                ingest_invite(dir.path(), &expired),
+                Err(ClientError::Trust(_))
+            ),
             "过期邀请拒载"
         );
         // 根变更：先钉 A，再拿 B 签的邀请 ⇒ RootChanged（显式告警，不静默）。

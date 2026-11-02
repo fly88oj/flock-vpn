@@ -239,7 +239,9 @@ pub struct ManualClock {
 impl ManualClock {
     /// 以当前真实时刻起。
     pub fn new() -> Self {
-        ManualClock { now: StdMutex::new(tokio::time::Instant::now()) }
+        ManualClock {
+            now: StdMutex::new(tokio::time::Instant::now()),
+        }
     }
 
     /// 前拨 `d`（rekey/硬拒绝阈值判定即刻可见）。
@@ -306,7 +308,13 @@ pub struct AeadPreference {
 
 impl Default for AeadPreference {
     fn default() -> Self {
-        AeadPreference { order: vec![AeadChoice::Aes256Gcm, AeadChoice::XChaCha20Poly1305, AeadChoice::Aes256GcmSiv] }
+        AeadPreference {
+            order: vec![
+                AeadChoice::Aes256Gcm,
+                AeadChoice::XChaCha20Poly1305,
+                AeadChoice::Aes256GcmSiv,
+            ],
+        }
     }
 }
 
@@ -377,7 +385,9 @@ impl RecordCipher for AesGcmCipher {
         let tag = self
             .0
             .encrypt_inout_detached(
-                &aes_gcm::Nonce::<<aes_gcm::Aes256Gcm as AeadCore>::NonceSize>::from(nonce12(counter)),
+                &aes_gcm::Nonce::<<aes_gcm::Aes256Gcm as AeadCore>::NonceSize>::from(nonce12(
+                    counter,
+                )),
                 aad,
                 InOutBuf::from(&mut buf[..]),
             )
@@ -397,7 +407,9 @@ impl RecordCipher for AesGcmCipher {
         let mut buf = body.to_vec();
         self.0
             .decrypt_inout_detached(
-                &aes_gcm::Nonce::<<aes_gcm::Aes256Gcm as AeadCore>::NonceSize>::from(nonce12(counter)),
+                &aes_gcm::Nonce::<<aes_gcm::Aes256Gcm as AeadCore>::NonceSize>::from(nonce12(
+                    counter,
+                )),
                 aad,
                 InOutBuf::from(&mut buf[..]),
                 &aes_gcm::Tag::from(tag_arr),
@@ -491,10 +503,15 @@ fn make_cipher(choice: AeadChoice, key: &[u8; 32]) -> Box<dyn RecordCipher + Sen
     use aes_gcm::aead::KeyInit as _;
     let k = *key;
     match choice {
-        AeadChoice::Aes256Gcm => { let key = aes_gcm::Key::<aes_gcm::Aes256Gcm>::from(k); Box::new(AesGcmCipher(aes_gcm::Aes256Gcm::new(&key))) }
+        AeadChoice::Aes256Gcm => {
+            let key = aes_gcm::Key::<aes_gcm::Aes256Gcm>::from(k);
+            Box::new(AesGcmCipher(aes_gcm::Aes256Gcm::new(&key)))
+        }
         AeadChoice::XChaCha20Poly1305 => {
             let key = chacha20poly1305::Key::from(k);
-            Box::new(XChaChaCipher(chacha20poly1305::XChaCha20Poly1305::new(&key)))
+            Box::new(XChaChaCipher(chacha20poly1305::XChaCha20Poly1305::new(
+                &key,
+            )))
         }
         AeadChoice::Aes256GcmSiv => {
             let key = aes_gcm_siv::Key::<aes_gcm_siv::Aes256GcmSiv>::from(k);
@@ -598,7 +615,6 @@ pub struct ServerId(pub [u8; 16]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeviceId(pub [u8; 32]);
 
-
 impl DeviceId {
     /// 由设备 Ed25519 公钥派生。
     pub fn from_ed25519(vk: &VerifyingKey) -> Self {
@@ -692,7 +708,9 @@ impl InMemoryDirectory {
 impl DeviceDirectory for InMemoryDirectory {
     fn lookup(&self, id: &DeviceId) -> BoxFuture<'static, LookupVerdict> {
         let verdict = if let Some(since) = self.revoked.get(id.as_bytes()) {
-            LookupVerdict::Revoked { since_epoch: *since }
+            LookupVerdict::Revoked {
+                since_epoch: *since,
+            }
         } else if let Some(rec) = self.devices.get(id.as_bytes()) {
             LookupVerdict::Active(rec.clone())
         } else {
@@ -759,7 +777,10 @@ impl DeviceStaticKeys {
 impl fmt::Debug for DeviceStaticKeys {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceStaticKeys")
-            .field("device_id", &DeviceId::from_ed25519(&self.ed25519.verifying_key()))
+            .field(
+                "device_id",
+                &DeviceId::from_ed25519(&self.ed25519.verifying_key()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -793,7 +814,11 @@ impl ServerEntry {
 }
 
 /// 集群根密钥对 ServerEntry 的签名（入群凭证；`trust` 模块复用同一规范字节）。
-pub fn sign_server_entry(root: &SigningKey, cluster_id: &ClusterId, entry: &ServerEntry) -> Signature {
+pub fn sign_server_entry(
+    root: &SigningKey,
+    cluster_id: &ClusterId,
+    entry: &ServerEntry,
+) -> Signature {
     root.sign(&entry.canonical_bytes(cluster_id))
 }
 
@@ -804,7 +829,9 @@ pub fn verify_server_entry(
     entry: &ServerEntry,
     sig: &Signature,
 ) -> bool {
-    root_pub.verify(&entry.canonical_bytes(cluster_id), sig).is_ok()
+    root_pub
+        .verify(&entry.canonical_bytes(cluster_id), sig)
+        .is_ok()
 }
 
 /// Ed25519 公钥指纹（SHA-256；展示格式同 [`Fingerprint`]）。
@@ -894,7 +921,11 @@ fn push_frame(out: &mut Vec<u8>, rtype: u8, body: &[u8]) {
     out.extend_from_slice(body);
 }
 
-async fn send_frame<S: AsyncWrite + Unpin>(io: &mut S, rtype: u8, payload: &[u8]) -> Result<(), SessionError> {
+async fn send_frame<S: AsyncWrite + Unpin>(
+    io: &mut S,
+    rtype: u8,
+    payload: &[u8],
+) -> Result<(), SessionError> {
     if payload.len() + 1 > MAX_FRAME {
         return Err(SessionError::Protocol("frame too large"));
     }
@@ -976,7 +1007,8 @@ impl<'a> Rd<'a> {
 
 fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], okm: &mut [u8]) {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
-    hk.expand(info, okm).expect("HKDF-SHA256 output length valid");
+    hk.expand(info, okm)
+        .expect("HKDF-SHA256 output length valid");
 }
 
 /// 握手 k1 合流（ikm = x25519_ss ‖ ml_kem_ss，`Zeroizing` 包裹 Drop 清零；
@@ -1058,7 +1090,17 @@ struct I1Parts<'a> {
 }
 
 fn build_i1(p: I1Parts<'_>, rng: &mut impl rand::TryRngCore) -> Vec<u8> {
-    let I1Parts { e_pub, ml_ct, k_enc, dev_x, dev_ed, dev_sig_ctx, device, aead_list, expected_identity } = p;
+    let I1Parts {
+        e_pub,
+        ml_ct,
+        k_enc,
+        dev_x,
+        dev_ed,
+        dev_sig_ctx,
+        device,
+        aead_list,
+        expected_identity,
+    } = p;
     let mut pt = Vec::with_capacity(128);
     pt.extend_from_slice(dev_x);
     pt.extend_from_slice(dev_ed);
@@ -1114,14 +1156,21 @@ fn parse_i1(b: &[u8]) -> Result<I1Msg, SessionError> {
     aead_list.extend_from_slice(r.take(list_len)?);
     let expected_identity = r.arr32()?;
     let e_pub = r.arr32()?;
-    let ml_ct: [u8; kem::ML_KEM_CT_LEN] =
-        r.take(kem::ML_KEM_CT_LEN)?.try_into().expect("1088B");
+    let ml_ct: [u8; kem::ML_KEM_CT_LEN] = r.take(kem::ML_KEM_CT_LEN)?.try_into().expect("1088B");
     let nonce: [u8; 12] = r.take(12)?.try_into().expect("12B");
     let enc = r.rest().to_vec();
     if enc.len() != 128 + 16 {
         return Err(SessionError::Handshake("i1 payload length"));
     }
-    Ok(I1Msg { ver, aead_list, expected_identity, e_pub, ml_ct, nonce, enc })
+    Ok(I1Msg {
+        ver,
+        aead_list,
+        expected_identity,
+        e_pub,
+        ml_ct,
+        nonce,
+        enc,
+    })
 }
 
 /// I1 签名覆盖字段（§1.3.3c：全部已发字段——含两个临时份额与算法集）。
@@ -1150,7 +1199,12 @@ fn parse_r1(b: &[u8]) -> Result<R1Msg, SessionError> {
     if confirm.len() != L_CONFIRM.len() + 16 {
         return Err(SessionError::Handshake("confirm length"));
     }
-    Ok(R1Msg { chosen, eph_srv, srv_sig, confirm })
+    Ok(R1Msg {
+        chosen,
+        eph_srv,
+        srv_sig,
+        confirm,
+    })
 }
 
 fn r1_sig_context(
@@ -1175,7 +1229,14 @@ fn i1_sig_context(
     expected_identity: &[u8; 32],
     fields: I1SignedFields<'_>,
 ) -> Vec<u8> {
-    let I1SignedFields { ver, aead_list, e_pub, ml_ct, dev_x, dev_ed } = fields;
+    let I1SignedFields {
+        ver,
+        aead_list,
+        e_pub,
+        ml_ct,
+        dev_x,
+        dev_ed,
+    } = fields;
     let mut v = Vec::with_capacity(SIG_I1.len() + 1300);
     v.extend_from_slice(SIG_I1);
     v.extend_from_slice(&cluster_id.0);
@@ -1292,8 +1353,16 @@ impl Core {
                 epoch: 0,
                 epoch_start: now,
                 aead,
-                send: DirKeys { cipher: make_cipher(aead, &send_key), counter: 0, key: send_key },
-                recv: DirKeys { cipher: make_cipher(aead, &recv_key), counter: 0, key: recv_key },
+                send: DirKeys {
+                    cipher: make_cipher(aead, &send_key),
+                    counter: 0,
+                    key: send_key,
+                },
+                recv: DirKeys {
+                    cipher: make_cipher(aead, &recv_key),
+                    counter: 0,
+                    key: recv_key,
+                },
                 retained_recv: None,
                 rekey_seed: tk.rekey_seed,
                 pending: None,
@@ -1362,7 +1431,10 @@ impl Core {
             zeroize_keys_on_close(inner); // §1.3.3c：reject_after 触发即清零密钥
             return Err(SessionError::Closed(reason));
         }
-        let ct = inner.send.cipher.seal(inner.send.counter, &[rtype], payload);
+        let ct = inner
+            .send
+            .cipher
+            .seal(inner.send.counter, &[rtype], payload);
         inner.send.counter += 1;
         let mut out = Vec::with_capacity(5 + ct.len());
         push_frame(&mut out, rtype, &ct);
@@ -1477,7 +1549,11 @@ impl Core {
         payload.extend_from_slice(&epoch.to_le_bytes());
         payload.extend_from_slice(&eph.public().to_bytes());
         let frame = Core::seal_locked(cfg, inner, RT_REKEY_INIT, &payload)?;
-        inner.pending = Some(PendingRekey { eph, epoch, at: now });
+        inner.pending = Some(PendingRekey {
+            eph,
+            epoch,
+            at: now,
+        });
         Ok(frame)
     }
 
@@ -1501,7 +1577,8 @@ impl Core {
                 return Ok(None); // 我们的 INIT 胜出，弃对端的
             }
         }
-        let eph_pub = HybridPubkey::from_bytes(&eph_bytes).map_err(|_| SessionError::Protocol("rekey ek"))?;
+        let eph_pub =
+            HybridPubkey::from_bytes(&eph_bytes).map_err(|_| SessionError::Protocol("rekey ek"))?;
         let (ss, ct) = kem::encapsulate(&eph_pub, &mut rand::rngs::OsRng);
         let mut resp = Vec::with_capacity(8 + kem::HYBRID_CT_LEN);
         resp.extend_from_slice(&epoch.to_le_bytes());
@@ -1509,7 +1586,15 @@ impl Core {
         // RESP 必须用旧发送密钥封装（对端收到 RESP 才切换）。
         let frame = Core::seal_locked(&self.cfg, &mut inner, RT_REKEY_RESP, &resp)?;
         // 切换：本端为该次 rekey 的响应方。
-        self.switch_locked(&mut inner, &ss, epoch, eph_bytes, ct.to_bytes(), false, self.cfg.clock.now());
+        self.switch_locked(
+            &mut inner,
+            &ss,
+            epoch,
+            eph_bytes,
+            ct.to_bytes(),
+            false,
+            self.cfg.clock.now(),
+        );
         Ok(Some(frame))
     }
 
@@ -1526,7 +1611,15 @@ impl Core {
                 let ct = kem::HybridCt::from_bytes(&ct_bytes);
                 if let Some(ss) = kem::decapsulate(&p.eph, &ct) {
                     let eph_pub = p.eph.public().to_bytes();
-                    self.switch_locked(&mut inner, &ss, epoch, eph_pub, ct_bytes, true, self.cfg.clock.now());
+                    self.switch_locked(
+                        &mut inner,
+                        &ss,
+                        epoch,
+                        eph_pub,
+                        ct_bytes,
+                        true,
+                        self.cfg.clock.now(),
+                    );
                 }
             }
         }
@@ -1563,12 +1656,24 @@ impl Core {
 
         let aead = inner.aead;
         // initiator 发 init_key 收 resp_key；responder 发 resp_key 收 init_key。
-        let (send_key, recv_key) = if we_are_initiator { (init_key, resp_key) } else { (resp_key, init_key) };
+        let (send_key, recv_key) = if we_are_initiator {
+            (init_key, resp_key)
+        } else {
+            (resp_key, init_key)
+        };
         let old_recv = std::mem::replace(
             &mut inner.recv,
-            DirKeys { cipher: make_cipher(aead, &recv_key), counter: 0, key: recv_key },
+            DirKeys {
+                cipher: make_cipher(aead, &recv_key),
+                counter: 0,
+                key: recv_key,
+            },
         );
-        inner.send = DirKeys { cipher: make_cipher(aead, &send_key), counter: 0, key: send_key };
+        inner.send = DirKeys {
+            cipher: make_cipher(aead, &send_key),
+            counter: 0,
+            key: send_key,
+        };
         inner.retained_recv = Some(old_recv); // 在途旧记录宽限（旧 DirKeys 的 key 随其 Drop 清零）
         inner.rekey_seed = okm[64..96].try_into().expect("32B");
         inner.epoch = epoch + 1;
@@ -1685,7 +1790,9 @@ async fn write_pump<W>(
                 }
             }
         }
-        if ctrl_done && data_done { break; }
+        if ctrl_done && data_done {
+            break;
+        }
     }
     core.kill(CloseReason::SessionClosed);
 }
@@ -1785,12 +1892,12 @@ async fn read_pump<R>(
 
 /// yamux 驱动命令。
 enum MuxCmd {
-    Open { prio: Prio, resp: oneshot::Sender<io::Result<Stream>> },
+    Open {
+        prio: Prio,
+        resp: oneshot::Sender<io::Result<Stream>>,
+    },
     Shutdown,
 }
-
-
-
 
 async fn mux_driver(
     mut conn: yamux::Connection<MuxIo>,
@@ -1843,7 +1950,7 @@ async fn mux_driver(
                         Poll::Ready(Some(Ok(s))) => pending_inbound = Some(s),
                         Poll::Ready(Some(Err(e))) => {
                             eprintln!("session: mux inbound error: {e}");
-                            return Poll::Ready(true)
+                            return Poll::Ready(true);
                         }
                         Poll::Ready(None) => return Poll::Ready(true),
                         Poll::Pending => break,
@@ -1859,9 +1966,7 @@ async fn mux_driver(
                         pending_inbound = Some(s.into_inner());
                         break; // 入站通道满：背压，等消费者取走再被唤醒
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        return Poll::Ready(true)
-                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Poll::Ready(true),
                 }
             }
             Poll::Pending
@@ -1893,7 +1998,8 @@ impl Tunnel {
         futures::SinkExt::send(&mut cmd, MuxCmd::Open { prio, resp: tx })
             .await
             .map_err(|_| io::Error::other("mux: driver gone"))?;
-        rx.await.map_err(|_| io::Error::other("mux: driver dropped open"))?
+        rx.await
+            .map_err(|_| io::Error::other("mux: driver dropped open"))?
     }
 
     /// 打开 TUN 包通道（`[u16 len][ip packet]` 帧化，VPN-14）。
@@ -1943,7 +2049,9 @@ impl Tunnel {
 
 impl fmt::Debug for Tunnel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Tunnel").field("stats", &self.stats()).finish_non_exhaustive()
+        f.debug_struct("Tunnel")
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
     }
 }
 
@@ -1967,12 +2075,21 @@ where
     let wr_task = tokio::spawn(write_pump(wr, core.clone(), ctrl_rx, data_rx));
     let rd_task = tokio::spawn(read_pump(rd, core.clone(), plain_tx, ctrl_tx));
     let mux_io = MuxIo::new(plain_rx, data_tx);
-    let mode = if client { yamux::Mode::Client } else { yamux::Mode::Server };
+    let mode = if client {
+        yamux::Mode::Client
+    } else {
+        yamux::Mode::Server
+    };
     let conn = yamux::Connection::new(mux_io, yamux::Config::default(), mode);
     let (cmd_tx, cmd_rx) = futures::channel::mpsc::channel::<MuxCmd>(16);
     let mux_task = tokio::spawn(mux_driver(conn, cmd_rx, inbound_tx));
 
-    Tunnel { core, cmd_tx, inbound_rx: tokio::sync::Mutex::new(inbound_rx), tasks: vec![wr_task, rd_task, mux_task] }
+    Tunnel {
+        core,
+        cmd_tx,
+        inbound_rx: tokio::sync::Mutex::new(inbound_rx),
+        tasks: vec![wr_task, rd_task, mux_task],
+    }
 }
 
 // ============================================================================
@@ -2098,7 +2215,10 @@ impl<S> fmt::Debug for TofuBootstrap<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TofuBootstrap")
             .field("cluster_id", &self.pin.cluster_id)
-            .field("root_fingerprint", &fingerprint_ed25519(&self.pin.cluster_root_pub))
+            .field(
+                "root_fingerprint",
+                &fingerprint_ed25519(&self.pin.cluster_root_pub),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -2184,17 +2304,18 @@ where
         r.take(kem::HYBRID_PUB_LEN)?.try_into().expect("1216B");
     let static_hybrid_pub = HybridPubkey::from_bytes(&hybrid_bytes)
         .map_err(|_| SessionError::Handshake("static hybrid pubkey"))?;
-    let entry_sig = Signature::from_bytes(
-        r.take(64)?.try_into().expect("64B"),
-    );
-    let srv_sig = Signature::from_bytes(
-        r.take(64)?.try_into().expect("64B"),
-    );
+    let entry_sig = Signature::from_bytes(r.take(64)?.try_into().expect("64B"));
+    let srv_sig = Signature::from_bytes(r.take(64)?.try_into().expect("64B"));
     if !r.done() {
         return Err(SessionError::Protocol("r0 trailing bytes"));
     }
 
-    let entry = ServerEntry { server_id, relay_endpoint: endpoint, identity_pub, static_hybrid_pub };
+    let entry = ServerEntry {
+        server_id,
+        relay_endpoint: endpoint,
+        identity_pub,
+        static_hybrid_pub,
+    };
     // 入群凭证：根公钥对 ServerEntry 的签名
     if !verify_server_entry(&root_pub, &cluster_id, &entry, &entry_sig) {
         return Err(SessionError::Handshake("enrollment signature"));
@@ -2213,7 +2334,11 @@ where
         io,
         device,
         cfg,
-        pin: ServerPin { cluster_id, cluster_root_pub: root_pub, entry },
+        pin: ServerPin {
+            cluster_id,
+            cluster_root_pub: root_pub,
+            entry,
+        },
     })
 }
 
@@ -2291,10 +2416,12 @@ where
     let client_list = parse_aead_list(&msg.aead_list)?;
 
     // 混合解封
-    let ml_ct: Ciphertext<MlKem768> =
-        Ciphertext::<MlKem768>::try_from(&msg.ml_ct[..])
-            .map_err(|_| SessionError::Protocol("ml ct"))?;
-    let ml_ss = server.static_hybrid.ml_kem_decapsulation().decapsulate(&ml_ct);
+    let ml_ct: Ciphertext<MlKem768> = Ciphertext::<MlKem768>::try_from(&msg.ml_ct[..])
+        .map_err(|_| SessionError::Protocol("ml ct"))?;
+    let ml_ss = server
+        .static_hybrid
+        .ml_kem_decapsulation()
+        .decapsulate(&ml_ct);
     let x_ss = server
         .static_hybrid
         .x25519_secret()
@@ -2330,7 +2457,8 @@ where
     let dev_x: [u8; 32] = pt[..32].try_into().expect("32B");
     let dev_ed: [u8; 32] = pt[32..64].try_into().expect("32B");
     let dev_sig = Signature::from_bytes(pt[64..128].try_into().expect("64B"));
-    let dev_ed_vk = VerifyingKey::from_bytes(&dev_ed).map_err(|_| SessionError::Handshake("device ed key"))?;
+    let dev_ed_vk =
+        VerifyingKey::from_bytes(&dev_ed).map_err(|_| SessionError::Handshake("device ed key"))?;
 
     // 设备签名覆盖：I1 全部已发字段 + 协议上下文（cluster_id/期望身份=本机身份）
     let sig_ctx = i1_sig_context(
@@ -2374,7 +2502,13 @@ where
     }
     let tk = derive_traffic(&k1, ee.as_bytes(), &th, chosen);
 
-    let sig_ctx = r1_sig_context(&server.cluster_id, &dev_ed, &i1, chosen.code(), &eph_srv_pub);
+    let sig_ctx = r1_sig_context(
+        &server.cluster_id,
+        &dev_ed,
+        &i1,
+        chosen.code(),
+        &eph_srv_pub,
+    );
     let srv_sig = server.identity.sign(&sig_ctx);
 
     // 密钥确认（服务器→客户端）：confirm_s 封装固定标签，AAD = transcript
@@ -2392,7 +2526,11 @@ where
     core.lock().peer_device = Some(device_id);
     eprintln!(
         "session: server handshake ok device={device_id} form={}",
-        if via_tofu { "tofu-2rtt(I0)" } else { "pinned-1rtt(I1)" }
+        if via_tofu {
+            "tofu-2rtt(I0)"
+        } else {
+            "pinned-1rtt(I1)"
+        }
     );
     Ok(spawn_session(io, core, false))
 }
@@ -2442,7 +2580,11 @@ mod tests {
 
     #[test]
     fn record_roundtrip_all_three_aeads() {
-        for aead in [AeadChoice::Aes256Gcm, AeadChoice::XChaCha20Poly1305, AeadChoice::Aes256GcmSiv] {
+        for aead in [
+            AeadChoice::Aes256Gcm,
+            AeadChoice::XChaCha20Poly1305,
+            AeadChoice::Aes256GcmSiv,
+        ] {
             let (c, s) = paired_cores(aead, TunnelConfig::default());
             let frame = c.seal_frame(RT_DATA, b"hello tunnel").expect("seal");
             let pt = s.open_record(RT_DATA, &frame[5..]).expect("open");
@@ -2457,7 +2599,10 @@ mod tests {
         let frame = c.seal_frame(RT_DATA, b"x").expect("seal");
         let mut tampered = frame.clone();
         tampered[4] = RT_PING; // 篡改 type 字节（AAD 覆盖）
-        assert!(s.open_record(RT_PING, &tampered[5..]).is_err(), "type 进 AAD");
+        assert!(
+            s.open_record(RT_PING, &tampered[5..]).is_err(),
+            "type 进 AAD"
+        );
         assert_eq!(s.stats().forge_attempts, 1, "计入伪造");
     }
 
@@ -2480,7 +2625,10 @@ mod tests {
 
     #[test]
     fn forge_limit_kills_at_exactly_limit() {
-        let cfg = TunnelConfig { forge_limit: 100, ..TunnelConfig::default() };
+        let cfg = TunnelConfig {
+            forge_limit: 100,
+            ..TunnelConfig::default()
+        };
         let (c, s) = paired_cores(AeadChoice::Aes256Gcm, cfg);
         let _ = c;
         let mut junk = vec![0u8; 32];
@@ -2516,14 +2664,21 @@ mod tests {
         // client 触发 rekey（注入时钟越过 120s 阈值）：INIT 以旧发送密钥封装
         clock.advance(Duration::from_secs(121));
         let frames = c.timer_tick();
-        let init = frames.iter().find(|f| f[4] == RT_REKEY_INIT).expect("REKEY_INIT 发出");
+        let init = frames
+            .iter()
+            .find(|f| f[4] == RT_REKEY_INIT)
+            .expect("REKEY_INIT 发出");
         let payload = open_with(&s, RT_REKEY_INIT, &init[5..]).expect("server opens INIT");
-        let resp_frame = s.handle_rekey_init(&payload).expect("handle").expect("RESP");
+        let resp_frame = s
+            .handle_rekey_init(&payload)
+            .expect("handle")
+            .expect("RESP");
         assert_eq!(s.stats().epoch, 1, "响应方立即切换");
         assert_eq!(s.stats().rekeys, 1);
 
         // RESP 以旧发送密钥封装（本端仍持旧接收密钥可开），随后新密钥计数从 0 起
-        let resp_payload = open_with(&c, RT_REKEY_RESP, &resp_frame[5..]).expect("client opens RESP");
+        let resp_payload =
+            open_with(&c, RT_REKEY_RESP, &resp_frame[5..]).expect("client opens RESP");
         c.handle_rekey_resp(&resp_payload).expect("switch");
         assert_eq!(c.stats().epoch, 1);
         assert_eq!(c.stats().rekeys, 1);
@@ -2582,7 +2737,11 @@ mod tests {
         assert_eq!(c.stats().closed, None);
         clock.advance(Duration::from_secs(61)); // 181s：rekey 未完成
         let _ = c.timer_tick();
-        assert_eq!(c.stats().closed, Some(CloseReason::RejectAfter), "180s 硬拒绝");
+        assert_eq!(
+            c.stats().closed,
+            Some(CloseReason::RejectAfter),
+            "180s 硬拒绝"
+        );
     }
 
     #[test]
@@ -2596,7 +2755,11 @@ mod tests {
         let (c, _s) = paired_cores(AeadChoice::Aes256Gcm, cfg);
         clock.advance(Duration::from_millis(3100));
         let _ = c.timer_tick();
-        assert_eq!(c.stats().closed, Some(CloseReason::DeadLink), "3×keepalive 静默断链");
+        assert_eq!(
+            c.stats().closed,
+            Some(CloseReason::DeadLink),
+            "3×keepalive 静默断链"
+        );
     }
 
     #[test]
@@ -2622,20 +2785,35 @@ mod tests {
             "relay.example:23000",
         );
         assert!(
-            verify_server_entry(&root.verifying_key(), &ident.cluster_id, &ident.entry, &ident.entry_sig),
+            verify_server_entry(
+                &root.verifying_key(),
+                &ident.cluster_id,
+                &ident.entry,
+                &ident.entry_sig
+            ),
             "合法凭证通过"
         );
         // 篡改条目（换 relay_endpoint）
         ident.entry.relay_endpoint = "evil.example:9".into();
         assert!(
-            !verify_server_entry(&root.verifying_key(), &ident.cluster_id, &ident.entry, &ident.entry_sig),
+            !verify_server_entry(
+                &root.verifying_key(),
+                &ident.cluster_id,
+                &ident.entry,
+                &ident.entry_sig
+            ),
             "条目被篡改 ⇒ 根验签失败"
         );
         // 换根
         let other_root = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
         ident.entry.relay_endpoint = "relay.example:23000".into();
         assert!(
-            !verify_server_entry(&other_root.verifying_key(), &ident.cluster_id, &ident.entry, &ident.entry_sig),
+            !verify_server_entry(
+                &other_root.verifying_key(),
+                &ident.cluster_id,
+                &ident.entry,
+                &ident.entry_sig
+            ),
             "另一根 ⇒ 验签失败"
         );
     }
@@ -2643,7 +2821,10 @@ mod tests {
     /// BoxFuture 接缝的编译期断言（§7-M1：异步接口编译期断言）。
     #[tokio::test]
     async fn device_directory_is_async_boxfuture() {
-        fn take_boxfuture<D: DeviceDirectory>(d: &D, id: &DeviceId) -> BoxFuture<'static, LookupVerdict> {
+        fn take_boxfuture<D: DeviceDirectory>(
+            d: &D,
+            id: &DeviceId,
+        ) -> BoxFuture<'static, LookupVerdict> {
             // BoxFuture 接缝的编译期断言：lookup 必须能以 'static BoxFuture 返回（§7-M1）
             let f: BoxFuture<'static, LookupVerdict> = d.lookup(id);
             f

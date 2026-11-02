@@ -43,7 +43,10 @@ pub struct TunSpec {
 
 impl Default for TunSpec {
     fn default() -> Self {
-        TunSpec { name: "tun0".into(), mtu: MTU }
+        TunSpec {
+            name: "tun0".into(),
+            mtu: MTU,
+        }
     }
 }
 
@@ -107,7 +110,10 @@ impl TunDevice for TunRsDevice {
         #[cfg(unix)]
         dev.set_nonblocking(true)
             .map_err(|e| io::Error::other(format!("tun nonblocking: {e}")))?;
-        Ok(TunRsDevice { dev, name: spec.name.clone() })
+        Ok(TunRsDevice {
+            dev,
+            name: spec.name.clone(),
+        })
     }
 
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -132,7 +138,9 @@ impl TunDevice for TunRsDevice {
 
     fn close(&self) -> io::Result<()> {
         // tun-rs 无显式 close（fd 随 Drop 关）；置 down 即拆接口。
-        self.dev.enabled(false).map_err(|e| io::Error::other(format!("tun down: {e}")))
+        self.dev
+            .enabled(false)
+            .map_err(|e| io::Error::other(format!("tun down: {e}")))
     }
 
     fn name(&self) -> String {
@@ -159,7 +167,10 @@ pub struct MockTunDevice {
 impl MockTunDevice {
     /// 注入一个「内核发出」的包（读侧可见）。
     pub fn inject(&self, pkt: &[u8]) {
-        self.to_read.lock().expect("mock tun poisoned").push_back(pkt.to_vec());
+        self.to_read
+            .lock()
+            .expect("mock tun poisoned")
+            .push_back(pkt.to_vec());
     }
 
     /// 本机写入的全部包（写侧记录）。
@@ -199,7 +210,10 @@ impl TunDevice for MockTunDevice {
         if self.closed.load(Ordering::Relaxed) {
             return Err(io::Error::from(io::ErrorKind::NotConnected));
         }
-        self.written.lock().expect("mock tun poisoned").push(buf.to_vec());
+        self.written
+            .lock()
+            .expect("mock tun poisoned")
+            .push(buf.to_vec());
         Ok(buf.len())
     }
 
@@ -239,7 +253,9 @@ pub struct TunIo {
 
 impl std::fmt::Debug for TunIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TunIo").field("name", &self.name).finish_non_exhaustive()
+        f.debug_struct("TunIo")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
     }
 }
 
@@ -322,7 +338,11 @@ impl TunIo {
                 })
                 .expect("spawn tun-write");
         }
-        TunSession { rx: read_rx, tx: write_tx, stop: session_stop }
+        TunSession {
+            rx: read_rx,
+            tx: write_tx,
+            stop: session_stop,
+        }
     }
 
     /// 全局停机：关设备（读/写泵随设备报错退出；进程退出路径）。
@@ -354,7 +374,11 @@ mod tests {
 
     #[test]
     fn mock_open_read_write_close_semantics() {
-        let dev = MockTunDevice::open(&TunSpec { name: "tun0".into(), mtu: MTU }).unwrap();
+        let dev = MockTunDevice::open(&TunSpec {
+            name: "tun0".into(),
+            mtu: MTU,
+        })
+        .unwrap();
         let mut buf = [0u8; 2048];
         // 读空队列 ⇒ WouldBlock（对齐 Linux 非阻塞语义）。
         assert_eq!(

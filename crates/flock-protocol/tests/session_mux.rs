@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use flock_protocol::mux::Prio;
 use flock_protocol::session::{
-    fingerprint_ed25519, initiate, initiate_tofu, respond, AeadChoice, AeadPreference, ClusterId,
-    CloseReason, DeviceId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory,
-    ManualClock, ServerIdentity, ServerId, ServerPin, SessionError, Tunnel, TunnelConfig,
-    RT_DATA, RT_I0, RT_I1, RT_R1, RT_REKEY_RESP,
+    fingerprint_ed25519, initiate, initiate_tofu, respond, AeadChoice, AeadPreference, CloseReason,
+    ClusterId, DeviceId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, ManualClock, ServerId,
+    ServerIdentity, ServerPin, SessionError, Tunnel, TunnelConfig, RT_DATA, RT_I0, RT_I1, RT_R1,
+    RT_REKEY_RESP,
 };
 use flock_protocol::{ed25519_dalek, rand};
 
@@ -38,9 +38,17 @@ struct Fix {
 fn fixture() -> Fix {
     let root = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
     let cluster = ClusterId(rand::random());
-    let server =
-        ServerIdentity::enroll(&root, cluster, ServerId(rand::random()), "relay.example:23000");
-    Fix { root, cluster, server }
+    let server = ServerIdentity::enroll(
+        &root,
+        cluster,
+        ServerId(rand::random()),
+        "relay.example:23000",
+    );
+    Fix {
+        root,
+        cluster,
+        server,
+    }
 }
 
 fn register(dir: &mut InMemoryDirectory, device: &DeviceStaticKeys) {
@@ -67,10 +75,7 @@ async fn session_pair() -> (Tunnel, Tunnel) {
     session_pair_cfg(TunnelConfig::default(), TunnelConfig::default()).await
 }
 
-async fn session_pair_cfg(
-    client_cfg: TunnelConfig,
-    server_cfg: TunnelConfig,
-) -> (Tunnel, Tunnel) {
+async fn session_pair_cfg(client_cfg: TunnelConfig, server_cfg: TunnelConfig) -> (Tunnel, Tunnel) {
     let fix = fixture();
     let device = DeviceStaticKeys::generate();
     let mut dir = InMemoryDirectory::new();
@@ -80,16 +85,22 @@ async fn session_pair_cfg(
     let pin = pin_of(&fix);
     let server = fix.server;
     let srv = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), respond(b, &server, dir, server_cfg))
-            .await
-            .expect("respond timeout")
-            .expect("respond")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            respond(b, &server, dir, server_cfg),
+        )
+        .await
+        .expect("respond timeout")
+        .expect("respond")
     });
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(a, &device, &pin, client_cfg))
-            .await
-            .expect("initiate timeout")
-            .expect("initiate")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(a, &device, &pin, client_cfg),
+        )
+        .await
+        .expect("initiate timeout")
+        .expect("initiate")
     });
     (cli.await.expect("cli task"), srv.await.expect("srv task"))
 }
@@ -156,9 +167,16 @@ async fn pinned_1rtt_handshake_and_stream_echo() {
     let st = client.stats();
     assert_eq!(st.epoch, 0);
     assert!(st.closed.is_none());
-    assert!(st.sent_records <= 2, "yamux 引导帧之外无多余记录: {}", st.sent_records);
+    assert!(
+        st.sent_records <= 2,
+        "yamux 引导帧之外无多余记录: {}",
+        st.sent_records
+    );
     assert!(client.stats().closed.is_none());
-    assert!(client.peer_server_id().is_some(), "客户端可索引对端服务器（漫游模型）");
+    assert!(
+        client.peer_server_id().is_some(),
+        "客户端可索引对端服务器（漫游模型）"
+    );
     assert!(server.peer_device_id().is_some());
 
     let mut cs = client.open_stream(Prio::Normal).await.expect("open_stream");
@@ -196,20 +214,27 @@ async fn pinned_handshake_over_tcp_pair() {
     let mut dir = InMemoryDirectory::new();
     register(&mut dir, &device);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let pin = pin_of(&fix);
     let server = fix.server;
     let srv = tokio::spawn(async move {
         let (sock, _) = listener.accept().await.expect("accept");
-        respond(sock, &server, dir, TunnelConfig::default()).await.expect("respond")
+        respond(sock, &server, dir, TunnelConfig::default())
+            .await
+            .expect("respond")
     });
     let cli = tokio::spawn(async move {
         let sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        tokio::time::timeout(Duration::from_secs(10), initiate(sock, &device, &pin, TunnelConfig::default()))
-            .await
-            .expect("timeout")
-            .expect("initiate")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(sock, &device, &pin, TunnelConfig::default()),
+        )
+        .await
+        .expect("timeout")
+        .expect("initiate")
     });
     let (client, server) = (cli.await.expect("cli"), srv.await.expect("srv"));
 
@@ -273,8 +298,14 @@ async fn multiple_streams_and_prio_passthrough() {
     // yamux SYN 惰性（首帧携带）：先写再 accept
     s1.write_all(b"one").await.expect("w1");
     s2.write_all(b"two").await.expect("w2");
-    let mut a1 = tokio::time::timeout(Duration::from_secs(5), server.accept_stream()).await.expect("t").expect("a1");
-    let mut a2 = tokio::time::timeout(Duration::from_secs(5), server.accept_stream()).await.expect("t").expect("a2");
+    let mut a1 = tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
+        .await
+        .expect("t")
+        .expect("a1");
+    let mut a2 = tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
+        .await
+        .expect("t")
+        .expect("a2");
     let mut m = [0u8; 3];
     a2.read_exact(&mut m).await.expect("r2");
     assert_eq!(&m, b"two");
@@ -314,14 +345,19 @@ async fn uks_wrong_server_identity_rejected() {
     register(&mut dir, &device);
 
     let (a, b) = duplex_pair();
-    let srv = tokio::spawn(async move { respond(b, &server_b, dir, TunnelConfig::default()).await });
+    let srv =
+        tokio::spawn(async move { respond(b, &server_b, dir, TunnelConfig::default()).await });
     let pin_a = ServerPin {
         cluster_id: cluster,
         cluster_root_pub: root.verifying_key(),
         entry: server_a.entry.clone(),
     };
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(a, &device, &pin_a, TunnelConfig::default())).await
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(a, &device, &pin_a, TunnelConfig::default()),
+        )
+        .await
     });
     let srv_err = srv.await.expect("task").expect_err("respond 必拒");
     let _ = cli.await.expect("cli task").expect("timeout");
@@ -353,7 +389,11 @@ async fn uks_tampered_cluster_context_rejected() {
     let mut pin = pin;
     pin.cluster_id = ClusterId(rand::random()); // ← 篡改上下文
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(a, &device, &pin, TunnelConfig::default())).await
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(a, &device, &pin, TunnelConfig::default()),
+        )
+        .await
     });
     let srv_err = srv.await.expect("task").expect_err("必拒");
     let _ = cli.await.expect("cli task").expect("timeout");
@@ -377,20 +417,28 @@ async fn pinned_i1_tamper_rejected_by_aad() {
     let pin = pin_of(&fix);
     let server = fix.server;
     let srv = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), respond(server_io, &server, dir, TunnelConfig::default()))
-            .await
-            .expect("timeout")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            respond(server_io, &server, dir, TunnelConfig::default()),
+        )
+        .await
+        .expect("timeout")
     });
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(client_io, &device, &pin, TunnelConfig::default()))
-            .await
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(client_io, &device, &pin, TunnelConfig::default()),
+        )
+        .await
     });
     // 代理：读 I1（断言形态），翻转 ml_ct 首字节转发
     let (t, mut body) = read_frame(&mut p_client).await.expect("first frame");
     assert_eq!(t, RT_I1, "已钉扎形态首帧必为 I1（1-RTT 佐证）");
     assert!(body.len() > 70);
     body[69] ^= 0xFF; // ml_kem_ct 区首字节（AAD 覆盖字段）
-    write_frame(&mut p_server, RT_I1, &body).await.expect("forward tampered");
+    write_frame(&mut p_server, RT_I1, &body)
+        .await
+        .expect("forward tampered");
     // 双向后续吞掉（各读各的，丢弃即可）
     {
         let (mut cr, _) = tokio::io::split(p_client);
@@ -440,14 +488,27 @@ async fn directory_three_states() {
     let pin = pin_of(&fix);
     let server = fix.server;
     let srv = tokio::spawn(async move {
-        respond(b, &server, InMemoryDirectory::new(), TunnelConfig::default()).await
+        respond(
+            b,
+            &server,
+            InMemoryDirectory::new(),
+            TunnelConfig::default(),
+        )
+        .await
     });
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(a, &device, &pin, TunnelConfig::default())).await
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(a, &device, &pin, TunnelConfig::default()),
+        )
+        .await
     });
     let not_found = srv.await.expect("task").expect_err("NotFound 必拒");
     let _ = cli.await.expect("cli").expect("timeout");
-    assert!(matches!(not_found, SessionError::DeviceRejected), "NotFound ⇒ {not_found:?}");
+    assert!(
+        matches!(not_found, SessionError::DeviceRejected),
+        "NotFound ⇒ {not_found:?}"
+    );
 
     // Revoked（与 NotFound 同一错误变体——时序对齐/防枚举）
     let fix = fixture();
@@ -460,11 +521,18 @@ async fn directory_three_states() {
     let server = fix.server;
     let srv = tokio::spawn(async move { respond(b, &server, dir, TunnelConfig::default()).await });
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(a, &device, &pin, TunnelConfig::default())).await
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(a, &device, &pin, TunnelConfig::default()),
+        )
+        .await
     });
     let revoked = srv.await.expect("task").expect_err("Revoked 必拒");
     let _ = cli.await.expect("cli").expect("timeout");
-    assert!(matches!(revoked, SessionError::DeviceRejected), "Revoked ⇒ {revoked:?}");
+    assert!(
+        matches!(revoked, SessionError::DeviceRejected),
+        "Revoked ⇒ {revoked:?}"
+    );
     assert_eq!(
         std::mem::discriminant(&not_found),
         std::mem::discriminant(&revoked),
@@ -485,11 +553,18 @@ async fn directory_three_states() {
     let server = fix.server;
     let srv = tokio::spawn(async move { respond(b, &server, dir, TunnelConfig::default()).await });
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(a, &device, &pin, TunnelConfig::default())).await
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(a, &device, &pin, TunnelConfig::default()),
+        )
+        .await
     });
     let mismatch = srv.await.expect("task").expect_err("失配必拒");
     let _ = cli.await.expect("cli").expect("timeout");
-    assert!(matches!(mismatch, SessionError::DeviceRejected), "公钥失配 ⇒ {mismatch:?}");
+    assert!(
+        matches!(mismatch, SessionError::DeviceRejected),
+        "公钥失配 ⇒ {mismatch:?}"
+    );
 
     // Active：正常路径
     let (_c, _s) = session_pair().await;
@@ -507,7 +582,10 @@ async fn aead_negotiation_intersection_and_failure() {
     assert_eq!(server.stats().aead, AeadChoice::XChaCha20Poly1305);
     let mut cs = client.open_stream(Prio::Normal).await.expect("open");
     cs.write_all(b"xchacha").await.expect("w");
-    let mut ss = tokio::time::timeout(Duration::from_secs(5), server.accept_stream()).await.expect("t").expect("s");
+    let mut ss = tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
+        .await
+        .expect("t")
+        .expect("s");
     let mut buf = [0u8; 7];
     ss.read_exact(&mut buf).await.expect("r");
     assert_eq!(&buf, b"xchacha");
@@ -536,7 +614,10 @@ async fn aead_negotiation_intersection_and_failure() {
     });
     let err = srv.await.expect("task").expect_err("无交集必拒");
     let _ = cli.await.expect("cli").expect("timeout");
-    assert!(matches!(err, SessionError::AeadMismatch), "无交集 ⇒ {err:?}");
+    assert!(
+        matches!(err, SessionError::AeadMismatch),
+        "无交集 ⇒ {err:?}"
+    );
 }
 
 // ============================================================================
@@ -555,20 +636,31 @@ async fn tofu_happy_path_i0_r0_i1_r1() {
     let server = fix.server;
     let srv = tokio::spawn(async move { respond(b, &server, dir, TunnelConfig::default()).await });
 
-    let boot = tokio::time::timeout(Duration::from_secs(10), initiate_tofu(a, device, TunnelConfig::default()))
-        .await
-        .expect("timeout")
-        .expect("bootstrap");
+    let boot = tokio::time::timeout(
+        Duration::from_secs(10),
+        initiate_tofu(a, device, TunnelConfig::default()),
+    )
+    .await
+    .expect("timeout")
+    .expect("bootstrap");
     // 根指纹展示（用户确认 UI 的数据源）与集群/条目材料
-    assert_eq!(boot.root_fingerprint(), fingerprint_ed25519(&fix.root.verifying_key()));
+    assert_eq!(
+        boot.root_fingerprint(),
+        fingerprint_ed25519(&fix.root.verifying_key())
+    );
     assert_eq!(boot.cluster_id(), fix.cluster);
     assert_eq!(boot.server_entry().server_id, expected_sid);
 
-    let (client, server_tunnel) =
-        (boot.confirm().await.expect("confirm"), srv.await.expect("srv").expect("respond"));
+    let (client, server_tunnel) = (
+        boot.confirm().await.expect("confirm"),
+        srv.await.expect("srv").expect("respond"),
+    );
     let mut cs = client.open_stream(Prio::Normal).await.expect("open");
     cs.write_all(b"tofu ok").await.expect("w");
-    let mut ss = tokio::time::timeout(Duration::from_secs(5), server_tunnel.accept_stream()).await.expect("t").expect("s");
+    let mut ss = tokio::time::timeout(Duration::from_secs(5), server_tunnel.accept_stream())
+        .await
+        .expect("t")
+        .expect("s");
     let mut buf = [0u8; 7];
     ss.read_exact(&mut buf).await.expect("r");
     assert_eq!(&buf, b"tofu ok");
@@ -590,10 +682,13 @@ async fn tofu_rejects_forged_enrollment_chain() {
     tokio::spawn(async move {
         let _ = respond(b, &bad, InMemoryDirectory::new(), TunnelConfig::default()).await;
     });
-    let err = tokio::time::timeout(Duration::from_secs(10), initiate_tofu(a, device, TunnelConfig::default()))
-        .await
-        .expect("timeout")
-        .expect_err("伪造凭证必拒");
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        initiate_tofu(a, device, TunnelConfig::default()),
+    )
+    .await
+    .expect("timeout")
+    .expect_err("伪造凭证必拒");
     assert!(
         matches!(&err, SessionError::Handshake(s) if s.contains("enrollment signature")),
         "伪造入群凭证 ⇒ {err:?}"
@@ -608,10 +703,13 @@ async fn tofu_rejects_forged_enrollment_chain() {
     tokio::spawn(async move {
         let _ = respond(b, &bad2, InMemoryDirectory::new(), TunnelConfig::default()).await;
     });
-    let err = tokio::time::timeout(Duration::from_secs(10), initiate_tofu(a, device, TunnelConfig::default()))
-        .await
-        .expect("timeout")
-        .expect_err("伪造 R0 签名必拒");
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        initiate_tofu(a, device, TunnelConfig::default()),
+    )
+    .await
+    .expect("timeout")
+    .expect_err("伪造 R0 签名必拒");
     assert!(
         matches!(&err, SessionError::Handshake(s) if s.contains("server identity signature")),
         "伪造 R0 身份签名 ⇒ {err:?}"
@@ -626,7 +724,9 @@ async fn tofu_state_machine_rejects_out_of_order() {
     tokio::spawn(async move {
         let (t, _i0) = read_frame(&mut fake).await.expect("read I0");
         assert_eq!(t, RT_I0, "TOFU 首帧必为 I0");
-        write_frame(&mut fake, RT_R1, &[0u8; 8]).await.expect("write R1");
+        write_frame(&mut fake, RT_R1, &[0u8; 8])
+            .await
+            .expect("write R1");
         let mut buf = [0u8; 512];
         loop {
             match fake.read(&mut buf).await {
@@ -635,10 +735,13 @@ async fn tofu_state_machine_rejects_out_of_order() {
             }
         }
     });
-    let err = tokio::time::timeout(Duration::from_secs(10), initiate_tofu(a, device, TunnelConfig::default()))
-        .await
-        .expect("timeout")
-        .expect_err("TOFU 首步非 R0 必拒");
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        initiate_tofu(a, device, TunnelConfig::default()),
+    )
+    .await
+    .expect("timeout")
+    .expect_err("TOFU 首步非 R0 必拒");
     assert!(
         matches!(err, SessionError::UnexpectedMessage(t) if t == RT_R1),
         "TOFU 状态机错序拒 ⇒ {err:?}"
@@ -649,9 +752,17 @@ async fn tofu_state_machine_rejects_out_of_order() {
     let (mut c, b) = duplex_pair();
     let srv = tokio::spawn(async move {
         let server = fix.server;
-        respond(b, &server, InMemoryDirectory::new(), TunnelConfig::default()).await
+        respond(
+            b,
+            &server,
+            InMemoryDirectory::new(),
+            TunnelConfig::default(),
+        )
+        .await
     });
-    write_frame(&mut c, RT_DATA, &[0u8; 32]).await.expect("write DATA");
+    write_frame(&mut c, RT_DATA, &[0u8; 32])
+        .await
+        .expect("write DATA");
     let err = srv.await.expect("task").expect_err("非握手首帧必拒");
     assert!(
         matches!(err, SessionError::UnexpectedMessage(t) if t == RT_DATA),
@@ -688,14 +799,23 @@ async fn clock_injection_rekey_both_sides() {
     assert_eq!(client.stats().epoch, 0, "119s 不触发 rekey");
 
     clock.advance(Duration::from_secs(2));
-    wait_until("双侧 epoch → 1", || client.stats().epoch == 1 && server.stats().epoch == 1).await;
+    wait_until("双侧 epoch → 1", || {
+        client.stats().epoch == 1 && server.stats().epoch == 1
+    })
+    .await;
     assert_eq!(client.stats().rekeys, 1);
     assert_eq!(server.stats().rekeys, 1);
 
     // rekey 后数据照常（计数器随新密钥重置）
-    let mut cs = client.open_stream(Prio::Normal).await.expect("open after rekey");
+    let mut cs = client
+        .open_stream(Prio::Normal)
+        .await
+        .expect("open after rekey");
     cs.write_all(b"post-rekey").await.expect("w");
-    let mut ss = tokio::time::timeout(Duration::from_secs(5), server.accept_stream()).await.expect("t").expect("s");
+    let mut ss = tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
+        .await
+        .expect("t")
+        .expect("s");
     let mut buf = [0u8; 10];
     ss.read_exact(&mut buf).await.expect("r");
     assert_eq!(&buf, b"post-rekey");
@@ -728,13 +848,18 @@ async fn clock_injection_hard_reject_180s() {
     let pin = pin_of(&fix);
     let server = fix.server;
     let srv = tokio::spawn(async move {
-        respond(server_io, &server, dir, TunnelConfig::default()).await.expect("respond")
+        respond(server_io, &server, dir, TunnelConfig::default())
+            .await
+            .expect("respond")
     });
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(client_io, &device, &pin, c_cfg))
-            .await
-            .expect("timeout")
-            .expect("initiate")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(client_io, &device, &pin, c_cfg),
+        )
+        .await
+        .expect("timeout")
+        .expect("initiate")
     });
     let client = cli.await.expect("cli task");
 
@@ -775,13 +900,18 @@ async fn keepalive_deadlink_detection() {
     let pin = pin_of(&fix);
     let server = fix.server;
     let srv = tokio::spawn(async move {
-        respond(server_io, &server, dir, TunnelConfig::default()).await.expect("respond")
+        respond(server_io, &server, dir, TunnelConfig::default())
+            .await
+            .expect("respond")
     });
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(client_io, &device, &pin, c_cfg))
-            .await
-            .expect("timeout")
-            .expect("initiate")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(client_io, &device, &pin, c_cfg),
+        )
+        .await
+        .expect("timeout")
+        .expect("initiate")
     });
     let client = cli.await.expect("cli");
 
@@ -846,16 +976,22 @@ async fn forge_session(garbage_n: u32) -> (Tunnel, Tunnel) {
     let pin = pin_of(&fix);
     let server = fix.server;
     let srv = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), respond(server_io, &server, dir, TunnelConfig::default()))
-            .await
-            .expect("timeout")
-            .expect("respond")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            respond(server_io, &server, dir, TunnelConfig::default()),
+        )
+        .await
+        .expect("timeout")
+        .expect("respond")
     });
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(client_io, &device, &pin, TunnelConfig::default()))
-            .await
-            .expect("timeout")
-            .expect("initiate")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(client_io, &device, &pin, TunnelConfig::default()),
+        )
+        .await
+        .expect("timeout")
+        .expect("initiate")
     });
     (cli.await.expect("cli"), srv.await.expect("srv"))
 }
@@ -879,7 +1015,10 @@ async fn forged_records_below_limit_keep_link() {
     assert_eq!(server.stats().closed, None, "99 次不断链");
     let mut cs = client.open_stream(Prio::Normal).await.expect("open");
     cs.write_all(b"alive").await.expect("w");
-    let mut ss = tokio::time::timeout(Duration::from_secs(5), server.accept_stream()).await.expect("t").expect("s");
+    let mut ss = tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
+        .await
+        .expect("t")
+        .expect("s");
     let mut buf = [0u8; 5];
     ss.read_exact(&mut buf).await.expect("r");
     assert_eq!(&buf, b"alive");
@@ -934,23 +1073,34 @@ async fn replayed_record_rejected_and_counted() {
     let pin = pin_of(&fix);
     let server = fix.server;
     let srv = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), respond(server_io, &server, dir, TunnelConfig::default()))
-            .await
-            .expect("timeout")
-            .expect("respond")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            respond(server_io, &server, dir, TunnelConfig::default()),
+        )
+        .await
+        .expect("timeout")
+        .expect("respond")
     });
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), initiate(client_io, &device, &pin, TunnelConfig::default()))
-            .await
-            .expect("timeout")
-            .expect("initiate")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            initiate(client_io, &device, &pin, TunnelConfig::default()),
+        )
+        .await
+        .expect("timeout")
+        .expect("initiate")
     });
     let (client, server) = (cli.await.expect("cli"), srv.await.expect("srv"));
 
     // 客户端发流数据（其首条记录被 proxy 重放）
     let mut cs = client.open_stream(Prio::Normal).await.expect("open");
-    cs.write_all(b"payload-under-replay-probe").await.expect("w");
-    let mut ss = tokio::time::timeout(Duration::from_secs(5), server.accept_stream()).await.expect("t").expect("s");
+    cs.write_all(b"payload-under-replay-probe")
+        .await
+        .expect("w");
+    let mut ss = tokio::time::timeout(Duration::from_secs(5), server.accept_stream())
+        .await
+        .expect("t")
+        .expect("s");
     let mut buf = [0u8; 26];
     ss.read_exact(&mut buf).await.expect("r");
     assert_eq!(&buf, b"payload-under-replay-probe");
@@ -974,7 +1124,6 @@ async fn replayed_record_rejected_and_counted() {
 // ============================================================================
 // 服务端目录接缝的异步性（BoxFuture，§7-M1）
 // ============================================================================
-
 
 // ============================================================================
 // rekey 切换竞态回归向量（blocking 复核修复）
@@ -1046,7 +1195,11 @@ async fn bulk_send(mut s: flock_protocol::mux::Stream, total: usize, chunk: usiz
 }
 
 /// 收全 `total` 个 chunk：返回（收到字节数, 序号全覆盖）。
-async fn bulk_recv(mut s: flock_protocol::mux::Stream, total: usize, chunk: usize) -> (usize, bool) {
+async fn bulk_recv(
+    mut s: flock_protocol::mux::Stream,
+    total: usize,
+    chunk: usize,
+) -> (usize, bool) {
     let mut seen = vec![false; total];
     let mut bytes = 0usize;
     for _ in 0..total {
@@ -1092,17 +1245,23 @@ async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
     let server = fix.server;
     let s_cfg = mk_cfg();
     let srv = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(30), respond(server_io, &server, dir, s_cfg))
-            .await
-            .expect("respond timeout")
-            .expect("respond")
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            respond(server_io, &server, dir, s_cfg),
+        )
+        .await
+        .expect("respond timeout")
+        .expect("respond")
     });
     let c_cfg = mk_cfg();
     let cli = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(30), initiate(client_io, &device, &pin, c_cfg))
-            .await
-            .expect("initiate timeout")
-            .expect("initiate")
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            initiate(client_io, &device, &pin, c_cfg),
+        )
+        .await
+        .expect("initiate timeout")
+        .expect("initiate")
     });
     let client = cli.await.expect("cli");
     let server = srv.await.expect("srv");
@@ -1114,23 +1273,36 @@ async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
     // 双向大流量写入（后台），中途触发 rekey
     let w1 = tokio::spawn(bulk_send(cs, BULK_CHUNKS, BULK_CHUNK_LEN));
     let w2 = tokio::spawn(bulk_send(ss2, BULK_CHUNKS, BULK_CHUNK_LEN));
-    let ss = tokio::time::timeout(Duration::from_secs(10), server.accept_stream()).await.expect("t").expect("s stream");
-    let cs2 = tokio::time::timeout(Duration::from_secs(10), client.accept_stream()).await.expect("t2").expect("c stream2");
+    let ss = tokio::time::timeout(Duration::from_secs(10), server.accept_stream())
+        .await
+        .expect("t")
+        .expect("s stream");
+    let cs2 = tokio::time::timeout(Duration::from_secs(10), client.accept_stream())
+        .await
+        .expect("t2")
+        .expect("c stream2");
     tokio::time::sleep(Duration::from_millis(300)).await; // 流量进行中
     clock.advance(Duration::from_secs(121)); // 触发 rekey（RESP 批到达竞态窗口）
     let (r1_bytes, r1_full) = tokio::time::timeout(
         Duration::from_secs(30),
         bulk_recv(ss, BULK_CHUNKS, BULK_CHUNK_LEN),
-    ).await.expect("recv c→s timeout");
+    )
+    .await
+    .expect("recv c→s timeout");
     let (r2_bytes, r2_full) = tokio::time::timeout(
         Duration::from_secs(30),
         bulk_recv(cs2, BULK_CHUNKS, BULK_CHUNK_LEN),
-    ).await.expect("recv s→c timeout");
+    )
+    .await
+    .expect("recv s→c timeout");
     w1.await.expect("w1");
     w2.await.expect("w2");
 
     // rekey 完成 + 竞态断言：零伪造、零重放误判、双向零丢失
-    wait_until("双侧 epoch → 1", || client.stats().epoch == 1 && server.stats().epoch == 1).await;
+    wait_until("双侧 epoch → 1", || {
+        client.stats().epoch == 1 && server.stats().epoch == 1
+    })
+    .await;
     let cst = client.stats();
     let sst = server.stats();
     assert_eq!(cst.forge_attempts, 0, "客户端零伪造（RESP 批到达不得误判）");
@@ -1138,14 +1310,17 @@ async fn rekey_resp_batched_with_new_epoch_records_no_loss() {
     assert_eq!(cst.replay_rejected, 0);
     assert_eq!(sst.replay_rejected, 0);
     assert!(cst.closed.is_none() && sst.closed.is_none(), "会话存活");
-    assert_eq!(r1_bytes, BULK_CHUNKS * BULK_CHUNK_LEN, "c→s 全量到达（无静默丢弃）");
+    assert_eq!(
+        r1_bytes,
+        BULK_CHUNKS * BULK_CHUNK_LEN,
+        "c→s 全量到达（无静默丢弃）"
+    );
     assert_eq!(r2_bytes, BULK_CHUNKS * BULK_CHUNK_LEN, "s→c 全量到达");
     assert!(r1_full && r2_full, "序号全覆盖（无乱序/丢失）");
 
     client.shutdown().await;
     server.shutdown().await;
 }
-
 
 // ============================================================================
 // M5 A8：单隧道 100 并发 yamux 流持续 60s 无错（R11——单隧道多会话复用的承载上限）

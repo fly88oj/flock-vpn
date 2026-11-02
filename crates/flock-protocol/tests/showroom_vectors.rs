@@ -33,7 +33,13 @@ fn showroom_sig_vector_byte_exact() {
     assert_eq!(k.pub_string(), SIG_PUB);
     // 签名逐字节复现（确定性 Ed25519：dalek 2.2 与 3.0 输出必须完全相同）
     let auth = sig::sign_prehashed(
-        "alice", &k, "POST", "/_api/publish?project=demo", SIG_BODY_SHA, SIG_TS, "cafe0011beef2233",
+        "alice",
+        &k,
+        "POST",
+        "/_api/publish?project=demo",
+        SIG_BODY_SHA,
+        SIG_TS,
+        "cafe0011beef2233",
     );
     assert_eq!(auth, SIG_AUTH, "SR-SIG1 线上格式跨代际逐字节不变（§1.3.2）");
     // 哈希与流式哈希一致（自洽样本，非互通面）
@@ -44,18 +50,49 @@ fn showroom_sig_vector_byte_exact() {
     );
     // showroom 生成的签名在本 crate 验签通过（含 ±300s 窗边界）
     let vk = [sig::UserKey::from_pub_string(SIG_PUB).unwrap()];
-    let v = sig::verify_with_hash(SIG_AUTH, &vk, "POST", "/_api/publish?project=demo", SIG_BODY_SHA, SIG_TS)
-        .expect("showroom 签名必须验过");
-    assert_eq!((v.user.as_str(), v.ts, v.nonce.as_str()), ("alice", SIG_TS, "cafe0011beef2233"));
-    assert!(sig::verify_with_hash(SIG_AUTH, &vk, "POST", "/_api/publish?project=demo", SIG_BODY_SHA, SIG_TS + 300).is_ok());
+    let v = sig::verify_with_hash(
+        SIG_AUTH,
+        &vk,
+        "POST",
+        "/_api/publish?project=demo",
+        SIG_BODY_SHA,
+        SIG_TS,
+    )
+    .expect("showroom 签名必须验过");
     assert_eq!(
-        sig::verify_with_hash(SIG_AUTH, &vk, "POST", "/_api/publish?project=demo", SIG_BODY_SHA, SIG_TS + 301),
+        (v.user.as_str(), v.ts, v.nonce.as_str()),
+        ("alice", SIG_TS, "cafe0011beef2233")
+    );
+    assert!(sig::verify_with_hash(
+        SIG_AUTH,
+        &vk,
+        "POST",
+        "/_api/publish?project=demo",
+        SIG_BODY_SHA,
+        SIG_TS + 300
+    )
+    .is_ok());
+    assert_eq!(
+        sig::verify_with_hash(
+            SIG_AUTH,
+            &vk,
+            "POST",
+            "/_api/publish?project=demo",
+            SIG_BODY_SHA,
+            SIG_TS + 301
+        ),
         Err(sig::AuthError::Stale)
     );
     // 篡改 body 哈希 ⇒ 拒（原 showroom_interop 的独有断言，合并于此）
     assert_eq!(
-        sig::verify_with_hash(SIG_AUTH, &vk, "POST", "/_api/publish?project=demo",
-            "0000000000000000000000000000000000000000000000000000000000000000", SIG_TS),
+        sig::verify_with_hash(
+            SIG_AUTH,
+            &vk,
+            "POST",
+            "/_api/publish?project=demo",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            SIG_TS
+        ),
         Err(sig::AuthError::BadSignature)
     );
 }
@@ -131,10 +168,14 @@ ooKPGHxyjAFTeBZV53nIF1E=
         let sealed = hex::decode(SEALED_A_HEX).unwrap();
         // 长度不变量（P0-1 兼容档守门）：384 + n + ceil(n/4MiB)×(12+16)
         let n = 1000usize;
-        assert_eq!(sealed.len(), WRAP_LEN + n + n.div_ceil(SEG) * (NONCE_LEN + TAG_LEN));
+        assert_eq!(
+            sealed.len(),
+            WRAP_LEN + n + n.div_ceil(SEG) * (NONCE_LEN + TAG_LEN)
+        );
         assert_eq!(sealed.len(), 1412);
         let mut out = Vec::new();
-        let m = open_v1_legacy(&sk, Cursor::new(sealed.as_slice()), &mut out).expect("showroom seal 产物必须被解开");
+        let m = open_v1_legacy(&sk, Cursor::new(sealed.as_slice()), &mut out)
+            .expect("showroom seal 产物必须被解开");
         assert_eq!(m as usize, n);
         assert_eq!(out, plain_a());
     }
@@ -167,10 +208,7 @@ ooKPGHxyjAFTeBZV53nIF1E=
     //     布局与 showroom-common seal 逐字节同构；单段互通已由上面的真实产物向量守门）————
 
     /// 测试专用 v1 封装镜像（showroom-common lib.rs:378-412 同构；仅测试内使用）。
-    fn seal_v1_mirror(
-        pub_key: &rsa::RsaPublicKey,
-        plain: &[u8],
-    ) -> Vec<u8> {
+    fn seal_v1_mirror(pub_key: &rsa::RsaPublicKey, plain: &[u8]) -> Vec<u8> {
         use aes_gcm::aead::inout::InOutBuf;
         use aes_gcm::aead::{AeadInOut, KeyInit};
         use aes_gcm::Aes256Gcm;
@@ -195,7 +233,9 @@ ooKPGHxyjAFTeBZV53nIF1E=
             let mut buf = chunk.to_vec();
             let tag = cipher
                 .encrypt_inout_detached(
-                    &aes_gcm::Nonce::<<Aes256Gcm as aes_gcm::aead::AeadCore>::NonceSize>::from(nonce),
+                    &aes_gcm::Nonce::<<Aes256Gcm as aes_gcm::aead::AeadCore>::NonceSize>::from(
+                        nonce,
+                    ),
                     b"",
                     InOutBuf::from(&mut buf[..]),
                 )
@@ -216,7 +256,11 @@ ooKPGHxyjAFTeBZV53nIF1E=
             let sealed = seal_v1_mirror(&pub_key, &plain);
             let segs = len.div_ceil(SEG);
             // v1 长度不变量：384 + n + ceil(n/4MiB)×(12+16)
-            assert_eq!(sealed.len(), WRAP_LEN + len + segs * (NONCE_LEN + TAG_LEN), "len={len}");
+            assert_eq!(
+                sealed.len(),
+                WRAP_LEN + len + segs * (NONCE_LEN + TAG_LEN),
+                "len={len}"
+            );
             let mut out = Vec::new();
             let m = open_v1_legacy(&sk, Cursor::new(sealed.as_slice()), &mut out)
                 .unwrap_or_else(|e| panic!("len={len}: {e}"));

@@ -51,7 +51,10 @@ mod tests {
         let p = dir.path().join("client.toml");
         std::fs::write(
             &p,
-            format!("state_dir = {:?}\n", dir.path().join("state").to_str().unwrap()),
+            format!(
+                "state_dir = {:?}\n",
+                dir.path().join("state").to_str().unwrap()
+            ),
         )
         .unwrap();
         let cfg = ClientConfig::load(&p).unwrap();

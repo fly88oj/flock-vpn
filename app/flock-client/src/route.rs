@@ -34,7 +34,11 @@ pub struct RoutePlan {
 impl RoutePlan {
     /// 按缺省池构造。
     pub fn new(ifname: &str, local_vip: Ipv4Addr) -> Self {
-        RoutePlan { ifname: ifname.into(), local_vip, pool: VIP_POOL }
+        RoutePlan {
+            ifname: ifname.into(),
+            local_vip,
+            pool: VIP_POOL,
+        }
     }
 }
 
@@ -139,7 +143,10 @@ async fn apply_linux(plan: &RoutePlan) -> Result<(), RouteError> {
         }
     };
     if ifindex == 0 {
-        return Err(RouteError::Netlink(format!("接口 {} ifindex=0", plan.ifname)));
+        return Err(RouteError::Netlink(format!(
+            "接口 {} ifindex=0",
+            plan.ifname
+        )));
     }
 
     // 2) 接口地址 vip/32（replace 幂等）。
@@ -162,7 +169,9 @@ async fn apply_linux(plan: &RoutePlan) -> Result<(), RouteError> {
         .replace()
         .execute()
         .await
-        .map_err(|e| RouteError::Netlink(format!("route add {}/{}: {e}", plan.pool.0, plan.pool.1)))?;
+        .map_err(|e| {
+            RouteError::Netlink(format!("route add {}/{}: {e}", plan.pool.0, plan.pool.1))
+        })?;
 
     // 4) rp_filter=1（严格反向路径过滤；all + 本接口，innernet 建议）。
     //    /proc/sys 在无特权容器只读 ⇒ 告警不失败（部署侧以 namespaced sysctl 兜底：
