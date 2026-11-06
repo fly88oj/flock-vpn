@@ -1,0 +1,71 @@
+# systemd-test.yml —— M6 systemd 开机自启真机语义实测（docs/design.md §7-M6.3/M6.6；
+# 结果记录 docs/manual/service-install.md「Linux 实测」小节）。
+#
+#   MSYS_NO_PATHCONV=1 docker compose -f deploy/systemd-test.yml up -d --build
+#   bash deploy/systemd_assert.sh          # S1–S6 逐项 PASS/FAIL，任一 FAIL ⇒ 退出码非零
+#
+# 拓扑（最小直接形态，配置面参照 m2-direct.yml）：
+#   server（Direct 模式 + M3 数据面：tun0 VIP 100.64.0.1；server-systemd-test.toml
+#     bind-mount 覆盖镜像内配置——端点为容器网视角 server:9443）
+#   client（Dockerfile.systemd-test：flock-client + systemd，PID 1 = /sbin/init；
+#     --privileged + STOPSIGNAL SIGRTMIN+3（compose 文件/Dockerfile）——docker
+#     restart 容器 = 模拟「关机再开机」，systemd 按单元 enablement 拉起服务）
+#
+# 断言脚本 deploy/systemd_assert.sh：
+#   S1 安装（install --config /etc/flock/client.toml → 单元/is-enabled/daemon-reload）
+#   S2 开机自启（docker restart → systemctl is-active = active）
+#   S3 VPN 连通（tun0 出现 + ping 通 server VIP 100.64.0.1）
+#   S4 IPC（flock-client status → state=connected、vip 正确）
+#   S5 无头（无 DISPLAY/DBus；无 tray 进程；tray 子命令优雅退出码 0）
+#   S6 退出语义（IPC Shutdown → exit 0 不复活；docker restart 又自启）
+
+name: flock-systemd-test
+
+services:
+  server:
+    build:
+      context: ..               # 与 m2-direct 同构（Dockerfile.server-direct 免 prepare）
+      dockerfile: deploy/Dockerfile.server-direct
+    image: flock/server:systemd-test
+    # M3 数据面（tun0 VIP 100.64.0.1）+ 管理面（容器内 127.0.0.1:9444——device-add/invite）。
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    volumes:
+      - server-state:/var/lib/flock
+      - ./server-systemd-test.toml:/etc/flock/server.toml:ro
+    networks: [sdnet]
+    restart: unless-stopped
+
+  client:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.systemd-test
+    image: flock/client:systemd-test
+    depends_on: [server]
+    hostname: sdclient
+    # systemd 需 cgroup 写权（--privileged 即含）；NET_ADMIN/tun 为 daemon 数据面。
+    privileged: true
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    environment:
+      - container=docker          # systemd 容器探测（免 chroot/mount 面的误判）
+    networks: [sdnet]
+    volumes:
+      - client-state:/var/lib/flock
+    restart: unless-stopped
+
+networks:
+  sdnet:
+    name: flock-systemd-testnet
+
+volumes:
+  server-state: {}
+  client-state: {}

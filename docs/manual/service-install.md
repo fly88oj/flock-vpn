@@ -80,6 +80,35 @@ daemon 启动时对 token 与 socket 尝试 chgrp 到该组（仅查本地 /etc/
 无 systemd ⇒ 安装命令报错即如实返回（单元渲染已由单测覆盖，宿主可跑
 `flock-client service` 验证 daemon 行为本身）。
 
+### 3.1 Linux 实测（systemd 容器：S1–S6 全 PASS，2026-11-07）
+
+M6 服务形态的完整语义验证在 **systemd 容器**内完成（Docker Desktop WSL2、cgroup v2、
+`--privileged`；`docker restart` 容器 = STOPSIGNAL SIGRTMIN+3 干净关机 → 再开机的
+「开机」语义）。资产与断言：
+
+- 拓扑 `deploy/systemd-test.yml`：server（Direct 模式 + M3 数据面，tun0 VIP
+  100.64.0.1；`deploy/server-systemd-test.toml`——端点为容器网视角 server:9443）+
+  client（`deploy/Dockerfile.systemd-test`：flock-client + systemd PID 1，
+  剥物理机单机面；不装 dbus/display 栈）；
+- 断言 `deploy/systemd_assert.sh`（S1–S6 逐项 PASS/FAIL，任一 FAIL ⇒ 退出码非零）。
+
+结果（两连跑均 PASS=6 FAIL=0、退出码 0；bootstrap 幂等）：
+
+| 项 | 断言 | 结果 |
+|---|---|---|
+| S1 安装 | `flock-client install --config /etc/flock/client.toml`（root，缺省 scope）→ 单元落 `/etc/systemd/system/flock-client.service`、`is-enabled`=enabled、`LoadState`=loaded + `FragmentPath` 指向新路径（daemon-reload 已执行的证据）、`enable --now` 已拉起（is-active=active）、ExecStart/Restart=on-failure/WantedBy 指令齐 | PASS |
+| S2 开机自启 | `docker restart` 容器（模拟开机）→ systemd 拉起服务（is-active=active） | PASS |
+| S3 VPN 连通 | 服务拉起后 tun0 出现（inet 100.64.0.2/32 mtu 1280）+ ping server VIP 100.64.0.1 通 | PASS |
+| S4 IPC | `flock-client status` → state=connected、vip=100.64.0.2（与 device-add 分配一致）、endpoint=server:9443 | PASS |
+| S5 无头 | daemon 进程环境无 DISPLAY/WAYLAND_DISPLAY/DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR（环境变量共 5 项）；进程面唯一 `flock-client service`（无 tray 进程）；`flock-client tray` 打「未检测到 GUI 会话（无 DISPLAY/WAYLAND_DISPLAY 或无会话 DBus），托盘未启动」**退出码 0**、无残留进程；journal 无 panic | PASS |
+| S6 退出语义 | IPC `CtrlReq::Shutdown` 帧手投（postcard over Unix socket——与 tray 停服同构；`[u32 LE len][变体号 1][32B 裸 token]`，布局以 Status 探针实证）→ 响应 `01 00 00 00 01` = CtrlResp::Ok；服务 exit 0 停止（`Result`=success、`ExecMainStatus`=0）且 >RestartSec(5s) **不复活**（Restart=on-failure 语义）；再次 `docker restart` 又自启（enabled 保持） | PASS |
+
+边界（如实）：本实测覆盖 systemd 语义面（单元写入/enable/daemon-reload/开机拉起/
+失败重启策略/优雅停服不复活）与 daemon 全链（tun/路由/连通/IPC/无头），运行环境为
+容器（镜像内 network-online.target.wants 剥空——`After=` 不阻塞启动；物理机的
+network-online 等待、发行版特定 preset 面不在覆盖内）。物理真机清单（发行版安装、
+`systemctl preset` 交互、非 root 用户的 sudo 提示路径）仍按本节上方提权说明手工执行。
+
 ## 4. macOS（launchd）——**未验证（本机无设备）**
 
 | 项 | 内容 |
@@ -166,8 +195,8 @@ tray ≥10s 存活无 panic、2s 刷新日志、与 `flock-client status` 状态
 | Windows HKCU Run 注册/注销往返 | 单测通过（宿主，非提升） |
 | Windows SCM 服务安装/卸载/自启/恢复策略 | **编译级验证**；真机需管理员 → §2 清单 |
 | Windows 事件日志事件上报 | 代码路径编译级 + 未注册源时事件仍落日志；真机确认 → §2 清单 |
-| Linux systemd 单元渲染 | 单测通过（宿主）；写入/enable 执行面需 root+systemd（容器无 systemd 报错如实） |
+| Linux systemd 单元渲染 | 单测通过（宿主）；**systemd 容器实测通过**（2026-11-07，`deploy/systemd_assert.sh` S1–S6：安装/enable/daemon-reload/开机自启/VPN 连通/IPC status/无头/Shutdown 不复活 → §3.1） |
 | Unix socket 服务端/权限 | 单测通过（Linux 容器档随 linux 编译面；本宿主为 Windows，socket 单测在 Unix 宿主跑） |
 | Linux 桌面托盘（ksni/SNI 宿主）真机 | **未验证**（容器档仅编译面；§7 清单第 6 项） |
 | macOS 全链路 | **未验证**（无设备；渲染/命令序列单测+审阅，§4/§7 清单留位） |
-| M7 peers 全链（登录保持/名册拉取/raw ICMP 延迟/流量列） | **容器实测通过**（Linux root，`deploy/m7_assert.sh`）；单测面（登录态机 pake 双端/毒化重连/表格渲染/IPC 契约/探测中位）宿主通过；Windows/macOS raw ICMP 真机 → §7 清单第 9 项 |
+| M7 peers 全链（登录保持/名册拉取/raw ICMP 延迟/流量列） | **容器实测通过**（Linux root，`deploy/m7_assert.sh`；2026-11-07 评审修复后复跑 P1–P3 全 PASS 退出码 0——断言脚本对 daemon re-login 窗「登录进行中（稍候重试）」transient 增有界重试，数值/语义门槛不降）；单测面（登录态机 pake 双端/毒化重连/表格渲染/IPC 契约/探测中位）宿主通过；Windows/macOS raw ICMP 真机 → §7 清单第 9 项 |

@@ -1,0 +1,18 @@
+# server.toml —— Direct 模式（deploy/systemd-test.yml 的 server 容器；M6 systemd 实测）。
+#
+# 与 server-direct.toml（m2-direct 单容器宿主形态）的差异：
+#   - advertise_endpoint = "server:9443"（**容器网视角**——systemd 客户端同 compose 网，
+#     目录签发的端点客户端可直接解析；m2-direct 客户端在宿主 ⇒ 127.0.0.1 映射口）；
+#   - tun_name 生效（M3 数据面：服务端自身也是 peer，VIP 100.64.0.1——S3 ping 面）。
+# 其余配置面与 m2-direct 同构（零 frp 资产、免 prepare）。挂载方式见 systemd-test.yml
+# （bind mount 覆盖镜像内 /etc/flock/server.toml，不动 Dockerfile.server-direct）。
+
+state_dir = "/var/lib/flock"
+bind = "0.0.0.0:9443"
+admin_bind = "127.0.0.1:9444"
+
+advertise_endpoint = "server:9443"
+dir_version = 1
+
+# M3 数据面接口名（服务端 tun；VIP 固定 100.64.0.1——netstate 分配从 .2 起）。
+tun_name = "tun0"
