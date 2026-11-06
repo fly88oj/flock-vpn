@@ -136,9 +136,7 @@ pub(crate) fn spawn_named_pipe_server(
                         tokio::time::sleep(crate::ipc::ACCEPT_RETRY_BACKOFF).await;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "flock-client: 控制管道下实例创建失败（致命），IPC 停止: {e}"
-                        );
+                        eprintln!("flock-client: 控制管道下实例创建失败（致命），IPC 停止: {e}");
                         break None;
                     }
                 }

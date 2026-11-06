@@ -1224,11 +1224,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains(".tmp.")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(leftovers.is_empty(), "临时文件不残留: {leftovers:?}");
     }
@@ -1263,10 +1259,7 @@ mod tests {
         let r = AuthPhase::peers_block_reason(None).expect("未装配 ⇒ 阻断文案");
         assert!(r.contains("未配置 [auth]"), "{r}");
         assert!(r.contains("flock-client login"), "{r}");
-        assert!(
-            !r.contains("稍候重试"),
-            "未配置形态不得落「稍候重试」: {r}"
-        );
+        assert!(!r.contains("稍候重试"), "未配置形态不得落「稍候重试」: {r}");
         // 显式 Unconfigured 同文案（分支激活——与 None 等价）。
         assert_eq!(
             AuthPhase::peers_block_reason(Some(AuthPhase::Unconfigured)),
@@ -1290,8 +1283,7 @@ mod tests {
             Some("凭据文件: boom")
         );
         assert!(
-            AuthPhase::peers_block_reason(Some(AuthPhase::LoggedIn { user: "a".into() }))
-                .is_none(),
+            AuthPhase::peers_block_reason(Some(AuthPhase::LoggedIn { user: "a".into() })).is_none(),
             "LoggedIn 放行拉取"
         );
     }

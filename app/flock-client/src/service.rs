@@ -478,10 +478,7 @@ mod scm {
         };
         /// 失败路径的非零退出码（SCM/恢复策略据此识别失败退出；优雅停服 = 0）。
         const SVC_EXIT_FAILURE: u32 = 1;
-        let set = |state: ServiceState,
-                   exit_code: u32,
-                   accept_stop: bool,
-                   wait_hint: Duration| {
+        let set = |state: ServiceState, exit_code: u32, accept_stop: bool, wait_hint: Duration| {
             let _ = handler.set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: state,
@@ -501,7 +498,12 @@ mod scm {
             Ok(c) => c,
             Err(e) => {
                 log_service_event(EventLevel::Error, &format!("config 载入失败: {e}"));
-                set(ServiceState::Stopped, SVC_EXIT_FAILURE, false, Duration::ZERO);
+                set(
+                    ServiceState::Stopped,
+                    SVC_EXIT_FAILURE,
+                    false,
+                    Duration::ZERO,
+                );
                 return;
             }
         };
@@ -512,7 +514,12 @@ mod scm {
             Ok(rt) => rt,
             Err(e) => {
                 log_service_event(EventLevel::Error, &format!("runtime 创建失败: {e}"));
-                set(ServiceState::Stopped, SVC_EXIT_FAILURE, false, Duration::ZERO);
+                set(
+                    ServiceState::Stopped,
+                    SVC_EXIT_FAILURE,
+                    false,
+                    Duration::ZERO,
+                );
                 return;
             }
         };

@@ -699,7 +699,10 @@ mod tests {
             .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_READ)
             .unwrap();
         let v: String = key.get_value("flock-client-tray").expect("Run 值存在");
-        let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        let exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(v, format!("\"{exe}\" tray"), "Run 值 = 引号 exe + tray");
         uninstall_tray().expect("HKCU Run 删除");
         let key = RegKey::predef(HKEY_CURRENT_USER)

@@ -167,7 +167,9 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
                         break; // WM_QUIT（正常收泵）
                     }
                     if got == -1 {
-                        eprintln!("flock-client tray: 消息泵错误（GetMessageW=-1）——图标失联，托盘收尾");
+                        eprintln!(
+                            "flock-client tray: 消息泵错误（GetMessageW=-1）——图标失联，托盘收尾"
+                        );
                         break;
                     }
                     if msg.message == WM_APP_TRAY_UPDATE {

@@ -161,7 +161,11 @@ pub fn accept_error_is_transient(e: &io::Error) -> bool {
     use io::ErrorKind as K;
     if matches!(
         e.kind(),
-        K::WouldBlock | K::Interrupted | K::ConnectionAborted | K::ConnectionReset | K::NotConnected
+        K::WouldBlock
+            | K::Interrupted
+            | K::ConnectionAborted
+            | K::ConnectionReset
+            | K::NotConnected
     ) {
         return true;
     }
@@ -679,13 +683,17 @@ mod tests {
             assert!(accept_error_is_transient(&io::Error::from_raw_os_error(24)));
             assert!(accept_error_is_transient(&io::Error::from_raw_os_error(23)));
             // 其余原始码（如 EACCES=13）致命。
-            assert!(!accept_error_is_transient(&io::Error::from_raw_os_error(13)));
+            assert!(!accept_error_is_transient(&io::Error::from_raw_os_error(
+                13
+            )));
         }
         #[cfg(windows)]
         {
             // ERROR_PIPE_BUSY=231（AllPipeInstancesBusy——实例在途）瞬态；
             // ERROR_ACCESS_DENIED=5 致命。
-            assert!(accept_error_is_transient(&io::Error::from_raw_os_error(231)));
+            assert!(accept_error_is_transient(&io::Error::from_raw_os_error(
+                231
+            )));
             assert!(!accept_error_is_transient(&io::Error::from_raw_os_error(5)));
         }
     }
@@ -695,7 +703,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn serve_conn_times_out_when_client_never_frames() {
         let (ctrl, _) = daemon_control(generate_token());
-        let (mut client, mut server) = duplex(4096);
+        let (client, mut server) = duplex(4096);
         let served = tokio::spawn(async move { serve_conn(&mut server, &ctrl).await });
         // 客户端连接在位但不发任何字节：服务端 10s 整链超时（paused 时钟自动推进）。
         let res = tokio::time::timeout(Duration::from_secs(15), served)
