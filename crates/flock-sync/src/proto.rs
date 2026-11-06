@@ -91,7 +91,7 @@ impl DeviceStatus {
 pub use flock_protocol::roster::{normalize_hostname, HOSTNAME_MAX, HOSTNAME_UNKNOWN};
 
 /// 注册表设备行（§2.2：设备 = (DeviceId, owner, VIP, 静态公钥集, status, hostname,
-/// expired_at)——后两字段 M7 增补）。
+/// expired_at, registered_at)——后三字段 M7 增补）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRow {
     pub owner: String,
@@ -105,6 +105,12 @@ pub struct DeviceRow {
     pub hostname: String,
     /// M7：置 Expired 的 unix 秒（审计）；非 Expired 恒 None。
     pub expired_at: Option<u64>,
+    /// M7（回收器语义修正，§7-M7.5）：注册时刻（unix 秒，**提交方注入**——apply 无
+    /// 时钟，确定性要求）。`last_seen` 无观测（0）时的保留期起算锚——「注册即起算」
+    /// 的落地形态；按纪元 0 起算会把重启后未及观测的在线设备一并终态化。
+    /// 快照/线格式兼容：postcard 无字段标签，加字段后旧快照/旧日志不可解码——
+    /// 未发布窗口允许（§7-M7.1 同一纪律）。
+    pub registered_at: u64,
 }
 
 /// 用户行：OPAQUE 注册记录 + SR-SIG1 用户公钥集（§2.4）。
@@ -237,11 +243,14 @@ pub enum SyncRequest {
         sig: [u8; 64],
     },
     /// 注册设备（分配 VIP，单调不复用；M7 增 hostname——空串落 "(unknown)"）。
+    /// `registered_at_unix` 由提交方注入（apply 无时钟——确定性；落
+    /// `DeviceRow.registered_at`，回收器的保留期起算锚）。
     RegisterDevice {
         owner: String,
         x25519: [u8; 32],
         ed25519: [u8; 32],
         hostname: String,
+        registered_at_unix: u64,
     },
     /// 吊销设备：状态置 Revoked（行保留、VIP 不回收）+ 全局 revocation_epoch +1（§2.2）。
     Revoke { device: [u8; 32] },

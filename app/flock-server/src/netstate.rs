@@ -222,7 +222,8 @@ fn encode_device(row: &DeviceRow) -> Vec<u8> {
     v.extend_from_slice(&row.vip);
     v.push(row.status.code());
     put_u64(&mut v, row.since_epoch);
-    // M7 字段：hostname（长度前缀串）+ expired_at（存在标志 + u64）。
+    // M7 字段：hostname（长度前缀串）+ expired_at（存在标志 + u64）+ registered_at
+    //（回收器锚——追加字段即改行布局：旧库行解码失败，未发布窗口允许，§7-M7.1）。
     put_str(&mut v, &row.hostname);
     match row.expired_at {
         Some(t) => {
@@ -231,6 +232,7 @@ fn encode_device(row: &DeviceRow) -> Vec<u8> {
         }
         None => v.push(0),
     }
+    put_u64(&mut v, row.registered_at);
     v
 }
 
@@ -248,6 +250,7 @@ fn decode_device(b: &[u8]) -> Option<DeviceRow> {
         1 => Some(r.u64()?),
         _ => return None,
     };
+    let registered_at = r.u64()?;
     if !r.done() {
         return None;
     }
@@ -260,6 +263,7 @@ fn decode_device(b: &[u8]) -> Option<DeviceRow> {
         since_epoch,
         hostname,
         expired_at,
+        registered_at,
     })
 }
 
@@ -643,6 +647,8 @@ impl StateStore {
                 since_epoch: 0,
                 hostname: flock_sync::normalize_hostname(req.hostname),
                 expired_at: None,
+                // 兑换时刻即注册时刻（回收器锚，§7-M7.5）。
+                registered_at: req.now_unix,
             };
             devices
                 .insert(device_id.as_slice(), encode_device(&dev_row).as_slice())
@@ -719,6 +725,8 @@ impl StateStore {
                 since_epoch: 0,
                 hostname: flock_sync::normalize_hostname(hostname),
                 expired_at: None,
+                // 注册时刻落行（回收器锚——last_seen 无观测时的保留期起算，§7-M7.5）。
+                registered_at: flock_protocol::trust::now_unix(),
             };
             devices
                 .insert(device_id.as_slice(), encode_device(&row).as_slice())

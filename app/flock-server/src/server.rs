@@ -837,8 +837,22 @@ const SECS_PER_DAY: u64 = 86_400;
 
 /// 回收单趟（注入时钟可测）：把「Active 且 last_seen 距今 > 保留期」的设备逐个提交
 /// Expire。`retention_days = 0` ⇒ 永不过期（空趟）。多台服务器并发回收幂等（状态机
-/// Expire 重放放行）。从未在线的设备 `last_seen = 0` ⇒ 按纪元 0 起算（注册即起算的
-/// 确定性近似）。返回本趟提交 Expire 的设备。
+/// Expire 重放放行）。返回本趟提交 Expire 的设备。
+///
+/// last_seen 语义（§7-M7.5 修正——「注册即起算」的落地）：
+/// - 有观测（单服 = TrafficMeter；多主 = 本地租约行）⇒ 观测值（与 registered_at 取大
+///   ——观测值早于注册时刻属时钟异常，按更近的锚取值）；
+/// - **无观测 ⇒ 以 `DeviceRow.registered_at` 为起算锚**。旧实现 `map_or(0)` 按纪元 0
+///   起算：`0 <= cutoff` 恒真 ⇒ 单服重启（TrafficMeter 纯内存清空）或多主租约表未及
+///   反熵回填时，**首拍把全部 Active 设备（含在线者）Expire 终态化**——邀请已消费即
+///   用户砖死（Expired 不可逆、VIP 已归还池）。
+///
+/// 重启/视图未就绪闸门（纵深防御，最小可靠形态）：
+/// - 单服：TrafficMeter 自创建起**零观测**（空表且注册表非空 ⇒ 刚重启）⇒ 本趟跳过。
+///   残余：无任何流量的部署（含无 tun 的控制流-only 形态）闸门恒关、保留期暂不生效
+///   ——一旦出现首个观测（任意设备/服务器自身流量）即开；
+/// - 多主：本地租约表空**或**自启动起未收到任何远端租约事件（反熵回填 ≤1 周期 5s
+///   与回收首拍的赛跑窗）⇒ 本趟跳过（见 `LeaseTable::reaper_view_ready` 的残留注记）。
 pub async fn reap_once(core: &ServerCore, retention_days: u64, now_unix: u64) -> Vec<DeviceId> {
     if retention_days == 0 {
         return Vec::new();
@@ -856,20 +870,50 @@ pub async fn reap_once(core: &ServerCore, retention_days: u64, now_unix: u64) ->
             .map(|(id, row)| (DeviceId(id), row))
             .collect(),
     };
+    // 重启/视图未就绪闸门（见函数文档）：跳过整趟，下一趟（60s 后）再判。
+    if !rows.is_empty() {
+        match &core.net {
+            NetBackend::Single(_) => {
+                if !core.traffic.has_any() {
+                    eprintln!(
+                        "flock-server: reaper: 流量计自启动起零观测（疑似刚重启）——\
+                         本趟跳过（防首拍误终态化在线设备）"
+                    );
+                    return Vec::new();
+                }
+            }
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                if !s.node.lease().reaper_view_ready() {
+                    eprintln!(
+                        "flock-server: reaper: 本地租约视图未就绪（表空/未收到远端事件）\
+                         ——本趟跳过（防反熵回填前误终态化远端托管设备）"
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+    }
     let mut expired = Vec::new();
     for (id, row) in rows {
         if row.status != crate::netstate::DeviceStatus::Active {
             continue;
         }
-        // last_seen：多主 = 本地租约视图；单服 = TrafficMeter（无条目 ⇒ 0）。
+        // last_seen：多主 = 本地租约视图；单服 = TrafficMeter；无观测 ⇒ registered_at
+        // 锚（注册即起算）。
         let last_seen = match &core.net {
-            NetBackend::Single(_) => core.traffic.stats(&row.vip).map_or(0, |(_, _, ls)| ls),
+            NetBackend::Single(_) => core
+                .traffic
+                .stats(&row.vip)
+                .map_or(row.registered_at, |(_, _, ls)| ls.max(row.registered_at)),
             #[cfg(feature = "multi-primary")]
             NetBackend::Sync(s) => s
                 .node
                 .lease()
                 .peer_stats(&id.0)
-                .map_or(0, |st| st.last_seen_unix),
+                .map_or(row.registered_at, |st| {
+                    st.last_seen_unix.max(row.registered_at)
+                }),
         };
         if last_seen <= cutoff {
             match core.net.expire(&id, now_unix).await {
@@ -1003,8 +1047,14 @@ mod reaper_tests {
         *vk.verifying_key().as_bytes()
     }
 
-    /// 窗口逻辑：保留期内不动；越界（last_seen 距今 > 保留期）⇒ Expire 提交 + 行置
-    /// Expired + VIP 归还池（新注册拿到该 VIP）；retention=0 ⇒ 永不过期。
+    /// 窗口逻辑（§7-M7.5 修正后的正确语义）：保留期内不动；越界（last_seen 距今 >
+    /// 保留期）⇒ Expire 提交 + 行置 Expired + VIP 归还池（新注册拿到该 VIP）；
+    /// retention=0 ⇒ 永不过期。
+    ///
+    /// 旧→新（被修正的固化行为）：旧断言「从未在线的 B（last_seen=0）第一趟即回收
+    /// （按纪元 0 起算）」——那正是重启砖死缺陷的窗口语义（0 <= cutoff 恒真）；新语义
+    /// 下从未在线的设备以 `registered_at` 为起算锚：锚龄 29d < 30d 保留期 ⇒ **不动**，
+    /// 锚龄超窗才回收。
     #[tokio::test]
     async fn reaper_window_logic_with_injected_clock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1014,28 +1064,34 @@ mod reaper_tests {
             crate::backend::NetBackend::Single(s) => s.clone(),
             _ => panic!("single"),
         };
-        // 设备 A（活跃——流量计近期 last_seen）、B（从未在线——last_seen=0）、
+        // 设备 A（活跃——流量计近期 last_seen）、B（从未在线——registered_at 锚）、
         // C（吊销——不可 Expire）。
         let row_a = store.register_device("u", [1; 32], ed_of(1), "a").unwrap();
         let row_b = store.register_device("u", [2; 32], ed_of(2), "b").unwrap();
         let _row_c = store.register_device("u", [3; 32], ed_of(3), "c").unwrap();
         store.revoke(&dev_id(3)).unwrap();
+        assert!(
+            store.device_row(&dev_id(2)).unwrap().registered_at > 0,
+            "注册即落 registered_at 锚"
+        );
         // A 的 last_seen = 真实墙钟「当前」（流量计——note 即抬）。
         core.traffic.note_tx(&row_a.vip, 100);
         let now_real = flock_protocol::trust::now_unix();
 
-        // ① 29 天后（A 在保留期内）：A 不过期；**从未在线的 B（last_seen=0）按纪元 0
-        // 起算 ⇒ 已越界**（确定性语义，§7-M7.5）；吊销的 C 不动。
+        // ① 29 天后：A（观测 29d < 30d）与 B（锚 29d < 30d）都在保留期内 ⇒ 空趟
+        //    （旧语义此处会把从未在线的 B 回收掉——见测试文档）；吊销的 C 不动。
         let now1 = now_real + 29 * 86_400;
         let expired = reap_once(&core, 30, now1).await;
-        assert_eq!(expired, vec![dev_id(2)], "{expired:?}");
-        let b = store.device_row(&dev_id(2)).unwrap();
-        assert_eq!(b.status, DeviceStatus::Expired);
-        assert_eq!(b.expired_at, Some(now1), "注入时钟确定性落 expired_at");
+        assert!(expired.is_empty(), "29d < 30d：A/B 均在窗内: {expired:?}");
         assert_eq!(
             store.device_row(&dev_id(1)).unwrap().status,
             DeviceStatus::Active,
-            "A（29d < 30d 保留期）不过期"
+            "A（观测 29d < 30d）不过期"
+        );
+        assert_eq!(
+            store.device_row(&dev_id(2)).unwrap().status,
+            DeviceStatus::Active,
+            "B（registered_at 锚 29d < 30d）不过期——注册即起算，非纪元 0 起算"
         );
         assert_eq!(
             store.device_row(&dev_id(3)).unwrap().status,
@@ -1043,18 +1099,20 @@ mod reaper_tests {
             "C 保持 Revoked（不转 Expired）"
         );
 
-        // ② 31 天后：A 仍在保留期内（31d < now 到 last_seen 的 30d？不——31d > 30d ⇒
-        // A 现在越界被回收；对照③的 retention=0 语义）。
+        // ② 31 天后：A（观测超窗）与 B（锚超窗）均回收；C 仍不动。
         let now2 = now_real + 31 * 86_400;
         let expired = reap_once(&core, 30, now2).await;
+        assert_eq!(expired.len(), 2, "A 与 B 均越界: {expired:?}");
+        assert!(expired.contains(&dev_id(1)), "A 观测超窗回收");
+        assert!(expired.contains(&dev_id(2)), "B 锚超窗回收（从未在线且超窗）");
+        for id in [dev_id(1), dev_id(2)] {
+            let row = store.device_row(&id).unwrap();
+            assert_eq!(row.status, DeviceStatus::Expired);
+            assert_eq!(row.expired_at, Some(now2), "注入时钟确定性落 expired_at");
+        }
         assert_eq!(
-            expired,
-            vec![dev_id(1)],
-            "A 越界（31d > 30d）被回收: {expired:?}"
-        );
-        assert_eq!(
-            store.device_row(&dev_id(1)).unwrap().status,
-            DeviceStatus::Expired
+            store.device_row(&dev_id(3)).unwrap().status,
+            DeviceStatus::Revoked
         );
         // 幂等：同窗再跑一趟 ⇒ 空趟。
         let expired = reap_once(&core, 30, now2).await;
@@ -1066,7 +1124,7 @@ mod reaper_tests {
         let row_e = store.register_device("u", [5; 32], ed_of(5), "e").unwrap();
         assert_eq!(row_e.vip, row_b.vip, "池序继续（B 的 .3）");
 
-        // ③ retention = 0 ⇒ 永不过期（空趟）——A 从此不再被回收。
+        // ③ retention = 0 ⇒ 永不过期（空趟）。
         let (core0, _) =
             ServerCore::open_or_init(m7_cfg(tempfile::tempdir().unwrap().path().to_path_buf(), 0))
                 .expect("core0");
@@ -1081,5 +1139,55 @@ mod reaper_tests {
             store0.device_row(&dev_id(1)).unwrap().status,
             DeviceStatus::Active
         );
+    }
+
+    /// 单服重启闸门：TrafficMeter 纯内存——重启即清空而注册表落盘。重启后首拍（零
+    /// 观测 + 注册表非空 ⇒ 刚重启）**必须跳过**——旧行为 `last_seen=0 <= cutoff` 恒真，
+    /// 即使时钟远超保留期也会把全部 Active 设备（含在线者）终态化（邀请已消费 = 用户
+    /// 砖死）。闸门开启（首个观测到达）后同刻回收恢复。
+    #[tokio::test]
+    async fn reaper_skips_fresh_restart_single_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().to_path_buf();
+        {
+            let (core, _) =
+                ServerCore::open_or_init(m7_cfg(state_dir.clone(), 30)).expect("core");
+            let store = match &core.net {
+                crate::backend::NetBackend::Single(s) => s.clone(),
+                _ => panic!("single"),
+            };
+            let row_a = store.register_device("u", [1; 32], ed_of(1), "a").unwrap();
+            store.register_device("u", [2; 32], ed_of(2), "b").unwrap();
+            // 在线设备的流量观测（重启前的世界）。
+            core.traffic.note_tx(&row_a.vip, 100);
+        }
+        // 「重启」：同状态目录重开（注册表两行仍在），TrafficMeter 全新（零观测）。
+        let (core2, _) = ServerCore::open_or_init(m7_cfg(state_dir, 30)).expect("reopen");
+        let store2 = match &core2.net {
+            crate::backend::NetBackend::Single(s) => s.clone(),
+            _ => panic!("single"),
+        };
+        assert_eq!(store2.devices_all().len(), 2, "注册表跨重启保留");
+        assert!(!core2.traffic.has_any(), "流量计重启清空（零观测）");
+
+        // 时钟远超保留期（100 天）也不回收任何行——闸门生效（旧行为此处砖死两台）。
+        let now = flock_protocol::trust::now_unix() + 100 * 86_400;
+        let expired = reap_once(&core2, 30, now).await;
+        assert!(expired.is_empty(), "刚重启 ⇒ 本趟跳过: {expired:?}");
+        for seed in 1u8..=2 {
+            assert_eq!(
+                store2.device_row(&dev_id(seed)).unwrap().status,
+                DeviceStatus::Active,
+                "重启后首拍不终态化任何行"
+            );
+        }
+
+        // 闸门开启（首个观测——任何设备的任意流量）后同刻回收恢复：A 有观测
+        // （last_seen=now_real）但 100d 前的观测已超窗、B 锚超窗 ⇒ 两者均回收——证明
+        // 先前的空趟确由闸门承担（而非窗口判定失效）。
+        let row_a = store2.device_row(&dev_id(1)).unwrap();
+        core2.traffic.note_tx(&row_a.vip, 1);
+        let expired = reap_once(&core2, 30, now).await;
+        assert_eq!(expired.len(), 2, "闸门开后按窗回收: {expired:?}");
     }
 }

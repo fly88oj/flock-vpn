@@ -81,6 +81,7 @@ async fn two_devices(c: &TestCluster, writer: usize) -> ([u8; 32], [u8; 32]) {
             x25519: [1; 32],
             ed25519: a_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -93,6 +94,7 @@ async fn two_devices(c: &TestCluster, writer: usize) -> ([u8; 32], [u8; 32]) {
             x25519: [2; 32],
             ed25519: b_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -123,6 +125,7 @@ async fn src_vip_binding_violation_dropped_and_counted() {
             x25519: [1; 32],
             ed25519: a_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -137,6 +140,7 @@ async fn src_vip_binding_violation_dropped_and_counted() {
             x25519: [2; 32],
             ed25519: b_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -249,6 +253,7 @@ async fn forward_local_delivery_and_redirect_with_hop_guard() {
             x25519: [1; 32],
             ed25519: a_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -263,6 +268,7 @@ async fn forward_local_delivery_and_redirect_with_hop_guard() {
             x25519: [3; 32],
             ed25519: c_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -369,6 +375,7 @@ async fn unresolved_destination_drops_with_best_effort_icmp() {
             x25519: [1; 32],
             ed25519: a_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -408,6 +415,7 @@ async fn unresolved_destination_drops_with_best_effort_icmp() {
             x25519: [4; 32],
             ed25519: d_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -459,6 +467,7 @@ async fn lease_domain_semantics_and_locate_fanout() {
             x25519: [5; 32],
             ed25519: d_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;

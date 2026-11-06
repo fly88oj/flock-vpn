@@ -130,6 +130,9 @@ pub struct LeaseTable {
     /// 残余依赖（诚实披露）：从未互通 term 的两节点间仍按各自墙钟定序——绝对时钟
     /// 偏移可让先到者暂时取胜，TTL 过期 + 反熵兜底收敛。
     term_floor: AtomicU64,
+    /// 自创建起合并过的远端 gossip 消息数（含空反熵摘要——任何到达都证明互连/反熵
+    /// 面已活）。回收器「视图就绪」闸门的信号（[`LeaseTable::reaper_view_ready`]）。
+    remote_events: AtomicU64,
 }
 
 impl LeaseTable {
@@ -142,6 +145,7 @@ impl LeaseTable {
             st: Mutex::new(BTreeMap::new()),
             acc: Mutex::new(BTreeMap::new()),
             term_floor: AtomicU64::new(0),
+            remote_events: AtomicU64::new(0),
         })
     }
 
@@ -246,7 +250,11 @@ impl LeaseTable {
 
     /// 收到远端 publish/反熵条目：合并（新者胜）；本地持有的租约被更新者取代 ⇒
     /// 触发踢出钩子（旧端踢会话）。
+    ///
+    /// 任何到达（含空反熵摘要）都计入 `remote_events`——「互连/反熵面已活」的证明，
+    /// 回收器闸门据此判定重启后的租约视图是否已就绪（§7-M7.5）。
     pub fn merge_remote(&self, msg: GossipMsg) {
+        self.remote_events.fetch_add(1, Ordering::SeqCst);
         let entries: Vec<AntiEntry> = match msg {
             GossipMsg::Publish {
                 device,
@@ -355,6 +363,33 @@ impl LeaseTable {
         st.iter()
             .filter(|(_, l)| l.expires_at > Instant::now())
             .count()
+    }
+
+    /// 表内总行数（**含 TTL 过期的保留行**——M7 过期不删，名册离线展示用）。
+    pub fn total_rows(&self) -> usize {
+        self.st.lock().expect("lease table").len()
+    }
+
+    /// 自创建起合并过的远端 gossip 消息数（含空摘要）。
+    pub fn remote_events(&self) -> u64 {
+        self.remote_events.load(Ordering::SeqCst)
+    }
+
+    /// M7 回收器「视图就绪」闸门（§7-M7.5，**最小可靠形态**）：表非空**且**自启动起
+    /// 收到过至少一条远端 gossip ⇒ 本地租约视图足以支撑回收判定。
+    ///
+    /// 语义取舍（如实注明）：
+    /// - 刚重启的节点租约表为空、且在收到首条远端事件（对端反熵摘要 ≤1 个周期 5s、
+    ///   或本机首台设备建连 publish）之前，视图不可判 ⇒ 回收跳过——闭合「反熵回填与
+    ///   回收首拍赛跑」窗口（该窗口内远端托管设备的租约行缺失，`last_seen=0` 会被
+    ///   锚到 `registered_at`，长注册的在线设备可能被误终态化）。
+    /// - 残余 1：闸门开启后首拍仍可能早于对端摘要回填（≤1 个反熵周期）——由回收周期
+    ///   60s ≫ 5s 与「真离线设备才超锚窗」共同兜底；主修复是 registered_at 锚，
+    ///   本闸门是纵深防御。
+    /// - 残余 2：单节点 raft 集群（无对端）永无远端事件 ⇒ 闸门恒关、保留期不生效——
+    ///   该形态不在部署面（§6.2 ≥2 台）；如需启用，接受此残留或补第 2 台服务器。
+    pub fn reaper_view_ready(&self) -> bool {
+        self.total_rows() > 0 && self.remote_events() > 0
     }
 
     /// 全表摘要（反熵消息体）。
@@ -466,6 +501,12 @@ impl TrafficMeter {
         let st = self.st.lock().expect("traffic meter");
         st.get(key)
             .map(|e| (e.tx_ewma, e.rx_ewma, e.last_seen_unix))
+    }
+
+    /// 是否有过任何观测（空表 = 自创建起从未计到任何流量——单服回收器的重启闸门
+    /// 用，§7-M7.5：TrafficMeter 纯内存，重启即清空；空表且注册表非空 ⇒ 刚重启）。
+    pub fn has_any(&self) -> bool {
+        !self.st.lock().expect("traffic meter").is_empty()
     }
 }
 

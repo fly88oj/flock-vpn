@@ -446,6 +446,7 @@ mod tests {
                     x25519: [1; 32],
                     ed25519: [1; 32],
                     hostname: String::new(),
+                    registered_at_unix: 1_700_000_000,
                 },
             ),
             entry(
@@ -504,6 +505,7 @@ mod tests {
                         x25519: [1; 32],
                         ed25519: [1; 32],
                         hostname: String::new(),
+                        registered_at_unix: 1_700_000_000,
                     },
                 ),
             ])

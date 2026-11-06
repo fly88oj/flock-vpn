@@ -109,6 +109,7 @@ async fn learner_snapshot_add_voter_promotion() {
                 x25519: [i; 32],
                 ed25519: [i; 32],
                 hostname: String::new(),
+                registered_at_unix: 1_700_000_000,
             })
             .await
             .expect("register");
@@ -268,6 +269,7 @@ async fn learner_snapshot_add_voter_promotion() {
             x25519: [7; 32],
             ed25519: [7; 32],
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         })
         .await
         .expect("voter 写");

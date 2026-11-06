@@ -107,6 +107,8 @@ impl NetBackend {
                         x25519,
                         ed25519,
                         hostname: hostname.to_string(),
+                        // 注册时刻由提交方注入（apply 无时钟——确定性；回收器锚）。
+                        registered_at_unix: flock_protocol::trust::now_unix(),
                     })
                     .await?;
                 match resp {

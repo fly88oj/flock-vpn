@@ -209,7 +209,8 @@ impl NetStateData {
                 x25519,
                 ed25519,
                 hostname,
-            } => self.apply_register(owner, *x25519, *ed25519, hostname),
+                registered_at_unix,
+            } => self.apply_register(owner, *x25519, *ed25519, hostname, *registered_at_unix),
             SyncRequest::Revoke { device } => self.apply_set_status(device, DeviceStatus::Revoked),
             SyncRequest::Disable { device } => {
                 self.apply_set_status(device, DeviceStatus::Disabled)
@@ -393,6 +394,7 @@ impl NetStateData {
         x25519: [u8; 32],
         ed25519: [u8; 32],
         hostname: &str,
+        registered_at: u64,
     ) -> ApplyOutcome {
         let device_id: [u8; 32] = Sha256::digest(ed25519).into();
         if self.devices.contains_key(&device_id) {
@@ -414,6 +416,7 @@ impl NetStateData {
             since_epoch: 0,
             hostname: crate::proto::normalize_hostname(hostname),
             expired_at: None,
+            registered_at,
         };
         self.devices.insert(device_id, row.clone());
         self.vip_index.insert(vip, device_id);
@@ -566,6 +569,8 @@ impl NetStateData {
                 since_epoch: 0,
                 hostname: crate::proto::normalize_hostname(hostname),
                 expired_at: None,
+                // 兑换时刻即注册时刻（回收器锚，§7-M7.5）。
+                registered_at: now_unix,
             },
         );
         self.vip_index.insert(vip, device_id);
@@ -727,6 +732,7 @@ mod tests {
                     x25519: [1; 32],
                     ed25519: [1; 32],
                     hostname: String::new(),
+                    registered_at_unix: 1_700_000_000,
                 },
                 None,
             )
@@ -742,6 +748,7 @@ mod tests {
                     x25519: [2; 32],
                     ed25519: [2; 32],
                     hostname: String::new(),
+                    registered_at_unix: 1_700_000_000,
                 },
                 None,
             )
@@ -757,7 +764,8 @@ mod tests {
                     owner: "u".into(),
                     x25519: [1; 32],
                     ed25519: [1; 32],
-                    hostname: String::new()
+                    hostname: String::new(),
+                    registered_at_unix: 1_700_000_000,
                 },
                 None,
             )
@@ -792,6 +800,7 @@ mod tests {
             x25519: [seed; 32],
             ed25519: [seed; 32],
             hostname: host.into(),
+            registered_at_unix: 1_700_000_000,
         };
         let a = d.apply(&reg(1, "laptop-a"), None).resp;
         let SyncResponse::Device(a_row) = a else {
@@ -912,6 +921,7 @@ mod tests {
                     x25519: [1; 32],
                     ed25519: [1; 32],
                     hostname: "  my-laptop  ".into(),
+                    registered_at_unix: 1_700_000_000,
                 },
                 None,
             )
@@ -1129,6 +1139,7 @@ mod tests {
                 x25519: [1; 32],
                 ed25519: [1; 32],
                 hostname: "host-rt".into(),
+                registered_at_unix: 1_700_000_000,
             },
             None,
         );
@@ -1198,6 +1209,7 @@ mod tests {
                         x25519: [i; 32],
                         ed25519: [i; 32],
                         hostname: String::new(),
+                        registered_at_unix: 1_700_000_000,
                     },
                     None,
                 )

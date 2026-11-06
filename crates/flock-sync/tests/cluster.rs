@@ -177,6 +177,7 @@ async fn write_any_read_any_linearizable_within_2s() {
             x25519: [1; 32],
             ed25519: [1; 32],
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -241,6 +242,7 @@ async fn kill_leader_reelects_within_15s_no_lost_writes() {
                 x25519: [i; 32],
                 ed25519: [i + 1; 32],
                 hostname: String::new(),
+                registered_at_unix: 1_700_000_000,
             },
         )
         .await;
@@ -297,6 +299,7 @@ async fn kill_leader_reelects_within_15s_no_lost_writes() {
             x25519: [9; 32],
             ed25519: [9; 32],
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -375,6 +378,7 @@ async fn register_revoke_register_ip_never_reused() {
             x25519: [1; 32],
             ed25519: [1; 32],
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -393,6 +397,7 @@ async fn register_revoke_register_ip_never_reused() {
             x25519: [2; 32],
             ed25519: [2; 32],
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -406,6 +411,7 @@ async fn register_revoke_register_ip_never_reused() {
             x25519: [1; 32],
             ed25519: [1; 32],
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         })
         .await
         .expect("write ok");
@@ -524,6 +530,7 @@ async fn revoke_apply_callback_epoch_and_kill_hook_within_2s() {
             x25519: [3; 32],
             ed25519: [3; 32],
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -603,6 +610,7 @@ async fn apply_lag_breaker_rejects_cache_and_new_handshake() {
             x25519: [4; 32],
             ed25519: dev_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -702,6 +710,7 @@ async fn full_partition_breaker_blocks_revoked_cache_until_rejoin() {
             x25519: [6; 32],
             ed25519: dev_pub,
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;
@@ -776,6 +785,7 @@ async fn ticket_root_in_raft_cross_node_and_epoch_invalidation() {
             x25519: [5; 32],
             ed25519: [5; 32],
             hostname: String::new(),
+            registered_at_unix: 1_700_000_000,
         },
     )
     .await;

@@ -197,7 +197,7 @@ impl SyncNodeBuilder {
 
         // 反熵循环（5s 全表摘要 fan-out）+ 本地会话租约续期（TTL/3 重发布）+ EWMA
         // 折叠（1s 窗——M7）。
-        tokio::spawn(anti_entropy_loop(ic.clone(), lease.clone()));
+        tokio::spawn(anti_entropy_loop(ic.clone(), lease.clone(), self.node_id));
         tokio::spawn(lease_refresh_loop(
             ic.clone(),
             lease.clone(),
@@ -322,13 +322,19 @@ fn broadcast_publish(
     }
 }
 
-async fn anti_entropy_loop(ic: Arc<Interconnect>, lease: Arc<LeaseTable>) {
+async fn anti_entropy_loop(ic: Arc<Interconnect>, lease: Arc<LeaseTable>, me: NodeId) {
     let mut tick = tokio::time::interval(ANTI_ENTROPY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let msg = lease.anti_entropy_msg();
         for peer in ic_peer_ids(&ic) {
+            // 自摘要自合并是纯浪费（同 (term, holder) 不可能「更新」⇒ 恒 no-op），且会
+            // 污染 LeaseTable::remote_events 的「远端视图已回填」信号（回收器闸门用，
+            // §7-M7.5）——与 broadcast_publish/locate 的自过滤同纪律。
+            if peer == me {
+                continue;
+            }
             let _ = ic
                 .call(peer, WireRpc::Gossip(msg.clone()), Duration::from_secs(2))
                 .await;

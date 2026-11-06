@@ -1049,6 +1049,131 @@ async fn roster_consistent_across_servers_with_traffic_pump() {
         .any(|p| p.vip == out_b.vip && p.hostname == "roster-b-pad"));
 }
 
+// ============================================================================
+// M7（§7-M7.5）：回收器——registered_at 锚 + 租约视图就绪闸门（多主形态）
+// ============================================================================
+
+/// 断言面（单节点 raft 集群 = 无对端 ⇒ 永无远端租约事件——闸门两态可精确驱动）：
+/// - **闸门关**（租约表无远端事件）：即使 dev_idle 的 registered_at 锚已超窗（40d >
+///   30d 保留期）也**不回收**——重启后「反熵回填 ≤5s 与回收首拍赛跑」窗口内，远端
+///   托管设备的租约行缺失，误终态化会殃及全网（含在线设备——邀请已消费即砖死）；
+/// - **闸门开**（注入一条远端 gossip = 反熵回填完成）：从未在线且锚超窗的 dev_idle
+///   被回收；有租约观测的 dev_online（registered_at 同为 40d 前、last_seen = 当前）
+///   不动——观测值优先于陈旧锚。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reaper_anchor_and_lease_gate_multi_primary() {
+    use flock_sync::lease::GossipMsg;
+
+    // 单节点集群装配（root 签身份 + 自签目录 + 内存织物仅本机）。
+    let root = ed25519_dalek::SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+    let cluster_id = flock_protocol::session::ClusterId(rand::random());
+    let ident = Arc::new(flock_protocol::session::ServerIdentity::enroll(
+        &root,
+        cluster_id,
+        sid(1),
+        "node-1.test:9443",
+    ));
+    let directory = flock_protocol::trust::ClusterDirectory::issue(
+        &root,
+        cluster_id,
+        1,
+        vec![ident.entry.clone()],
+    );
+    let reg = MemoryFabric::registry();
+    let fabric = MemoryFabric::new(ident.server_id, &reg, FABRIC_DELAY, 2 * 1024 * 1024);
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let node = Arc::new(
+        SyncNodeBuilder::new(
+            SyncSettings::default(),
+            ident.clone(),
+            directory,
+            fabric,
+            tmp.path().join("db-1.redb"),
+        )
+        .voters(&[1])
+        .build()
+        .await
+        .expect("node build"),
+    );
+    // Bootstrap + ServerKeys + 本机 Rewrap（open_sync 就绪前置）。
+    let leader = wait_leader(&[node.clone()]).await;
+    let oprf_b64 = server_setup_new(&mut rand::rngs::OsRng);
+    submit_wrapped_oprf(&leader, &root, &[ident.clone()], &oprf_b64).await;
+
+    let tmp2 = tempfile::tempdir().expect("tmpdir");
+    let cfg = sync_server_cfg(tmp2.path().to_path_buf(), "node-1.test:9443".into(), vec![]);
+    std::mem::forget(tmp2);
+    let core = ServerCore::open_sync(cfg, ident.clone(), node.clone())
+        .await
+        .expect("open_sync");
+
+    // 两台设备：registered_at 同为 40 天前（提交方注入——apply 确定性）；dev_online
+    // 另有本机租约观测（publish ⇒ last_seen = 当前）。
+    let now = flock_protocol::trust::now_unix();
+    let t_old = now.saturating_sub(40 * 86_400);
+    let vk_of = |seed: u8| {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_owned()
+    };
+    for seed in 1u8..=2 {
+        let resp = node
+            .write(SyncRequest::RegisterDevice {
+                owner: format!("u{seed}"),
+                x25519: [seed; 32],
+                ed25519: *vk_of(seed).as_bytes(),
+                hostname: String::new(),
+                registered_at_unix: t_old,
+            })
+            .await
+            .expect("register");
+        assert!(
+            matches!(resp, flock_sync::proto::SyncResponse::Device(_)),
+            "register: {resp:?}"
+        );
+    }
+    let dev_online = DeviceId::from_ed25519(&vk_of(1));
+    let dev_idle = DeviceId::from_ed25519(&vk_of(2));
+    node.publish_lease(&dev_online.0).await;
+    let row_status = |dev: &DeviceId| {
+        node.devices_snapshot()
+            .iter()
+            .find(|(id, _)| DeviceId(*id) == *dev)
+            .map(|(_, r)| r.status)
+            .expect("row")
+    };
+    let day = 86_400u64;
+
+    // ① 闸门关（表有行但自启动起零远端事件）：锚超窗的 dev_idle 也不回收。
+    assert!(!node.lease().reaper_view_ready(), "单节点无对端 ⇒ 闸门关");
+    let expired = flock_server::server::reap_once(&core, 30, now + day).await;
+    assert!(expired.is_empty(), "视图未就绪 ⇒ 跳过整趟: {expired:?}");
+    assert_eq!(row_status(&dev_idle), flock_sync::proto::DeviceStatus::Active);
+    assert_eq!(
+        row_status(&dev_online),
+        flock_sync::proto::DeviceStatus::Active
+    );
+
+    // ② 闸门开（注入一条远端 gossip = 反熵回填完成）：dev_idle（从未在线且锚 41d >
+    // 30d）回收；dev_online（观测 1d < 30d）不动。
+    node.lease().merge_remote(GossipMsg::Anti { entries: vec![] });
+    assert!(node.lease().reaper_view_ready());
+    let expired = flock_server::server::reap_once(&core, 30, now + day).await;
+    assert_eq!(expired, vec![dev_idle], "仅锚超窗且从未在线者回收");
+    assert_eq!(
+        row_status(&dev_idle),
+        flock_sync::proto::DeviceStatus::Expired
+    );
+    assert_eq!(
+        row_status(&dev_online),
+        flock_sync::proto::DeviceStatus::Active,
+        "租约观测（1d）优先于陈旧锚（41d）"
+    );
+    // 幂等：同窗再跑 ⇒ 空趟。
+    let expired = flock_server::server::reap_once(&core, 30, now + day).await;
+    assert!(expired.is_empty(), "幂等");
+}
+
 /// M7 roster 测试的邀请 fixture（登记 + 根签签发）。
 async fn m7_invite(c3: &Node3, id: [u8; 16]) -> InviteFile {
     let expiry = flock_protocol::trust::now_unix() + 3600;
