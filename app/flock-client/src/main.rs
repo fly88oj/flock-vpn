@@ -33,6 +33,9 @@ flock-client [--config <client.toml>] [<subcommand>]
   (run)                  前台调试模式（缺省）：tun + 路由 + 接入器守护（不起 IPC）
   service                daemon：supervise + 控制面 IPC + 优雅停服（§7-M6）
   status                 向 daemon 发一次 Status 请求并打印（无托盘环境探针）
+  install [--user|--service]  安装服务+托盘自启（缺省两者；安装时 --config 记入服务定义）
+  uninstall [--user|--service] 反向卸载
+  tray                   托盘进程（M6 第二阶段；本阶段为占位入口，tray feature 门控）
   invite <path>          载入邀请（b64 文本/原始字节）→ 钉扎根公钥 + 存根签目录
   gen-keys               生成/复用设备密钥并打印公钥（device-x=/device-ed= b64）
   --smoke                真机冒烟：建 tun + 配路由 + 打印状态即退（§7-M3 手工清单）
@@ -58,7 +61,17 @@ enum Cmd {
     Run,
     Service,
     Status,
-    Invite { path: PathBuf },
+    Install {
+        scope: flock_client::install::Scope,
+    },
+    Uninstall {
+        scope: flock_client::install::Scope,
+    },
+    #[cfg(feature = "tray")]
+    Tray,
+    Invite {
+        path: PathBuf,
+    },
     GenKeys,
     Smoke,
 }
@@ -79,11 +92,48 @@ fn parse_args() -> Result<Cli, String> {
         }
         i += 1;
     }
-    let mut it = rest.into_iter();
-    let cmd = match it.next().as_deref() {
+    let mut it = rest.into_iter().peekable();
+    let first = it.next();
+    // 范围旗标（install/uninstall）：--user 只托盘自启、--service 只服务、缺省两者
+    //（旗标跟在子命令之后：`install --user`）。
+    let mut scope_user = false;
+    let mut scope_service = false;
+    if matches!(first.as_deref(), Some("install") | Some("uninstall")) {
+        while let Some(flag) = it.peek() {
+            match flag.as_str() {
+                "--user" => {
+                    scope_user = true;
+                    it.next();
+                }
+                "--service" => {
+                    scope_service = true;
+                    it.next();
+                }
+                _ => break,
+            }
+        }
+    }
+    let scope = match (scope_user, scope_service) {
+        (true, false) => flock_client::install::Scope::TrayOnly,
+        (false, true) => flock_client::install::Scope::ServiceOnly,
+        (false, false) => flock_client::install::Scope::Both,
+        (true, true) => {
+            return Err("--user 与 --service 互斥（缺省 = 两者都装）".into());
+        }
+    };
+    let cmd = match first.as_deref() {
         None | Some("run") => Cmd::Run,
         Some("service") => Cmd::Service,
         Some("status") => Cmd::Status,
+        Some("install") => Cmd::Install { scope },
+        Some("uninstall") => Cmd::Uninstall { scope },
+        #[cfg(feature = "tray")]
+        Some("tray") => Cmd::Tray,
+        #[cfg(not(feature = "tray"))]
+        Some("tray") => return Err(
+            "tray 子命令未编入本构建（--no-default-features 无头档；重编译请启用 tray feature）"
+                .into(),
+        ),
         Some("invite") => Cmd::Invite {
             path: PathBuf::from(it.next().ok_or("invite 需要 <文件路径>")?),
         },
@@ -110,6 +160,16 @@ fn run_cli() -> Result<(), String> {
         // 上下文内自载 config（工作目录 = system32，配置路径须安装时写绝对路径）。
         Cmd::Status => cmd_status(),
         Cmd::Service => cmd_service(&cli.config),
+        Cmd::Install { scope } => flock_client::install::install(&cli.config, scope)
+            .map_err(|e| format!("{e}\n（提权要求与平台矩阵见 docs/manual/service-install.md）")),
+        Cmd::Uninstall { scope } => flock_client::install::uninstall(scope)
+            .map_err(|e| format!("{e}\n（提权要求与平台矩阵见 docs/manual/service-install.md）")),
+        #[cfg(feature = "tray")]
+        Cmd::Tray => Err(
+            "tray 子命令为 M6 第二阶段占位（IPC 契约已就绪：flock_client::ipc 的 \
+             CtrlReq/CtrlResp + ControlPaths::platform_default）"
+                .into(),
+        ),
         Cmd::Run | Cmd::GenKeys | Cmd::Invite { .. } | Cmd::Smoke => {
             let cfg = ClientConfig::load(&cli.config)?;
             match cli.cmd {
@@ -256,7 +316,11 @@ fn run_cli() -> Result<(), String> {
                     })
                 }
                 // 不可达（外层 match 已分流；保穷尽性）。
-                Cmd::Service | Cmd::Status => unreachable!("已在 run_cli 分流"),
+                Cmd::Service | Cmd::Status | Cmd::Install { .. } | Cmd::Uninstall { .. } => {
+                    unreachable!("已在 run_cli 分流")
+                }
+                #[cfg(feature = "tray")]
+                Cmd::Tray => unreachable!("已在 run_cli 分流"),
             }
         }
     }

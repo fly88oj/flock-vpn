@@ -11,7 +11,9 @@
 //! - [`ipc`]：控制 IPC v1 契约 + daemon 服务端 + 客户端单次请求（§7-M6.2——托盘
 //!   工程直接消费本模块，`service` 子命令装配服务端）；
 //! - [`service`]：daemon 装配（§7-M6.1：supervise 复用 + IPC 服务端 + 状态快照源 +
-//!   优雅停服 + Windows SCM 集成）。
+//!   优雅停服 + Windows SCM 集成）；
+//! - [`install`]：服务安装/卸载 + 托盘自启注册（§7-M6.3：Windows SCM/事件日志源/
+//!   HKCU Run、systemd 单元、launchd plist）。
 //!
 //! 服务器（`flock-server`）以库形式复用 [`tun`]/[`route`]/dataplane 桥
 //! （§2.2「服务端自身也是 peer」、§3.11「对上挂 tun 适配器」）——`TunDevice` 接缝按
@@ -20,6 +22,7 @@
 pub mod config;
 pub mod connector;
 pub mod dataplane;
+pub mod install;
 pub mod ipc;
 // 控制面平台传输（私有：契约/服务端/客户端入口全走 [`ipc`]）。
 #[cfg(unix)]

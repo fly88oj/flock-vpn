@@ -909,6 +909,7 @@ dependencies = [
  "tun-rs",
  "windows-service",
  "windows-sys",
+ "winreg",
 ]
 
 [[package]]

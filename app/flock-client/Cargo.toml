@@ -33,6 +33,15 @@ rtnetlink = { workspace = true }
 windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_EventLog"] }
 # 服务化（§7-M6.3）：SCM 分派器 + 服务安装/恢复策略（编译级验证；真机安装列手工清单）。
 windows-service = "0.8"
+# 托盘自启 HKCU Run 键 + 事件日志源注册（§7-M6.3）。
+winreg = "0.56"
 
 [dev-dependencies]
 tempfile = "3"
+
+# §7-M6.5：tray feature 门控（托盘 GUI 依赖第二阶段按 target 门控挂入；本阶段仅门控
+# 子命令注册面）。cargo 无法表达按平台差异的 default features——Linux 无头档以
+# --no-default-features 构建（CI 门禁含该档），见设计文档 M6.5 限制声明。
+[features]
+default = ["tray"]
+tray = []
