@@ -49,8 +49,18 @@ pub(crate) fn spawn_unix_server(
                         let _ = serve_conn(&mut stream, &ctrl).await;
                     });
                 }
+                // 评审项 4：瞬态（fd 耗尽/对端半途消失等）记日志退避 continue——
+                // 不杀 IPC 任务；仅致命（listener 关闭/损坏等其余）上浮返回，
+                // daemon 主流程经任务收尾感知。
+                Err(e) if crate::ipc::accept_error_is_transient(&e) => {
+                    eprintln!(
+                        "flock-client: 控制 socket accept 瞬态失败，{}ms 后重试: {e}",
+                        crate::ipc::ACCEPT_RETRY_BACKOFF.as_millis()
+                    );
+                    tokio::time::sleep(crate::ipc::ACCEPT_RETRY_BACKOFF).await;
+                }
                 Err(e) => {
-                    eprintln!("flock-client: 控制 socket accept 失败，IPC 停止: {e}");
+                    eprintln!("flock-client: 控制 socket accept 失败（致命），IPC 停止: {e}");
                     return;
                 }
             }

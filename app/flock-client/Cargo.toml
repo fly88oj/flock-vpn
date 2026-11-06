@@ -66,6 +66,9 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSO
 
 [dev-dependencies]
 tempfile = "3"
+# 测试档：tokio paused 时钟（start_paused + auto-advance）——serve_conn 10s 整链
+# 超时单测即时推进（不真等 10s；仅 dev 面拉起 test-util，不进生产特性面）。
+tokio = { workspace = true, features = ["test-util"] }
 
 # §7-M6.5：tray feature 门控。GUI 依赖全部按 target 门控挂 optional、由 tray 拉起
 # （cargo 限制如实声明：dep: 引用在不匹配 target 上为 no-op——Linux 默认构建不出现

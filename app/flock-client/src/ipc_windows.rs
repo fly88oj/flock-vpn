@@ -18,8 +18,9 @@ use crate::ipc::{request_over, serve_conn, CtrlReq, CtrlResp, DaemonControl};
 const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)";
 /// token 文件 ACL 的 SDDL：SYSTEM/管理员全权 + Builtin Users 只读。
 const TOKEN_FILE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)";
-/// `ERROR_PIPE_BUSY`（服务端实例瞬时耗尽；客户端短重试）。
-const ERROR_PIPE_BUSY: i32 = 231;
+/// `ERROR_PIPE_BUSY`（服务端实例瞬时耗尽——客户端短重试 / 服务端下实例创建退避
+/// 重试两处消费；评审项 4 分类面）。
+pub(crate) const ERROR_PIPE_BUSY: i32 = 231;
 /// 客户端 busy 重试窗口。
 const CLIENT_RETRY_WINDOW: Duration = Duration::from_millis(500);
 
@@ -91,8 +92,19 @@ pub(crate) fn spawn_named_pipe_server(
         let sa = sa; // 移入任务域（Drop 在循环结束）。
         let mut server = first;
         loop {
+            // 评审项 4：connect（管首 accept）错误分类——瞬态（客户端连后即断
+            // NotConnected/对端半途消失/资源压力）记日志退避后**同一实例**重试；
+            // 其余致命上浮返回（daemon 主流程经任务收尾感知）。
             if let Err(e) = server.connect().await {
-                eprintln!("flock-client: 控制管道 accept 失败，IPC 停止: {e}");
+                if crate::ipc::accept_error_is_transient(&e) {
+                    eprintln!(
+                        "flock-client: 控制管道 accept 瞬态失败，{}ms 后重试: {e}",
+                        crate::ipc::ACCEPT_RETRY_BACKOFF.as_millis()
+                    );
+                    tokio::time::sleep(crate::ipc::ACCEPT_RETRY_BACKOFF).await;
+                    continue;
+                }
+                eprintln!("flock-client: 控制管道 accept 失败（致命），IPC 停止: {e}");
                 return;
             }
             let ctrl = ctrl.clone();
@@ -100,20 +112,39 @@ pub(crate) fn spawn_named_pipe_server(
                 let mut s = server;
                 let _ = serve_conn(&mut s, &ctrl).await;
             });
-            // 预建下实例（同 DACL；非首实例不得带 first_pipe_instance）。
-            let mut opts = ServerOptions::new();
-            opts.pipe_mode(tokio::net::windows::named_pipe::PipeMode::Byte);
-            // SAFETY：sa 在本循环作用域存活。
-            let next = unsafe {
-                opts.create_with_security_attributes_raw(&name, &sa.sa as *const _ as *mut c_void)
-            };
-            match next {
-                Ok(s) => server = s,
-                Err(e) => {
-                    eprintln!("flock-client: 控制管道下实例创建失败，IPC 停止: {e}");
-                    return;
+            // 预建下实例（同 DACL；非首实例不得带 first_pipe_instance）。创建失败
+            // 分类（评审项 4）：ERROR_PIPE_BUSY=AllPipeInstancesBusy（实例在途耗尽）
+            // 为瞬态——退避重试（既有 serve_conn 完成即释放额度）；其余致命上浮。
+            let next = loop {
+                let mut opts = ServerOptions::new();
+                opts.pipe_mode(tokio::net::windows::named_pipe::PipeMode::Byte);
+                // SAFETY：sa 在本循环作用域存活。
+                let next = unsafe {
+                    opts.create_with_security_attributes_raw(
+                        &name,
+                        &sa.sa as *const _ as *mut c_void,
+                    )
+                };
+                match next {
+                    Ok(s) => break Some(s),
+                    Err(e) if e.raw_os_error() == Some(crate::ipc_windows::ERROR_PIPE_BUSY) => {
+                        eprintln!(
+                            "flock-client: 控制管道实例在途耗尽（AllPipeInstancesBusy），\
+                             {}ms 后重试",
+                            crate::ipc::ACCEPT_RETRY_BACKOFF.as_millis()
+                        );
+                        tokio::time::sleep(crate::ipc::ACCEPT_RETRY_BACKOFF).await;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "flock-client: 控制管道下实例创建失败（致命），IPC 停止: {e}"
+                        );
+                        break None;
+                    }
                 }
-            }
+            };
+            let Some(next) = next else { return };
+            server = next;
         }
     }))
 }

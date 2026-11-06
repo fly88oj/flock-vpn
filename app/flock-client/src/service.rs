@@ -343,7 +343,7 @@ async fn daemon_loop(
             }))
         },
     });
-    let ipc_task = match spawn_server(&paths, cfg.control_group.as_deref(), ctrl) {
+    let mut ipc_task = match spawn_server(&paths, cfg.control_group.as_deref(), ctrl) {
         Ok(t) => t,
         Err(e) => {
             supervise_task.abort();
@@ -352,12 +352,17 @@ async fn daemon_loop(
         }
     };
 
-    // —— 停机等待：IPC Shutdown / SCM Stop / 信号 任一触发；supervise 死亡同停 ——
+    // —— 停机等待：IPC Shutdown / SCM Stop / 信号 任一触发；supervise/IPC 死亡同停 ——
     let outcome = tokio::select! {
         _ = stop.notified() => Ok(()),
         // supervise 任务终止（仅可能 panic）⇒ 存活通道关闭 ⇒ 按失败停服。
         sup_dead = sup_alive_rx.recv() => Err(format!(
             "守护循环异常退出（存活信号: {sup_dead:?}）"
+        )),
+        // IPC accept 循环致命退出（评审项 4：瞬态已在其内退避 continue，仅致命
+        // 上浮返回）⇒ 控制面失能——按失败停服，主流程可见（非静默失联）。
+        ipc_dead = &mut ipc_task => Err(format!(
+            "控制 IPC 循环异常退出（致命 accept/创建错误，详见日志）: {ipc_dead:?}"
         )),
     };
 

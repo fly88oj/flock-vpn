@@ -35,6 +35,13 @@ pub const MAX_CTRL_FRAME: usize = 256 * 1024;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// `Peers` 请求的整链超时档（名册拉取 + 3 探针 × 2s 超时串行 ⇒ 上限 ~10s，留余量）。
 pub const PEERS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// 单连接服务整链超时（评审项 4：连接后不发帧/不读帧的对端不得永久占住管道
+/// 实例——超时即断开释放）。10s 对 Peers 最重路径自洽：名册拉取内部
+/// [`crate::ctrl::CTRL_REQ_TIMEOUT`] 10s 到点即错出（不叠加）、ping 并发 ≤6s，
+/// 典型完成 <10s；拉取恰在 10s 到点错误的极窄竞态下客户端见断管（与超时同义）。
+pub const SERVE_CONN_TIMEOUT: Duration = Duration::from_secs(10);
+/// accept/connect 瞬态错误的退避（评审项 4：持续瞬态压力下不空转刷日志）。
+pub const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 // ============================================================================
 // 契约类型（v1——托盘工程消费面，改字段=破契；M7 增 Peers 面）
@@ -141,29 +148,71 @@ fn token_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     diff == 0
 }
 
-/// 单连接服务：读一帧请求 → 认证 → 分发 → 写一帧响应。
+/// accept/connect 循环错误分类（评审项 4）。
+///
+/// - **瞬态**（记日志 + [`ACCEPT_RETRY_BACKOFF`] 退避后 continue——不杀 IPC 任务）：
+///   fd 耗尽（EMFILE/ENFILE——进程级资源压力）、WouldBlock/Interrupted、
+///   ConnectionAborted/ConnectionReset（对端半途消失）、Windows 管道首连
+///   NotConnected（ERROR_NO_DATA：客户端连后即断，实例可重用）与下实例创建
+///   ERROR_PIPE_BUSY（231，AllPipeInstancesBusy——实例在途，既有连接完成后可建）；
+/// - **致命**（其余：listener/管道损坏、权限、编程错误）⇒ 循环返回上浮，daemon
+///   主流程经 IPC 任务收尾感知（service.rs select 臂）。
+pub fn accept_error_is_transient(e: &io::Error) -> bool {
+    use io::ErrorKind as K;
+    if matches!(
+        e.kind(),
+        K::WouldBlock | K::Interrupted | K::ConnectionAborted | K::ConnectionReset | K::NotConnected
+    ) {
+        return true;
+    }
+    // Windows：ERROR_PIPE_BUSY（231）——管道实例在途耗尽（AllPipeInstancesBusy）。
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(231) {
+        return true;
+    }
+    // Unix：EMFILE(24)/ENFILE(23)——linux/macos 同值（无 libc 依赖面；fd 耗尽为
+    // 进程级瞬态压力，退避后既有连接释放即恢复）。
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(24) | Some(23)) {
+        return true;
+    }
+    false
+}
+
+/// 单连接服务：读一帧请求 → 认证 → 分发 → 写一帧响应（整链受
+/// [`SERVE_CONN_TIMEOUT`] 约束——评审项 4：不发帧/不读帧的连接不得永久占住
+/// 管道实例，超时断开释放）。
 ///
 /// 传输层泛型（mock duplex 单测面）；畸形帧 ⇒ io 错误关闭连接，无响应。
 pub async fn serve_conn<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut S,
     ctrl: &DaemonControl,
 ) -> io::Result<()> {
-    let req: CtrlReq = recv_frame(io).await?;
-    let resp = match &req {
-        CtrlReq::Status { token } if token_eq(token, &ctrl.token) => (ctrl.status)(),
-        CtrlReq::Shutdown { token } if token_eq(token, &ctrl.token) => {
-            (ctrl.shutdown)();
-            CtrlResp::Ok
-        }
-        CtrlReq::Peers { token } if token_eq(token, &ctrl.token) => match &ctrl.peers {
-            Some(f) => f().await,
-            None => CtrlResp::PeersUnavailable {
-                reason: "daemon 未装配名册面（client.toml 缺 [auth]？）".into(),
+    let served = async {
+        let req: CtrlReq = recv_frame(io).await?;
+        let resp = match &req {
+            CtrlReq::Status { token } if token_eq(token, &ctrl.token) => (ctrl.status)(),
+            CtrlReq::Shutdown { token } if token_eq(token, &ctrl.token) => {
+                (ctrl.shutdown)();
+                CtrlResp::Ok
+            }
+            CtrlReq::Peers { token } if token_eq(token, &ctrl.token) => match &ctrl.peers {
+                Some(f) => f().await,
+                None => CtrlResp::PeersUnavailable {
+                    reason: "daemon 未装配名册面（client.toml 缺 [auth]？）".into(),
+                },
             },
-        },
-        _ => CtrlResp::Denied,
+            _ => CtrlResp::Denied,
+        };
+        send_frame(io, &resp).await
     };
-    send_frame(io, &resp).await
+    match tokio::time::timeout(SERVE_CONN_TIMEOUT, served).await {
+        Ok(res) => res,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "控制连接整链超时（10s——连接不发帧/不收帧即断开释放实例）",
+        )),
+    }
 }
 
 /// 控制面端点（平台传输地址；测试注入临时路径）。
@@ -594,6 +643,67 @@ mod tests {
         b[31] ^= 1;
         assert!(!token_eq(&a, &b));
         assert!(!token_eq(&[0u8; 32], &[1u8; 32]));
+    }
+
+    /// 评审项 4：错误分类——瞬态集（WouldBlock/Interrupted/ConnAborted/ConnReset/
+    /// 管道首连 NotConnected/EMFILE/ENFILE（unix）/ERROR_PIPE_BUSY 231（windows））
+    /// 记日志退避 continue；其余（PermissionDenied/EBADF 等）致命上浮。
+    #[test]
+    fn accept_error_classification() {
+        // —— 瞬态（ErrorKind 面，全平台）——
+        for kind in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::NotConnected,
+        ] {
+            assert!(
+                accept_error_is_transient(&io::Error::from(kind)),
+                "{kind:?} 应为瞬态"
+            );
+        }
+        // —— 致命（其余 kind / 原始码）——
+        assert!(
+            !accept_error_is_transient(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            "权限错误致命"
+        );
+        assert!(
+            !accept_error_is_transient(&io::Error::from_raw_os_error(9)),
+            "EBADF（监听面损坏）致命"
+        );
+        // —— 平台原始码面 ——
+        #[cfg(unix)]
+        {
+            // EMFILE=24/ENFILE=23（linux/macos 同值）——fd 耗尽瞬态。
+            assert!(accept_error_is_transient(&io::Error::from_raw_os_error(24)));
+            assert!(accept_error_is_transient(&io::Error::from_raw_os_error(23)));
+            // 其余原始码（如 EACCES=13）致命。
+            assert!(!accept_error_is_transient(&io::Error::from_raw_os_error(13)));
+        }
+        #[cfg(windows)]
+        {
+            // ERROR_PIPE_BUSY=231（AllPipeInstancesBusy——实例在途）瞬态；
+            // ERROR_ACCESS_DENIED=5 致命。
+            assert!(accept_error_is_transient(&io::Error::from_raw_os_error(231)));
+            assert!(!accept_error_is_transient(&io::Error::from_raw_os_error(5)));
+        }
+    }
+
+    /// 评审项 4：连接后不发帧 ⇒ serve_conn 整链超时错出（TimedOut）——不占住
+    /// 管道实例（paused 时钟下 10s 即时推进）。
+    #[tokio::test(start_paused = true)]
+    async fn serve_conn_times_out_when_client_never_frames() {
+        let (ctrl, _) = daemon_control(generate_token());
+        let (mut client, mut server) = duplex(4096);
+        let served = tokio::spawn(async move { serve_conn(&mut server, &ctrl).await });
+        // 客户端连接在位但不发任何字节：服务端 10s 整链超时（paused 时钟自动推进）。
+        let res = tokio::time::timeout(Duration::from_secs(15), served)
+            .await
+            .expect("超时须在 10s 整链档内触发")
+            .unwrap();
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        drop(client);
     }
 
     /// M7：Peers 契约往返——对 token ⇒ 增强名册行（含 latency/self）；错 token ⇒
