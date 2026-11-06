@@ -15,6 +15,10 @@
 //! 在 IPC mock（真传输：临时命名管道或 Unix socket）上的请求顺序。
 
 pub mod icon;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod backend_native;
+#[cfg(target_os = "linux")]
+mod backend_ksni;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -266,10 +270,37 @@ pub(crate) fn linux_gui_session_present() -> bool {
         .unwrap_or_else(|_| {
             std::env::var("XDG_RUNTIME_DIR")
                 .ok()
-                .map(|d| d.as_path().join("bus"))
+                .map(|d| PathBuf::from(d).join("bus"))
                 .is_some_and(|p| p.exists())
         });
     gui_session_present(display, wayland, bus)
+}
+
+// ============================================================================
+// 进程入口（`tray` 子命令体；平台后端分派）
+// ============================================================================
+
+/// 托盘进程入口（main 直调）：端点/token 取平台缺省（§7-M6.2），GUI 缺席与托盘
+/// 创建失败均**优雅退出**（`Ok(())`——退出码 0，清晰日志落 stderr）；仅内部错误
+/// （线程/运行时创建失败等）以 `Err` 上浮（退出码 2）。
+pub fn run_tray() -> Result<(), String> {
+    let paths = ControlPaths::platform_default();
+    #[cfg(windows)]
+    let endpoint_disp = paths.endpoint.pipe_name.as_str();
+    #[cfg(unix)]
+    let endpoint_disp = paths.endpoint.socket_path.display().to_string();
+    eprintln!(
+        "flock-client tray: 启动（控制端点 {endpoint_disp}，token 文件 {}）",
+        paths.token_file.display()
+    );
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        backend_native::run(&paths)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        backend_ksni::run(&paths)
+    }
 }
 
 // ============================================================================

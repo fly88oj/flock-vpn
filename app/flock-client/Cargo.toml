@@ -24,24 +24,51 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "tim
 tun-rs = { workspace = true }
 
 # 路由配置（§2.3：rtnetlink /16 池指向 TUN + rp_filter=1）仅 Linux。
+# ksni（§7-M6 二阶段）= Linux 托盘：纯 Rust DBus StatusNotifierItem（zbus 后端，
+# tokio 特性与既有运行时同域）——不引 GTK/libappindicator 系统依赖。optional + 仅
+# tray feature 拉起（无头档 --no-default-features 编译面零 GUI 依赖）。
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = { workspace = true }
+ksni = { version = "0.3", default-features = false, features = ["tokio"], optional = true }
 
 # 控制 IPC Windows 侧（§7-M6.2）：命名管道显式 DACL（SDDL）+ token 文件 ACL。
 # Authorization = SDDL 转换/SetNamedSecurityInfo；Foundation = LocalFree。
+# 托盘（§7-M6 二阶段）追加：WindowsAndMessaging = Win32 消息泵（GetMessageW/
+#   PostThreadMessageW/DispatchMessageW——tray 后端）；Threading = GetCurrentThreadId。
+#   仅 facade 声明（零运行时依赖），无 GUI 库面。
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_EventLog"] }
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_EventLog", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 # 服务化（§7-M6.3）：SCM 分派器 + 服务安装/恢复策略（编译级验证；真机安装列手工清单）。
 windows-service = "0.8"
 # 托盘自启 HKCU Run 键 + 事件日志源注册（§7-M6.3）。
 winreg = "0.56"
 
+# 托盘（§7-M6 第二阶段）：Windows/macOS 用 tray-icon（内建 muda 菜单经
+# tray_icon::menu 再导出消费——不直接依赖 muda）。default-features=false 关掉
+# libappindicator（Linux/BSD 面的 GTK 路径——本平台不用）。
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.26", default-features = false, optional = true }
+
+# macOS 托盘主循环（tray-icon mac 后端要求主线程 NSApplication 事件循环）：
+# NSApplication/NSEvent = 事件排空；objc2-foundation = NSDate/NSDefaultRunLoopMode；
+# objc2 = MainThreadMarker。编译级验证（无设备，真机清单留位）。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"], optional = true }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSResponder", "NSEvent"], optional = true }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSObjCRuntime", "NSString", "NSDate", "NSRunLoop"], optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 
-# §7-M6.5：tray feature 门控（托盘 GUI 依赖第二阶段按 target 门控挂入；本阶段仅门控
-# 子命令注册面）。cargo 无法表达按平台差异的 default features——Linux 无头档以
-# --no-default-features 构建（CI 门禁含该档），见设计文档 M6.5 限制声明。
+# §7-M6.5：tray feature 门控。GUI 依赖全部按 target 门控挂 optional、由 tray 拉起
+# （cargo 限制如实声明：dep: 引用在不匹配 target 上为 no-op——Linux 默认构建不出现
+# tray-icon/objc2 面，Windows 不出现 ksni 面；--no-default-features 三平台全零）。
 [features]
 default = ["tray"]
-tray = []
+tray = [
+  "dep:tray-icon",
+  "dep:objc2",
+  "dep:objc2-app-kit",
+  "dep:objc2-foundation",
+  "dep:ksni",
+]
