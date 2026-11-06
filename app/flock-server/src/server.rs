@@ -241,6 +241,19 @@ impl ServerCore {
     /// 打开既有状态或引导新集群（`init-cluster` 语义；已初始化则原样加载）。
     /// 返回 `(core, created)`。
     pub fn open_or_init(cfg: ServerConfig) -> Result<(Arc<Self>, bool), String> {
+        // 单服形态 VIP 校验（server_vip_of 一致性面的另一半）：cfg.vip 不得落入设备
+        // 分配段（VIP_FIRST..=VIP_LAST）——服务器自身 VIP 与设备池撞段 ⇒ 首台设备注册
+        // 即同 IP，路由/名册/源 VIP 校验全体错位。服务器自身用 100.64.0.1（§2.2）。
+        let vip_u32 = u32::from(cfg.vip);
+        if (crate::netstate::VIP_FIRST..=crate::netstate::VIP_LAST).contains(&vip_u32) {
+            let lo = std::net::Ipv4Addr::from(crate::netstate::VIP_FIRST);
+            let hi = std::net::Ipv4Addr::from(crate::netstate::VIP_LAST);
+            return Err(format!(
+                "cfg.vip {} 落入设备分配段 {lo}..={hi}（VIP_FIRST..=VIP_LAST）——\
+                 服务器自身 VIP 与设备池撞段即冲突，拒绝起服（服务器自身用 100.64.0.1）",
+                cfg.vip
+            ));
+        }
         let db_path = cfg.state_dir.join("netstate.redb");
         let store = StateStore::open(&db_path).map_err(|e| e.to_string())?;
         let created = store.meta_get(keys::CLUSTER_ID).is_none();
@@ -391,6 +404,28 @@ impl ServerCore {
     ) -> Result<Arc<Self>, String> {
         // 本机 node_id（wrap 的键 = node_id_of(server_id)——与 ServerKeys/Rewrap 同键）。
         let my_node = flock_sync::node::node_id_of(&ident.server_id);
+        // server_vip_of 一致性断言（§6.2 服务器段 .1–.10 确定性推导）：cfg.vip 必须等于
+        // 本机 node_id 的推导值——根签 ServerKeys 登记与名册 Server 条目均按推导值，
+        // 配置漂移会造成「登记 VIP ≠ 本机实配 VIP」的路由/名册错位。不匹配 ⇒ 拒起，
+        // 错误给出期望值（永久错误——非 SYNC_NOT_READY 前缀，就绪重试循环不吞它）。
+        match flock_sync::proto::server_vip_of(my_node) {
+            Some(expected) if expected == cfg.vip.octets() => {}
+            Some(expected) => {
+                let want = std::net::Ipv4Addr::from(expected);
+                return Err(format!(
+                    "cfg.vip {my_vip} 与 node {my_node} 的确定性服务器 VIP {want} 不一致\
+                     （§6.2 服务器段 .1–.10——ServerKeys 登记与名册 Server 条目均按推导值）\
+                     ——拒绝起服，请把 vip 改为 {want}",
+                    my_vip = cfg.vip
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "node_id {my_node} 超出服务器 VIP 保留段（1..=10）——无法推导服务器 \
+                     VIP（server_vip_of），拒绝起服"
+                ));
+            }
+        }
         // 等本服务器的 OPRF 封装在本节点 apply（Bootstrap → ServerKeys → Rewrap 的提交
         // 序 ⇒ wrap 可见蕴含 Bootstrap/票据根就位）。能力经 SyncNode 白名单方法
         // （评审项 13）。
@@ -1189,5 +1224,56 @@ mod reaper_tests {
         core2.traffic.note_tx(&row_a.vip, 1);
         let expired = reap_once(&core2, 30, now).await;
         assert_eq!(expired.len(), 2, "闸门开后按窗回收: {expired:?}");
+    }
+}
+
+// ============================================================================
+// 单元测试：server_vip_of 一致性——单服形态的 VIP 撞段拒起（多主断言面在
+// tests/multi_primary.rs::open_sync_rejects_vip_mismatch_with_expected_value）
+// ============================================================================
+
+#[cfg(test)]
+mod vip_guard_tests {
+    use super::*;
+    use crate::config::ServerConfig;
+
+    fn cfg_with_vip(vip: &str) -> ServerConfig {
+        ServerConfig {
+            state_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+            bind: "127.0.0.1:9443".parse().unwrap(),
+            mode: "direct".into(),
+            advertise_endpoint: "127.0.0.1:9443".into(),
+            extra_endpoints: vec![],
+            dir_version: 1,
+            ticket_ttl_secs: 60,
+            peer_retention_days: 30,
+            admin_bind: "127.0.0.1:9444".parse().unwrap(),
+            max_sessions: 1024,
+            tun_name: "tun0".into(),
+            vip: vip.parse().unwrap(),
+            frp: None,
+            sync: None,
+        }
+    }
+
+    /// 单服：cfg.vip 落入设备分配段（VIP_FIRST..=VIP_LAST，即 100.64.0.2 起）⇒ 拒起且
+    /// 错误点名段界与正确值；.1（服务器自身保留位）放行。
+    #[test]
+    fn single_form_vip_in_device_segment_refuses_start() {
+        // 段首（100.64.0.2 = 首台设备的 VIP）与段中段尾均拒。
+        for bad in ["100.64.0.2", "100.64.0.11", "100.127.255.254"] {
+            let err = match ServerCore::open_or_init(cfg_with_vip(bad)) {
+                Err(e) => e,
+                Ok(_) => panic!("{bad} 落入设备分配段必须拒起"),
+            };
+            assert!(err.contains("设备分配段"), "{bad} 拒: {err}");
+            assert!(err.contains("100.64.0.1"), "错误给出正确值: {err}");
+        }
+        // 服务器自身保留位放行。
+        ServerCore::open_or_init(cfg_with_vip("100.64.0.1"))
+            .expect(".1 = 服务器自身 VIP，放行");
+        // 段外（如 100.128.0.1——/10 之外）放行：校验只管撞段，不管选址合理性。
+        ServerCore::open_or_init(cfg_with_vip("100.128.0.1"))
+            .expect("段外地址不在本校验面（部署自担选址）");
     }
 }

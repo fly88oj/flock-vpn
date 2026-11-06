@@ -229,7 +229,13 @@ async fn serve_on(c3: &Node3, idx: usize, extra_endpoints: Vec<String>) -> SyncS
     std::mem::forget(tmp);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = l.local_addr().unwrap().to_string();
-    let cfg = sync_server_cfg(state_dir, endpoint.clone(), extra_endpoints);
+    // VIP = 本机 node_id 的确定性推导值（server_vip_of——open_sync 的一致性断言要求；
+    // 旧配置全部硬编码 .1 对 node 2/3 是「登记 VIP ≠ 实配 VIP」的错位形态）。
+    let node_id = flock_sync::node::node_id_of(&c3.idents[idx].server_id);
+    let vip = std::net::Ipv4Addr::from(
+        flock_sync::proto::server_vip_of(node_id).expect("node 1..=10"),
+    );
+    let cfg = sync_server_cfg(state_dir, endpoint.clone(), extra_endpoints, vip);
     let core = ServerCore::open_sync(cfg, c3.idents[idx].clone(), c3.nodes[idx].clone())
         .await
         .expect("open_sync");
@@ -242,6 +248,7 @@ fn sync_server_cfg(
     state_dir: std::path::PathBuf,
     advertise_endpoint: String,
     extra_endpoints: Vec<String>,
+    vip: std::net::Ipv4Addr,
 ) -> ServerConfig {
     ServerConfig {
         state_dir,
@@ -255,7 +262,7 @@ fn sync_server_cfg(
         admin_bind: "127.0.0.1:0".parse().unwrap(),
         max_sessions: 1024,
         tun_name: "tun0".into(),
-        vip: "100.64.0.1".parse().unwrap(),
+        vip,
         frp: None,
         sync: None,
     }
@@ -801,7 +808,12 @@ async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
     let tmp = tempfile::tempdir().expect("tmp");
     let state_dir = tmp.path().to_path_buf();
     std::mem::forget(tmp);
-    let cfg = sync_server_cfg(state_dir, "node-3.test:9443".into(), vec![]);
+    let cfg = sync_server_cfg(
+        state_dir,
+        "node-3.test:9443".into(),
+        vec![],
+        std::net::Ipv4Addr::from(flock_sync::proto::server_vip_of(3).expect("node 3")),
+    );
 
     // ① 无对应 wrap 的服务器：短窗（300ms）后明确失败——错误点名 OPRF 封装缺失。
     let err = match ServerCore::open_sync_with_wait(
@@ -825,7 +837,12 @@ async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
     );
     // 对照：有 wrap 的节点 1 同窗成功。
     let tmp1 = tempfile::tempdir().expect("tmp");
-    let cfg1 = sync_server_cfg(tmp1.path().to_path_buf(), "node-1.test:9443".into(), vec![]);
+    let cfg1 = sync_server_cfg(
+        tmp1.path().to_path_buf(),
+        "node-1.test:9443".into(),
+        vec![],
+        std::net::Ipv4Addr::from(flock_sync::proto::server_vip_of(1).expect("node 1")),
+    );
     std::mem::forget(tmp1);
     ServerCore::open_sync_with_wait(
         cfg1,
@@ -1050,6 +1067,59 @@ async fn roster_consistent_across_servers_with_traffic_pump() {
 }
 
 // ============================================================================
+// server_vip_of 一致性（多主形态）：open_sync 的 VIP 断言
+// ============================================================================
+
+/// node 1 的确定性服务器 VIP = 100.64.0.1：配置错位（.9）⇒ 拒起且错误**给出期望值**、
+/// 属永久错误（非 SYNC_NOT_READY 前缀——就绪重试循环不吞它）；匹配值可起。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_sync_rejects_vip_mismatch_with_expected_value() {
+    let c3 = build_cluster().await;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let state_dir = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    // 错配（node 1 应为 .1，配了 .9）：明确失败 + 期望值 + 永久错误（短窗内立即返回，
+    // 不等 wrap）。
+    let mut cfg = sync_server_cfg(
+        state_dir.clone(),
+        "node-1.test:9443".into(),
+        vec![],
+        "100.64.0.9".parse().unwrap(),
+    );
+    let t0 = std::time::Instant::now();
+    let err = match ServerCore::open_sync_with_wait(
+        cfg.clone(),
+        c3.idents[0].clone(),
+        c3.nodes[0].clone(),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("vip 错配必须拒起"),
+    };
+    assert!(
+        err.contains("100.64.0.1"),
+        "错误给出期望值（确定性推导）: {err}"
+    );
+    assert!(
+        !err.starts_with(flock_server::server::SYNC_NOT_READY_PREFIX),
+        "配置错误是永久错误（不被就绪重试吞掉）: {err}"
+    );
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "断言先于 wrap 等待（立即拒）"
+    );
+
+    // 匹配（.1 = server_vip_of(node 1)）⇒ 正常起（wraps 已在 build_cluster 落库）。
+    cfg.vip = "100.64.0.1".parse().unwrap();
+    ServerCore::open_sync_with_wait(cfg, c3.idents[0].clone(), c3.nodes[0].clone(), std::time::Duration::from_secs(5))
+        .await
+        .expect("推导值匹配 ⇒ 可起");
+}
+
+// ============================================================================
 // M7（§7-M7.5）：回收器——registered_at 锚 + 租约视图就绪闸门（多主形态）
 // ============================================================================
 
@@ -1101,7 +1171,12 @@ async fn reaper_anchor_and_lease_gate_multi_primary() {
     submit_wrapped_oprf(&leader, &root, &[ident.clone()], &oprf_b64).await;
 
     let tmp2 = tempfile::tempdir().expect("tmpdir");
-    let cfg = sync_server_cfg(tmp2.path().to_path_buf(), "node-1.test:9443".into(), vec![]);
+    let cfg = sync_server_cfg(
+        tmp2.path().to_path_buf(),
+        "node-1.test:9443".into(),
+        vec![],
+        std::net::Ipv4Addr::from(flock_sync::proto::server_vip_of(1).expect("node 1")),
+    );
     std::mem::forget(tmp2);
     let core = ServerCore::open_sync(cfg, ident.clone(), node.clone())
         .await
