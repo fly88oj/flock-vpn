@@ -1,16 +1,16 @@
-# 服务安装手册（M6 第一阶段：daemon 侧；docs/design.md §7-M6）
+# 服务安装手册（M6：daemon 侧 + 托盘；docs/design.md §7-M6）
 
 > 覆盖：Windows/Linux/macOS 的服务安装/卸载、托盘自启注册、提权要求、退出语义、
-> 无 GUI 行为。`flock-client install` / `uninstall` / `service` / `status` 子命令。
-> 托盘 UI 本身属 M6 第二阶段（本阶段的 `tray` 子命令为 feature 门控占位入口；IPC
-> 契约见 `app/flock-client/src/ipc.rs`，托盘工程直接 `use flock_client::ipc::*`）。
+> 无 GUI 行为。`flock-client install` / `uninstall` / `service` / `status` / `tray`
+> 子命令。托盘 UI 已随 M6 第二阶段实现（设计 §7-M6.7；IPC 契约
+> `app/flock-client/src/ipc.rs`）。
 
 ## 0. 双进程模型速览（§7-M6.1）
 
 | 进程 | 上下文 | 职责 |
 |---|---|---|
 | `flock-client service` | 系统服务（开机自启、无 GUI） | 全部 supervise/数据面 + 控制 IPC 服务端 |
-| `flock-client tray` | 用户会话（登录自启） | 仅托盘；经 IPC 查询/控制（第二阶段） |
+| `flock-client tray` | 用户会话（登录自启） | 仅托盘（三项菜单：连接状态/VPN IP/退出）；经 IPC 查询/控制 |
 
 Windows 服务跑在 session 0 无法创建托盘——双进程是硬约束；Linux/macOS 同构
 （systemd system unit / LaunchDaemon 与用户会话分离）。
@@ -110,20 +110,57 @@ daemon 启动时对 token 与 socket 尝试 chgrp 到该组（仅查本地 /etc/
 
 - `flock-client service` 无任何 GUI 依赖（feature 门控 `tray` 不进 daemon 路径；
   `--no-default-features` 构建档为无头服务器形态——托盘子命令不编入）。
-- 托盘缺席时：`status` 子命令提供等价查询（输出 state/vip/endpoint/epoch/uptime）。
+- `flock-client tray` 的 GUI 探测：Linux 检查 `DISPLAY`/`WAYLAND_DISPLAY` 至少其一
+  + 会话 DBus（`DBUS_SESSION_BUS_ADDRESS` 或 `$XDG_RUNTIME_DIR/bus`），缺任一 ⇒
+  日志「未检测到 GUI 会话，托盘未启动」**退出码 0**；Windows/macOS 托盘创建失败
+  同样优雅退出（不 panic）。托盘缺席时：`status` 子命令提供等价查询（输出
+  state/vip/endpoint/epoch/uptime）。
 - tray feature 的平台默认差异（cargo 无法表达按平台 default features）见设计
-  §7-M6.5 限制声明：三平台 default 一致含 tray，但 GUI 依赖第二阶段按 target 门控
-  挂入；Linux 无头发布档用 `--no-default-features`。
+  §7-M6.5 限制声明：GUI 依赖（tray-icon/objc2*/ksni）已全部按 target 门控挂
+  optional、由 `tray` feature 拉起——Linux 默认构建零 GUI 依赖面，无头发布档用
+  `--no-default-features`。
 
-## 7. 已验证/未验证边界（如实）
+## 7. 托盘真机清单（M6 第二阶段；自动化盲区，待用户目视确认）
+
+`flock-client tray` 的 IPC 面（轮询/文案投影/退出裁决顺序/Shutdown 停服）已由单测
+（真传输 IPC mock）与宿主 Windows 真进程实测（mock daemon 落位真端点/token：
+tray ≥10s 存活无 panic、2s 刷新日志、与 `flock-client status` 状态一致、对 token
+`Shutdown` ⇒ daemon 退出 + tray 转显「服务未运行」并继续重试）覆盖。**目视项无法
+自动化**，逐项确认：
+
+1. [ ] **图标出现**：启动 daemon（真拓扑或 §2 服务）后运行 `flock-client tray`——
+   系统托盘出现 flock 图标（32×32 深青圆角底 + 白色雁阵箭头）；tooltip 显示状态
+   摘要（如「Flock VPN：已连接 · frps-a:23000 · VPN IP 100.64.0.11」）；
+2. [ ] **菜单三项**：右键图标——「连接状态：…」「VPN IP：…」两项置灰只读 +
+   「退出」可点；
+3. [ ] **文字刷新**：daemon 状态变化（连接/断开/停服）后 ≤2s 菜单文字跟随
+   （停服时显示「连接状态：服务未运行」「VPN IP：—」）；
+4. [ ] **退出动作**：点「退出」⇒ daemon 优雅停服（`flock-client status` 不可达、
+   服务仍已安装）+ 托盘图标消失、托盘进程退出（退出码 0）；
+5. [ ] daemon 不在时启动 `flock-client tray`：图标仍在、菜单显示「服务未运行」，
+   起 daemon 后 ≤2s 恢复真实状态（token 自动重载——daemon 重启换 token 场景同）。
+6. [ ] （Linux 桌面真机）有 GUI 会话托盘出现（KDE/GNOME+扩展）；无头主机
+   `flock-client tray` 打「未检测到 GUI 会话，托盘未启动」退出码 0。
+7. [ ] （macOS，无设备未验证）托盘出现 + 退出语义同上；`cargo check --target
+   aarch64-apple-darwin -p flock-client --features tray` 编译级核验（本会话工具链
+   下载过慢未完成，待有环境补跑）。
+8. [ ] （Windows 真机 daemon 联测）提升会话起真服务（§2 清单）后重跑 1–5 项——
+   非提升会话 wintun/路由注入受阻（windows-smoke.md 先例），本会话实测以
+   mock daemon 在 IPC 面替代。
+
+## 8. 已验证/未验证边界（如实）
 
 | 面 | 状态 |
 |---|---|
 | IPC 契约/服务端/客户端（ duplex mock + Windows 命名管道真回环） | 单测通过（宿主） |
 | daemon 装配与 Shutdown 语义（mock tun + 真 IPC） | 单测通过（宿主；`daemon_loop_shutdown_via_ipc`） |
+| 托盘核心逻辑（文案投影全分支/token 失效重载/轮询恢复/退出顺序真传输 IPC mock/图标像素） | 单测通过（宿主，`tray::tests` 9 项） |
+| 托盘 Windows 真进程（mock daemon 真端点/token 落位） | 实测通过（宿主：存活/刷新日志/状态一致/Shutdown 停服转「服务未运行」；目视项 → §7 清单） |
+| 托盘平台后端编译面 | Windows 宿主编译+clippy 全绿；Linux 容器档（--features tray 含 ksni / --no-default-features）check+clippy 全绿；macOS **未验证**（无设备；aarch64-apple-darwin 工具链下载过慢未及编译级核验，API 按 crate 源核对，§7 清单） |
 | Windows HKCU Run 注册/注销往返 | 单测通过（宿主，非提升） |
 | Windows SCM 服务安装/卸载/自启/恢复策略 | **编译级验证**；真机需管理员 → §2 清单 |
 | Windows 事件日志事件上报 | 代码路径编译级 + 未注册源时事件仍落日志；真机确认 → §2 清单 |
 | Linux systemd 单元渲染 | 单测通过（宿主）；写入/enable 执行面需 root+systemd（容器无 systemd 报错如实） |
 | Unix socket 服务端/权限 | 单测通过（Linux 容器档随 linux 编译面；本宿主为 Windows，socket 单测在 Unix 宿主跑） |
-| macOS 全链路 | **未验证**（无设备；渲染/命令序列单测+审阅，§4 清单留位） |
+| Linux 桌面托盘（ksni/SNI 宿主）真机 | **未验证**（容器档仅编译面；§7 清单第 6 项） |
+| macOS 全链路 | **未验证**（无设备；渲染/命令序列单测+审阅，§4/§7 清单留位） |

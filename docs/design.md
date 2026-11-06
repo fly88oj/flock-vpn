@@ -994,9 +994,9 @@ v1 无版本协商字段——枚举加变体向后兼容（postcard varint 变�
 
 现有默认运行（`--config` 裸跑）保留为**前台调试模式**（不起 IPC，日志直连 stderr）；新增
 子命令：`service`（daemon 装配：supervise + IPC 服务端 + 优雅停服，前台运行于服务管理器
-之下）、`tray`（第二阶段；本阶段为 feature 门控的占位入口）、`install`/`uninstall`
-（§M6.3）、`status`（直接发一次 `Status` 请求并打印——无托盘环境与测试的探针；token 从
-token 文件读，读不到即报「daemon 未运行/无权限」）。
+之下）、`tray`（**第二阶段已实现**：§M6.7——托盘菜单/轮询/退出，feature 门控）、
+`install`/`uninstall`（§M6.3）、`status`（直接发一次 `Status` 请求并打印——无托盘环境
+与测试的探针；token 从 token 文件读，读不到即报「daemon 未运行/无权限」）。
 
 #### M6.5 feature 门控
 
@@ -1019,6 +1019,50 @@ feature，Linux 默认构建（含 default features）不引入 GUI 依赖面，
    macOS 标注未验证）。
 5. 托盘工程可直接 `use flock_client::ipc::{CtrlReq, CtrlResp, ...}` 消费契约（lib 面
    导出 + 契约单测即消费样例）。
+
+#### M6.7 托盘进程（第二阶段实现，2026-11-06）
+
+- **入口**：`flock-client tray`（`tray` feature 门控；不建任何 GUI 窗口）。托盘/daemon
+  依 §M6.2 契约交互，token 自 token 文件读取；核心逻辑（文案投影/token 源/轮询拍/退出
+  裁决/图标/GUI 判定）在 `flock_client::tray` 平台无关层——**零 GUI 依赖、宿主全单测**。
+- **菜单（三项）**：「连接状态」「VPN IP」为动态只读菜单项（disabled 项——置灰只读的
+  平台惯用形态），2s 轮询 `Status` 刷新文本（「连接状态：已连接 · frps-a:23000」
+  「VPN IP：100.64.0.11」；未连接/`vip: None` 时 VPN IP 显示「—」；daemon 未运行/IPC
+  失败/`Denied` ⇒「服务未运行」并继续重试）；「退出」为动作项：对 token 发 `Shutdown`
+  ⇒ daemon 优雅停服（§M6.1：服务保持已安装、下次开机自启）⇒ 托盘进程退出；daemon 不在
+  （token 缺失/IPC 失败）⇒ **仅退托盘**；`Denied` ⇒ 不退出并提示——token 失效重载
+  （daemon 重启换 token 的恢复路径），用户重点「退出」即重试。tooltip 同步状态摘要。
+- **图标**：32×32 程序化 RGBA（圆角方底 + 雁阵前向箭头，SDF 亚像素抗锯齿）——不引入
+  image crate/PNG 资产：`tray_icon::Icon::from_rgba` 与 ksni ARGB32 均吃原始像素，PNG
+  纯中转；无二进制资产 diff，像素级可断言（角透明/中心不透明/前景像素数/确定性）。
+- **平台库与最小泵**（不引 winit/tauri/egui 全套 GUI 栈）：
+  - Windows/macOS：`tray-icon`（内建 muda 菜单，经 `tray_icon::menu` 再导出消费）。
+    Windows 用最小 Win32 消息泵（专用线程 `GetMessageW`，主线程经
+    `PostThreadMessageW` 唤醒刷新/`WM_QUIT` 收泵——官方最小示例形态；tray-icon 的
+    事件派发要求创建线程泵消息，此为硬约束）；macOS 用主线程 NSApp 事件排空循环
+    （`nextEvent/sendEvent/updateWindows` + 50ms 节律消费共享刷新；AppKit 托盘/NSMenu
+    主线程约束）。
+  - Linux：`ksni`（纯 Rust DBus StatusNotifierItem，zbus 后端 tokio 特性与既有运行时
+    同域）——**零 GTK/libappindicator 系统依赖**，与无头纪律一致；菜单每次打开按最新
+    状态重建（ksni 语义天然满足 2s 刷新），tooltip 经 `Handle::update` 主动刷新。
+- **GUI 探测与回退**：Linux 前置判定 `DISPLAY`/`WAYLAND_DISPLAY` 至少其一 + 会话 DBus
+  （`DBUS_SESSION_BUS_ADDRESS` 或 `$XDG_RUNTIME_DIR/bus`），缺任一 ⇒ 日志「未检测到
+  GUI 会话，托盘未启动」退出码 0；Windows/macOS 不预判——托盘创建失败同样优雅退出
+  （不 panic、退出码 0）。SNI 宿主晚于自启就绪不判死（`assume_sni_available` +
+  `watcher_offline` 保持等待——登录竞速容错）。
+- **feature/依赖门控（M6.5 兑现）**：`tray` feature 自 `[]` 占位填充真依赖——
+  tray-icon（win/macos target 门控 optional）、objc2/objc2-app-kit/objc2-foundation
+  （macos 泵）、ksni（linux，default-features=false + tokio 特性）；`dep:` 引用在
+  不匹配 target 上为 no-op ⇒ Linux 默认构建不出现 tray-icon/objc2 面、Windows 不出现
+  ksni 面、`--no-default-features` 三平台编译面零 GUI 依赖（门禁实测）。
+- **验证边界（如实）**：核心单测（投影全分支/token 失效重载/轮询恢复/退出顺序真传输
+  IPC mock）+ 宿主 Windows 真进程实测（mock daemon 真端点/token 落位：tray ≥10s 存活
+  无 panic、菜单刷新日志、与 `status` 两进程状态一致、对 token `Shutdown` 停 daemon 后
+  tray 转显「服务未运行」并继续重试）；**图标/菜单目视与「退出」点击**无法自动化 ⇒
+  `docs/manual/service-install.md` 托盘真机清单；真 daemon 联测需 invite 引导 + wintun
+  管理员（windows-smoke.md 先例），列同清单；macOS 全链路未验证（无设备；且
+  aarch64-apple-darwin 工具链本会话下载过慢未及编译级核验——API 面按 crate 源核对，
+  列清单待补）；Linux 桌面真机未验证（容器档覆盖编译面）。
 
 ### M7 成员名册与可观测性（服务端侧）
 
@@ -1310,3 +1354,4 @@ VIP（M7.2 路径）。`peer_retention_days = 0` ⇒ 不装配回收器。多台
 - 2026-11-02 项目更名：ChmlVPN → Flock VPN（chmlvpn-server/client→flock-server/client、chml-sync/frpc→flock-sync/frpc、网络 chmlpub→flockpub、占位 git URL 换 flock 域；flock-protocol 线上行为零变化）。仓库目录同步更名为 FlockVPN——会话占用期间经 junction 过渡（宿主机两路径等价、Docker 挂载内仅真实路径可见，容器命令暂用 ChmlVPN 路径），收尾步骤见 docs/manual/dir-rename-final.md。
 - 2026-11-06 M6 第一阶段（系统服务化 + 控制面 daemon 侧）：新增 §7-M6——双进程模型（`flock-client service` 系统服务持全部 supervise/数据面 + `flock-client tray` 用户会话托盘经本地 IPC，Windows session 0 托盘约束定案）；控制 IPC v1 契约（postcard over 命名管道/Unix socket + 32B token 信封认证，**每请求带 token**——较「仅 Shutdown 带 token」收紧，Status 不裸奔）；三平台服务安装（Windows AUTO_START+恢复策略 / systemd Restart=on-failure / launchd 无 KeepAlive）+ 托盘自启 + `install/uninstall/status` 子命令 + `tray` feature 门控（cargo 无按平台 default features 的限制如实声明，GUI 依赖留 target 门控给第二阶段）；退出语义定型（Shutdown=优雅停服不复活、服务保持已安装）。IPC 契约固化为 `flock_client::ipc` 模块供托盘工程独立消费。
 - 2026-11-06 M7（成员名册与可观测性·服务端侧）：新增 §7-M7；**§2.1 IP 复用策略修订**（吊销→永不复用不变；离线超保留期→Expired+VIP 归还分配池、记录留册审计、名册排除；`peer_retention_days` 缺省 30、0=永不过期兼容旧行为）；注册表 DeviceRow 增 `hostname/expired_at` + `DeviceStatus::Expired`（终态）+ VIP 释放池（快照/线格式兼容性如实声明：postcard 无字段标签，旧快照不可解码——未发布窗口允许）；动态面搭租约便车（lease 条目 + gossip 携带 per-device EWMA 流量与 last_seen，α=0.2/1s 窗，「投递成功点计数」单点原则防双计）；名册契约 `CtrlRequest::PeerListPull`（票据先行）→ `Vec<PeerInfo>`（VIP 升序，含 Server 条目）；60s 回收器置 Expired。
+- 2026-11-06 M6 第二阶段（托盘进程）：新增 §7-M6.7（§7-M6.4 tray 行同步）——`flock-client tray` 落地：三项菜单（连接状态/VPN IP 动态只读 + 退出动作），2s 轮询刷新、Denied/IPC 失败⇒「服务未运行」继续重试；退出=对 token Shutdown⇒托盘退出（服务保持已安装）/daemon 不在⇒仅退托盘/Denied⇒不退出+token 失效重载；程序化 32×32 RGBA 图标（零资产文件）；平台库 tray-icon（Windows 最小 Win32 消息泵/macOS 主线程 NSApp 排空循环）+ ksni（Linux DBus SNI，零 GTK 系统依赖），不引 winit/tauri/egui；GUI 探测（Linux DISPLAY/WAYLAND+会话 DBus 前置判定，win/mac 创建失败兜底）无 GUI 一律优雅退出码 0；M6.5 feature 门控兑现（GUI 依赖全部 target 门控 optional、dep: 引用不匹配 target no-op，--no-default-features 三平台零 GUI 依赖——门禁实测）。验证边界如实：核心单测 + Windows 真进程 mock-daemon 实测（存活/刷新日志/状态一致/Shutdown 停服后转显服务未运行）；图标目视/退出点击/真 daemon 联测（需 invite+管理员）列 service-install.md 托盘真机清单；macOS 无设备未验证（apple target 工具链下载过慢未及编译级核验，API 按 crate 源核对）；Linux 桌面真机未验证（容器编译面过）。
