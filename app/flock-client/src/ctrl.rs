@@ -407,9 +407,12 @@ pub async fn login_and_bind<T: CtrlTransport + ?Sized>(
         Err(e) => return Err(LoginError::Io(e)),
     };
 
-    // ④ 重登节奏：TTL 的 2/3（相对量——免疫两端时钟偏移；下限 2s 保底推进）。
+    // ④ 重登节奏：TTL 的 2/3（相对量——免疫两端时钟偏移；下限 2s、**上限 25s**——
+    // 服务端控制流空闲超时 = 3×keepalive = 30s（§2.2 评审项 8），重登即保活；超 25s
+    // 会让流先于票据过期被空闲关闭，届时本会话控制面不可再开（首流契约：一条会话
+    // 恰一条控制流）⇒ 只能杀会话重连——封顶避免该形态成为常态）。
     let ttl = ticket.ttl_hint_secs().max(2);
-    let refresh_after = Duration::from_secs((ttl * 2 / 3).max(2));
+    let refresh_after = Duration::from_secs((ttl * 2 / 3).clamp(2, 25));
     Ok(LoginOutcome {
         ticket,
         epoch,
@@ -737,16 +740,16 @@ pub async fn run_auth_keepalive(
                     }
                 }
                 Err(LoginError::Io(e)) => {
-                    // 传输失败大概率 = 会话失位/毒化；短暂等待后回到会话等待层
-                    //（wait_down 已 false 则立即 break，避免空转）。
-                    eprintln!("flock-client: login io: {e}");
+                    // 传输失败 = 控制流已不可用（EOF/坏帧；**首流契约**下本会话控制
+                    // 面不可再开——服务端只把流 id=1 分派为控制流）。毒化 ⇒ 杀会话
+                    // 重连换新流；不做「plane 仍在的短退避重试」——死流上重试只会
+                    // 空转（评审补：原 500ms 重试循环在服务端 30s 空闲关流后死循环）。
+                    eprintln!("flock-client: login io（控制流不可用，重连换流）: {e}");
                     shared.set_phase(AuthPhase::Failed {
                         reason: format!("控制流 IO: {e}"),
                     });
+                    plane.poison("登录传输失败");
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                            if !plane.is_up() { break; }
-                        }
                         _ = plane.wait_down() => break,
                         _ = stop.notified() => return,
                     }
@@ -1060,8 +1063,8 @@ mod tests {
         );
         assert_eq!(
             out.refresh_after,
-            Duration::from_secs(40),
-            "TTL 60 ⇒ 2/3 重登"
+            Duration::from_secs(25),
+            "TTL 60 ⇒ 2/3=40 封顶 25（服务端控制流 30s 空闲窗内保活）"
         );
         let g = st.lock().unwrap();
         assert_eq!(
