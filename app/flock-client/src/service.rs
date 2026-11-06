@@ -443,13 +443,9 @@ mod scm {
             log_service_event(EventLevel::Error, "service 上下文缺失（内部错误）");
             return;
         };
-        let cfg = match ClientConfig::load(&ctx.cfg_path) {
-            Ok(c) => c,
-            Err(e) => {
-                log_service_event(EventLevel::Error, &format!("config 载入失败: {e}"));
-                return;
-            }
-        };
+        // SCM handler 注册**先行**（评审项 6）：持有状态句柄后，config 载入失败等
+        // 后续路径才能把 Stopped(+非零退出码) 落进状态机；注册本身失败 ⇒ 无句柄
+        // 可 set——事件日志 + 非零进程退出码兜底（SCM 按进程退出记录）。
         let stop = ctx.stop.clone();
         let registered = service_control_handler::register(
             crate::service::SERVICE_NAME,
@@ -467,10 +463,15 @@ mod scm {
             Ok(h) => h,
             Err(e) => {
                 log_service_event(EventLevel::Error, &format!("SCM handler 注册失败: {e}"));
-                return;
+                std::process::exit(2);
             }
         };
-        let set = |state: ServiceState, accept_stop: bool, wait_hint: Duration| {
+        /// 失败路径的非零退出码（SCM/恢复策略据此识别失败退出；优雅停服 = 0）。
+        const SVC_EXIT_FAILURE: u32 = 1;
+        let set = |state: ServiceState,
+                   exit_code: u32,
+                   accept_stop: bool,
+                   wait_hint: Duration| {
             let _ = handler.set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: state,
@@ -479,13 +480,21 @@ mod scm {
                 } else {
                     ServiceControlAccept::empty()
                 },
-                exit_code: ServiceExitCode::Win32(0),
+                exit_code: ServiceExitCode::Win32(exit_code),
                 checkpoint: 0,
                 wait_hint,
                 process_id: None,
             });
         };
-        set(ServiceState::StartPending, false, STOP_HINT);
+        set(ServiceState::StartPending, 0, false, STOP_HINT);
+        let cfg = match ClientConfig::load(&ctx.cfg_path) {
+            Ok(c) => c,
+            Err(e) => {
+                log_service_event(EventLevel::Error, &format!("config 载入失败: {e}"));
+                set(ServiceState::Stopped, SVC_EXIT_FAILURE, false, Duration::ZERO);
+                return;
+            }
+        };
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -493,17 +502,37 @@ mod scm {
             Ok(rt) => rt,
             Err(e) => {
                 log_service_event(EventLevel::Error, &format!("runtime 创建失败: {e}"));
-                set(ServiceState::Stopped, false, Duration::ZERO);
+                set(ServiceState::Stopped, SVC_EXIT_FAILURE, false, Duration::ZERO);
                 return;
             }
         };
-        set(ServiceState::Running, true, Duration::ZERO);
+        set(ServiceState::Running, 0, true, Duration::ZERO);
         let paths = ControlPaths::platform_default();
-        let res = rt.block_on(run_service_inner(cfg, paths, ctx.stop.clone()));
+        // 评审项 6：run_service_inner 包 catch_unwind——panic 也落 Stopped(+非零) +
+        // 事件日志（AssertUnwindSafe：panic 后装配态不复用，进程即退——无 unwind
+        // 安全债）。子任务（supervise 等）panic 由 daemon_loop 存活通道另行接管。
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(run_service_inner(cfg, paths, ctx.stop.clone()))
+        }));
+        let res = match res {
+            Ok(r) => r,
+            Err(panic) => {
+                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<非字符串 panic 载荷>".to_string()
+                };
+                log_service_event(EventLevel::Error, &format!("service panic: {msg}"));
+                Err(format!("service panic: {msg}"))
+            }
+        };
         if let Err(e) = &res {
             log_service_event(EventLevel::Error, &format!("service 异常退出: {e}"));
         }
-        set(ServiceState::Stopped, false, Duration::ZERO);
+        let exit = if res.is_ok() { 0 } else { SVC_EXIT_FAILURE };
+        set(ServiceState::Stopped, exit, false, Duration::ZERO);
     }
 }
 
