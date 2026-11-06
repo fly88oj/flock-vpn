@@ -211,18 +211,20 @@ fn home_dir() -> Result<PathBuf, String> {
 
 /// LaunchDaemon/LaunchAgent plist 渲染（RunAtLoad；**无 KeepAlive**——Shutdown 后
 /// 不复活，§7-M6.1）。
-#[cfg(target_os = "macos")]
-pub fn render_launchd_plist(label: &str, exe: &str, cfg: Option<&str>) -> String {
-    let mut args = format!(
-        "\n        <string>{}</string>\n        <string>service</string>",
-        xml_escape(exe)
-    );
-    if let Some(cfg) = cfg {
-        args.push_str(&format!(
-            "\n        <string>--config</string>\n        <string>{}</string>",
-            xml_escape(cfg)
-        ));
-    }
+///
+/// `program_args` **逐项**渲染为独立 `<string>`（launchd ProgramArguments 语义：数组
+/// 直接 exec、不经 shell——含空格路径无须也不得内嵌引号）。评审项 1 修正：此前
+/// 「托盘把 `exe tray` 拼进单参数 + 渲染器无条件补 `service`」产出
+/// `["<exe> tray","service"]` 双错形——渲染器改为参数化后由调用方给形态：
+/// daemon = `[exe, "service", "--config", cfg]`、tray = `[exe, "tray"]`。
+///
+/// 纯函数全平台编译（渲染断言进宿主门禁；非 macOS 仅测试消费 ⇒ allow(dead_code)）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn render_launchd_plist(label: &str, program_args: &[&str]) -> String {
+    let args = program_args
+        .iter()
+        .map(|a| format!("\n        <string>{}</string>", xml_escape(a)))
+        .collect::<String>();
     format!(
         "\
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -246,11 +248,9 @@ pub fn render_launchd_plist(label: &str, exe: &str, cfg: Option<&str>) -> String
 fn install_service(cfg_path: &Path) -> Result<(), String> {
     let exe = current_exe()?;
     let cfg = abs_config(cfg_path)?;
-    let plist = render_launchd_plist(
-        LAUNCHD_SERVICE_LABEL,
-        &exe.to_string_lossy(),
-        Some(&cfg.to_string_lossy()),
-    );
+    let exe = exe.to_string_lossy().into_owned();
+    let cfg = cfg.to_string_lossy().into_owned();
+    let plist = render_launchd_plist(LAUNCHD_SERVICE_LABEL, &[&exe, "service", "--config", &cfg]);
     write_root_file(Path::new(LAUNCHDAEMON_PATH), plist.as_bytes(), "sudo")?;
     run_cmd(
         "launchctl",
@@ -279,12 +279,9 @@ fn uninstall_service() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn install_tray() -> Result<(), String> {
     let exe = current_exe()?;
-    // 托盘 LaunchAgent：同一二进制 `tray` 子命令（GUI 依赖第二阶段挂入）。
-    let plist = render_launchd_plist(
-        LAUNCHD_TRAY_LABEL,
-        &format!("{} tray", exe.to_string_lossy()),
-        None,
-    );
+    // 托盘 LaunchAgent：同一二进制 `tray` 子命令——独立 string 项（评审项 1）。
+    let exe = exe.to_string_lossy().into_owned();
+    let plist = render_launchd_plist(LAUNCHD_TRAY_LABEL, &[&exe, "tray"]);
     let path = home_dir()?.join(TRAY_AGENT_REL);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -315,7 +312,7 @@ fn uninstall_tray() -> Result<(), String> {
 }
 
 /// plist 文本转义（路径里的 &/</>；属性值上下文）。
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -590,32 +587,63 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    /// 提取 plist 的 ProgramArguments 数组项（逐项断言用——评审项 1：args 必须各自
+    /// 独立 `<string>`，不得把「exe+子命令」拼进同项）。
+    fn plist_program_args(plist: &str) -> Vec<String> {
+        let start = plist
+            .find("<key>ProgramArguments</key>")
+            .expect("ProgramArguments 键在位");
+        let body = &plist[start..];
+        let end = body.find("</array>").expect("数组闭合");
+        body[..end]
+            .split("<string>")
+            .skip(1)
+            .map(|s| s.split("</string>").next().unwrap().to_string())
+            .collect()
+    }
+
+    /// daemon 形态：args 逐项 = `[exe, "service", "--config", cfg]`（含空格路径独立
+    /// 成项、xml 转义）；RunAtLoad 在、无 KeepAlive。
     #[test]
-    fn launchd_plist_renders_runatload_without_keepalive() {
-        let plist = render_launchd_plist(
-            "com.flockvpn.client",
-            "/usr/local/bin/flock-client",
-            Some("/etc/flock/client.toml"),
+    fn launchd_plist_daemon_args_are_separate_strings() {
+        let exe = "/usr/local/bin/Flock Client/flock-client";
+        let cfg = "/etc/flock/client&.toml";
+        let plist = render_launchd_plist("com.flockvpn.client", &[exe, "service", "--config", cfg]);
+        assert_eq!(
+            plist_program_args(&plist),
+            vec![
+                "/usr/local/bin/Flock Client/flock-client".to_string(),
+                "service".to_string(),
+                "--config".to_string(),
+                "/etc/flock/client&amp;.toml".to_string(), // xml 转义（&）
+            ],
+            "daemon 形态四项独立 string（exe 不与 service 拼接）"
         );
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(
             !plist.contains("KeepAlive"),
             "无 KeepAlive（Shutdown 不复活）"
         );
-        assert!(plist.contains("<string>service</string>"));
-        assert!(plist.contains("/etc/flock/client.toml"));
-        // 托盘形态（无 config 参数）。
-        let tray = render_launchd_plist(
-            "com.flockvpn.client-tray",
-            "/usr/local/bin/flock-client tray",
-            None,
-        );
-        assert!(!tray.contains("KeepAlive"));
-        assert!(!tray.contains("--config"));
     }
 
-    #[cfg(target_os = "macos")]
+    /// tray 形态：args 逐项 = `[exe, "tray"]`——无 `service` 项、无 `--config`
+    ///（评审项 1：旧实现托盘形态产出 `["<exe> tray","service"]` 双错形）。
+    #[test]
+    fn launchd_plist_tray_args_are_exe_tray_only() {
+        let exe = "/usr/local/bin/Flock Client/flock-client";
+        let plist = render_launchd_plist("com.flockvpn.client-tray", &[exe, "tray"]);
+        assert_eq!(
+            plist_program_args(&plist),
+            vec![
+                "/usr/local/bin/Flock Client/flock-client".to_string(),
+                "tray".to_string(),
+            ],
+            "tray 形态两项独立 string"
+        );
+        assert!(!plist.contains("--config"));
+        assert!(!plist.contains("KeepAlive"));
+    }
+
     #[test]
     fn xml_escape_covers_path_characters() {
         assert_eq!(xml_escape("a&b<c>d"), "a&amp;b&lt;c&gt;d");
