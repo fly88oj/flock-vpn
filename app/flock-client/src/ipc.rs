@@ -24,16 +24,20 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// 单帧上限（v1 消息面远小于此；防御位）。
-pub const MAX_CTRL_FRAME: usize = 4096;
+/// 单帧上限（v1 原为 4KiB；M7 `Peers` 名册面扩到 256KiB——千行级名册 ~64B/行余量，
+/// 仍远小于控制面 256KiB 上限的记录层语义；防御位不变：超限拒帧）。
+pub const MAX_CTRL_FRAME: usize = 256 * 1024;
 /// 客户端单次请求的整链超时（连接 + 往返；status/托盘轮询的默认档）。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// `Peers` 请求的整链超时档（名册拉取 + 3 探针 × 2s 超时串行 ⇒ 上限 ~10s，留余量）。
+pub const PEERS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ============================================================================
-// 契约类型（v1——托盘工程消费面，改字段=破契）
+// 契约类型（v1——托盘工程消费面，改字段=破契；M7 增 Peers 面）
 // ============================================================================
 
 /// 控制面认证 token（32B 随机，daemon 每次启动生成）。
@@ -46,6 +50,8 @@ pub enum CtrlReq {
     Status { token: CtrlToken },
     /// 优雅停服（断会话 → 停数据面 → 拆 tun → 进程退出；服务管理器不复活）。
     Shutdown { token: CtrlToken },
+    /// 成员名册（M7 §7-M7.7）：daemon 组装增强名册（拉取/≤5s 缓存 + ping 探测）。
+    Peers { token: CtrlToken },
 }
 
 /// 连接状态（`flock-client service` 的 supervise 投影）。
@@ -73,6 +79,10 @@ pub enum CtrlResp {
     },
     /// Shutdown 受理。
     Ok,
+    /// 成员名册（M7 §7-M7.7；按 VIP 升序——服务端装配序）。
+    Peers { rows: Vec<crate::peers::PeerRow> },
+    /// 名册不可用（M7：未登录/隧道未连/未配置 [auth] 等——`reason` 供 CLI 指引文案）。
+    PeersUnavailable { reason: String },
     /// token 错（任何请求）。
     Denied,
 }
@@ -109,7 +119,7 @@ async fn recv_frame<S: AsyncRead + Unpin, M: for<'de> Deserialize<'de>>(
 // daemon 侧
 // ============================================================================
 
-/// daemon 侧控制面依赖（service 装配注入；快照源 + 停机触发）。
+/// daemon 侧控制面依赖（service 装配注入；快照源 + 停机触发 + 名册装配）。
 pub struct DaemonControl {
     /// 通行 token（请求侧比对基准）。
     pub token: CtrlToken,
@@ -117,6 +127,9 @@ pub struct DaemonControl {
     pub status: std::sync::Arc<dyn Fn() -> CtrlResp + Send + Sync>,
     /// 停机触发（受理 Shutdown 后同步返回前调用；实际拆除由 service 主流程执行）。
     pub shutdown: std::sync::Arc<dyn Fn() + Send + Sync>,
+    /// 名册装配（M7 §7-M7.7：拉取/缓存 + ping 探测；None = 未装配——
+    /// 无 [auth] 配置/测试注入面 ⇒ PeersUnavailable）。
+    pub peers: Option<std::sync::Arc<dyn Fn() -> BoxFuture<'static, CtrlResp> + Send + Sync>>,
 }
 
 /// 常量时间比对（长度不等直接假——token 定长 32B，无长度泄露面）。
@@ -142,6 +155,12 @@ pub async fn serve_conn<S: AsyncRead + AsyncWrite + Unpin>(
             (ctrl.shutdown)();
             CtrlResp::Ok
         }
+        CtrlReq::Peers { token } if token_eq(token, &ctrl.token) => match &ctrl.peers {
+            Some(f) => f().await,
+            None => CtrlResp::PeersUnavailable {
+                reason: "daemon 未装配名册面（client.toml 缺 [auth]？）".into(),
+            },
+        },
         _ => CtrlResp::Denied,
     };
     send_frame(io, &resp).await
@@ -315,7 +334,17 @@ pub async fn request_over<S: AsyncRead + AsyncWrite + Unpin>(
 /// Windows 管道 busy（服务端实例瞬时耗尽）时短重试；Unix 连接失败直接返回错误
 /// （daemon 未运行 ⇒ socket 不存在，语义交调用方）。
 pub async fn request_once(endpoint: &IpcEndpoint, req: CtrlReq) -> io::Result<CtrlResp> {
-    tokio::time::timeout(REQUEST_TIMEOUT, async {
+    request_once_timeout(endpoint, req, REQUEST_TIMEOUT).await
+}
+
+/// [`request_once`] 的超时注入档（`Peers` 用 [`PEERS_REQUEST_TIMEOUT`]——探测面远超
+/// 默认 3s）。
+pub async fn request_once_timeout(
+    endpoint: &IpcEndpoint,
+    req: CtrlReq,
+    timeout: Duration,
+) -> io::Result<CtrlResp> {
+    tokio::time::timeout(timeout, async {
         #[cfg(windows)]
         {
             crate::ipc_windows::client_request(&endpoint.pipe_name, &req).await
@@ -356,6 +385,7 @@ mod tests {
                 uptime_secs: 42,
             }),
             shutdown: Arc::new(move || fired.store(true, std::sync::atomic::Ordering::SeqCst)),
+            peers: None,
         });
         (ctrl, shutdown_fired)
     }
@@ -498,5 +528,98 @@ mod tests {
         b[31] ^= 1;
         assert!(!token_eq(&a, &b));
         assert!(!token_eq(&[0u8; 32], &[1u8; 32]));
+    }
+
+    /// M7：Peers 契约往返——对 token ⇒ 增强名册行（含 latency/self）；错 token ⇒
+    /// Denied；未装配 peers 处理器 ⇒ PeersUnavailable。
+    #[tokio::test]
+    async fn ctrl_roundtrip_peers_over_duplex() {
+        use crate::peers::PeerRow;
+        use flock_protocol::roster::{PeerInfo, PeerKind};
+        let token = generate_token();
+        let rows = vec![
+            PeerRow {
+                info: PeerInfo {
+                    vip: [100, 64, 0, 1],
+                    hostname: "srv".into(),
+                    owner: "1".into(),
+                    kind: PeerKind::Server,
+                    online: true,
+                    last_seen_unix: 5,
+                    tx_bps: 10,
+                    rx_bps: 20,
+                },
+                latency_ms: Some(3),
+                self_flag: false,
+            },
+            PeerRow {
+                info: PeerInfo {
+                    vip: [100, 64, 0, 11],
+                    hostname: "me".into(),
+                    owner: "alice".into(),
+                    kind: PeerKind::Device,
+                    online: true,
+                    last_seen_unix: 5,
+                    tx_bps: 1,
+                    rx_bps: 2,
+                },
+                latency_ms: None,
+                self_flag: true,
+            },
+        ];
+        let expected = rows.clone();
+        // ① 对 token ⇒ Peers{rows}（逐字段往返）。
+        {
+            let ctrl = Arc::new(DaemonControl {
+                token,
+                status: Arc::new(|| CtrlResp::Ok),
+                shutdown: Arc::new(|| {}),
+                peers: Some(Arc::new(move || {
+                    Box::pin(std::future::ready(CtrlResp::Peers {
+                        rows: expected.clone(),
+                    }))
+                })),
+            });
+            let (mut client, mut server) = duplex(MAX_CTRL_FRAME);
+            let served = tokio::spawn(async move { serve_conn(&mut server, &ctrl).await });
+            let resp = request_over(&mut client, &CtrlReq::Peers { token })
+                .await
+                .unwrap();
+            match resp {
+                CtrlResp::Peers { rows } => {
+                    assert_eq!(rows.len(), 2);
+                    assert_eq!(rows[0].latency_ms, Some(3));
+                    assert!(rows[1].self_flag);
+                    assert_eq!(rows[1].info.hostname, "me");
+                }
+                other => panic!("Peers 变体，得 {other:?}"),
+            }
+            served.await.unwrap().unwrap();
+        }
+        // ② 错 token ⇒ Denied。
+        {
+            let (ctrl, _) = daemon_control(token);
+            let (mut client, mut server) = duplex(4096);
+            let served = tokio::spawn(async move { serve_conn(&mut server, &ctrl).await });
+            let resp = request_over(&mut client, &CtrlReq::Peers { token: [7; 32] })
+                .await
+                .unwrap();
+            assert_eq!(resp, CtrlResp::Denied);
+            served.await.unwrap().unwrap();
+        }
+        // ③ 未装配 peers 处理器 ⇒ PeersUnavailable（reason 非空）。
+        {
+            let (ctrl, _) = daemon_control(token);
+            let (mut client, mut server) = duplex(4096);
+            let served = tokio::spawn(async move { serve_conn(&mut server, &ctrl).await });
+            let resp = request_over(&mut client, &CtrlReq::Peers { token })
+                .await
+                .unwrap();
+            match resp {
+                CtrlResp::PeersUnavailable { reason } => assert!(!reason.is_empty()),
+                other => panic!("PeersUnavailable，得 {other:?}"),
+            }
+            served.await.unwrap().unwrap();
+        }
     }
 }

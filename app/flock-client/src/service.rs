@@ -192,6 +192,17 @@ async fn daemon_loop(
 
     // —— M7 控制流共享槽（supervise 装流；登录保持/名册拉取业务消费）——
     let plane = crate::ctrl::ControlPlane::new();
+    let plane_for_peers = plane.clone();
+
+    // —— M7 名册缓存 + 延迟探测器（raw 权限缺失 ⇒ 降级无延迟档，名册照常）——
+    let roster_cache = Arc::new(crate::ctrl::RosterCache::new());
+    let pinger: Option<Arc<dyn crate::ping::Pinger>> = match crate::ping::RawIcmpPinger::new() {
+        Ok(p) => Some(Arc::new(p)),
+        Err(e) => {
+            eprintln!("flock-client: 告警：raw ICMP 探测器不可用（延迟列将显示 —）: {e}");
+            None
+        }
+    };
 
     // —— M7 登录保持任务（[auth] 配置在位才装配；票据只存内存，§7-M7.7）——
     let auth_shared = Arc::new(crate::ctrl::AuthShared::new());
@@ -269,6 +280,67 @@ async fn daemon_loop(
         shutdown: {
             let stop = stop.clone();
             Arc::new(move || stop.notify_one())
+        },
+        // M7 名册装配（§7-M7.7）：≤5s 缓存 → 否则 PeerListPull（票据来自登录保持）；
+        // 对 online 非自身行并发 ping 探测（raw 权限缺失 ⇒ 降级无延迟档）。
+        peers: {
+            let plane = plane_for_peers.clone();
+            let auth_shared = auth_shared.clone();
+            let roster = roster_cache.clone();
+            let pinger = pinger.clone();
+            let self_vip = vip;
+            Some(Arc::new(move || {
+                let plane = plane.clone();
+                let auth_shared = auth_shared.clone();
+                let roster = roster.clone();
+                let pinger = pinger.clone();
+                Box::pin(async move {
+                    // 阶段检查前置：未配置/未登录/隧道断的指引文案（不发起拉取）。
+                    if let Some(phase) = auth_shared.phase() {
+                        let reason: Option<String> = match phase {
+                            crate::ctrl::AuthPhase::Unconfigured => Some(
+                                "client.toml 未配置 [auth] username（M7 登录/名册需登录态）".into(),
+                            ),
+                            crate::ctrl::AuthPhase::WaitingSession => {
+                                Some("隧道未连接（等待会话建立后自动登录）".into())
+                            }
+                            crate::ctrl::AuthPhase::LoggingIn => {
+                                Some("登录进行中（稍候重试）".into())
+                            }
+                            crate::ctrl::AuthPhase::Failed { reason } => Some(reason),
+                            crate::ctrl::AuthPhase::LoggedIn { .. } => None,
+                        };
+                        if let Some(r) = reason {
+                            return CtrlResp::PeersUnavailable { reason: r };
+                        }
+                    }
+                    // 名册：缓存新鲜（≤5s）直接用；否则持当前票据拉取。
+                    let peers = match roster.fresh() {
+                        Some(p) => p,
+                        None => {
+                            let Some(ticket) = auth_shared.ticket() else {
+                                return CtrlResp::PeersUnavailable {
+                                    reason: "尚无登录票据（登录保持任务启动中——稍候重试）".into(),
+                                };
+                            };
+                            match crate::ctrl::pull_roster(&plane, &ticket).await {
+                                Ok(p) => {
+                                    roster.store(p.clone());
+                                    p
+                                }
+                                Err(e) => {
+                                    return CtrlResp::PeersUnavailable {
+                                        reason: format!("名册拉取失败: {e}"),
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    let rows =
+                        crate::peers::assemble_rows(peers, self_vip, pinger.as_deref()).await;
+                    CtrlResp::Peers { rows }
+                })
+            }))
         },
     });
     let ipc_task = match spawn_server(&paths, cfg.control_group.as_deref(), ctrl) {

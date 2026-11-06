@@ -67,6 +67,9 @@ enum Cmd {
     Service,
     Status,
     Login,
+    Peers {
+        json: bool,
+    },
     Install {
         scope: flock_client::install::Scope,
     },
@@ -132,6 +135,20 @@ fn parse_args() -> Result<Cli, String> {
         Some("service") => Cmd::Service,
         Some("status") => Cmd::Status,
         Some("login") => Cmd::Login,
+        Some("peers") => {
+            // `peers [--json]`：机读档旗标跟在子命令后。
+            let mut json = false;
+            while let Some(flag) = it.peek() {
+                match flag.as_str() {
+                    "--json" => {
+                        json = true;
+                        it.next();
+                    }
+                    _ => break,
+                }
+            }
+            Cmd::Peers { json }
+        }
         Some("install") => Cmd::Install { scope },
         Some("uninstall") => Cmd::Uninstall { scope },
         #[cfg(feature = "tray")]
@@ -166,6 +183,7 @@ fn run_cli() -> Result<(), String> {
         // status 不依赖 config（端点/token 全取平台缺省）；Windows service 在 SCM
         // 上下文内自载 config（工作目录 = system32，配置路径须安装时写绝对路径）。
         Cmd::Status => cmd_status(),
+        Cmd::Peers { json } => cmd_peers(json),
         Cmd::Service => cmd_service(&cli.config),
         Cmd::Install { scope } => flock_client::install::install(&cli.config, scope)
             .map_err(|e| format!("{e}\n（提权要求与平台矩阵见 docs/manual/service-install.md）")),
@@ -323,7 +341,11 @@ fn run_cli() -> Result<(), String> {
                     Ok(())
                 }
                 // 不可达（外层 match 已分流；保穷尽性）。
-                Cmd::Service | Cmd::Status | Cmd::Install { .. } | Cmd::Uninstall { .. } => {
+                Cmd::Service
+                | Cmd::Status
+                | Cmd::Peers { .. }
+                | Cmd::Install { .. }
+                | Cmd::Uninstall { .. } => {
                     unreachable!("已在 run_cli 分流")
                 }
                 #[cfg(feature = "tray")]
@@ -510,6 +532,52 @@ fn cmd_status() -> Result<(), String> {
             Ok(other) => Err(format!("意外响应: {other:?}")),
             Err(e) => Err(format!(
                 "控制面不可达: {e}（daemon 未运行？`flock-client service` 或服务管理器启动）"
+            )),
+        }
+    })
+}
+
+/// `peers` 子命令（M7 §7-M7.7）：IPC `Peers` → 表格（缺省）/`--json` 机读档。
+/// daemon 不在/未登录 ⇒ 明确错误与指引（退出码 2）。
+fn cmd_peers(json: bool) -> Result<(), String> {
+    use flock_client::ipc::{CtrlReq, CtrlResp, PEERS_REQUEST_TIMEOUT};
+    let paths = flock_client::ipc::ControlPaths::platform_default();
+    let token = flock_client::ipc::load_token_file(&paths.token_file).map_err(|e| {
+        format!(
+            "{e}\n（daemon 未运行？`flock-client service` 或系统服务管理器启动；\
+             控制面 token 由 daemon 启动时生成）"
+        )
+    })?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        match flock_client::ipc::request_once_timeout(
+            &paths.endpoint,
+            CtrlReq::Peers { token },
+            PEERS_REQUEST_TIMEOUT,
+        )
+        .await
+        {
+            Ok(CtrlResp::Peers { rows }) => {
+                if json {
+                    println!("{}", flock_client::peers::render_json(&rows)?);
+                } else {
+                    print!("{}", flock_client::peers::render_table(&rows));
+                }
+                Ok(())
+            }
+            Ok(CtrlResp::PeersUnavailable { reason }) => Err(format!(
+                "{reason}\n（指引：确认 `flock-client service` 在跑、client.toml 配置了 \
+                 `[auth] username`、且已跑过 `flock-client login` 完成口令引导）"
+            )),
+            Ok(CtrlResp::Denied) => {
+                Err("请求被拒（token 失配——daemon 重启后旧 token 失效，重试）".into())
+            }
+            Ok(other) => Err(format!("意外响应: {other:?}")),
+            Err(e) => Err(format!(
+                "控制面不可达: {e}\n（daemon 未运行？`flock-client service` 或系统服务管理器启动）"
             )),
         }
     })

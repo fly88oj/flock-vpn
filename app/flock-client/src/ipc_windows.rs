@@ -224,6 +224,7 @@ mod tests {
                 uptime_secs: 1,
             }),
             shutdown: Arc::new(|| {}),
+            peers: None,
         });
         let server = spawn_named_pipe_server(&name, ctrl).expect("首实例创建（管道未占用）");
 

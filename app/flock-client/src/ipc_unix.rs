@@ -79,6 +79,7 @@ mod tests {
                 uptime_secs: 7,
             }),
             shutdown: Arc::new(|| {}),
+            peers: None,
         });
         let server = spawn_unix_server(&sock, None, ctrl).expect("bind 临时 socket");
         use std::os::unix::fs::PermissionsExt as _;

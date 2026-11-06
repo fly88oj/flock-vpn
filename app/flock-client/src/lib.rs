@@ -9,6 +9,9 @@
 //!   指数退避 + 端点轮询）；
 //! - [`ctrl`]：控制流半边（M7 §7-M7.7：OPAQUE 登录/key-bind/票据保持的客户端实现——
 //!   线类型复用 `flock_protocol::roster`，两端同类型）；
+//! - [`ping`]：peers 延迟探测（M7 §7-M7.7：raw ICMP echo 经 tun，3 探针 2s 超时取
+//!   中位；socket2 薄层——选型理由见模块文档）；
+//! - [`peers`]：名册组装与渲染（M7 §7-M7.7：PeerRow 增强名册 + 表格/--json）；
 //! - [`dataplane`]：IP 包 ↔ `PacketChannel` 桥；
 //! - [`ipc`]：控制 IPC v1 契约 + daemon 服务端 + 客户端单次请求（§7-M6.2——托盘
 //!   工程直接消费本模块，`service` 子命令装配服务端）；
@@ -29,6 +32,8 @@ pub mod ctrl;
 pub mod dataplane;
 pub mod install;
 pub mod ipc;
+pub mod peers;
+pub mod ping;
 // 控制面平台传输（私有：契约/服务端/客户端入口全走 [`ipc`]）。
 #[cfg(unix)]
 mod ipc_unix;

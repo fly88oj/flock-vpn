@@ -490,6 +490,7 @@ mod tests {
                 uptime_secs: 2,
             }),
             shutdown: Arc::new(|| {}),
+            peers: None,
         });
         let server = ipc::spawn_server(&paths, None, ctrl).expect("mock daemon IPC 起");
         (paths, server)
@@ -575,6 +576,7 @@ mod tests {
             shutdown: Arc::new(move || {
                 log_shutdown.lock().unwrap().push("shutdown");
             }),
+            peers: None,
         });
         let server = ipc::spawn_server(&paths, None, ctrl).expect("mock daemon IPC 起");
 
