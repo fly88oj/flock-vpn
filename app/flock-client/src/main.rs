@@ -6,6 +6,8 @@
 //! - `service`：daemon 装配（§7-M6.1：supervise 复用 + 控制面 IPC + 优雅停服；
 //!   Windows 走 SCM 分派，终端直跑自动回落前台）；
 //! - `status`：向 daemon 发一次 `Status` 请求并打印（无托盘环境/测试探针）；
+//! - `tray`：托盘进程（§7-M6 第二阶段）：右键菜单「连接状态/VPN IP/退出」2s 轮询
+//!   刷新，经控制 IPC 查询/停服；无 GUI 主机优雅退出（tray feature 门控）；
 //! - `invite <path>`：载入邀请文件（b64 文本或原始字节）→ 钉扎集群根公钥 + 存根签
 //!   目录（一次性引导，§1.3.3f 强路径）；
 //! - `gen-keys`：生成/复用设备静态密钥并打印公钥（部署编排把公钥交给
@@ -35,7 +37,7 @@ flock-client [--config <client.toml>] [<subcommand>]
   status                 向 daemon 发一次 Status 请求并打印（无托盘环境探针）
   install [--user|--service]  安装服务+托盘自启（缺省两者；安装时 --config 记入服务定义）
   uninstall [--user|--service] 反向卸载
-  tray                   托盘进程（M6 第二阶段；本阶段为占位入口，tray feature 门控）
+  tray                   托盘进程（右键菜单：连接状态/VPN IP/退出；无 GUI 会话优雅退出）
   invite <path>          载入邀请（b64 文本/原始字节）→ 钉扎根公钥 + 存根签目录
   gen-keys               生成/复用设备密钥并打印公钥（device-x=/device-ed= b64）
   --smoke                真机冒烟：建 tun + 配路由 + 打印状态即退（§7-M3 手工清单）
@@ -165,11 +167,7 @@ fn run_cli() -> Result<(), String> {
         Cmd::Uninstall { scope } => flock_client::install::uninstall(scope)
             .map_err(|e| format!("{e}\n（提权要求与平台矩阵见 docs/manual/service-install.md）")),
         #[cfg(feature = "tray")]
-        Cmd::Tray => Err(
-            "tray 子命令为 M6 第二阶段占位（IPC 契约已就绪：flock_client::ipc 的 \
-             CtrlReq/CtrlResp + ControlPaths::platform_default）"
-                .into(),
-        ),
+        Cmd::Tray => flock_client::tray::run_tray(),
         Cmd::Run | Cmd::GenKeys | Cmd::Invite { .. } | Cmd::Smoke => {
             let cfg = ClientConfig::load(&cli.config)?;
             match cli.cmd {
