@@ -94,6 +94,49 @@ fn abs_config(cfg_path: &Path) -> Result<PathBuf, String> {
 }
 
 // ============================================================================
+// 托盘自启命令行引号（评审项 2：含空格路径不得把子命令吞进路径参数）
+// ============================================================================
+
+/// Windows HKCU Run 值渲染：`"<exe>" tray`——exe 路径整体加引号（Run 值经
+/// CreateProcess 命令行解析，未加引号的空格路径会把首段目录当 exe）。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn tray_run_value(exe: &str) -> String {
+    format!("\"{exe}\" tray")
+}
+
+/// .desktop `Exec=` 行参数引号转义（Desktop Entry Spec：含保留字符的参数整体
+/// 双引号包裹，引号串内仅 `\\`、`\\``、`\\$`、`\\"` 四个转义序列有效——空格为
+/// 字面值）。固定整体加引号（spec 允许、形态确定）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn desktop_quote_arg(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    for c in arg.chars() {
+        if matches!(c, '\\' | '`' | '$' | '"') {
+            out.push('\\'); // 引号串内可转义的仅此四字符
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Linux 托盘自启 .desktop 条目渲染（Exec 行 = `<引号 exe> tray`）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn render_tray_desktop_entry(exe: &str) -> String {
+    format!(
+        "\
+[Desktop Entry]
+Type=Application
+Name=Flock VPN Tray
+Exec={} tray
+X-GNOME-Autostart-enabled=true
+",
+        desktop_quote_arg(exe)
+    )
+}
+
+// ============================================================================
 // Linux：systemd
 // ============================================================================
 
@@ -172,16 +215,8 @@ fn install_tray() -> Result<(), String> {
     let exe = current_exe()?;
     let dir = home_dir()?.join(AUTOSTART_DIR_REL);
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    let entry = format!(
-        "\
-[Desktop Entry]
-Type=Application
-Name=Flock VPN Tray
-Exec={} tray
-X-GNOME-Autostart-enabled=true
-",
-        exe.to_string_lossy()
-    );
+    // Exec 行引号转义（评审项 2：含空格路径按 Desktop Entry Spec 加引号）。
+    let entry = render_tray_desktop_entry(&exe.to_string_lossy());
     let path = dir.join(TRAY_DESKTOP_NAME);
     std::fs::write(&path, entry).map_err(|e| format!("写 {}: {e}", path.display()))?;
     println!("托盘自启已注册：{}", path.display());
@@ -525,7 +560,8 @@ fn install_tray() -> Result<(), String> {
         .map_err(|e| format!("打开 HKCU Run: {e}"))?;
     key.set_value(
         "flock-client-tray",
-        &format!("{} tray", exe.to_string_lossy()),
+        // 引号包裹 exe（评审项 2：空格路径下 CreateProcess 才不把目录段当 exe）。
+        &tray_run_value(&exe.to_string_lossy()),
     )
     .map_err(|e| format!("写 Run 值: {e}"))?;
     println!("托盘自启已注册：HKCU\\...\\Run\\flock-client-tray");
@@ -656,13 +692,15 @@ mod tests {
     fn hkcu_run_tray_autostart_roundtrip() {
         use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
         use winreg::RegKey;
-        // 直接调用 install_tray（写的是当前测试进程 exe 路径——值在即可，内容不比对）。
+        // 直接调用 install_tray（写的是当前测试进程 exe 路径）——值形如
+        // `"<exe>" tray`：exe 引号包裹（评审项 2），内嵌路径与 current_exe 一致。
         install_tray().expect("HKCU Run 写入（无提权面）");
         let key = RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_READ)
             .unwrap();
         let v: String = key.get_value("flock-client-tray").expect("Run 值存在");
-        assert!(v.ends_with(" tray"), "Run 值形如 <exe> tray，得 {v:?}");
+        let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        assert_eq!(v, format!("\"{exe}\" tray"), "Run 值 = 引号 exe + tray");
         uninstall_tray().expect("HKCU Run 删除");
         let key = RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_READ)
@@ -671,5 +709,36 @@ mod tests {
             key.get_value::<String, _>("flock-client-tray").is_err(),
             "注销后值不存在"
         );
+    }
+
+    /// 评审项 2：自启命令行含空格路径——HKCU Run 值 exe 整体加引号（`"<exe>" tray`）。
+    #[test]
+    fn tray_run_value_quotes_exe_with_spaces() {
+        assert_eq!(
+            tray_run_value("/opt/Flock Client/bin/flock-client"),
+            "\"/opt/Flock Client/bin/flock-client\" tray"
+        );
+        assert_eq!(
+            tray_run_value("C:\\Program Files\\Flock\\flock-client.exe"),
+            "\"C:\\Program Files\\Flock\\flock-client.exe\" tray"
+        );
+    }
+
+    /// 评审项 2：.desktop Exec 行按 Desktop Entry Spec 引号转义（含空格路径整体
+    /// 双引号；引号串内 \\、\\`、\\$、\\" 转义；tray 参数无保留字符不加引号）。
+    #[test]
+    fn tray_desktop_exec_quotes_and_escapes_per_spec() {
+        let entry = render_tray_desktop_entry("/opt/Flock Client/bin/flock-client");
+        assert!(
+            entry.contains("Exec=\"/opt/Flock Client/bin/flock-client\" tray\n"),
+            "Exec 行 = 引号 exe + 裸 tray，得 {entry}"
+        );
+        // 保留字符转义（spec 四序列）。
+        assert_eq!(
+            desktop_quote_arg(r##"a"b\c$d`e"##),
+            "\"a\\\"b\\\\c\\$d\\`e\""
+        );
+        // 空参数仍得空引号串（spec：空串必须引号）。
+        assert_eq!(desktop_quote_arg(""), "\"\"");
     }
 }

@@ -38,7 +38,7 @@ flock-client status                                                 # 单次 Sta
 | 命令行 | `<exe> service --config <abs>`（exe = 执行 install 时的二进制路径） |
 | 失败恢复 | 第 1/2 次失败重启（延迟 5s），第 3 次起不再动作；计数 24h 重置 |
 | 事件日志 | 源 `flock-client` 注册进 Application 日志（HKLM，随 install）；服务启停/错误落事件日志；无消息 DLL ⇒ 消息以插入串呈现（模板 DLL 列后续打磨项） |
-| 托盘自启 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 值 `flock-client-tray` = `<exe> tray`（**无需提权**） |
+| 托盘自启 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 值 `flock-client-tray` = `"<exe>" tray`（exe 加引号——空格路径安全；**无需提权**） |
 | 控制 IPC | 命名管道 `\\.\pipe\flock-client-control`，显式 DACL：SYSTEM + Administrators + 交互用户组（IU）；token 文件 `%ProgramData%\flock\control-token`（ACL：Users 读） |
 
 **提权**：服务安装/卸载需管理员（打开 SCM 的 CREATE_SERVICE/DELETE 权限）。非提升
