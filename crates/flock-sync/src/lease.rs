@@ -616,7 +616,10 @@ mod tests {
             ms += 1000;
             t.tick_ewma(ms);
             let ewma = t.peer_stats(&dev).unwrap().tx_ewma;
-            assert!(ewma >= prev_ewma, "恒定速率下折叠单调非减（{prev_ewma}→{ewma}）");
+            assert!(
+                ewma >= prev_ewma,
+                "恒定速率下折叠单调非减（{prev_ewma}→{ewma}）"
+            );
             prev_ewma = ewma;
         }
         let stats = t.peer_stats(&dev).unwrap();

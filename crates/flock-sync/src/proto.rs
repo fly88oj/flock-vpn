@@ -34,6 +34,15 @@ pub const VIP_FIRST: u32 = u32::from_be_bytes([100, 64, 0, 11]);
 /// 池末（/10 段最后一个可用地址）。
 pub const VIP_LAST: u32 = u32::from_be_bytes([100, 127, 255, 254]);
 
+/// 服务器自身 VIP 的确定性推导（§6.2 服务器段 .1–.10）：node 1..=10 →
+/// `100.64.0.<node_id>`；越界（0 或 >10）⇒ None。ServerKeys 根签登记时以此为
+/// `ServerKeyEntry.vip`（M7 名册 Server 条目数据源——全网同推导，无第二真相源）。
+pub fn server_vip_of(node_id: NodeId) -> Option<[u8; 4]> {
+    (1..=10)
+        .contains(&node_id)
+        .then_some([100, 64, 0, node_id as u8])
+}
+
 /// 管理操作签名域分离标签（canonical 字节前缀）。
 const L_ADMIN: &[u8] = b"flock-sync/admin/v1";
 /// server_keys 签名域分离标签（目录更名 ch-sync→flock-sync 的漏网点——未发布窗口
