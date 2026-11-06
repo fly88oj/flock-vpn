@@ -1192,6 +1192,53 @@ VIP（M7.2 路径）。`peer_retention_days = 0` ⇒ 不装配回收器。多台
 从未在线的设备 `last_seen_unix = 0` ⇒ 按纪元 0 起算保留期（确定性：注册即起算）。
 窗口判定函数以注入时钟取值（`reap_once(.., now_unix)` 可测）。
 
+#### M7.7 客户端侧（M7 第二批次：登录/票据保持/名册消费/peers CLI）
+
+**契约上收（偿还架构债）**：`PeerInfo`/`PeerKind`、票据线格式 `TicketWire`/
+`SignedTicket`、控制面消息 `CtrlRequest`/`CtrlResponse` 与值类型、key-bind 设备签名
+canonical、hostname 规范化——上收至 **`flock-protocol::roster`**（两端同类型无第二
+真相源；`flock-server::{control,ticket}` 与 `flock-sync::proto` 以 `pub use` 再导出，
+既有引用路径不变；票据权威逻辑 TicketAuthority/NonceLedger 不搬——服务端内部面）。
+flock-protocol 门禁含 wasm32 check（roster 纯数据无平台面）。
+
+**凭据与登录（客户端半边）**：
+
+- `client.toml` 增 `[auth] username`（+ 可选 `credentials_file`，缺省 state 目录
+  `credentials`）；口令**单行明文**存 0600 文件（Windows 显式 DACL：SYSTEM+管理员+
+  属主，无 Users）。**静止风险如实声明**：OPAQUE（RFC 9807）保证口令不上线；本地
+  静止 = 本地信任域（属主侧明文可读——与「root 可读 /etc/shadow」同级取舍，无钥匙
+  环依赖）。
+- `flock-client login`（一次性引导）：stdin 读口令（tty 有回显——本地信任域取舍）→
+  写 0600 凭据 → 直连隧道控制流：`PwBegin/PwCommit` 设服务端口令（授权 = 会话设备
+  owner；admin 面无开户口令操作，口令设置本就走控制流）→ 登录验证 + key-bind
+  携带 hostname 入册。票据不保留（一次性命令）。
+- daemon（`service` 形态）登录保持任务：会话在位 ⇒ OPAQUE 登录（anchor 以**钉扎
+  目录内该 server 的身份公钥**验签——端点轮询换服后锚仍正确）→ key-bind（hostname
+  re-register 更新链路；`add_user_sig_key` 去重 ⇒ 周期重登不膨胀注册表）→ 票据
+  **只存内存**；重登节奏 = TTL·2/3（**相对量**——免疫两端时钟偏移；票据 TTL 内保持
+  新鲜）。凭据文件**每次登录现读**（`login` 换口令免重启 daemon）。控制流请求超时 ⇒
+  流毒化 + 主动杀会话重连（yamux 流超时后可能错位——宁可重连不带错位继续）。
+
+**hostname 上报**：`client.toml hostname` 覆写，缺省 OS 主机名（hostname crate）；
+统一 `normalize_hostname`（trim/64B 截断/空串 "(unknown)"——与服务端落库同语义）。
+
+**PeerListPull 消费 + IPC/CLI**：
+
+- daemon 缓存最近一次名册（`RosterCache`，拉取时刻 + ≤5s 新鲜窗）；IPC 增
+  `CtrlReq::Peers{token}` → daemon：缓存新鲜或持当前票据拉取 → 对 **online 且非
+  自身**条目并发 ping 探测（ICMP echo 经 tun——raw socket 发往 VIP 由路由表走
+  tun0；3 探针、2s 超时/探针、取上中位；实现 = socket2 raw ICMP 薄层：daemon 特权
+  上下文 raw 权限在位、三平台同一 API 面、校验和/回复匹配全控；raw 不可用 ⇒ 延迟列
+  降级「—」）→ `Peers{rows}`，`PeerRow = PeerInfo + latency_ms + self_flag`；
+  未登录/隧道断/未配置 ⇒ `PeersUnavailable{reason}`（CLI 转指引文案）。
+- `flock-client peers`：对齐列表格 `VIP｜主机名｜账户｜类型｜状态｜延迟(ms)｜↓流量
+  (B/s)｜↑流量(B/s)`；状态三态 = 在线 / 离线（Device）/ **服务未运行**（Server 型
+  离线——与设备离线可区分）；离线延迟列 `—`；自身行 `(self)` 标注；`--json` 机读档
+  （数组，latency null = 离线/未探测）。daemon 不在/未登录 ⇒ 明确错误与指引。
+- 实测：`deploy/m7.yml` + `m7_assert.sh`（两 client + server：名册条目/延迟/iperf3
+  流量列/JSON 解析）；Windows/macOS raw ICMP 真机 → `docs/manual/service-install.md`
+  §7 清单第 9 项。
+
 #### M7.6 完成标准
 
 1. `cargo test -p flock-sync --all-features`：含 DeviceRow 往返（新字段）、Expired
@@ -1356,4 +1403,15 @@ VIP（M7.2 路径）。`peer_retention_days = 0` ⇒ 不装配回收器。多台
 - 2026-11-02 项目更名：ChmlVPN → Flock VPN（chmlvpn-server/client→flock-server/client、chml-sync/frpc→flock-sync/frpc、网络 chmlpub→flockpub、占位 git URL 换 flock 域；flock-protocol 线上行为零变化）。仓库目录同步更名为 FlockVPN——会话占用期间经 junction 过渡（宿主机两路径等价、Docker 挂载内仅真实路径可见，容器命令暂用 ChmlVPN 路径），收尾步骤见 docs/manual/dir-rename-final.md。
 - 2026-11-06 M6 第一阶段（系统服务化 + 控制面 daemon 侧）：新增 §7-M6——双进程模型（`flock-client service` 系统服务持全部 supervise/数据面 + `flock-client tray` 用户会话托盘经本地 IPC，Windows session 0 托盘约束定案）；控制 IPC v1 契约（postcard over 命名管道/Unix socket + 32B token 信封认证，**每请求带 token**——较「仅 Shutdown 带 token」收紧，Status 不裸奔）；三平台服务安装（Windows AUTO_START+恢复策略 / systemd Restart=on-failure / launchd 无 KeepAlive）+ 托盘自启 + `install/uninstall/status` 子命令 + `tray` feature 门控（cargo 无按平台 default features 的限制如实声明，GUI 依赖留 target 门控给第二阶段）；退出语义定型（Shutdown=优雅停服不复活、服务保持已安装）。IPC 契约固化为 `flock_client::ipc` 模块供托盘工程独立消费。
 - 2026-11-06 M7（成员名册与可观测性·服务端侧）：新增 §7-M7；**§2.1 IP 复用策略修订**（吊销→永不复用不变；离线超保留期→Expired+VIP 归还分配池、记录留册审计、名册排除；`peer_retention_days` 缺省 30、0=永不过期兼容旧行为）；注册表 DeviceRow 增 `hostname/expired_at` + `DeviceStatus::Expired`（终态）+ VIP 释放池（快照/线格式兼容性如实声明：postcard 无字段标签，旧快照不可解码——未发布窗口允许）；动态面搭租约便车（lease 条目 + gossip 携带 per-device EWMA 流量与 last_seen，α=0.2/1s 窗，「投递成功点计数」单点原则防双计）；名册契约 `CtrlRequest::PeerListPull`（票据先行）→ `Vec<PeerInfo>`（VIP 升序，含 Server 条目）；60s 回收器置 Expired。
+- 2026-11-07 M7 第二批次（成员名册·客户端侧）：新增 §7-M7.7——契约类型上收
+  `flock-protocol::roster`（PeerInfo/PeerKind/TicketWire 线格式 + 控制面消息 +
+  key-bind canonical + hostname 规范化；两端同类型无第二真相源，server/sync `pub use`
+  再导出）；客户端控制流半边（凭据 0600 单行 + `[auth] username`；`login` 一次性
+  引导 = 设口令→登录验证→hostname 入册；daemon 登录保持 = anchor 验签 + key-bind
+  re-register + 票据只存内存 + TTL·2/3 相对量重登 + 超时毒化杀会话重连）；IPC 增
+  `Peers{token}`（≤5s 名册缓存 + online 非自身并发 raw ICMP 探测：socket2 薄层
+  3 探针 2s 超时取上中位，raw 缺权降级「—」；MAX_CTRL_FRAME 4KiB→256KiB）；
+  `flock-client peers`（对齐表格：状态三态在线/离线/服务未运行 + `--json` 机读档）；
+  容器实测 `deploy/m7.yml`+`m7_assert.sh`（两 client + server：条目/延迟/iperf3
+  流量列/JSON）；Windows/macOS raw ICMP 真机列 service-install.md §7 清单。
 - 2026-11-06 M6 第二阶段（托盘进程）：新增 §7-M6.7（§7-M6.4 tray 行同步）——`flock-client tray` 落地：三项菜单（连接状态/VPN IP 动态只读 + 退出动作），2s 轮询刷新、Denied/IPC 失败⇒「服务未运行」继续重试；退出=对 token Shutdown⇒托盘退出（服务保持已安装）/daemon 不在⇒仅退托盘/Denied⇒不退出+token 失效重载；程序化 32×32 RGBA 图标（零资产文件）；平台库 tray-icon（Windows 最小 Win32 消息泵/macOS 主线程 NSApp 排空循环）+ ksni（Linux DBus SNI，零 GTK 系统依赖），不引 winit/tauri/egui；GUI 探测（Linux DISPLAY/WAYLAND+会话 DBus 前置判定，win/mac 创建失败兜底）无 GUI 一律优雅退出码 0；M6.5 feature 门控兑现（GUI 依赖全部 target 门控 optional、dep: 引用不匹配 target no-op，--no-default-features 三平台零 GUI 依赖——门禁实测）。验证边界如实：核心单测 + Windows 真进程 mock-daemon 实测（存活/刷新日志/状态一致/Shutdown 停服后转显服务未运行）；图标目视/退出点击/真 daemon 联测（需 invite+管理员）列 service-install.md 托盘真机清单；macOS 无设备未验证（apple target 工具链下载过慢未及编译级核验，API 按 crate 源核对）；Linux 桌面真机未验证（容器编译面过）。

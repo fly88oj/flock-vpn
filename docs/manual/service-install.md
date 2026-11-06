@@ -147,6 +147,11 @@ tray ≥10s 存活无 panic、2s 刷新日志、与 `flock-client status` 状态
 8. [ ] （Windows 真机 daemon 联测）提升会话起真服务（§2 清单）后重跑 1–5 项——
    非提升会话 wintun/路由注入受阻（windows-smoke.md 先例），本会话实测以
    mock daemon 在 IPC 面替代。
+9. [ ] **（M7 `peers` 真机）**提升会话起真服务 + 真拓扑后：`flock-client login`
+   （口令引导）→ `flock-client peers` 表格出现（含服务器与远端 peer 条目、延迟列
+   数字——raw ICMP 需管理员/服务上下文；容器 Linux 路径已由 `deploy/m7_assert.sh`
+   实测，Windows/macOS raw 面真机确认在此）→ `peers --json` 可被 `jq` 解析 →
+   iperf3 跑流后 `↓/↑流量` 列非 0（EWMA 收敛窗 ~10s）。
 
 ## 8. 已验证/未验证边界（如实）
 
@@ -164,3 +169,4 @@ tray ≥10s 存活无 panic、2s 刷新日志、与 `flock-client status` 状态
 | Unix socket 服务端/权限 | 单测通过（Linux 容器档随 linux 编译面；本宿主为 Windows，socket 单测在 Unix 宿主跑） |
 | Linux 桌面托盘（ksni/SNI 宿主）真机 | **未验证**（容器档仅编译面；§7 清单第 6 项） |
 | macOS 全链路 | **未验证**（无设备；渲染/命令序列单测+审阅，§4/§7 清单留位） |
+| M7 peers 全链（登录保持/名册拉取/raw ICMP 延迟/流量列） | **容器实测通过**（Linux root，`deploy/m7_assert.sh`）；单测面（登录态机 pake 双端/毒化重连/表格渲染/IPC 契约/探测中位）宿主通过；Windows/macOS raw ICMP 真机 → §7 清单第 9 项 |

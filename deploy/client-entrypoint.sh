@@ -11,8 +11,12 @@ set -e
 STATE=/var/lib/flock
 
 if [ -f "$STATE/ready" ]; then
-    echo "flock-client: state ready; starting (config /etc/flock/client.toml)"
-    exec flock-client --config /etc/flock/client.toml
+    # $@ 覆盖缺省（M7：compose command 注入 --config 卷内配置 + service 子命令）。
+    if [ "$#" -eq 0 ]; then
+        set -- --config /etc/flock/client.toml
+    fi
+    echo "flock-client: state ready; starting (flock-client $*)"
+    exec flock-client "$@"
 fi
 
 echo "flock-client: awaiting bootstrap (run deploy/m3_assert.sh)..."

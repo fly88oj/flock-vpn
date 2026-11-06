@@ -1,0 +1,99 @@
+# m7.yml —— M7 客户端名册（docs/design.md §7-M7.7：m3 拓扑 + 第二客户端 + peers 实测）。
+#
+#   docker compose -f deploy/m7.yml up -d --build
+#   bash deploy/m7_assert.sh
+#
+# 拓扑（m3.yml 的 frp 中转变体 + 两台客户端——名册 ≥3 条目：server + client-1/2）：
+#   frps（原版 v0.71.1；用户口 27500/27501 容器网内可达）
+#     └─ server（Frp 模式 + M3 数据面：tun0 VIP 100.64.0.1；与 m3 同构，状态卷独立）
+#   client-1 / client-2（flock-client；**service daemon 形态**（M7：IPC + 登录保持），
+#     hostname=client-1/client-2（key-bind 入册「主机名」列的确定性断言源）；
+#     command 覆盖为卷内配置 /var/lib/flock/client.toml——[auth] username 由
+#     m7_assert.sh bootstrap 写入（卷持久 ⇒ 容器重建不丢））。
+#
+# 凭据引导（admin 开户路径，对齐 m3 既有脚本）：gen-keys → 服务端 device-add
+# --user m7cN → invite → ingest → vip → `flock-client login`（设口令 + 登录验证 +
+# hostname 入册）→ ready → restart（daemon 接管）。
+
+name: flock-m7
+
+services:
+  frps:
+    build:
+      context: build            # 仅 Dockerfile.frps + frps.toml（committed）
+      dockerfile: Dockerfile.frps
+      additional_contexts:
+        bins: ../.tmp/frp_0.71.1_linux_amd64
+    image: flock/frps:0.71.1
+    networks: [m7net]
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ..               # workspace 根（源码；.dockerignore 裁剪 target/.tmp）
+      dockerfile: deploy/Dockerfile.server
+      additional_contexts:
+        frpbin: ../.tmp/frp_0.71.1_linux_amd64
+      args:
+        server_conf: server-m3.toml   # 与 m3 同构（容器网络视角端点 + ticket_ttl 6s）
+    image: flock/server:m7
+    depends_on: [frps]
+    # M3 数据面：服务端自身也是 peer（tun + 路由，§2.2）。
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    networks: [m7net]
+    volumes:
+      - server-state:/var/lib/flock
+    restart: unless-stopped
+
+  client-1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.client
+    image: flock/client:m7
+    depends_on: [server]
+    hostname: client-1
+    # service daemon 形态（M7：IPC + 登录保持 + peers 面）；配置在卷内（bootstrap 写）。
+    command: ["--config", "/var/lib/flock/client.toml", "service"]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    networks: [m7net]
+    volumes:
+      - client-1-state:/var/lib/flock
+    restart: unless-stopped
+
+  client-2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.client
+    image: flock/client:m7
+    depends_on: [server]
+    hostname: client-2
+    command: ["--config", "/var/lib/flock/client.toml", "service"]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    networks: [m7net]
+    volumes:
+      - client-2-state:/var/lib/flock
+    restart: unless-stopped
+
+networks:
+  m7net:
+    name: flock-m7net
+
+volumes:
+  server-state: {}
+  client-1-state: {}
+  client-2-state: {}
