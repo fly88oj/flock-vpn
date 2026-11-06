@@ -378,9 +378,17 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
 - 数据面：客户端 ↔ 服务端会话型隧道（首版 hub-and-spoke，peer 间经服务端路由；不做 P2P
   直连，vpn-mesh §6 明示首发策略）；任何链路形态下第三方只见本协议密文。
 - 虚拟网：`100.64.0.0/10`（RFC 6598 CGNAT 段，Tailscale/NetBird 双先例，vpn-mesh §3.1），
-  内部保留 /24 若干；分配由 Raft 状态机裁决（强一致防撞）；**禁用不删除、IP 不复用**
-  （innernet 先例，安全优先，vpn-mesh §3.1）；MTU 1280（Tailscale 同款、IPv6 下限，
-  vpn-mesh §3.2）。
+  内部保留 /24 若干；分配由 Raft 状态机裁决（强一致防撞）；MTU 1280（Tailscale 同款、
+  IPv6 下限，vpn-mesh §3.2）。
+  **IP 复用策略（M7 修订，取代此前「禁用不删除、IP 不复用」的一刀切表述）**：
+  - **吊销（Revoked）→ IP 永不复用**（不变；innernet 先例，安全优先，vpn-mesh §3.1）；
+    禁用（Disabled）同理：行保留、VIP 不回收。
+  - **离线超过保留期 → Expired + VIP 归还分配池**（新，M7）：回收器把「离线 > 保留期」
+    的设备经 Raft 管理操作置 Expired 并释放其 VIP 回分配池——新设备可分到该 VIP；
+    **过期记录本身保留在册**（审计可查），名册查询排除 Expired。窗口内重连同设备保持
+    同 IP（未过期不动行）。保留期 = server.toml `peer_retention_days`（缺省 30 天；
+    **0 = 永不过期**，兼容旧行为）。Expired ≠ Revoked：两者都阻断握手，但状态可区分
+    （审计/名册语义不同——Expired 是时间性淘汰，Revoked 是安全处置）。
 
 ### 2.2 服务端（`app/flock-server`）
 
@@ -398,8 +406,9 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
     顺序 = 票据有效性（签名+TTL+epoch+吊销）**先于** nonce 记账；等效重放窗 =
     min(±300s, 票据 TTL)。没有这个前提，同一签名请求发给未见过 nonce 的另一台服务器即可
     重放（票据密钥根 Raft 共享、任何服务器都验得了，挡得住的只有「票据 TTL + epoch 失效」）。
-- 设备管理：设备 = `(DeviceId=Ed25519 指纹, owner, VIP, 静态公钥集, status)`，全部进
-  `flock-sync` 强一致状态机。
+- 设备管理：设备 = `(DeviceId=Ed25519 指纹, owner, VIP, 静态公钥集, status, hostname,
+  expired_at)`（hostname/expired_at 为 M7 增补，§7-M7），全部进 `flock-sync` 强一致
+  状态机。
   - **吊销传播界（数字定死，A6 据此可验证）**：吊销 = Raft 提交；每台服务器在**自己的
     日志 apply 回调**里 (a) 推进 revocation_epoch、失效记录缓存，(b) 杀死本地该设备会话，
     (c) 清拒其票据（票据 epoch < 当前 epoch 即拒）。即「踢会话」不需要额外广播——Raft
@@ -594,6 +603,9 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
   （§2.2 吊销传播界）+ **apply-lag >2s 熔断本地缓存、降级线性一致读**（§4 读与缓存）；
   learner→快照→add_voter→rewrap 准入流水（§4）；租约冲突 = 新者胜 + 旧端踢会话
   （vpn-mesh §5.2）；invite_id 单次消费在 Raft 内查重（§1.3.3f 邀请一生）。
+  M7 增补（§7-M7）：租约条目携带 per-device EWMA 流量与 last_seen（动态面搭租约
+  便车，不进 Raft）；注册表支持 Expired 状态与 VIP 归还分配池（§2.1 IP 复用策略
+  修订）。
 
 ### 3.11 `app/flock-server`（服务端装配）
 - **接口**：`flock-server --config server.toml` / `init-cluster` / `enroll`（进程入口）
@@ -1008,6 +1020,146 @@ feature，Linux 默认构建（含 default features）不引入 GUI 依赖面，
 5. 托盘工程可直接 `use flock_client::ipc::{CtrlReq, CtrlResp, ...}` 消费契约（lib 面
    导出 + 契约单测即消费样例）。
 
+### M7 成员名册与可观测性（服务端侧）
+
+需求（用户原话浓缩）：CLI 要能列出各 VPN IP 的主机名、账户、在线状态、平均流量；
+主机离线不马上消失，默认保留 1 个月；窗口内重连同设备保持同 IP（到期后设备过期、
+IP 归还池子）；响应速度由客户端实测（不在本里程碑范围）。
+
+#### M7.1 注册表扩展（Raft 静态面）
+
+`DeviceRow` 增两字段（`crates/flock-sync/src/proto.rs`，注册表行 = Raft 状态机快照
+线格式）：
+
+```rust
+pub struct DeviceRow {
+    pub owner: String,
+    pub device_x25519: [u8; 32],
+    pub device_ed25519: [u8; 32],
+    pub vip: [u8; 4],
+    pub status: DeviceStatus,      // Active | Disabled | Revoked | Expired(新)
+    pub since_epoch: u64,
+    pub hostname: String,          // 新（M7）：客户端入网上报；空 ⇒ "(unknown)"；
+                                   //   re-register（同设备 key-bind 再入网）可更新
+    pub expired_at: Option<u64>,   // 新（M7）：置 Expired 的 unix 秒（审计）；非 Expired
+                                   //   恒 None
+}
+```
+
+- `hostname` 来源：enroll/key-bind 路径（`DevicePubs` 增 `hostname: String` 字段，进
+  key-bind 设备签名覆盖面）；服务端先把字段与默认值打通——客户端上报为 M8 客户端
+  阶段补齐，空串落 `"(unknown)"`（长度上限 64 字节，超长截断）。
+- **快照/线格式兼容（如实声明）**：postcard 无字段标签，`DeviceRow`/`SyncRequest`
+  加字段后**旧快照与旧日志条目不可解码**——未发布窗口允许（与 proto.rs 既有
+  `L_SERVER_KEYS` 更名的同一纪律）；升级残留旧库需重建（init-cluster 重跑），不提供
+  迁移。
+
+#### M7.2 IP 复用策略修订（§2.1 已同步修订）
+
+- **吊销 → IP 永不复用**（不变）；**离线超过保留期 → Expired + VIP 归还分配池**
+  （新设备可分到）；**过期记录保留在册**（审计），名册查询排除。
+- 实现：`SyncRequest::Expire { device, now_unix }`（Raft 写操作；`now_unix` 由提交方
+  注入，状态机确定性落 `expired_at`）。apply 语义：仅 Active/Disabled → Expired
+  （幂等：已 Expired 重放放行、不动 epoch）；推进 revocation_epoch 并触发吊销传播钩子
+  （杀残留会话/废票据——与 Revoked 同路径，仅状态语义不同）；释放 VIP 进分配池
+  （`NetStateData.vip_pool: BTreeSet<[u8; 4]>`，**优先于水位线分配**——池取最小，
+  池空回退水位线 `vip_next` 单调递增）；VIP 反查索引删除旧条目（Expired 行不进索引
+  ——释放后的 VIP 单射性由「池内 VIP 不在索引」维持）。
+- **Expired 为终态**（同 Revoked）：不可 Enable（旧 VIP 可能已属他设备，复活会破
+  单射）；同设备身份复活 = 新 key-bind 注册新行新 VIP。单服形态（netstate.rs
+  StateStore）同语义：`expire()` + VIP 池表。
+- 保留期 = server.toml `peer_retention_days`（缺省 30；**0 = 永不过期**，兼容旧行为；
+  u64 天然 ≥0，解析即校验）。
+
+#### M7.3 动态面搭租约便车（EWMA 流量 + last_seen，不进 Raft）
+
+- 租约条目（`flock-sync/src/lease.rs`）增：`tx_ewma/rx_ewma: u64`（bytes/s，**设备
+  视角**——tx = 设备发出、rx = 设备收到；服务器自身条目同理）与
+  `last_seen_unix: u64`。gossip `Publish`/`Anti` 消息同步携带（持有者权威值）。
+- EWMA：α = 0.2（`EWMA_ALPHA_NUM/DEN = 1/5`），**1s 更新窗口**——`LeaseTable` 内
+  per-device 字节累加器（`note_tx/note_rx`），`tick_ewma(now_ms)` 每 1s 折一次：
+  `ewma = ewma·(1−α) + (Δbytes/Δt)·α`（只折本机持有的行——远端行的值以持有者
+  publish/反熵为准，不本地覆写）。
+- **计数点（单点原则，杜绝双计）**：按「投递成功点计数」——
+  - **src 设备 tx**：由**接入服务器**（src 租约持有者）在其 ingest 通过第 0 步源
+    VIP 绑定校验后计 1 次（收进 mesh 即成功；dst 侧绝不计 src）；
+  - **dst 设备 rx**：由**投递成功的服务器**（本机 sink 投递成功 / ForwardEnvelope
+    收端本机投递成功——即 dst 的真实持有者）计 1 次；跨服 FRWD 的 origin 不计 dst，
+    Not_HERE/丢弃不计；
+  - **服务器自身条目**：dst = 本机 VIP 注内核成功 ⇒ 本机 rx；内核回程
+    `route_outbound` ⇒ 本机 tx。
+  - TTL 过期的租约行**保留**（不再删除）：`observe` 语义不变（过期 ⇒ None），但
+    行内 `last_seen_unix`/ewma 留存供名册离线设备展示（内存权衡：每行 ~60B）。
+- `last_seen_unix` 更新点：publish/续期（持有者）、本机计到该设备流量（持有者）、
+  收到对端 publish/反熵事件（远端条目以消息携带值为准）。
+- 同步通道：随**现有**租约 publish/事件（≤1s 语义；续期循环 10s 重发布携带最新
+  ewma）与反熵（5s）——不新增 gossip 消息类型。名册装配从**本地租约视图**取。
+- 单服形态：无租约表——`flock-sync` 提供同数学的 `TrafficMeter`（任意键 + EWMA +
+  last_seen，无 gossip），`PeerRouter::serve_stream` 双向计数（入站 = 该设备 tx、
+  出站 = 该设备 rx；dst = 服务器 VIP 的入站包计服务器 rx，内核回程计服务器 tx）。
+
+#### M7.4 名册契约（控制流新增；客户端阶段消费，逐字固化）
+
+`CtrlRequest` 新增变体 + 响应 + 行类型（postcard，`flock-server/src/control.rs`）：
+
+```rust
+CtrlRequest::PeerListPull { ticket: Option<TicketWire> }
+CtrlResponse::PeerList { peers: Vec<PeerInfo> }
+
+pub struct PeerInfo {
+    vip: [u8; 4],
+    hostname: String,
+    owner: String,
+    kind: PeerKind,            // pub enum PeerKind { Device, Server }
+    online: bool,
+    last_seen_unix: u64,
+    tx_bps: u64,               // 设备视角 EWMA（bytes/s）
+    rx_bps: u64,
+}
+```
+
+- **票据保护**：登录票据必带（`ticket: None` ⇒ `TicketMissing`）；**票据校验
+  （签名+TTL+epoch+设备态）先于名册数据装配**——沿 §2.2 票据强制契约纪律（本操作
+  为只读，无 nonce 记账面；顺序有测试断言：坏票据 ⇒ `TicketBad` 且装配计数不动）。
+- **装配** = 注册表快照（**本地已 apply 视图**——两级读缓存档即可，不强制线性一致
+  读：名册是展示面，允许follower 视图的秒级陈旧）⋈ 本地租约视图（含 ewma）：
+  - 设备条目：`status == Active` 的行（Disabled/Revoked/Expired 排除——名册 = 现任
+    成员；审计走 DeviceList）；`online` = 本地租约视图 TTL 有效；`last_seen_unix`/
+    `tx_bps`/`rx_bps` 取租约行（无租约历史 ⇒ 0）。
+  - **服务器自身也进名册**（kind=Server）：多主形态取 Raft `server_keys` 本地视图
+    （`ServerKeyEntry` 增 `vip: [u8; 4]`——根签登记时随身份/混合公钥同签，canonical
+    字节随之扩展）；`owner` = 该服务器的 node_id 十进制串（server_id 的承载形态），
+    `hostname` = 根签 ClusterDirectory 内该服务器 `relay_endpoint`（客户端可见端点，
+    熟悉且唯一）；流量 = 本地租约视图内该服务器的自发布条目（`server_self_device_id
+    (node_id)` 合成设备键——node_id 大端居前 8B + 固定标记后缀，与真实设备 id
+    （sha256(ed25519)）碰撞概率可忽略；各服务器在租约续期循环里自发布 + 内核路径
+    计数）。单服形态：本机一条 Server 条目（vip = `cfg.vip`，hostname =
+    `advertise_endpoint`，流量 = 本机 TrafficMeter）。
+  - **按 VIP 升序**排序输出。
+
+#### M7.5 回收器（低频任务）
+
+server 内低频任务（周期 60s）：扫本地已 apply 注册表快照，把「Active 且
+`last_seen_unix` 距今 > `peer_retention_days`」的设备经 Raft 写操作置 Expired + 释放
+VIP（M7.2 路径）。`peer_retention_days = 0` ⇒ 不装配回收器。多台并发回收幂等
+（Expire 重放放行）；`last_seen_unix` = 本地租约视图（多主）/TrafficMeter（单服）；
+从未在线的设备 `last_seen_unix = 0` ⇒ 按纪元 0 起算保留期（确定性：注册即起算）。
+窗口判定函数以注入时钟取值（`reap_once(.., now_unix)` 可测）。
+
+#### M7.6 完成标准
+
+1. `cargo test -p flock-sync --all-features`：含 DeviceRow 往返（新字段）、Expired
+   释放后新设备拿到该 VIP、EWMA 收敛、lease gossip 带宽字段往返、快照兼容性声明
+   （旧格式不可解码 ⇒ 干净失败）。
+2. `cargo test -p flock-server --all-features`：roster 装配（在线/离线/过期三态 +
+   Server 条目）、票据先行顺序断言、回收器窗口逻辑（注入时钟）、hostname 默认值/
+   re-register 更新。
+3. `tests/multi_primary.rs` 追加：双客户端跨服时 roster 在任一服务器装配一致
+   （结构字段严格相等；ewma/last_seen 容差比较——两服务器的本地视图来自不同时刻的
+   反熵快照，逐字节相等不可实现也不必要），假流量泵使 ewma 非零。
+4. 门禁：两 crate clippy `-D warnings`、workspace check、fmt；容器 linux 档 check
+   （涉及 cfg 的仅数据面计数路径，不新增平台分支）。
+
 ---
 
 ## 8. 风险与对策
@@ -1157,3 +1309,4 @@ feature，Linux 默认构建（含 default features）不引入 GUI 依赖面，
 - 2026-11-01 命名调整：chml-protocol → flock-protocol（协议层独立于 chml/frp 品牌；flock=雁群，小型分布式网络意象；行为零变化）。
 - 2026-11-02 项目更名：ChmlVPN → Flock VPN（chmlvpn-server/client→flock-server/client、chml-sync/frpc→flock-sync/frpc、网络 chmlpub→flockpub、占位 git URL 换 flock 域；flock-protocol 线上行为零变化）。仓库目录同步更名为 FlockVPN——会话占用期间经 junction 过渡（宿主机两路径等价、Docker 挂载内仅真实路径可见，容器命令暂用 ChmlVPN 路径），收尾步骤见 docs/manual/dir-rename-final.md。
 - 2026-11-06 M6 第一阶段（系统服务化 + 控制面 daemon 侧）：新增 §7-M6——双进程模型（`flock-client service` 系统服务持全部 supervise/数据面 + `flock-client tray` 用户会话托盘经本地 IPC，Windows session 0 托盘约束定案）；控制 IPC v1 契约（postcard over 命名管道/Unix socket + 32B token 信封认证，**每请求带 token**——较「仅 Shutdown 带 token」收紧，Status 不裸奔）；三平台服务安装（Windows AUTO_START+恢复策略 / systemd Restart=on-failure / launchd 无 KeepAlive）+ 托盘自启 + `install/uninstall/status` 子命令 + `tray` feature 门控（cargo 无按平台 default features 的限制如实声明，GUI 依赖留 target 门控给第二阶段）；退出语义定型（Shutdown=优雅停服不复活、服务保持已安装）。IPC 契约固化为 `flock_client::ipc` 模块供托盘工程独立消费。
+- 2026-11-06 M7（成员名册与可观测性·服务端侧）：新增 §7-M7；**§2.1 IP 复用策略修订**（吊销→永不复用不变；离线超保留期→Expired+VIP 归还分配池、记录留册审计、名册排除；`peer_retention_days` 缺省 30、0=永不过期兼容旧行为）；注册表 DeviceRow 增 `hostname/expired_at` + `DeviceStatus::Expired`（终态）+ VIP 释放池（快照/线格式兼容性如实声明：postcard 无字段标签，旧快照不可解码——未发布窗口允许）；动态面搭租约便车（lease 条目 + gossip 携带 per-device EWMA 流量与 last_seen，α=0.2/1s 窗，「投递成功点计数」单点原则防双计）；名册契约 `CtrlRequest::PeerListPull`（票据先行）→ `Vec<PeerInfo>`（VIP 升序，含 Server 条目）；60s 回收器置 Expired。
