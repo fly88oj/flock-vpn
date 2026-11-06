@@ -39,9 +39,10 @@ pub const LAUNCHD_TRAY_LABEL: &str = "com.flockvpn.client-tray";
 // 平台常量（路径）
 // ============================================================================
 
-/// systemd 单元路径。
+/// systemd 单元路径（必须在单元搜索目录内——`/etc/systemd/system/`；
+/// 放 `/etc/systemd/` 根目录 systemd 不加载，`systemctl enable` 会报 unit not found）。
 #[cfg(target_os = "linux")]
-pub const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/flock-client.service";
+pub const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/flock-client.service";
 /// macOS LaunchDaemon plist 路径。
 #[cfg(target_os = "macos")]
 pub const LAUNCHDAEMON_PATH: &str = "/Library/LaunchDaemons/com.flockvpn.client.plist";
