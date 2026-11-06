@@ -17,5 +17,11 @@
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <!-- stderr 落盘（launchd 不继承会话 stdout/stderr——不指定则丢）。轮转建议：
+         macOS 用 newsyslog，/etc/newsyslog.d/flock-client.conf 加一行
+         `/var/log/flock-client.log root:wheel 640 3 1024 * J`
+         （3 份归档、单份 1024KB、J=压缩），防长期运行无限增长。 -->
+    <key>StandardErrorPath</key>
+    <string>/var/log/flock-client.log</string>
 </dict>
 </plist>

@@ -1,6 +1,8 @@
 # flock-client systemd 单元样例（docs/design.md §7-M6.3）
-# 正式安装由 `flock-client install` 生成（/etc/systemd/flock-client.service，安装时
-# --config 绝对路径写进 ExecStart）；本样例供部署审阅与手工部署参考。
+# 正式安装由 `flock-client install` 生成（/etc/systemd/system/flock-client.service，
+# 安装时 --config 绝对路径写进 ExecStart）；本样例供部署审阅与手工部署参考。
+# 注：systemd 只加载 /etc/systemd/system（及 /usr/lib/systemd/system 等）目录下的
+# 单元——/etc/systemd 根目录不是单元搜索路径，旧表述（/etc/systemd/...）为笔误。
 # 退出语义（§7-M6.1）：Restart=on-failure——IPC Shutdown/SIGTERM 的优雅停服以退出码 0
 # 结束，systemd 不复活；仅失败退出（panic/崩溃）在 5s 后重启。
 [Unit]

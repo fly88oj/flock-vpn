@@ -62,14 +62,14 @@ daemon（日志直连 stderr）——调试形态，与 Unix `service` 子命令
 
 | 项 | 内容 |
 |---|---|
-| 单元 | `/etc/systemd/flock-client.service`（install 渲染；样例 `deploy/systemd/flock-client.service`） |
+| 单元 | `/etc/systemd/system/flock-client.service`（install 渲染；样例 `deploy/systemd/flock-client.service`） |
 | 关键指令 | `WantedBy=multi-user.target`、`After=network-online.target` + `Wants=`、`Restart=on-failure`、`RestartSec=5`、`ExecStart=<exe> service --config <abs>` |
 | 安装动作 | 写单元 → `systemctl daemon-reload` → `systemctl enable --now flock-client` |
 | 托盘自启 | `~/.config/autostart/flock-client-tray.desktop` |
 | 控制 IPC | Unix socket `/run/flock/client.sock`（0660；目录 /run/flock 0755）；token `/var/lib/flock/client/control-token`（0640 root） |
 
-**提权**：写 `/etc/systemd` 与 systemctl 动作需 root——非 root 时错误信息带 sudo
-提示（`sudo flock-client install`）。
+**提权**：写 `/etc/systemd/system` 与 systemctl 动作需 root——非 root 时错误信息带
+sudo 提示（`sudo flock-client install`）。
 
 **组授权（可选，放开非 root 控制）**：缺省 root:root（即装即用 = 仅 root 可控）。
 要让 tray 用户查询/停服，把 `control_group = "flock"`（组需先建）写进 client.toml——
@@ -85,6 +85,7 @@ daemon 启动时对 token 与 socket 尝试 chgrp 到该组（仅查本地 /etc/
 | 项 | 内容 |
 |---|---|
 | daemon | `/Library/LaunchDaemons/com.flockvpn.client.plist`（RunAtLoad、**无 KeepAlive**；样例 `deploy/launchd/com.flockvpn.client.plist`） |
+| 日志 | `StandardErrorPath=/var/log/flock-client.log`（样例已含）；轮转走 newsyslog——`/etc/newsyslog.d/flock-client.conf`：`/var/log/flock-client.log root:wheel 640 3 1024 * J` |
 | 安装动作 | 写 plist → `launchctl load -w <path>`（卸载 `unload -w` + 删文件） |
 | 托盘自启 | `~/Library/LaunchAgents/com.flockvpn.client-tray.plist`（RunAtLoad）+ `launchctl load -w` |
 | 控制 IPC | 同 Linux 布局（/run/flock/client.sock、/var/lib/flock/client/control-token） |
