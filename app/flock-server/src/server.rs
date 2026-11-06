@@ -1139,7 +1139,10 @@ mod reaper_tests {
         let expired = reap_once(&core, 30, now2).await;
         assert_eq!(expired.len(), 2, "A 与 B 均越界: {expired:?}");
         assert!(expired.contains(&dev_id(1)), "A 观测超窗回收");
-        assert!(expired.contains(&dev_id(2)), "B 锚超窗回收（从未在线且超窗）");
+        assert!(
+            expired.contains(&dev_id(2)),
+            "B 锚超窗回收（从未在线且超窗）"
+        );
         for id in [dev_id(1), dev_id(2)] {
             let row = store.device_row(&id).unwrap();
             assert_eq!(row.status, DeviceStatus::Expired);
@@ -1185,8 +1188,7 @@ mod reaper_tests {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().to_path_buf();
         {
-            let (core, _) =
-                ServerCore::open_or_init(m7_cfg(state_dir.clone(), 30)).expect("core");
+            let (core, _) = ServerCore::open_or_init(m7_cfg(state_dir.clone(), 30)).expect("core");
             let store = match &core.net {
                 crate::backend::NetBackend::Single(s) => s.clone(),
                 _ => panic!("single"),
@@ -1270,8 +1272,7 @@ mod vip_guard_tests {
             assert!(err.contains("100.64.0.1"), "错误给出正确值: {err}");
         }
         // 服务器自身保留位放行。
-        ServerCore::open_or_init(cfg_with_vip("100.64.0.1"))
-            .expect(".1 = 服务器自身 VIP，放行");
+        ServerCore::open_or_init(cfg_with_vip("100.64.0.1")).expect(".1 = 服务器自身 VIP，放行");
         // 段外（如 100.128.0.1——/10 之外）放行：校验只管撞段，不管选址合理性。
         ServerCore::open_or_init(cfg_with_vip("100.128.0.1"))
             .expect("段外地址不在本校验面（部署自担选址）");

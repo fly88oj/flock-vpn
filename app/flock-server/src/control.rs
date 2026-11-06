@@ -1202,7 +1202,12 @@ mod tests {
         // 变体契约：同钥匙重注册 ⇒ NetError::DeviceExists（非 InvalidState 串）。
         assert!(matches!(
             store
-                .register_device("anyone", [5; 32], *vk_alice_dev.verifying_key().as_bytes(), "")
+                .register_device(
+                    "anyone",
+                    [5; 32],
+                    *vk_alice_dev.verifying_key().as_bytes(),
+                    ""
+                )
                 .unwrap_err(),
             crate::netstate::NetError::DeviceExists
         ));
@@ -1230,7 +1235,13 @@ mod tests {
             ed25519: *vk_alice_dev.verifying_key().as_bytes(),
             hostname: "hijacked".into(),
         };
-        let canon = keybind_canonical(&core.identity.cluster_id.0, "bob", &bind_token, &pubs, &[9; 32]);
+        let canon = keybind_canonical(
+            &core.identity.cluster_id.0,
+            "bob",
+            &bind_token,
+            &pubs,
+            &[9; 32],
+        );
         let mut ctx = ConnCtx {
             device: bob_dev,
             pending_login: None,

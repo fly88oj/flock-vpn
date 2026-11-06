@@ -132,7 +132,7 @@ async fn chmlfrp_config_parses_to_relay_spec() {
     let ListenerMode::Frp { plan, .. } = cfg.listener_mode().unwrap() else {
         panic!("frp mode")
     };
-    let flock_server::config::FrpRelayPlan::ChmlFrp {
+    let FrpRelayPlan::ChmlFrp {
         ini,
         user_token_auto,
     } = &plan.relay
@@ -171,7 +171,7 @@ async fn chmlfrp_config_parses_to_relay_spec() {
     let ListenerMode::Frp { plan, .. } = cfg2.listener_mode().unwrap() else {
         panic!("frp mode 2")
     };
-    let flock_server::config::FrpRelayPlan::ChmlFrp {
+    let FrpRelayPlan::ChmlFrp {
         ini,
         user_token_auto,
     } = &plan.relay

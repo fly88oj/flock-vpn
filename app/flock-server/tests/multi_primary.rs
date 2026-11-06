@@ -232,9 +232,8 @@ async fn serve_on(c3: &Node3, idx: usize, extra_endpoints: Vec<String>) -> SyncS
     // VIP = 本机 node_id 的确定性推导值（server_vip_of——open_sync 的一致性断言要求；
     // 旧配置全部硬编码 .1 对 node 2/3 是「登记 VIP ≠ 实配 VIP」的错位形态）。
     let node_id = flock_sync::node::node_id_of(&c3.idents[idx].server_id);
-    let vip = std::net::Ipv4Addr::from(
-        flock_sync::proto::server_vip_of(node_id).expect("node 1..=10"),
-    );
+    let vip =
+        std::net::Ipv4Addr::from(flock_sync::proto::server_vip_of(node_id).expect("node 1..=10"));
     let cfg = sync_server_cfg(state_dir, endpoint.clone(), extra_endpoints, vip);
     let core = ServerCore::open_sync(cfg, c3.idents[idx].clone(), c3.nodes[idx].clone())
         .await
@@ -1114,9 +1113,14 @@ async fn open_sync_rejects_vip_mismatch_with_expected_value() {
 
     // 匹配（.1 = server_vip_of(node 1)）⇒ 正常起（wraps 已在 build_cluster 落库）。
     cfg.vip = "100.64.0.1".parse().unwrap();
-    ServerCore::open_sync_with_wait(cfg, c3.idents[0].clone(), c3.nodes[0].clone(), std::time::Duration::from_secs(5))
-        .await
-        .expect("推导值匹配 ⇒ 可起");
+    ServerCore::open_sync_with_wait(
+        cfg,
+        c3.idents[0].clone(),
+        c3.nodes[0].clone(),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("推导值匹配 ⇒ 可起");
 }
 
 // ============================================================================
@@ -1166,9 +1170,9 @@ async fn reaper_anchor_and_lease_gate_multi_primary() {
         .expect("node build"),
     );
     // Bootstrap + ServerKeys + 本机 Rewrap（open_sync 就绪前置）。
-    let leader = wait_leader(&[node.clone()]).await;
+    let leader = wait_leader(std::slice::from_ref(&node)).await;
     let oprf_b64 = server_setup_new(&mut rand::rngs::OsRng);
-    submit_wrapped_oprf(&leader, &root, &[ident.clone()], &oprf_b64).await;
+    submit_wrapped_oprf(&leader, &root, std::slice::from_ref(&ident), &oprf_b64).await;
 
     let tmp2 = tempfile::tempdir().expect("tmpdir");
     let cfg = sync_server_cfg(
@@ -1223,7 +1227,10 @@ async fn reaper_anchor_and_lease_gate_multi_primary() {
     assert!(!node.lease().reaper_view_ready(), "单节点无对端 ⇒ 闸门关");
     let expired = flock_server::server::reap_once(&core, 30, now + day).await;
     assert!(expired.is_empty(), "视图未就绪 ⇒ 跳过整趟: {expired:?}");
-    assert_eq!(row_status(&dev_idle), flock_sync::proto::DeviceStatus::Active);
+    assert_eq!(
+        row_status(&dev_idle),
+        flock_sync::proto::DeviceStatus::Active
+    );
     assert_eq!(
         row_status(&dev_online),
         flock_sync::proto::DeviceStatus::Active
@@ -1231,7 +1238,8 @@ async fn reaper_anchor_and_lease_gate_multi_primary() {
 
     // ② 闸门开（注入一条远端 gossip = 反熵回填完成）：dev_idle（从未在线且锚 41d >
     // 30d）回收；dev_online（观测 1d < 30d）不动。
-    node.lease().merge_remote(GossipMsg::Anti { entries: vec![] });
+    node.lease()
+        .merge_remote(GossipMsg::Anti { entries: vec![] });
     assert!(node.lease().reaper_view_ready());
     let expired = flock_server::server::reap_once(&core, 30, now + day).await;
     assert_eq!(expired, vec![dev_idle], "仅锚超窗且从未在线者回收");
