@@ -568,20 +568,29 @@ a8() {
 
 a9() {
     log "A9 静默死链：disconnect client-3（flockpub）⇒ 双侧 ≤${A9_DEADLINE}s 检测并重连"
-    local cid
+    local cid scid
     cid="$(compose ps -q client-3)"
     [ -n "$cid" ] || { record FAIL A9 "client-3 容器 id 为空"; return; }
+    scid="$(compose ps -q server-c)"
+    [ -n "$scid" ] || { record FAIL A9 "server-c 容器 id 为空"; return; }
     local base_c base_s
-    base_c="$(compose logs client-3 2>/dev/null | grep -c 'reason=dead-link' || true)"
-    base_s="$(compose logs server-c 2>/dev/null | grep -c 'reason=dead-link' || true)"
+    base_c="$(docker logs "$cid" 2>&1 | grep -c 'reason=dead-link' || true)"
+    base_s="$(docker logs "$scid" 2>&1 | grep -c 'reason=dead-link' || true)"
 
     docker network disconnect "$NET_PUB" "$cid" || { record FAIL A9 "network disconnect 失败"; return; }
+    # 观测循环纪律：**先采样、后判窗**——窗口到点后必做一次末次采样才可判 FAIL。原实现
+    # （SECONDS 到点即盲退出）会把落在 30–32s 观测容差带尾部的检出漏采成假 FAIL：检出时刻
+    # = 断链前最后入站记录 + 3×keepalive(30s) + 50ms tick，随 ping 相位落在断链后 [20,30.3]s
+    # ——2026-11-07 一轮实测 ~31.1s 检出（相位贴界 + disconnect 生效尾延）恰入容差带，而末次
+    # 采样停在其前 0.1s。已检出侧不再轮询 + docker logs 直读容器 id（省 compose 解析 ~40%），
+    # 采样密度翻倍。语义不变：A9_DEADLINE=30s 预算 + 既有 +2s 观测容差，双侧检出缺一不可。
     local t0=$SECONDS saw_c=0 saw_s=0 elapsed=0
-    while [ $SECONDS -lt $((t0 + A9_DEADLINE + 2)) ]; do
-        [ "$saw_c" = 0 ] && [ "$(compose logs client-3 2>/dev/null | grep -c 'reason=dead-link' || true)" -gt "$base_c" ] && saw_c=1
-        [ "$saw_s" = 0 ] && [ "$(compose logs server-c 2>/dev/null | grep -c 'reason=dead-link' || true)" -gt "$base_s" ] && saw_s=1
+    while :; do
+        [ "$saw_c" = 0 ] && [ "$(docker logs "$cid" 2>&1 | grep -c 'reason=dead-link' || true)" -gt "$base_c" ] && saw_c=1
+        [ "$saw_s" = 0 ] && [ "$(docker logs "$scid" 2>&1 | grep -c 'reason=dead-link' || true)" -gt "$base_s" ] && saw_s=1
         elapsed=$((SECONDS - t0))
         [ "$saw_c" = 1 ] && [ "$saw_s" = 1 ] && break
+        [ "$elapsed" -ge $((A9_DEADLINE + 2)) ] && break
         sleep 1
     done
     if [ "$saw_c" != 1 ] || [ "$saw_s" != 1 ]; then
