@@ -12,7 +12,10 @@
 
 use flock_protocol::ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use flock_protocol::session::DeviceId;
-use serde::{Deserialize, Serialize};
+
+// M7 类型上收：票据**线格式**（SignedTicket/TicketWire）定义在 flock_protocol::roster
+// （两端同类型）；本文件保留票据权威逻辑（签发/校验/nonce 记账——服务端内部面）。
+pub use flock_protocol::roster::{SignedTicket, TicketWire};
 
 /// 票据签名域分离标签。
 pub const TICKET_LABEL: &[u8] = b"flock-server/ticket/v1";
@@ -44,31 +47,19 @@ impl TicketClaims {
     }
 }
 
-/// 已签名票据（线上形态；postcard 载体）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedTicket {
-    pub user: String,
-    pub device: Vec<u8>,
-    pub epoch: u64,
-    pub iat: u64,
-    pub exp: u64,
-    pub sig: Vec<u8>,
-}
-
-impl SignedTicket {
-    fn claims(&self) -> Result<TicketClaims, TicketReason> {
-        Ok(TicketClaims {
-            user: self.user.clone(),
-            device: self
-                .device
-                .clone()
-                .try_into()
-                .map_err(|_| TicketReason::Malformed)?,
-            epoch: self.epoch,
-            iat: self.iat,
-            exp: self.exp,
-        })
-    }
+/// 已签名票据 → 声明（形状校验；`SignedTicket` 线格式上收后 claims 为服务端侧自由函数）。
+fn claims_of(t: &SignedTicket) -> Result<TicketClaims, TicketReason> {
+    Ok(TicketClaims {
+        user: t.user.clone(),
+        device: t
+            .device
+            .clone()
+            .try_into()
+            .map_err(|_| TicketReason::Malformed)?,
+        epoch: t.epoch,
+        iat: t.iat,
+        exp: t.exp,
+    })
 }
 
 /// 票据拒绝原因（三态契约测试逐项断言：无票据/过期/低 epoch/签名坏/设备吊销）。
@@ -152,7 +143,7 @@ impl TicketIssuer {
         current_epoch: u64,
         lookup: impl FnOnce(&DeviceId) -> flock_protocol::session::LookupVerdict,
     ) -> Result<TicketClaims, TicketReason> {
-        let claims = ticket.claims()?;
+        let claims = claims_of(ticket)?;
         // 1) 签名
         let sig = Signature::from_slice(&ticket.sig).map_err(|_| TicketReason::BadSignature)?;
         if self
@@ -178,21 +169,6 @@ impl TicketIssuer {
             _ => Err(TicketReason::DeviceNotActive),
         }
     }
-}
-
-// ============================================================================
-// 线上票据（TicketWire）：单服（本地票据根）与多主（Raft 内票据根）双形态
-// ============================================================================
-
-/// 控制流承载的会话票据（对客户端不透明 blob：登录取回、状态变更请求回呈）。
-///
-/// - [`TicketWire::Local`]：单服形态——票据根 = 本地状态库种子（[`SignedTicket`]）；
-/// - [`TicketWire::Sync`]：多主形态——票据根在 Raft 状态内（`flock_sync::ticket::Ticket`
-///   线格式；任何服务器都验得了——SR-SIG1 跨服重放面的闭合前提，§2.2）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum TicketWire {
-    Local(SignedTicket),
-    Sync(Vec<u8>),
 }
 
 /// 票据校验通过的产物（user 对 Local 内嵌于票据；Sync 票据绑定 device，

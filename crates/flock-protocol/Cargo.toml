@@ -33,6 +33,9 @@ yamux = { workspace = true }
 chacha20poly1305 = { workspace = true }
 aes-gcm-siv = { workspace = true }
 futures = { workspace = true}
+# M7 roster 批次（§7-M7.4/§7-M7.7）：控制面共享契约消息线格式（两端同类型，纯数据无平台面）。
+serde = { workspace = true }
+postcard = { workspace = true }
 # 密钥材料确定性清零（设计 §1.3.3c「reject_after 触发即清零密钥」承诺）：
 # TrafficKeys/DirKeys/SealedShared、握手 k1/k_enc 与 KEM combine 的 ikm。
 # 版本直接钉（本批次不动 workspace 依赖收口面）。

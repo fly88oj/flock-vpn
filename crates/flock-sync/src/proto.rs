@@ -86,26 +86,9 @@ impl DeviceStatus {
     }
 }
 
-/// hostname 缺省占位（客户端入网未上报/空串 ⇒ 落此值，§7-M7）。
-pub const HOSTNAME_UNKNOWN: &str = "(unknown)";
-/// hostname 长度上限（入网上报超长截断——展示面字段不做长内容承载）。
-pub const HOSTNAME_MAX: usize = 64;
-
-/// hostname 规范化：trim + 空串 ⇒ [`HOSTNAME_UNKNOWN`] + 超长截断（char 边界安全）。
-pub fn normalize_hostname(raw: &str) -> String {
-    let t = raw.trim();
-    if t.is_empty() {
-        return HOSTNAME_UNKNOWN.to_string();
-    }
-    if t.len() <= HOSTNAME_MAX {
-        return t.to_string();
-    }
-    let mut cut = HOSTNAME_MAX;
-    while !t.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    t[..cut].to_string()
-}
+// hostname 契约（M7 客户端批次上收 flock_protocol::roster——客户端上报侧与服务端落库侧
+// 同一截断/空串语义，无第二真相源；既有路径 `flock_sync::proto::*`/`flock_sync::*` 不变）。
+pub use flock_protocol::roster::{normalize_hostname, HOSTNAME_MAX, HOSTNAME_UNKNOWN};
 
 /// 注册表设备行（§2.2：设备 = (DeviceId, owner, VIP, 静态公钥集, status, hostname,
 /// expired_at)——后两字段 M7 增补）。

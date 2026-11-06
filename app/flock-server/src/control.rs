@@ -33,256 +33,29 @@ use flock_protocol::rand;
 use flock_protocol::session::DeviceId;
 use flock_protocol::sig;
 use flock_protocol::{ed25519_dalek, x25519_dalek};
-use serde::{Deserialize, Serialize};
 
 use crate::backend::NetBackend;
 use crate::netstate::{NetError, RedeemError, RedeemRequest};
 use crate::server::ServerCore;
-use crate::ticket::{NonceLedger, TicketAuthority, TicketWire};
+use crate::ticket::{NonceLedger, TicketAuthority};
 
-/// 控制协议版本（Hello 交换；不匹配即拒——版本化，§3.11）。
-pub const CTRL_PROTO_VERSION: u32 = 1;
+// ============================================================================
+// 共享契约再导出（M7 类型上收——定义在 flock_protocol::roster，两端同类型无第二
+// 真相源；既有引用路径 `flock_server::control::*` 不变）
+// ============================================================================
+
+pub use flock_protocol::roster::{
+    keybind_canonical, recv_ctrl_msg, send_ctrl_msg, CtrlError, CtrlRequest, CtrlResponse,
+    DeviceOp, DevicePubs, DeviceRowWire, PeerInfo, PeerKind, SrAuth, TicketWire,
+    CTRL_PROTO_VERSION, KEYBIND_LABEL, MAX_CTRL_MSG,
+};
+
 /// SR-SIG1 canonical 的 method 槽（控制面统一方法名；path 区分操作）。
 pub const CTRL_METHOD: &str = "CTRL";
 /// 各 SR-SIG1 保护操作的 path（进 canonical 七字段，§1.3.2 线上格式不变）。
 pub const PATH_TICKET_RENEW: &str = "/ticket-renew";
 pub const PATH_REDEEM_INVITE: &str = "/redeem-invite";
 pub const PATH_DEVICE_OP: &str = "/device-op";
-/// key-bind 设备签名域分离标签（公钥经登录态登记，受服务端身份签名覆盖的 bind_token 佐证）。
-pub const KEYBIND_LABEL: &[u8] = b"flock-server/control/key-bind/v1";
-
-/// 单条控制消息上限（防御性；远小于记录层 1MiB 上限）。
-pub const MAX_CTRL_MSG: usize = 256 * 1024;
-
-// ============================================================================
-// 线上消息（postcard）
-// ============================================================================
-
-/// 设备静态公钥集 + 入网上报主机名（key-bind/redeem 携带；M7——hostname 空串 ⇒
-/// 服务端落 "(unknown)"，客户端上报为后续客户端阶段）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DevicePubs {
-    pub x25519: [u8; 32],
-    pub ed25519: [u8; 32],
-    pub hostname: String,
-}
-
-/// SR-SIG1 授权头（`SR-SIG1 user:ts:nonce:sig_b64url`，§1.3.2 逐字节同格式）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SrAuth {
-    pub header: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DeviceOp {
-    Revoke {
-        device: [u8; 32],
-    },
-    Disable {
-        device: [u8; 32],
-    },
-    Enable {
-        device: [u8; 32],
-    },
-    /// owner 名下设备清单（断言/诊断面）。
-    List,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum CtrlRequest {
-    Hello {
-        ver: u32,
-    },
-    /// OPAQUE 注册第一步（设置口令；仅账号未设口令时）。
-    PwBegin {
-        user: String,
-        m1_b64: String,
-    },
-    /// OPAQUE 注册收尾（落 pass.opaque 记录）。
-    PwCommit {
-        record_b64: String,
-        profile: u16,
-    },
-    LoginBegin {
-        user: String,
-        ke1_b64: String,
-    },
-    LoginFinish {
-        ke3_b64: String,
-    },
-    /// 设备公钥登记（状态变更：需票据 + bind_token 一次性 + 设备签名）。
-    KeyBind {
-        ticket: TicketWire,
-        bind_token: [u8; 16],
-        device: DevicePubs,
-        sr_sig_pub: [u8; 32],
-        device_sig: Vec<u8>,
-    },
-    /// 票据换发（状态变更：SR-SIG1 + 票据 + nonce；`ticket: None` = 无票据 ⇒ TicketMissing）。
-    TicketRenew {
-        ticket: Option<TicketWire>,
-        auth: SrAuth,
-    },
-    /// 邀请兑换（状态变更：SR-SIG1 + 票据 + nonce）。
-    RedeemInvite {
-        ticket: Option<TicketWire>,
-        auth: SrAuth,
-        invite_b64: String,
-        username: String,
-        device: DevicePubs,
-    },
-    /// 注册表操作（状态变更：SR-SIG1 + 票据 + nonce）。
-    DeviceOp {
-        ticket: Option<TicketWire>,
-        auth: SrAuth,
-        op: DeviceOp,
-    },
-    /// 目录拉取（只读，无需票据；根签 ClusterDirectory，§1.3.3f）。
-    DirPull {
-        since_version: u64,
-    },
-    /// M7（§7-M7.4）：成员名册拉取（登录票据保护——**票据校验先于名册数据装配**，
-    /// 契约序有测试断言）。
-    PeerListPull {
-        ticket: Option<TicketWire>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum CtrlResponse {
-    Hello {
-        ver: u32,
-        cluster_id: [u8; 16],
-        server_id: [u8; 16],
-    },
-    PwChallenge {
-        m2_b64: String,
-    },
-    Ok,
-    LoginChallenge {
-        ke2_b64: String,
-        bind_token: [u8; 16],
-        anchor_sig: Vec<u8>,
-    },
-    LoginOk {
-        ticket: TicketWire,
-        epoch: u64,
-    },
-    KeyBound {
-        device_id: [u8; 32],
-        vip: [u8; 4],
-    },
-    TicketRenewed {
-        ticket: TicketWire,
-    },
-    Redeemed {
-        device_id: [u8; 32],
-        vip: [u8; 4],
-    },
-    DeviceList {
-        rows: Vec<DeviceRowWire>,
-    },
-    /// dir_version 未变 ⇒ bytes 为空（客户端保留既有目录）。
-    Directory {
-        dir_version: u64,
-        bytes: Vec<u8>,
-    },
-    /// M7（§7-M7.4）：成员名册（按 VIP 升序；契约逐字固化于 docs/design.md §7-M7.4）。
-    PeerList {
-        peers: Vec<PeerInfo>,
-    },
-    Err {
-        code: CtrlError,
-        msg: String,
-    },
-}
-
-/// 名册条目类型（设备 / 服务器自身——服务器也是 peer，§2.2）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PeerKind {
-    Device,
-    Server,
-}
-
-/// 名册条目（§7-M7.4 逐字契约）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerInfo {
-    pub vip: [u8; 4],
-    pub hostname: String,
-    pub owner: String,
-    pub kind: PeerKind,
-    pub online: bool,
-    pub last_seen_unix: u64,
-    /// 设备视角 EWMA（bytes/s）：tx = 设备发出、rx = 设备收到。
-    pub tx_bps: u64,
-    pub rx_bps: u64,
-}
-
-/// 注册表行的线上形态。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceRowWire {
-    pub device_id: [u8; 32],
-    pub owner: String,
-    pub vip: [u8; 4],
-    pub status: u8, // 1=Active 2=Disabled 3=Revoked
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CtrlError {
-    ProtoVersion,
-    NotAuthorized,
-    PasswordExists,
-    LoginFailed,
-    TicketMissing,
-    TicketBad,
-    SigFormat,
-    SigStale,
-    SigBad,
-    NonceReplay,
-    BindTokenUsed,
-    BindSigBad,
-    DeviceUnknown,
-    InviteUsed,
-    InviteRevoked,
-    InviteExpired,
-    InviteUnknown,
-    InviteBadSig,
-    UserExists,
-    DeviceExists,
-    IpExhausted,
-    InvalidState,
-    Internal,
-}
-
-impl CtrlError {
-    fn msg(self) -> &'static str {
-        match self {
-            CtrlError::ProtoVersion => "control protocol version mismatch",
-            CtrlError::NotAuthorized => "not authorized for this operation",
-            CtrlError::PasswordExists => "password already set",
-            CtrlError::LoginFailed => "opaque login rejected",
-            CtrlError::TicketMissing => "state-changing request requires a valid ticket",
-            CtrlError::TicketBad => "ticket rejected (signature/ttl/epoch/revocation)",
-            CtrlError::SigFormat => "SR-SIG1 malformed",
-            CtrlError::SigStale => "SR-SIG1 timestamp outside ±300s window",
-            CtrlError::SigBad => "SR-SIG1 signature verification failed",
-            CtrlError::NonceReplay => "nonce replayed",
-            CtrlError::BindTokenUsed => "bind_token already consumed",
-            CtrlError::BindSigBad => "key-bind device signature rejected",
-            CtrlError::DeviceUnknown => "unknown device",
-            CtrlError::InviteUsed => "invite already redeemed",
-            CtrlError::InviteRevoked => "invite revoked",
-            CtrlError::InviteExpired => "invite expired",
-            CtrlError::InviteUnknown => "unknown invite",
-            CtrlError::InviteBadSig => "invite root signature mismatch",
-            CtrlError::UserExists => "username exists",
-            CtrlError::DeviceExists => "device already registered",
-            CtrlError::IpExhausted => "VIP pool exhausted",
-            CtrlError::InvalidState => "invalid state transition",
-            CtrlError::Internal => "internal error",
-        }
-    }
-}
 
 fn err(code: CtrlError) -> CtrlResponse {
     CtrlResponse::Err {
@@ -314,43 +87,6 @@ fn redeem_err_code(e: &RedeemError) -> CtrlError {
         RedeemError::IpExhausted => CtrlError::IpExhausted,
         RedeemError::Internal(_) => CtrlError::Internal,
     }
-}
-
-// ============================================================================
-// 帧编解码（futures-io 面：mux::Stream 实现的是 futures 的 AsyncRead/Write）
-// ============================================================================
-
-/// 发送一条控制消息（`[u32 LE len][postcard]`）。
-pub async fn send_ctrl_msg<S: futures::io::AsyncWrite + Unpin, M: Serialize>(
-    io: &mut S,
-    msg: &M,
-) -> std::io::Result<()> {
-    use futures::io::AsyncWriteExt as _;
-    let bytes = postcard::to_allocvec(msg).map_err(|e| std::io::Error::other(e.to_string()))?;
-    if bytes.len() > MAX_CTRL_MSG {
-        return Err(std::io::Error::other("ctrl msg too large"));
-    }
-    let mut frame = Vec::with_capacity(4 + bytes.len());
-    frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&bytes);
-    io.write_all(&frame).await?;
-    io.flush().await
-}
-
-/// 接收一条控制消息。
-pub async fn recv_ctrl_msg<S: futures::io::AsyncRead + Unpin, M: for<'de> Deserialize<'de>>(
-    io: &mut S,
-) -> std::io::Result<M> {
-    use futures::io::AsyncReadExt as _;
-    let mut hdr = [0u8; 4];
-    io.read_exact(&mut hdr).await?;
-    let len = u32::from_le_bytes(hdr) as usize;
-    if len == 0 || len > MAX_CTRL_MSG {
-        return Err(std::io::Error::other("ctrl frame length"));
-    }
-    let mut buf = vec![0u8; len];
-    io.read_exact(&mut buf).await?;
-    postcard::from_bytes(&buf).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 // ============================================================================
@@ -1029,32 +765,9 @@ async fn authorize_owner(net: &NetBackend, user: &str, device: &DeviceId) -> boo
         .unwrap_or(false)
 }
 
-pub fn keybind_canonical(
-    cluster_id: &[u8; 16],
-    user: &str,
-    bind_token: &[u8; 16],
-    device: &DevicePubs,
-    sr_sig_pub: &[u8; 32],
-) -> Vec<u8> {
-    let mut v =
-        Vec::with_capacity(KEYBIND_LABEL.len() + 16 + 8 + user.len() + device.hostname.len() + 116);
-    v.extend_from_slice(KEYBIND_LABEL);
-    v.extend_from_slice(cluster_id);
-    v.extend_from_slice(&(user.len() as u32).to_le_bytes());
-    v.extend_from_slice(user.as_bytes());
-    v.extend_from_slice(bind_token);
-    v.extend_from_slice(&device.x25519);
-    v.extend_from_slice(&device.ed25519);
-    // M7：hostname 进设备签名覆盖面（长度前缀定界——与 owner 同纪律，杜绝拼接歧义）。
-    v.extend_from_slice(&(device.hostname.len() as u32).to_le_bytes());
-    v.extend_from_slice(device.hostname.as_bytes());
-    v.extend_from_slice(sr_sig_pub);
-    v
-}
-
 /// RedeemInvite 的 SR-SIG1 签名覆盖 body（与客户端构造逐字节一致）。
 fn redeem_body(username: &str, device: &DevicePubs) -> Vec<u8> {
-    #[derive(Serialize)]
+    #[derive(serde::Serialize)]
     struct RedeemBody<'a> {
         username: &'a str,
         device: &'a DevicePubs,

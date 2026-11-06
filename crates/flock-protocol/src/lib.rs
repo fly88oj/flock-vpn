@@ -12,6 +12,9 @@
 //! - [`mux`]：yamux 0.14.1 复用 + 显式 FIN + PacketChannel（§1.3.3d / §3.6，P1-9/VPN-14）；
 //! - [`trust`]：首登信任锚——PinStore（集群根级钉扎）、ClusterDirectory（根签目录，端点与
 //!   条目同签、dir_version 递增）、InviteFile v3（§1.3.3f / §3.8，P0-5）；
+//! - [`roster`]：M7 名册与控制面共享契约（PeerInfo/PeerKind、票据线格式 TicketWire、
+//!   CtrlRequest/CtrlResponse 消息与 key-bind canonical——自 flock-server/flock-sync
+//!   上收，两端同类型无第二真相源，§7-M7.4/§7-M7.7）；
 //! - [`compat`]：showroom 兼容工具面（§1.3.2「工具」清单——`Result` 别名 / `write_private`
 //!   0600 落盘 / `names` 名字校验；showroom 迁移为薄再导出的接缝）。
 //!
@@ -37,6 +40,7 @@ pub mod envelope;
 pub mod kem;
 pub mod mux;
 pub mod pake;
+pub mod roster;
 pub mod session;
 pub mod sig;
 pub mod trust;
