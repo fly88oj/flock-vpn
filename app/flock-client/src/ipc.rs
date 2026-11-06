@@ -244,6 +244,50 @@ pub fn spawn_server(
     }
 }
 
+/// Unix 私有文件原子落盘（评审项 3：消除「先 `fs::write`（umask 默认权限）再补
+/// chmod」的间窗——窗口内机密按默认权限可读）。
+///
+/// - 首次：`OpenOptions::create_new` + `mode`——文件**出生即目标权限**（open 原子
+///   携带 mode，无 umask 参与窗口）；
+/// - 已存在（换写）：同目录临时文件（同 mode `create_new`）写毕 `rename` 覆盖。
+///   选型注释（vs「先收紧旧文件权限再 truncate 重写」）：rename 在同文件系统内
+///   原子替换——既无新内容的默认权限窗口，也无截断窗口（崩溃时磁盘上要么完整
+///   旧文件要么完整新文件；truncate 重写崩溃则丢凭据内容），对凭据/token 这类
+///   「丢内容即失联、泄内容即失守」的文件取可恢复性优先。
+#[cfg(unix)]
+pub(crate) fn write_file_private(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let create_new = |p: &Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(p)
+    };
+    match create_new(path) {
+        Ok(mut f) => f.write_all(bytes),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // 换写：tempfile（同 mode）→ rename 原子替换（选型见函数文档）。
+            // 同目录 ⇒ 同文件系统；名字带进程内序号防并发写者碰撞。
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tmp = path.with_file_name(format!(
+                ".{}.tmp.{}",
+                path.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let mut f = create_new(&tmp)?;
+            f.write_all(bytes)?;
+            drop(f); // 关闭落盘后再替换（rename 不携未刷新缓冲）。
+            std::fs::rename(&tmp, path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // ============================================================================
 // token 生成与落盘
 // ============================================================================
@@ -255,17 +299,19 @@ pub fn generate_token() -> CtrlToken {
 
 /// token 文件写盘：hex 文本（64 字符，可人工检视）。
 ///
-/// 权限（§7-M6.2）：Windows 显式 ACL（SYSTEM/管理员全权 + Users 读）；Unix 0640，
+/// 权限（§7-M6.2）：Windows 显式 ACL（SYSTEM/管理员全权 + Users 读）；Unix 0640
+///（[`write_file_private`]——出生即 0640，无默认权限间窗；评审项 3），
 /// `group` 给定则尝试 chgrp（解析失败/无权限仅告警——「尝试」语义）。
 pub fn write_token_file(path: &Path, token: &CtrlToken, group: Option<&str>) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    #[cfg(unix)]
+    write_file_private(path, hex::encode(token).as_bytes(), 0o640)?;
+    #[cfg(windows)]
     std::fs::write(path, hex::encode(token))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))?;
         if let Some(gname) = group {
             match resolve_gid(gname) {
                 Some(gid) => {
@@ -517,6 +563,26 @@ mod tests {
         let bad = dir.path().join("bad-token");
         std::fs::write(&bad, "zz-nothex").unwrap();
         assert!(load_token_file(&bad).is_err());
+    }
+
+    /// 评审项 3：token 换写路径——已存在松权限（0666）文件被替换后 0640 + 新 token
+    /// 读回一致（tempfile 出生即 0640，rename 原子落位——无默认权限间窗）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_file_overwrite_replaces_loose_perm_file_with_0640() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-token");
+        std::fs::write(&path, "stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let token = generate_token();
+        write_token_file(&path, &token, None).expect("换写 token 文件");
+        assert_eq!(load_token_file(&path).unwrap(), token, "新 token 在位");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "换写后 0640"
+        );
     }
 
     /// 常量时间比对：等长不同值 ⇒ false；等值 ⇒ true（行为面，时序面由实现保证）。

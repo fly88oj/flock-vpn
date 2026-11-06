@@ -524,18 +524,19 @@ pub fn load_or_create_sr_key(state_dir: &Path) -> io::Result<UserKey> {
 }
 
 /// 机密文件写盘：0600（unix）/ SYSTEM+Administrators 全权（Windows 显式 DACL，无 Users）。
+///
+/// Unix 走 [`crate::ipc::write_file_private`]（评审项 3：`create_new(0o600)` 出生即
+/// 目标权限、换写 tempfile+rename 原子替换——消除「fs::write 默认权限 → 补 chmod
+/// 0600」的间窗；选型注释见该函数文档）。
 fn write_secret_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, bytes)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    crate::ipc::write_file_private(path, bytes, 0o600)?;
     #[cfg(windows)]
     {
+        std::fs::write(path, bytes)?;
         // Windows：写后立即显式收紧 DACL（SYSTEM+管理员；短暂窗口 = 创建到收紧之间，
         // 继承 ACL 默认——如实声明，非 0600 等价瞬时）。失败仅告警（继承 ACL 兜底可读）。
         if let Err(e) = crate::ipc_windows::set_file_acl_admins_only(path) {
@@ -545,6 +546,8 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
             );
         }
     }
+    #[cfg(not(any(unix, windows)))]
+    std::fs::write(path, bytes)?;
     Ok(())
 }
 
@@ -1157,6 +1160,36 @@ mod tests {
         let empty = dir.path().join("empty-cred");
         std::fs::write(&empty, "\r\n").unwrap();
         assert!(load_credentials(&empty).is_err(), "空口令拒");
+    }
+
+    /// 评审项 3：换写路径——**已存在且权限松（0666）**的凭据文件被替换后：
+    /// (a) 新内容在位；(b) 权限 0600（rename 携新 inode 权限，旧松权限不残留）；
+    /// (c) 无 `.tmp.` 残留（rename 消费掉临时文件）。
+    #[cfg(unix)]
+    #[test]
+    fn credentials_overwrite_replaces_loose_perm_file_with_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(CREDENTIALS_FILE);
+        std::fs::write(&p, "old").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
+        save_credentials(&p, "new-pw").unwrap();
+        assert_eq!(load_credentials(&p).unwrap(), "new-pw");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "换写后 0600（tempfile 出生权限随 rename 落位）"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "临时文件不残留: {leftovers:?}");
     }
 
     /// SR-SIG1 密钥落位：首建持久化、二次载入同种子。
