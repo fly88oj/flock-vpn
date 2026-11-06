@@ -1,0 +1,21 @@
+# server-s1-direct.toml —— 场景一【单 Server · Direct】的 flock-s1（jowency LXD）配置。
+#
+# 形态（docs/design.md §2.1）：Direct 缺省监听，零 frp 逻辑；无 [sync] 段 =
+# 单服状态库。接入端点经 LXD proxy device 发布到 jowency 宿主 0.0.0.0:9443，
+# 客户端（Windows Docker ×2 + LXD ×2）跨机直连 WIN 侧到 jowency LAN IP:9443。
+#
+# 模板变量：@JOW_LAN_IP@ = jowency 宿主 LAN IP（lxd-setup.sh 渲染）。
+
+state_dir = "/var/lib/flock"
+bind = "0.0.0.0:9443"
+admin_bind = "127.0.0.1:9444"
+
+advertise_endpoint = "@JOW_LAN_IP@:9443"
+extra_endpoints = []
+dir_version = 1
+
+ticket_ttl_secs = 60
+
+# 数据面：服务端自身也是 peer（VIP 100.64.0.1，§2.2）。
+tun_name = "tun0"
+vip = "100.64.0.1"

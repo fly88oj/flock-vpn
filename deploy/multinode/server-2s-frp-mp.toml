@@ -1,0 +1,45 @@
+# server-2s-frp-mp.toml —— 场景二【双 Server · 跨机 Raft + 双传输】server-2（jowency LXD flock-s2）。
+#
+# Frp 中转接入（§2.1 可选适配器形态）：frps 跑在 jowency 宿主 :7000/:24000，
+# 本 server 进程内 flock-frpc Supervisor（Original 栈代）注册 9443 → 用户口 24000；
+# LXD 侧客户端经 jowency LAN IP:24000 接入。Raft 织物 :9500 经 LXD proxy device
+# 发布到 jowency 0.0.0.0:9500，与 Windows Docker 侧 server-1 跨机组网。
+#
+# 模板变量：@JOW_LAN_IP@ / @LXD_GW_IP@（lxd-setup.sh 渲染；LXD_GW = lxdbr0 宿主 IP）。
+
+state_dir = "/var/lib/flock"
+mode = "frp"
+bind = "0.0.0.0:9443"
+admin_bind = "127.0.0.1:9444"
+
+advertise_endpoint = "@JOW_LAN_IP@:24000"
+extra_endpoints = []
+dir_version = 1
+
+ticket_ttl_secs = 60
+
+tun_name = "tun0"
+vip = "100.64.0.2"
+
+[frp]
+frpc_bin = "/usr/local/bin/frpc"
+original_toml = """
+serverAddr = "@LXD_GW_IP@"
+serverPort = 7000
+
+[[proxies]]
+name = "flock-s2-main"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 9443
+remotePort = 24000
+"""
+
+[sync]
+mode = "raft"
+bundle = "/var/lib/flock/bundle.bin"
+raft_bind = "0.0.0.0:9500"
+raft_peers = [
+    "1=@WIN_LAN_IP@:9500",
+    "2=@JOW_LAN_IP@:9500",
+]

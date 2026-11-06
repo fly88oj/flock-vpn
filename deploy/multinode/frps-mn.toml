@@ -1,0 +1,7 @@
+# frps-mn.toml —— 场景二的 frps（jowency 宿主进程，原版 frp v0.71.1）。
+#
+# 只服务于 flock-s2（LXD，无 LAN 直达发布需求时的接入端点）：bind 7000（frpc 注册口）
+# + 用户口 24000 由 flock-s2 进程内 frpc 注册（remotePort）。LAN 内裸跑（ufw 已对
+# 192.168.0.0/16 放行入站；测试期短生命周期，无 token——复刻时自担）。
+
+bindPort = 7000

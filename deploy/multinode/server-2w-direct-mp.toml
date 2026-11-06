@@ -1,0 +1,31 @@
+# server-2w-direct-mp.toml —— 场景二【双 Server · 跨机 Raft】server-1（Windows Docker）。
+#
+# Direct 接入 + multi-primary 构建档：发布 0.0.0.0:9443（客户端主端点）与
+# 0.0.0.0:9500（Raft 织物）到 Windows 宿主。raft_peers 跨真实网络：
+#   node 1 = Windows 宿主（本机，Docker NAT 拉入）
+#   node 2 = jowency 宿主（LXD proxy device 发布 flock-s2:9500）
+# 两台 server 的 raft_peers 表一致（§6.2 TcpFabric 拨号表）。
+#
+# 模板变量：@WIN_LAN_IP@ / @JOW_LAN_IP@（win-docker-setup.sh 渲染）。
+
+state_dir = "/var/lib/flock"
+bind = "0.0.0.0:9443"
+admin_bind = "127.0.0.1:9444"
+
+advertise_endpoint = "@WIN_LAN_IP@:9443"
+extra_endpoints = []
+dir_version = 1
+
+ticket_ttl_secs = 60
+
+tun_name = "tun0"
+vip = "100.64.0.1"
+
+[sync]
+mode = "raft"
+bundle = "/var/lib/flock/bundle.bin"
+raft_bind = "0.0.0.0:9500"
+raft_peers = [
+    "1=@WIN_LAN_IP@:9500",
+    "2=@JOW_LAN_IP@:9500",
+]
