@@ -17,6 +17,13 @@ hex = { workspace = true }
 postcard = { workspace = true }
 # 接入器主循环（多线程 rt + 定时退避）。
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
+# M7 §7-M7.7：上报 hostname 的 OS 主机名源（跨平台 gethostname 薄封装，纯 Rust）。
+hostname = "0.4"
+# M7 peers 延迟探测：raw ICMP echo（socket2 建 SOCK_RAW/IPPROTO_ICMP；选型理由见
+# ping.rs 模块文档——三平台同一 API 面，tokio 注册经 from_std 转换）。
+socket2 = "0.6"
+# M7 peers --json 机读档输出。
+serde_json = "1"
 
 # tun-rs 平台适配器（§2.3）：Linux/Windows/macOS 三平台原生路径；Android/iOS 走 fd 注入
 # 接缝（vpn-mesh §1.1——两平台无 native 等价 API），不装配 tun-rs 构建路径。

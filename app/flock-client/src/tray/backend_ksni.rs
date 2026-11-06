@@ -13,7 +13,7 @@ use ksni::menu::StandardItem;
 use ksni::{Icon as KsniIcon, MenuItem as KsniMenuItem, ToolTip, TrayMethods};
 
 use super::icon::{flock_rgba, rgba_to_argb32_network_order, ICON_SIZE};
-use super::{menu_texts, ExitDecision, MenuTexts, ControlPaths, POLL_INTERVAL};
+use super::{menu_texts, ControlPaths, ExitDecision, MenuTexts, POLL_INTERVAL};
 
 /// `flock-client tray` Linux 后端入口。
 pub fn run(paths: &ControlPaths) -> Result<(), String> {
@@ -134,9 +134,7 @@ impl ksni::Tray for FlockTray {
     }
 
     fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
-        eprintln!(
-            "flock-client tray: 托盘宿主暂不可用（{reason:?}）——保持运行等待其恢复"
-        );
+        eprintln!("flock-client tray: 托盘宿主暂不可用（{reason:?}）——保持运行等待其恢复");
         true
     }
 }

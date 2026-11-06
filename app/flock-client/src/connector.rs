@@ -17,6 +17,7 @@
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use flock_protocol::rand;
@@ -26,6 +27,7 @@ use flock_protocol::session::{
 use flock_protocol::trust::{ClusterDirectory, InviteFile, PinStore, PinVerdict, TrustError};
 use tokio::net::TcpStream;
 
+use crate::ctrl::ControlPlane;
 use crate::dataplane;
 use crate::tun::TunIo;
 
@@ -466,7 +468,7 @@ pub async fn supervise(
     backoff: Backoff,
     events: impl FnMut(ConnEvent),
 ) {
-    supervise_inner(state, tun, tunnel_cfg, backoff, events, None).await
+    supervise_inner(state, tun, tunnel_cfg, backoff, events, None, None).await
 }
 
 /// [`supervise`] + 纪元观测（§7-M6 service 装配）：连接建立发当前纪元初值，此后每次
@@ -479,7 +481,40 @@ pub async fn supervise_with_epoch(
     events: impl FnMut(ConnEvent),
     epoch_tx: tokio::sync::watch::Sender<u64>,
 ) {
-    supervise_inner(state, tun, tunnel_cfg, backoff, events, Some(epoch_tx)).await
+    supervise_inner(
+        state,
+        tun,
+        tunnel_cfg,
+        backoff,
+        events,
+        Some(epoch_tx),
+        None,
+    )
+    .await
+}
+
+/// [`supervise_with_epoch`] + 控制流共享槽（M7 §7-M7.7 service 装配）：会话建立把控制流
+/// 装入 `plane`（登录保持/名册拉取业务消费），会话结束/毒化即取出；`plane` 的毒化信号
+/// （请求超时——流可能错位）会提前结束数据面进入重连（换新流，不带错位继续）。
+pub async fn supervise_with_control(
+    state: &ClientState,
+    tun: &TunIo,
+    tunnel_cfg: TunnelConfig,
+    backoff: Backoff,
+    events: impl FnMut(ConnEvent),
+    epoch_tx: tokio::sync::watch::Sender<u64>,
+    plane: ControlPlane,
+) {
+    supervise_inner(
+        state,
+        tun,
+        tunnel_cfg,
+        backoff,
+        events,
+        Some(epoch_tx),
+        Some(plane),
+    )
+    .await
 }
 
 async fn supervise_inner(
@@ -489,6 +524,7 @@ async fn supervise_inner(
     mut backoff: Backoff,
     mut events: impl FnMut(ConnEvent),
     epoch_tx: Option<tokio::sync::watch::Sender<u64>>,
+    plane: Option<ControlPlane>,
 ) {
     let mut ring = EndpointRing::new(state.endpoints());
     loop {
@@ -511,11 +547,18 @@ async fn supervise_inner(
         });
         match dial(&pin, &state.device, tunnel_cfg.clone()).await {
             Ok(tunnel) => {
-                // 首流 = 控制流（排序契约，见模块文档）：M3 不发控制业务，占位并**持有到
-                // 会话结束**（保序 + 防止过早 Drop 引入的流生命周期变量）。
+                // 首流 = 控制流（排序契约，见模块文档）：占位并**持有到会话结束**（保序
+                // + 防止过早 Drop 引入的流生命周期变量）；M7 起 service 形态把流装入
+                // ControlPlane 共享槽供登录/名册业务复用（毒化信号 ⇒ 提前重连）。
                 // 控制流打不开 ⇒ 会话已坏，直接走退避（不得让包通道变成首流破坏分派）。
                 let control = match tunnel.open_stream(flock_protocol::mux::Prio::Control).await {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        let shared = Arc::new(tokio::sync::Mutex::new(s));
+                        if let Some(p) = &plane {
+                            p.install_arc(shared.clone());
+                        }
+                        shared
+                    }
                     Err(_) => {
                         events(ConnEvent::SessionEnded {
                             endpoint: endpoint.clone(),
@@ -561,13 +604,30 @@ async fn supervise_inner(
                             }
                         });
                         let mut sess = tun.session();
-                        let bridge_err = dataplane::bridge(&mut sess, ch).await.err();
+                        // M7：控制流毒化（业务请求超时——流错位风险）⇒ 提前结束数据面
+                        // 进入重连（无 plane 形态 select 永不就绪，行为不变）。
+                        let bridge_fut = dataplane::bridge(&mut sess, ch);
+                        let bridge_err = tokio::select! {
+                            r = bridge_fut => r.err(),
+                            _ = async {
+                                match &plane {
+                                    Some(p) => p.killed().await,
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {
+                                eprintln!("flock-client: 控制流毒化 ⇒ 结束本会话重连");
+                                None
+                            }
+                        };
                         if let Some(e) = &bridge_err {
                             eprintln!("flock-client: dataplane ended: {e}");
                         }
                         drop(sess);
                         rekey_watcher.abort();
                         let reason = tunnel.stats().closed;
+                        if let Some(p) = &plane {
+                            p.remove();
+                        }
                         drop(control); // 控制流随会话结束（显式：先于 shutdown 的 FIN 次序）
                         events(ConnEvent::SessionEnded {
                             endpoint: endpoint.clone(),
@@ -903,6 +963,116 @@ mod tests {
         );
         let mut empty = EndpointRing::new(vec![]);
         assert!(empty.next_endpoint().is_none());
+    }
+
+    /// M7 控制流共享槽 × supervise：静默对端（真会话、控制流不答）⇒ ① 连接后
+    /// plane 在位；② 短超时请求 ⇒ 超时 + **毒化**（plane 失位）+ killed 信号 ⇒
+    /// supervise 提前结束本会话 → 退避 → 重连后 plane 恢复在位（新流）。
+    #[tokio::test]
+    async fn supervise_with_control_poisons_and_reconnects_on_timeout() {
+        use flock_protocol::session::{
+            respond, ClusterId, DeviceRecord, InMemoryDirectory, ServerId, ServerIdentity,
+        };
+        use flock_protocol::trust::ClusterDirectory;
+
+        // 静默对端：真 respond 会话 + 控制流持有不答（复刻 R1 黑洞形态的控制面版本）。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ep = listener.local_addr().unwrap().to_string();
+        let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let identity = std::sync::Arc::new(ServerIdentity::enroll(
+            &root,
+            ClusterId([7; 16]),
+            ServerId([9; 16]),
+            &ep,
+        ));
+        let directory =
+            ClusterDirectory::issue(&root, identity.cluster_id, 1, vec![identity.entry.clone()]);
+        let device = DeviceStaticKeys::generate();
+        let dev_dir = std::sync::Arc::new({
+            let mut d = InMemoryDirectory::new();
+            d.register(DeviceRecord {
+                device_x25519: device.x25519_public(),
+                device_ed25519: device.ed25519_public(),
+            });
+            d
+        });
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((io, _)) = listener.accept().await {
+                let dir = (*dev_dir).clone();
+                let identity = identity.clone();
+                held.push(tokio::spawn(async move {
+                    // 会话建立后持有全部流不答（静默——控制流黑洞）。
+                    if let Ok(tunnel) = respond(io, &identity, dir, TunnelConfig::default()).await {
+                        let _streams: Vec<_> = {
+                            let mut v = Vec::new();
+                            while let Some(s) = tunnel.accept_stream().await {
+                                v.push(s);
+                            }
+                            v
+                        };
+                    }
+                }));
+            }
+        });
+
+        let mut pins = PinStore::new();
+        pins.pin(&directory.cluster_id, &root.verifying_key());
+        let state = ClientState {
+            device,
+            pins,
+            directory: directory.clone(),
+        };
+
+        let mock = std::sync::Arc::new(MockTunDevice::open(&TunSpec::default()).unwrap());
+        let tun = std::sync::Arc::new(TunIo::from_arc(mock.clone()));
+        let tun_sup = tun.clone();
+
+        let plane = crate::ctrl::ControlPlane::new();
+        let plane_sup = plane.clone();
+        let (epoch_tx, _epoch_rx) = tokio::sync::watch::channel(0u64);
+        let sup = tokio::spawn(async move {
+            supervise_with_control(
+                &state,
+                tun_sup.as_ref(),
+                TunnelConfig::default(),
+                Backoff::new(Duration::from_millis(80), Duration::from_millis(300)),
+                |_| {},
+                epoch_tx,
+                plane_sup,
+            )
+            .await;
+        });
+
+        // ① 连接建立 ⇒ plane 在位。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !plane.is_up() {
+            assert!(tokio::time::Instant::now() < deadline, "15s 内未连接");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // ② 短超时请求（静默对端）⇒ TimedOut + 毒化（plane 失位）。
+        let r = plane
+            .request_timeout(
+                flock_protocol::roster::CtrlRequest::Hello { ver: 1 },
+                Duration::from_millis(150),
+            )
+            .await;
+        assert!(r.is_err() && r.unwrap_err().kind() == std::io::ErrorKind::TimedOut);
+        assert!(!plane.is_up(), "毒化 ⇒ 失位");
+        // 无会话时的请求 ⇒ 立即「未就绪」错误。
+        assert!(plane
+            .request(flock_protocol::roster::CtrlRequest::Hello { ver: 1 })
+            .await
+            .is_err());
+        // ③ killed ⇒ supervise 拆会话 → 退避 → 重连 ⇒ plane 恢复在位（新流）。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !plane.is_up() {
+            assert!(tokio::time::Instant::now() < deadline, "15s 内未重连");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        sup.abort();
+        silent.abort();
+        tun.shutdown();
     }
 
     fn invite_fixture(

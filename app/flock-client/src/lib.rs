@@ -7,6 +7,8 @@
 //!   留待 M5 真机手工验证）；
 //! - [`connector`]：接入器（邀请/钉扎目录加载 → 端点拨号 → `session::initiate`；
 //!   指数退避 + 端点轮询）；
+//! - [`ctrl`]：控制流半边（M7 §7-M7.7：OPAQUE 登录/key-bind/票据保持的客户端实现——
+//!   线类型复用 `flock_protocol::roster`，两端同类型）；
 //! - [`dataplane`]：IP 包 ↔ `PacketChannel` 桥；
 //! - [`ipc`]：控制 IPC v1 契约 + daemon 服务端 + 客户端单次请求（§7-M6.2——托盘
 //!   工程直接消费本模块，`service` 子命令装配服务端）；
@@ -23,6 +25,7 @@
 
 pub mod config;
 pub mod connector;
+pub mod ctrl;
 pub mod dataplane;
 pub mod install;
 pub mod ipc;

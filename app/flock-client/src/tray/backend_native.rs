@@ -21,7 +21,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use super::icon::{flock_rgba, ICON_SIZE};
-use super::{ExitDecision, MenuTexts, ControlPaths, POLL_INTERVAL};
+use super::{ControlPaths, ExitDecision, MenuTexts, POLL_INTERVAL};
 
 /// 菜单项 id（muda `MenuId` 字符串；「退出」匹配 MenuEvent，两项只读展示）。
 const ITEM_STATUS: &str = "flock-status";
@@ -47,8 +47,8 @@ fn build_native_tray() -> Result<NativeTray, String> {
     let menu = Menu::new();
     menu.append_items(&[&status, &vip, &exit])
         .map_err(|e| format!("菜单构建: {e}"))?;
-    let icon = Icon::from_rgba(flock_rgba(), ICON_SIZE, ICON_SIZE)
-        .map_err(|e| format!("图标: {e}"))?;
+    let icon =
+        Icon::from_rgba(flock_rgba(), ICON_SIZE, ICON_SIZE).map_err(|e| format!("图标: {e}"))?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Flock VPN：服务未运行")
@@ -150,7 +150,8 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
                         break;
                     }
                     if msg.message == WM_APP_TRAY_UPDATE {
-                        if let Some(texts) = pump_latest.lock().expect("托盘状态锁中毒").take() {
+                        if let Some(texts) = pump_latest.lock().expect("托盘状态锁中毒").take()
+                        {
                             native.apply(&texts);
                         }
                         continue; // posted 线程消息无窗口句柄，无须 Translate/Dispatch
@@ -190,11 +191,15 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
         .build()
         .map_err(|e| format!("tokio 运行时创建失败: {e}"))?;
     let drive_latest = latest.clone();
-    rt.block_on(drive(paths, move |texts| {
-        *drive_latest.lock().expect("托盘状态锁中毒") = Some(texts);
-        // SAFETY：线程消息投递（唤醒泵消费最新文案）；托盘线程已结束时失败可忽略。
-        unsafe { PostThreadMessageW(thread_id, WM_APP_TRAY_UPDATE, 0, 0) };
-    }, exit_rx));
+    rt.block_on(drive(
+        paths,
+        move |texts| {
+            *drive_latest.lock().expect("托盘状态锁中毒") = Some(texts);
+            // SAFETY：线程消息投递（唤醒泵消费最新文案）；托盘线程已结束时失败可忽略。
+            unsafe { PostThreadMessageW(thread_id, WM_APP_TRAY_UPDATE, 0, 0) };
+        },
+        exit_rx,
+    ));
 
     // 收泵：WM_QUIT 令 GetMessageW 返回 0；join 确保图标移除后进程再退。
     // SAFETY：同上。
@@ -234,7 +239,10 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
     let poll_thread = std::thread::Builder::new()
         .name("flock-tray-poll".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     eprintln!("flock-client tray: 轮询线程运行时创建失败: {e}——托盘退出");
@@ -248,9 +256,13 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
                 .name("flock-tray-menu".into())
                 .spawn(move || forward_menu_events(exit_tx));
             let poll_latest = poll_latest;
-            rt.block_on(drive(&poll_paths, move |texts| {
-                *poll_latest.lock().expect("托盘状态锁中毒") = Some(texts);
-            }, exit_rx));
+            rt.block_on(drive(
+                &poll_paths,
+                move |texts| {
+                    *poll_latest.lock().expect("托盘状态锁中毒") = Some(texts);
+                },
+                exit_rx,
+            ));
             poll_quit.store(true, Ordering::SeqCst);
         })
         .map_err(|e| format!("轮询线程创建失败: {e}"))?;
@@ -258,7 +270,7 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
     // 主线程：排空 NSApp 事件（菜单点击经 sendEvent 派发到 muda）+ 50ms 节律消费
     // 共享刷新/退出标志（tray-icon mac 后端要求主线程事件循环在跑）。
     use objc2_app_kit::{NSApplication, NSEventMask};
-    use objc2_foundation::{NSDefaultRunLoopMode, NSDate};
+    use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
     // MainThreadMarker::new() 在非主线程返回 None（托盘后端入口保证主线程调用）。
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         return Err("托盘主循环不在主线程（内部错误）".into());

@@ -120,11 +120,24 @@ pub(crate) fn spawn_named_pipe_server(
 
 /// token 文件显式 ACL（§7-M6.2：Users 读）。
 pub(crate) fn set_file_acl_users_read(path: &std::path::Path) -> io::Result<()> {
+    set_file_acl_from_sddl(path, TOKEN_FILE_SDDL)
+}
+
+/// 机密文件（凭据/SR-SIG1 种子）显式 ACL：SYSTEM + 管理员 + **文件属主**（OW——
+/// 创建者即属主，非提权进程也保有读写；0600 的 Windows 等价物），**无 Users 条目**
+/// （M7 §7-M7.7：口令静止面 = 属主侧本地信任域；比 token 文件更紧——Users 连读都没有）。
+pub(crate) fn set_file_acl_admins_only(path: &std::path::Path) -> io::Result<()> {
+    const SECRETS_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)";
+    set_file_acl_from_sddl(path, SECRETS_SDDL)
+}
+
+/// 以 SDDL 构造 DACL 并显式落到文件（PROTECTED 去继承）。
+fn set_file_acl_from_sddl(path: &std::path::Path, sddl: &str) -> io::Result<()> {
     use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
-    let sd_guard = SaGuard::from_sddl(TOKEN_FILE_SDDL)?;
+    let sd_guard = SaGuard::from_sddl(sddl)?;
     let mut present: windows_sys::core::BOOL = 0;
     let mut defaulted: windows_sys::core::BOOL = 0;
     let mut dacl: *mut windows_sys::Win32::Security::ACL = std::ptr::null_mut();

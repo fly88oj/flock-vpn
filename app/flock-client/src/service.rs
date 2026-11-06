@@ -171,7 +171,7 @@ async fn run_service_inner(
     daemon_loop(cfg, state, tun, Some(vip), paths, stop, started).await
 }
 
-/// daemon 循环（快照源 + supervise + IPC + 停机等待 + 拆除）。
+/// daemon 循环（快照源 + supervise + 控制流登录保持 + IPC + 停机等待 + 拆除）。
 ///
 /// 独立于 tun/route 装配（`run_service_inner` 先行完成）——集成测试注入 mock tun
 /// 直达此层（宿主无真设备）。
@@ -189,12 +189,42 @@ async fn daemon_loop(
     let status = Arc::new(ServiceStatus::new(vip, epoch_rx));
     let ev_status = status.clone();
     let tun_sup = tun.clone();
+
+    // —— M7 控制流共享槽（supervise 装流；登录保持/名册拉取业务消费）——
+    let plane = crate::ctrl::ControlPlane::new();
+
+    // —— M7 登录保持任务（[auth] 配置在位才装配；票据只存内存，§7-M7.7）——
+    let auth_shared = Arc::new(crate::ctrl::AuthShared::new());
+    let mut auth_task: Option<tokio::task::JoinHandle<()>> = None;
+    if let Some(auth) = &cfg.auth {
+        let ctx = crate::ctrl::AuthCtx {
+            username: auth.username.clone(),
+            credentials_path: crate::ctrl::credentials_path(
+                &cfg.state_dir,
+                auth.credentials_file.as_deref(),
+            ),
+            hostname: crate::ctrl::resolve_hostname(cfg.hostname.as_deref()),
+            device: flock_protocol::session::DeviceStaticKeys::from_bytes(&state.device.to_bytes()),
+            cluster_id: state.directory.cluster_id,
+            directory: state.directory.clone(),
+            sr_key: crate::ctrl::load_or_create_sr_key(&cfg.state_dir)
+                .map_err(|e| format!("SR-SIG1 密钥: {e}"))?,
+        };
+        let stop_auth = stop.clone();
+        auth_task = Some(tokio::spawn(crate::ctrl::run_auth_keepalive(
+            plane.clone(),
+            ctx,
+            auth_shared.clone(),
+            stop_auth,
+        )));
+    }
+
     // supervise 永不正常返回；任务 panic ⇒ 死亡信号通道关闭（recv 返回 None）⇒ 主
     // 流程按失败停机（服务管理器失败语义接管——Restart/恢复策略只在此路径生效）。
     let (sup_alive_tx, mut sup_alive_rx) = tokio::sync::mpsc::channel::<()>(1);
     let supervise_task = tokio::spawn(async move {
         let _alive = sup_alive_tx; // 持有到任务终止（Drop ⇒ 主流程 recv 得 None）
-        connector::supervise_with_epoch(
+        connector::supervise_with_control(
             &state,
             tun_sup.as_ref(),
             flock_protocol::session::TunnelConfig::default(),
@@ -218,6 +248,7 @@ async fn daemon_loop(
                 }
             },
             epoch_tx,
+            plane,
         )
         .await;
     });
@@ -258,15 +289,24 @@ async fn daemon_loop(
         )),
     };
 
-    // —— 优雅拆除：IPC → supervise（断会话/停数据面：隧道随任务 Drop）→ tun ——
+    // —— 优雅拆除：IPC → 登录保持 → supervise（断会话/停数据面：隧道随任务 Drop）→ tun ——
     ipc_task.abort();
     #[cfg(unix)]
     let _ = std::fs::remove_file(&paths.endpoint.socket_path); // 停机即时收；残留兜底见 ipc_unix
+    if let Some(t) = &auth_task {
+        t.abort();
+    }
     supervise_task.abort();
     tun.shutdown();
     log_service_event(
         EventLevel::Info,
-        &format!("service 停止（运行 {:?}）", started.elapsed()),
+        &format!(
+            "service 停止（运行 {:?}，登录态 {:?}）",
+            started.elapsed(),
+            auth_shared
+                .phase()
+                .unwrap_or(crate::ctrl::AuthPhase::Unconfigured)
+        ),
     );
     outcome
 }
@@ -567,6 +607,8 @@ mod tests {
             mtu: 1280,
             endpoints: vec![],
             control_group: None,
+            hostname: None,
+            auth: None,
         };
         let state = connector::ClientState {
             device: flock_protocol::session::DeviceStaticKeys::generate(),

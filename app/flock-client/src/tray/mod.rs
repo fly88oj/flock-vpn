@@ -14,11 +14,11 @@
 //! 单元测试全在核心层（无 GUI 宿主可跑）：投影全分支/token 往返/轮询恢复/退出动作
 //! 在 IPC mock（真传输：临时命名管道或 Unix socket）上的请求顺序。
 
-pub mod icon;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-mod backend_native;
 #[cfg(target_os = "linux")]
 mod backend_ksni;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod backend_native;
+pub mod icon;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -143,7 +143,10 @@ impl TokenSource {
 // ============================================================================
 
 fn log_refresh(texts: &MenuTexts) {
-    eprintln!("flock-client tray: 菜单刷新｜{}｜{}", texts.status, texts.vip);
+    eprintln!(
+        "flock-client tray: 菜单刷新｜{}｜{}",
+        texts.status, texts.vip
+    );
 }
 
 /// 单拍 Status 轮询 → 菜单文案。
@@ -230,15 +233,11 @@ pub async fn request_exit(paths: &ControlPaths, tokens: &mut TokenSource) -> Exi
             ExitDecision::StayRunning
         }
         Ok(other) => {
-            eprintln!(
-                "flock-client tray: 退出——daemon 回复意外响应 {other:?}，托盘保持运行"
-            );
+            eprintln!("flock-client tray: 退出——daemon 回复意外响应 {other:?}，托盘保持运行");
             ExitDecision::StayRunning
         }
         Err(e) => {
-            eprintln!(
-                "flock-client tray: 退出——控制面不可达: {e}（daemon 未运行），仅退出托盘"
-            );
+            eprintln!("flock-client tray: 退出——控制面不可达: {e}（daemon 未运行），仅退出托盘");
             ExitDecision::ExitTray
         }
     }
@@ -261,7 +260,9 @@ pub fn gui_session_present(display: bool, wayland: bool, session_bus: bool) -> b
 /// Linux 运行时探测（env + `$XDG_RUNTIME_DIR/bus` 存在性）。
 #[cfg(target_os = "linux")]
 pub(crate) fn linux_gui_session_present() -> bool {
-    let display = std::env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);
+    let display = std::env::var("DISPLAY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
     let wayland = std::env::var("WAYLAND_DISPLAY")
         .map(|v| !v.is_empty())
         .unwrap_or(false);
@@ -331,7 +332,10 @@ mod tests {
         }));
         assert_eq!(t.status, "连接状态：已连接 · frps-a:23000");
         assert_eq!(t.vip, "VPN IP：100.64.0.11");
-        assert_eq!(t.tooltip, "Flock VPN：已连接 · frps-a:23000 · VPN IP 100.64.0.11");
+        assert_eq!(
+            t.tooltip,
+            "Flock VPN：已连接 · frps-a:23000 · VPN IP 100.64.0.11"
+        );
 
         // 已连接但 vip None（文案容错位）⇒「VPN IP：—」。
         let t = menu_texts(Some(&StatusSnapshot {
@@ -520,7 +524,10 @@ mod tests {
         std::fs::write(&paths.token_file, hex::encode(stale)).unwrap();
         let mut src = TokenSource::new(paths.token_file.clone());
         let texts = poll_once(&paths, &mut src).await;
-        assert_eq!(texts.status, "连接状态：服务未运行", "Denied 拍按服务未运行显示");
+        assert_eq!(
+            texts.status, "连接状态：服务未运行",
+            "Denied 拍按服务未运行显示"
+        );
         std::fs::write(&paths.token_file, hex::encode(token)).unwrap();
         let texts = poll_once(&paths, &mut src).await;
         assert_eq!(
@@ -576,8 +583,14 @@ mod tests {
         let stale = ipc::generate_token();
         std::fs::write(&paths.token_file, hex::encode(stale)).unwrap();
         let mut src = TokenSource::new(paths.token_file.clone());
-        assert_eq!(request_exit(&paths, &mut src).await, ExitDecision::StayRunning);
-        assert!(log.lock().unwrap().is_empty(), "Denied 不得触发 daemon 停机");
+        assert_eq!(
+            request_exit(&paths, &mut src).await,
+            ExitDecision::StayRunning
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "Denied 不得触发 daemon 停机"
+        );
 
         // (2) 修正 token 文件（失效重载）再退：Shutdown ⇒ 钩子触发 + Ok ⇒ ExitTray。
         std::fs::write(&paths.token_file, hex::encode(token)).unwrap();
@@ -594,7 +607,10 @@ mod tests {
             token_file: dir.path().join("absent-token"),
         };
         let mut src = TokenSource::new(absent.token_file.clone());
-        assert_eq!(request_exit(&absent, &mut src).await, ExitDecision::ExitTray);
+        assert_eq!(
+            request_exit(&absent, &mut src).await,
+            ExitDecision::ExitTray
+        );
         assert_eq!(
             log.lock().unwrap().len(),
             1,

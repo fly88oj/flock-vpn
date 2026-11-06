@@ -33,8 +33,11 @@ flock-client [--config <client.toml>] [<subcommand>]
 
 子命令：
   (run)                  前台调试模式（缺省）：tun + 路由 + 接入器守护（不起 IPC）
-  service                daemon：supervise + 控制面 IPC + 优雅停服（§7-M6）
+  service                daemon：supervise + 控制面 IPC + 优雅停服（§7-M6）+ M7 登录保持
   status                 向 daemon 发一次 Status 请求并打印（无托盘环境探针）
+  login                  首次配置：读口令 → 0600 凭据文件 → 设服务端口令 + 登录验证
+                         + hostname 入册（M7 §7-M7.7；daemon 非交互读文件）
+  peers [--json]         成员名册（VIP/主机名/账户/状态/延迟/流量；M7 §7-M7.7）
   install [--user|--service]  安装服务+托盘自启（缺省两者；安装时 --config 记入服务定义）
   uninstall [--user|--service] 反向卸载
   tray                   托盘进程（右键菜单：连接状态/VPN IP/退出；无 GUI 会话优雅退出）
@@ -63,6 +66,7 @@ enum Cmd {
     Run,
     Service,
     Status,
+    Login,
     Install {
         scope: flock_client::install::Scope,
     },
@@ -127,6 +131,7 @@ fn parse_args() -> Result<Cli, String> {
         None | Some("run") => Cmd::Run,
         Some("service") => Cmd::Service,
         Some("status") => Cmd::Status,
+        Some("login") => Cmd::Login,
         Some("install") => Cmd::Install { scope },
         Some("uninstall") => Cmd::Uninstall { scope },
         #[cfg(feature = "tray")]
@@ -168,7 +173,7 @@ fn run_cli() -> Result<(), String> {
             .map_err(|e| format!("{e}\n（提权要求与平台矩阵见 docs/manual/service-install.md）")),
         #[cfg(feature = "tray")]
         Cmd::Tray => flock_client::tray::run_tray(),
-        Cmd::Run | Cmd::GenKeys | Cmd::Invite { .. } | Cmd::Smoke => {
+        Cmd::Run | Cmd::GenKeys | Cmd::Invite { .. } | Cmd::Smoke | Cmd::Login => {
             let cfg = ClientConfig::load(&cli.config)?;
             match cli.cmd {
                 Cmd::GenKeys => {
@@ -313,6 +318,10 @@ fn run_cli() -> Result<(), String> {
                         Ok(())
                     })
                 }
+                Cmd::Login => {
+                    cmd_login(&cfg)?;
+                    Ok(())
+                }
                 // 不可达（外层 match 已分流；保穷尽性）。
                 Cmd::Service | Cmd::Status | Cmd::Install { .. } | Cmd::Uninstall { .. } => {
                     unreachable!("已在 run_cli 分流")
@@ -326,6 +335,124 @@ fn run_cli() -> Result<(), String> {
 
 fn cli_err(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+/// `login` 子命令（M7 §7-M7.7 首次配置）：读口令（stdin 单行）→ 0600 凭据文件 →
+/// 直连隧道控制流：设服务端口令（PwBegin/PwCommit——授权 = 设备 owner == [auth]
+/// username）→ 登录验证（anchor + key-bind hostname 入册）。
+///
+/// 口令回显：tty 下 stdin 行读有回显——本地信任域内的取舍（OPAQUE 保证口令不上线；
+/// 本地静止 = 本地信任域，§7-M7.7）；管道/容器（echo pw | login）无回显无碍。
+fn cmd_login(cfg: &ClientConfig) -> Result<(), String> {
+    let auth = cfg
+        .auth
+        .as_ref()
+        .ok_or_else(|| "client.toml 缺 [auth] username（登录配置）".to_string())?;
+    let cred_path =
+        flock_client::ctrl::credentials_path(&cfg.state_dir, auth.credentials_file.as_deref());
+    eprint!(
+        "flock-client: 登录口令（user={}，单行，将保存到 {}）: ",
+        auth.username,
+        cred_path.display()
+    );
+    let _ = std::io::stderr().flush();
+    let mut pw = String::new();
+    std::io::stdin()
+        .read_line(&mut pw)
+        .map_err(|e| format!("读口令: {e}"))?;
+    let pw = pw.trim_end_matches(['\n', '\r']).to_string();
+    if pw.is_empty() {
+        return Err("口令为空".into());
+    }
+    flock_client::ctrl::save_credentials(&cred_path, &pw)
+        .map_err(|e| format!("写凭据文件: {e}"))?;
+    eprintln!("flock-client: 凭据已保存（0600）: {}", cred_path.display());
+
+    // 状态三件套（invite 先行）+ SR-SIG1 密钥 + hostname。
+    let state = ClientState::load(&cfg.state_dir, false).map_err(cli_err)?;
+    let sr_key =
+        flock_client::ctrl::load_or_create_sr_key(&cfg.state_dir).map_err(|e| e.to_string())?;
+    let hostname = flock_client::ctrl::resolve_hostname(cfg.hostname.as_deref());
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(async move {
+        let mut last_err = String::from("目录无可用端点（先 `flock-client invite <file>`）");
+        for ep in state.endpoints() {
+            let Some(pin) = state.pin_for(&ep) else {
+                continue;
+            };
+            let tunnel = match connector::dial(
+                &pin,
+                &state.device,
+                flock_protocol::session::TunnelConfig::default(),
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    last_err = format!("拨号 {ep}: {e}");
+                    continue;
+                }
+            };
+            let stream = match tunnel
+                .open_stream(flock_protocol::mux::Prio::Control)
+                .await
+            {
+                Ok(s) => std::sync::Arc::new(tokio::sync::Mutex::new(s)),
+                Err(e) => {
+                    last_err = format!("控制流 {ep}: {e}");
+                    tunnel.shutdown().await;
+                    continue;
+                }
+            };
+            let t = flock_client::ctrl::StreamTransport(stream);
+            // ① 设口令（PasswordExists = 已设——沿用，登录验证兜底）。
+            match flock_client::ctrl::set_password_once(&t, &auth.username, &pw).await {
+                Ok(true) => eprintln!("flock-client: 服务端口令已设置"),
+                Ok(false) => eprintln!("flock-client: 服务端口令已存在（沿用；若登录失败说明口令失配）"),
+                Err(e) => {
+                    tunnel.shutdown().await;
+                    last_err = format!("设口令: {e}");
+                    continue;
+                }
+            }
+            // ② 登录验证 + hostname 入册（票据不保留——一次性命令，daemon 自行登录）。
+            let params = flock_client::ctrl::AuthParams {
+                username: auth.username.clone(),
+                password: pw.clone(),
+                hostname: hostname.clone(),
+                device: flock_protocol::session::DeviceStaticKeys::from_bytes(
+                    &state.device.to_bytes(),
+                ),
+                cluster_id: state.directory.cluster_id,
+                directory: state.directory.clone(),
+                sr_key: flock_protocol::sig::UserKey::from_seed(&sr_key.to_seed()),
+            };
+            let out = match flock_client::ctrl::login_and_bind(&t, &params).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tunnel.shutdown().await;
+                    last_err = format!("登录验证: {e}");
+                    continue;
+                }
+            };
+            tunnel.shutdown().await;
+            println!(
+                "login ok: user={} vip={} hostname={}（hostname 已入册；daemon 将自动登录保持票据）",
+                auth.username,
+                std::net::Ipv4Addr::from(out.vip),
+                hostname
+            );
+            return Ok(());
+        }
+        Err(format!(
+            "{last_err}（端点全试尽；检查服务端可达性与 device-add --user 是否为 {}）",
+            auth.username
+        ))
+    })
 }
 
 /// `service` 子命令：Windows 走 SCM 分派（终端直跑自动回落前台 daemon）；Unix
