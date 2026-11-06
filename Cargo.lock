@@ -900,12 +900,14 @@ dependencies = [
  "flock-protocol",
  "futures",
  "hex",
+ "postcard",
  "rtnetlink",
  "serde",
  "tempfile",
  "tokio",
  "toml",
  "tun-rs",
+ "windows-sys",
 ]
 
 [[package]]

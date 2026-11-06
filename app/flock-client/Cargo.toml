@@ -13,8 +13,10 @@ serde = { workspace = true }
 toml = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+# 控制 IPC（§7-M6.2：postcard over 命名管道/Unix socket，帧格式与 admin 面同构）。
+postcard = { workspace = true }
 # 接入器主循环（多线程 rt + 定时退避）。
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 
 # tun-rs 平台适配器（§2.3）：Linux/Windows/macOS 三平台原生路径；Android/iOS 走 fd 注入
 # 接缝（vpn-mesh §1.1——两平台无 native 等价 API），不装配 tun-rs 构建路径。
@@ -24,6 +26,11 @@ tun-rs = { workspace = true }
 # 路由配置（§2.3：rtnetlink /16 池指向 TUN + rp_filter=1）仅 Linux。
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = { workspace = true }
+
+# 控制 IPC Windows 侧（§7-M6.2）：命名管道显式 DACL（SDDL）+ token 文件 ACL。
+# Authorization = SDDL 转换/SetNamedSecurityInfo；Foundation = LocalFree。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation"] }
 
 [dev-dependencies]
 tempfile = "3"
