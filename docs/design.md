@@ -888,6 +888,124 @@ NetState 适配器：redb 单机版，接口与 flock-sync 相同）/frpc 托管
 未含项如实声明：ChmlFrp 真实节点端到端（需账号，手工清单：M5 后有账号时补 R1/R6/R7 于
 ChmlFrp 节点）；移动端（Android/iOS）真机（M3 后独立排期，接缝已在 §3.12 预留）。
 
+### M6 系统服务化 + 客户端控制面（第一阶段：daemon 侧；托盘第二阶段并行）
+
+需求（用户原话）：Windows/Linux/macOS 作为系统服务开机启动；主机有 GUI 则显示系统托盘
+图标（暂不弹 GUI 窗口），托盘右键菜单三项：连接状态、VPN IP、退出。第一阶段交付 daemon
+侧（服务化/IPC/安装器），托盘 UI 第二阶段开发——**IPC 契约本阶段固化为可独立编译消费的
+模块**（`flock_client::ipc`，托盘工程直接依赖）。
+
+#### M6.1 双进程模型（架构定型）
+
+- `flock-client service`：**系统服务进程**——无任何 GUI 依赖，开机自启（Windows SCM /
+  systemd / launchd），持有全部既有 supervise/数据面逻辑（§3.12 不变），另起本地控制
+  IPC 服务端。
+- `flock-client tray`：**用户会话进程**——仅托盘 UI（第二阶段实现），经控制 IPC 查询
+  状态/触发退出，不接触密钥/tun/数据面。
+- **理由**：Windows 服务运行在 session 0，无法创建托盘（Shell 屏蔽，事实约束）；单进程
+  无法同时满足「无会话开机自启」与「会话内托盘」。Linux/macOS 服务同样跑在系统上下文
+  （systemd system unit / LaunchDaemon），与用户会话 GUI 分离——三平台同构，避免平台
+  分叉（Linux 的 user-service 形态不采用：与 Windows 服务形态不可对齐、登录前不启动）。
+- **退出语义**（「退出」托盘菜单）：停 VPN + 托盘进程退出；**服务保持已安装**（下次开机
+  自启）。daemon 侧的 Shutdown = 优雅停服：断会话（隧道 GoAway/FIN）→ 停数据面 → 拆
+  tun → 进程退出；服务管理器**不复活**（systemd 单元 `Restart=on-failure`——正常退出
+  非失败；launchd plist 不设 KeepAlive；Windows 服务恢复策略只对失败退出动作）。
+
+#### M6.2 控制 IPC（v1 契约）
+
+**传输**（postcard over 本地传输，帧格式与 §3.11 admin 面同构：`[u32 LE len][postcard]`，
+单连接单请求-响应）：
+
+| 平台 | 端点 | 权限 |
+|---|---|---|
+| Windows | 命名管道 `\\.\pipe\flock-client-control` | 显式 DACL（SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)`）：SYSTEM + Administrators + 交互用户组（IU）读写 |
+| Linux/macOS | Unix socket `/run/flock/client.sock` | 0660，目录 `/run/flock` 0755 root |
+
+**认证**：daemon 每次启动生成 32B 随机 token（`rand::random`），落 token 文件——Windows
+`%ProgramData%\flock\control-token`（显式 ACL：Users 读）；Linux/macOS
+`/var/lib/flock/client/control-token`（0640 root；安装时以 `--control-group <组>` 指定
+组则 chgrp 该组，缺省 root:root 即「仅 root 可控」，即装即用文档说明）。**每请求都带
+token**（Status 与 Shutdown 同一信封字段），校验先于分发，错即 `Denied`——比「仅
+Shutdown 带 token」收紧：Status 泄露端点/VIP，不放开给传输层全体可连者。
+
+**消息**（`flock_client::ipc`，postcard/serde，`#[derive(Clone, PartialEq)]`）：
+
+```rust
+pub enum CtrlReq {
+    Status   { token: [u8; 32] },
+    Shutdown { token: [u8; 32] },
+}
+pub enum CtrlResp {
+    Status {
+        state: ConnState,              // Connected | Connecting | Disconnected
+        vip: Option<String>,           // 本端 VIP（启动即解析 ⇒ Some；文案容错位）
+        endpoint: Option<String>,      // 当前/最近拨号端点
+        epoch: u64,                    // 当前会话密钥纪元（rekey 推进；断开 ⇒ 0）
+        uptime_secs: u64,              // daemon 启动至今秒数
+    },
+    Ok,        // Shutdown 受理
+    Denied,    // token 错
+}
+```
+
+**语义**：`Status` 无副作用幂等；`Shutdown` = §M6.1 优雅停服，回 `Ok` 后 daemon 完成拆除
+即退出（进程退出与响应写出竞速以响应先写为承诺，极端情形客户端见连接重置亦视为已受理）。
+v1 无版本协商字段——枚举加变体向后兼容（postcard varint 变体序号），跨版本策略留给 v2。
+
+#### M6.3 服务安装（`flock-client install` / `uninstall`）
+
+`--user` 只装托盘自启、`--service` 只装服务、缺省两者。安装动作记录**安装时**的 `--config`
+路径进服务定义（unit/plist/服务命令行携带），卸载反向清理。
+
+- **Windows**（windows-service crate）：`SERVICE_AUTO_START` + 失败恢复策略（重启，延迟
+  5s/次封顶 3 次）；服务名 `flock-client`，二进制路径 = 当前 exe，命令行 `service --config
+  <path>`；事件日志源 `flock-client`（报告 Start/Stop/失败）。**服务安装需管理员**：非提升
+  会话给出清晰错误提示（docs/manual/windows-smoke.md 先例——真机安装列入手工清单项
+  `docs/manual/service-install.md`）。
+- **Linux**：渲染 `/etc/systemd/flock-client.service`（`WantedBy=multi-user.target`，
+  `Restart=on-failure`，`After=network-online.target` + `Wants=network-online.target`，
+  `ExecStart=<exe> service --config <path>`）→ `systemctl daemon-reload` → `systemctl
+  enable --now flock-client`。**需 root**（sudo 提示）。uninstall：`disable --now` → 删单元
+  → `daemon-reload`。容器内安装需 systemd 运行（测试阶段只验证单元渲染与命令序列，
+  enable 执行面留给真机清单）。
+- **macOS**：写 `/Library/LaunchDaemons/com.flockvpn.client.plist`（`RunAtLoad=true`、
+  **无 KeepAlive**——Shutdown 后不复活）→ `launchctl load -w`。需 root。**本机无设备 ⇒
+  标注未验证**（文件与命令照常写出，M6 手工清单留位）。
+- **托盘自启**：Windows `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 值
+  `flock-client-tray` = `<exe> tray`（HKCU 无需提权）；Linux
+  `~/.config/autostart/flock-client-tray.desktop`；macOS
+  `~/Library/LaunchAgents/com.flockvpn.client-tray.plist`（`RunAtLoad`，无 KeepAlive）。
+
+#### M6.4 CLI 面
+
+现有默认运行（`--config` 裸跑）保留为**前台调试模式**（不起 IPC，日志直连 stderr）；新增
+子命令：`service`（daemon 装配：supervise + IPC 服务端 + 优雅停服，前台运行于服务管理器
+之下）、`tray`（第二阶段；本阶段为 feature 门控的占位入口）、`install`/`uninstall`
+（§M6.3）、`status`（直接发一次 `Status` 请求并打印——无托盘环境与测试的探针；token 从
+token 文件读，读不到即报「daemon 未运行/无权限」）。
+
+#### M6.5 feature 门控
+
+`tray` feature：Windows/macOS 开发默认包含；Linux 无头服务器镜像默认不拖累托盘 GUI 依赖。
+**Cargo 限制如实声明**：cargo 无法表达按 target 差异的 default features——本阶段 `default =
+["tray"]` 对三平台一致，但 tray 门控面仅是子命令注册（零依赖差异）；第二阶段托盘 GUI 依赖
+全部按 `[target.'cfg(windows/macos)'.dependencies]` + `optional = true` 挂进 `tray`
+feature，Linux 默认构建（含 default features）不引入 GUI 依赖面，发布档以
+`--no-default-features` 显式去托盘（CI 门禁含该档）。
+
+#### M6.6 完成标准（第一阶段）
+
+1. `cargo test -p flock-client --all-features` 全绿（IPC 契约往返/token 拒绝/Denied/守护
+   装配与服务语义单测；传输层 mock + 平台真实回环各一组）。
+2. `cargo check -p flock-client --no-default-features`（无 tray 档）与
+   `cargo check --target x86_64-unknown-linux-gnu -p flock-client`（Linux 编译面）通过。
+3. `cargo clippy -p flock-client -- -D warnings` 通过。
+4. Windows 服务安装/启动/真机托盘自启、macOS 全链路：需管理员/真机，列
+   `docs/manual/service-install.md` 手工清单（Windows 真机项标注「待管理员会话执行」；
+   macOS 标注未验证）。
+5. 托盘工程可直接 `use flock_client::ipc::{CtrlReq, CtrlResp, ...}` 消费契约（lib 面
+   导出 + 契约单测即消费样例）。
+
 ---
 
 ## 8. 风险与对策
@@ -1036,3 +1154,4 @@ ChmlFrp 节点）；移动端（Android/iOS）真机（M3 后独立排期，接�
 
 - 2026-11-01 命名调整：chml-protocol → flock-protocol（协议层独立于 chml/frp 品牌；flock=雁群，小型分布式网络意象；行为零变化）。
 - 2026-11-02 项目更名：ChmlVPN → Flock VPN（chmlvpn-server/client→flock-server/client、chml-sync/frpc→flock-sync/frpc、网络 chmlpub→flockpub、占位 git URL 换 flock 域；flock-protocol 线上行为零变化）。仓库目录同步更名为 FlockVPN——会话占用期间经 junction 过渡（宿主机两路径等价、Docker 挂载内仅真实路径可见，容器命令暂用 ChmlVPN 路径），收尾步骤见 docs/manual/dir-rename-final.md。
+- 2026-11-06 M6 第一阶段（系统服务化 + 控制面 daemon 侧）：新增 §7-M6——双进程模型（`flock-client service` 系统服务持全部 supervise/数据面 + `flock-client tray` 用户会话托盘经本地 IPC，Windows session 0 托盘约束定案）；控制 IPC v1 契约（postcard over 命名管道/Unix socket + 32B token 信封认证，**每请求带 token**——较「仅 Shutdown 带 token」收紧，Status 不裸奔）；三平台服务安装（Windows AUTO_START+恢复策略 / systemd Restart=on-failure / launchd 无 KeepAlive）+ 托盘自启 + `install/uninstall/status` 子命令 + `tray` feature 门控（cargo 无按平台 default features 的限制如实声明，GUI 依赖留 target 门控给第二阶段）；退出语义定型（Shutdown=优雅停服不复活、服务保持已安装）。IPC 契约固化为 `flock_client::ipc` 模块供托盘工程独立消费。
