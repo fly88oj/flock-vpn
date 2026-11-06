@@ -23,6 +23,17 @@ pub(crate) fn spawn_unix_server(
         // §7-M6.2：目录 0755（umask 可能收紧，显式放开执行/读）。
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))?;
     }
+    // 单实例守卫（评审项 7）：bind 前先 connect 旧 socket——**连通即已有 daemon
+    // 在跑**：报错返回（上浮 daemon_loop「控制面监听失败」⇒ 非零退出），不抢绑、
+    // 不动他人 socket；连接失败才是残留文件（上次异常退出），清理后绑定。
+    // 同步 connect：本地 unix socket 即时完成，无长阻塞面。TOCTOU 窗口由服务
+    // 管理器串行启动兜底（模块文档）——本守卫为「手跑第二实例」的快失败位。
+    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        return Err(io::Error::other(format!(
+            "已有 daemon 运行（{} 可连）——单实例守卫拒绝二次启动",
+            socket_path.display()
+        )));
+    }
     // 残留清理（见模块文档）。
     let _ = std::fs::remove_file(socket_path);
     let listener = tokio::net::UnixListener::bind(socket_path)?;
@@ -122,5 +133,28 @@ mod tests {
         .expect("往返");
         assert_eq!(resp, CtrlResp::Denied);
         server.abort();
+    }
+
+    /// 评审项 7：单实例守卫——socket 被既有监听者占住 ⇒ 二次启动被拒（错误带
+    /// 「已有 daemon 运行」——上浮即非零退出），且不清除/不抢绑既有 socket。
+    #[tokio::test]
+    async fn second_daemon_rejected_while_socket_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("guard.sock");
+        let holder = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let ctrl = Arc::new(DaemonControl {
+            token: ipc::generate_token(),
+            status: Arc::new(|| CtrlResp::Ok),
+            shutdown: Arc::new(|| {}),
+            peers: None,
+        });
+        let err = spawn_unix_server(&sock, None, ctrl).expect_err("socket 被占 ⇒ 必须拒绝");
+        assert!(err.to_string().contains("已有 daemon"), "{err}");
+        // 既有 socket 原样保留（占位监听者仍可被连——守卫未清文件）。
+        assert!(
+            std::os::unix::net::UnixStream::connect(&sock).is_ok(),
+            "守卫不得清除在用 socket"
+        );
+        drop(holder);
     }
 }
