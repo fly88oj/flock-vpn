@@ -21,6 +21,12 @@ pub struct PeerRow {
 }
 
 /// 组装增强名册：self 标注（VIP 比对）+ 对 online 非自身行**并发**探测。
+///
+/// `self_vip: None` 降级档（评审项 8 说明）：服务装配恒 `Some`（daemon 启动即
+/// resolve_vip），None 仅测试/异常注入面可达——无 VIP 可比对 ⇒ **无行可标
+/// `(self)`，本机行按普通 online 行被探测**：本机 VIP 是本机本地地址，ICMP echo
+/// 由本机协议栈本地应答（不经 tun），延迟列显示 ~0ms——显示语义降级（自身行不
+/// 标注、延迟列失真为 ~0）而非功能错误，CLI 仍可用。
 pub async fn assemble_rows(
     peers: Vec<PeerInfo>,
     self_vip: Option<Ipv4Addr>,

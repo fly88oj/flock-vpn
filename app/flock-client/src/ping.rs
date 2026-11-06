@@ -75,11 +75,16 @@ pub async fn probe_latency_with(
 type Waiters = Arc<Mutex<HashMap<(Ipv4Addr, u16), tokio::sync::oneshot::Sender<()>>>>;
 
 /// raw ICMP 探测器（单套接字复用；id = 进程派生——同机多 daemon 不互扰）。
+///
+/// seq 由调用方给（[`probe_latency_with`] 以 `0..probes` 序）；评审项 8 删除了
+/// 无人接线的 `next_seq` 全局序号。残余影响（如实声明）：同目标跨轮次（>5s 名册
+/// 缓存过期后的两次探测）复用相同 seq 值，上一轮迟到的回包可唤醒本轮等待者——
+/// 回复仍按 `(源, id, seq)` 匹配（不同目标隔离），且 3 探针取中位下单样本污染
+/// 至多抬高/压低一个采样、中位稳定，不致误判在线性。
 pub struct RawIcmpPinger {
     id: u16,
     socket: Arc<tokio::net::UdpSocket>,
     waiters: Waiters,
-    seq: Mutex<u16>,
 }
 
 impl RawIcmpPinger {
@@ -129,15 +134,7 @@ impl RawIcmpPinger {
             id,
             socket,
             waiters,
-            seq: Mutex::new(0),
         })
-    }
-
-    /// 全局探针序号（跨目标唯一——回复匹配键的 seq 分量）。
-    pub fn next_seq(&self) -> u16 {
-        let mut g = self.seq.lock().expect("ping seq");
-        *g = g.wrapping_add(1);
-        *g
     }
 }
 

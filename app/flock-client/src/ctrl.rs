@@ -279,10 +279,32 @@ fn refused<M: Into<String>>(m: M) -> LoginError {
 }
 
 /// 从 [`CtrlResponse::Err`] 提取可读描述。
+///
+/// 意外响应分支只打**变体名**（评审项 8）：`{other:?}` 会把整载荷拖进错误串/日志
+/// ——`LoginOk`/`TicketRenewed` 携带的票据（TicketWire）、`LoginChallenge` 的 ke2、
+/// `Directory` 的目录字节等敏感载荷不应出现在日志面。
 fn describe_err(resp: CtrlResponse) -> String {
     match resp {
         CtrlResponse::Err { code, msg } => format!("{code:?}: {msg}"),
-        other => format!("意外响应: {other:?}"),
+        other => format!("意外响应: {}", ctrl_response_variant(&other)),
+    }
+}
+
+/// 意外响应的变体名（日志面零载荷）。
+fn ctrl_response_variant(r: &CtrlResponse) -> &'static str {
+    match r {
+        CtrlResponse::Hello { .. } => "Hello",
+        CtrlResponse::PwChallenge { .. } => "PwChallenge",
+        CtrlResponse::Ok => "Ok",
+        CtrlResponse::LoginChallenge { .. } => "LoginChallenge",
+        CtrlResponse::LoginOk { .. } => "LoginOk",
+        CtrlResponse::KeyBound { .. } => "KeyBound",
+        CtrlResponse::TicketRenewed { .. } => "TicketRenewed",
+        CtrlResponse::Redeemed { .. } => "Redeemed",
+        CtrlResponse::DeviceList { .. } => "DeviceList",
+        CtrlResponse::Directory { .. } => "Directory",
+        CtrlResponse::PeerList { .. } => "PeerList",
+        CtrlResponse::Err { .. } => "Err",
     }
 }
 
@@ -1271,6 +1293,35 @@ mod tests {
             AuthPhase::peers_block_reason(Some(AuthPhase::LoggedIn { user: "a".into() }))
                 .is_none(),
             "LoggedIn 放行拉取"
+        );
+    }
+
+    /// 评审项 8：describe_err 意外响应分支只打变体名——票据等载荷不进错误串。
+    #[test]
+    fn describe_err_unexpected_response_hides_payload() {
+        let now = flock_protocol::trust::now_unix();
+        let resp = CtrlResponse::LoginOk {
+            ticket: TicketWire::Local(SignedTicket {
+                user: "secret-user".into(),
+                device: vec![1; 32],
+                epoch: 0,
+                iat: now,
+                exp: now + 60,
+                sig: vec![7; 64],
+            }),
+            epoch: 1,
+        };
+        let msg = describe_err(resp);
+        assert!(msg.contains("LoginOk"), "变体名在位: {msg}");
+        assert!(!msg.contains("secret-user"), "票据用户不进日志: {msg}");
+        assert!(!msg.contains("TicketWire"), "载荷 Debug 不进日志: {msg}");
+        // Err 变体原语义不变（code + msg）。
+        assert_eq!(
+            describe_err(CtrlResponse::Err {
+                code: CtrlError::LoginFailed,
+                msg: "nope".into(),
+            }),
+            "LoginFailed: nope"
         );
     }
 }

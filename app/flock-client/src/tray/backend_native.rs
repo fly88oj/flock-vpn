@@ -84,10 +84,15 @@ fn forward_menu_events(exit_tx: tokio::sync::mpsc::UnboundedSender<()>) {
 
 /// 轮询/退出驱动（平台后端共用）：2s 拍轮询 → `refresh` 回调落位；「退出」→
 /// [`super::request_exit`] 裁决——ExitTray 结束循环（StayRunning 继续：token 已重载）。
+///
+/// `pump_ended`（Windows 专用）：托盘泵线程终结（GetMessageW=-1 错误或 WM_QUIT
+/// 收泵）⇒ 立即结束驱动循环——图标已失，不留「无图标僵尸进程」（评审项 8）。
+/// macOS 侧持有永不发送的配对端（oneshot）——该臂不触发。
 async fn drive(
     paths: &ControlPaths,
     mut refresh: impl FnMut(MenuTexts),
     mut exit_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    mut pump_ended: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut tokens = super::TokenSource::new(paths.token_file.clone());
     let mut ticker = tokio::time::interval(POLL_INTERVAL); // 首拍立即——启动即有文案
@@ -102,6 +107,11 @@ async fn drive(
                     ExitDecision::ExitTray => break,
                     ExitDecision::StayRunning => continue,
                 }
+            }
+            // Ok（泵发过信号）/Err（发送端 drop）均视为泵已终结——直接退出进程。
+            _ = &mut pump_ended => {
+                eprintln!("flock-client tray: 托盘泵已结束——进程收尾（不留无图标僵尸进程）");
+                break;
             }
         }
     }
@@ -124,9 +134,14 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
     let latest: Arc<Mutex<Option<MenuTexts>>> = Arc::new(Mutex::new(None));
     let pump_latest = latest.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    // 泵终结信号（评审项 8）：泵线程 GetMessageW=-1（错误）或收泵退出时通知
+    // drive 循环结束——图标已失的进程不得继续空转。
+    let (pump_end_tx, pump_end_rx) = tokio::sync::oneshot::channel::<()>();
     let tray_thread = std::thread::Builder::new()
         .name("flock-tray".into())
         .spawn(move || {
+            // pump_end_tx 随本线程 Drop——「线程意外终结」同样点亮 drive 的该臂。
+            let _pump_end_tx = pump_end_tx;
             let native = match build_native_tray() {
                 Ok(n) => n,
                 Err(e) => {
@@ -140,13 +155,19 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
                 return; // 主线程已放弃（接收端 drop）
             }
             // 泵循环（tray-icon 官方最小示例形态）：GetMessageW 阻塞等消息；
-            // 更新消息消费最新文案；WM_QUIT/错误（返回值 != 1）结束——native Drop
-            // 在本线程发生（Windows 侧 Drop 移除托盘图标）。
+            // 更新消息消费最新文案；WM_QUIT（0）/错误（-1）结束——native Drop
+            // 在本线程发生（Windows 侧 Drop 移除托盘图标）。-1 与正常收泵分别
+            // 记日志（评审项 8：-1 不再无声吞掉）。
             // SAFETY：msg 为合法出参指针；句柄参数 NULL = 不按窗口过滤。
             unsafe {
                 let mut msg: MSG = std::mem::zeroed();
                 loop {
-                    if GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) != 1 {
+                    let got = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                    if got == 0 {
+                        break; // WM_QUIT（正常收泵）
+                    }
+                    if got == -1 {
+                        eprintln!("flock-client tray: 消息泵错误（GetMessageW=-1）——图标失联，托盘收尾");
                         break;
                     }
                     if msg.message == WM_APP_TRAY_UPDATE {
@@ -199,6 +220,7 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
             unsafe { PostThreadMessageW(thread_id, WM_APP_TRAY_UPDATE, 0, 0) };
         },
         exit_rx,
+        pump_end_rx,
     ));
 
     // 收泵：WM_QUIT 令 GetMessageW 返回 0；join 确保图标移除后进程再退。
@@ -256,12 +278,17 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
                 .name("flock-tray-menu".into())
                 .spawn(move || forward_menu_events(exit_tx));
             let poll_latest = poll_latest;
+            // macOS 无独立泵线程（主线程 NSApp 循环即泵）——drive 的泵终结臂配
+            // 永不发送的占位通道（tx 随本闭包持有至轮询线程结束，该臂不触发；
+            // 线程终结时 tx Drop ⇒ rx Err 点亮 = 同样收尾，语义不劣化）。
+            let (_pump_hold_tx, pump_end_rx) = tokio::sync::oneshot::channel::<()>();
             rt.block_on(drive(
                 &poll_paths,
                 move |texts| {
                     *poll_latest.lock().expect("托盘状态锁中毒") = Some(texts);
                 },
                 exit_rx,
+                pump_end_rx,
             ));
             poll_quit.store(true, Ordering::SeqCst);
         })

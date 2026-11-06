@@ -471,7 +471,9 @@ fn cmd_login(cfg: &ClientConfig) -> Result<(), String> {
             return Ok(());
         }
         Err(format!(
-            "{last_err}（端点全试尽；检查服务端可达性与 device-add --user 是否为 {}）",
+            "{last_err}（端点全试尽；凭据已写入 {}——排障后重跑 `flock-client login` 可换口令；\
+             检查服务端可达性与 device-add --user 是否为 {}）",
+            cred_path.display(),
             auth.username
         ))
     })

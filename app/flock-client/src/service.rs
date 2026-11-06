@@ -29,6 +29,10 @@ use crate::tun::{TunIo, TunSpec};
 /// 服务名（Windows SCM / systemd unit / launchd label 统一标识）。
 pub const SERVICE_NAME: &str = "flock-client";
 
+/// 停机触发后的响应让步窗（评审项 8）：停机与在途 serve_conn 写响应帧之间存在
+/// 竞态——主流程返回即拆 runtime，客户端可能见断管而非 `Ok`/最后快照。
+const SHUTDOWN_RESP_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
 // ============================================================================
 // 状态快照源（IPC Status 的数据面）
 // ============================================================================
@@ -353,6 +357,12 @@ async fn daemon_loop(
             "控制 IPC 循环异常退出（致命 accept/创建错误，详见日志）: {ipc_dead:?}"
         )),
     };
+
+    // —— Shutdown 响应让步（评审项 8，选最小实现）：停机触发后固定 100ms 定时隙
+    // 让在途 serve_conn（每连接独立任务——abort IPC accept 循环不触及它们）把
+    // Shutdown `Ok`/最后快照帧写完，再进拆除/退 runtime。vs「在途 serve_conn 注册
+    // 表清点」：无需连接记账面，一条 sleep 覆盖全部触发路径（IPC/SCM/信号）。
+    tokio::time::sleep(SHUTDOWN_RESP_GRACE).await;
 
     // —— 优雅拆除：IPC → 登录保持 → supervise（断会话/停数据面：隧道随任务 Drop）→ tun ——
     ipc_task.abort();

@@ -187,10 +187,9 @@ fn set_file_acl_from_sddl(path: &std::path::Path, sddl: &str) -> io::Result<()> 
     if present == 0 || dacl.is_null() {
         return Err(io::Error::other("SDDL 转换产物无 DACL"));
     }
-    let mut wide: Vec<u16> = path
-        .as_os_str()
-        .to_string_lossy()
-        .encode_utf16()
+    // 路径转 wide：encode_wide（评审项 8）——to_string_lossy 会把不可表示字节替换
+    // 成 U+FFFD 导致 ACL 落错文件；OsStr→UTF-16 直转无损。
+    let mut wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
         .chain(std::iter::once(0))
         .collect();
     // SAFETY：wide 以 NUL 结尾；dacl 来自上述 SD（SetNamedSecurityInfoW 拷贝语义，
