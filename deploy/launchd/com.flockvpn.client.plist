@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- flock-client LaunchDaemon 样例（docs/design.md §7-M6.3）。
+     正式安装由 `flock-client install` 写 /Library/LaunchDaemons/com.flockvpn.client.plist。
+     退出语义（§7-M6.1）：不设 KeepAlive——IPC Shutdown/SIGTERM 优雅停服后 launchd 不复活。
+     ⚠ macOS 路径本机无设备 ⇒ 未验证（真机清单：docs/manual/service-install.md）。 -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.flockvpn.client</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/flock-client</string>
+        <string>service</string>
+        <string>--config</string>
+        <string>/etc/flock/client.toml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

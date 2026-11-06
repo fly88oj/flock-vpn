@@ -923,8 +923,10 @@ ChmlFrp 节点）；移动端（Android/iOS）真机（M3 后独立排期，接�
 
 **认证**：daemon 每次启动生成 32B 随机 token（`rand::random`），落 token 文件——Windows
 `%ProgramData%\flock\control-token`（显式 ACL：Users 读）；Linux/macOS
-`/var/lib/flock/client/control-token`（0640 root；安装时以 `--control-group <组>` 指定
-组则 chgrp 该组，缺省 root:root 即「仅 root 可控」，即装即用文档说明）。**每请求都带
+`/var/lib/flock/client/control-token`（0640 root；`client.toml` 的 `control_group` 字段
+指定组则 daemon 写盘时 chgrp token 与 socket 到该组——组名单一真相源在配置而非
+install 参数，安装动作不改写用户配置；仅解析本地 /etc/group 或数字 gid，失败告警
+不阻断，缺省 root:root 即「仅 root 可控」，即装即用文档说明）。**每请求都带
 token**（Status 与 Shutdown 同一信封字段），校验先于分发，错即 `Denied`——比「仅
 Shutdown 带 token」收紧：Status 泄露端点/VIP，不放开给传输层全体可连者。
 
