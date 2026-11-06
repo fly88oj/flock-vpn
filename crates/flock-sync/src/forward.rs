@@ -13,6 +13,18 @@
 //!    `NOT_HERE`（**禁止二次转发**，hop=1 防环——hop 耗尽的再转发 ⇒ 丢 + 计数）。
 //! 4. NOT_HERE ⇒ **一次性位置查询**（location_query，fan-out ≤3）重定向一次；
 //!    仍失败 ⇒ **丢包 + 尽力发 ICMP unreachable**（不广播、不缓存重试）。
+//!
+//! # M7 per-device 字节计数（§7-M7.3「投递成功点计数」单点原则）
+//!
+//! 每笔流量恰由**一台服务器**计数（杜绝跨服双计）：
+//! - **src 设备 tx**：由**接入服务器**（src 租约持有者）在 ingest 通过第 0 步源 VIP
+//!   绑定校验后计一次（收进 mesh 即成功；dst 侧任何服务器都不计 src）；
+//! - **dst 设备 rx**：由**投递成功的服务器**计——本机 sink 投递成功（同服路径）或
+//!   ForwardEnvelope 收端本机投递成功（跨服路径，收端即 dst 的真实持有者）；
+//!   NotHere/丢弃不计；跨服的 origin 服务器**不**计 dst（它只计 src tx）；
+//! - **服务器自身**（`server_self_device_id(me)` 合成键）：dst = 本机 VIP 注内核
+//!   成功 ⇒ rx；内核回程 `route_outbound` ⇒ tx（服务器自身条目只在自身计——
+//!   其他服务器经 gossip 视图读）。
 
 use std::collections::HashMap;
 use std::io;
@@ -23,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
-use crate::lease::{LeaseTable, LocateFanout};
+use crate::lease::{server_self_device_id, LeaseTable, LocateFanout};
 use crate::proto::NodeId;
 use crate::sm::SmCore;
 
@@ -225,6 +237,9 @@ impl ForwardPlane {
     /// 设备不在本机时尽力语义，源为本机 ⇒ 无处送 ICMP，纯丢）。
     pub async fn route_outbound(&self, pkt: &[u8]) {
         self.stats.outbound_kernel.fetch_add(1, Ordering::Relaxed);
+        // M7 计数点：服务器自身 tx（内核回程进 mesh——本机单点计）。
+        self.leases
+            .note_tx(&server_self_device_id(self.me), pkt.len() as u64);
         let Some(dst_vip) = ipv4_dst(pkt) else {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -274,6 +289,9 @@ impl ForwardPlane {
             self.stats.src_violations.fetch_add(1, Ordering::Relaxed);
             return IngestResult::SrcViolation;
         }
+        // M7 计数点：src tx 在接入服务器（本机 = src 租约持有者）收进 mesh 时计一次
+        //（绑定校验通过；dst 侧不重复计 src——单点原则，见模块文档）。
+        self.leases.note_tx(device, pkt.len() as u64);
         // 1. 目标 VIP。
         let Some(dst_vip) = ipv4_dst(pkt) else {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
@@ -287,6 +305,9 @@ impl ForwardPlane {
                 if dst_vip == vip {
                     if kernel.deliver(pkt).is_ok() {
                         self.stats.delivered_kernel.fetch_add(1, Ordering::Relaxed);
+                        // M7 计数点：服务器自身 rx（本机 VIP 注内核成功——本机单点计）。
+                        self.leases
+                            .note_rx(&server_self_device_id(self.me), pkt.len() as u64);
                         return IngestResult::DeliveredLocal;
                     }
                     self.stats.dropped.fetch_add(1, Ordering::Relaxed);
@@ -320,6 +341,8 @@ impl ForwardPlane {
         {
             if sink.deliver(pkt).is_ok() {
                 self.stats.delivered_local.fetch_add(1, Ordering::Relaxed);
+                // M7 计数点：dst rx（投递成功的服务器计——本机即 dst 持有者）。
+                self.leases.note_rx(&dst_dev, pkt.len() as u64);
                 return IngestResult::DeliveredLocal;
             }
         }
@@ -455,7 +478,12 @@ impl ForwardPlane {
             .get(&env.dst_dev)
             .cloned();
         match sink {
-            Some(sink) if sink.deliver(&env.payload).is_ok() => ForwardOutcome::Delivered,
+            Some(sink) if sink.deliver(&env.payload).is_ok() => {
+                // M7 计数点：跨服 dst rx 由**收端**（= dst 的真实持有者）计——origin
+                // 只计过 src tx，不双计（单点原则，模块文档）。
+                self.leases.note_rx(&env.dst_dev, env.payload.len() as u64);
+                ForwardOutcome::Delivered
+            }
             _ => ForwardOutcome::NotHere,
         }
     }

@@ -195,7 +195,8 @@ impl SyncNodeBuilder {
             ic_serve_ic.serve_loop(target).await;
         });
 
-        // 反熵循环（5s 全表摘要 fan-out）+ 本地会话租约续期（TTL/3 重发布）。
+        // 反熵循环（5s 全表摘要 fan-out）+ 本地会话租约续期（TTL/3 重发布）+ EWMA
+        // 折叠（1s 窗——M7）。
         tokio::spawn(anti_entropy_loop(ic.clone(), lease.clone()));
         tokio::spawn(lease_refresh_loop(
             ic.clone(),
@@ -203,6 +204,7 @@ impl SyncNodeBuilder {
             forward.clone(),
             self.node_id,
         ));
+        tokio::spawn(ewma_tick_loop(lease.clone()));
 
         // 成员初始化（同配置多节点并发 initialize 安全——openraft 契约）。
         if !self.members.is_empty() {
@@ -248,6 +250,8 @@ impl SyncNodeBuilder {
 
 /// 本地会话租约续期：每 [`LEASE_REFRESH`]（TTL/3）把仍在本机在线的设备重新
 /// publish + 广播（publish 建连时只发一次——无此循环则 30s 后租约全网蒸发）。
+/// M7：同循环**自发布服务器自身租约**（合成设备键——名册 Server 条目的 ewma/在线
+/// 状态经既有 gossip 通路全网可见）。
 async fn lease_refresh_loop(
     ic: Arc<Interconnect>,
     lease: Arc<LeaseTable>,
@@ -258,22 +262,52 @@ async fn lease_refresh_loop(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        for device in forward.local_devices() {
+        let mut devices = forward.local_devices();
+        devices.push(crate::lease::server_self_device_id(me));
+        for device in devices {
             let _ = lease.publish(&device);
-            broadcast_publish(&ic, me, device);
+            broadcast_publish(&ic, &lease, me, device);
         }
     }
 }
 
-/// 单条租约事件广播（publish/续期共用）。
-fn broadcast_publish(ic: &Arc<Interconnect>, me: NodeId, device: [u8; 32]) {
+/// M7：EWMA 折叠循环（1s 窗，§7-M7.3）——持有者侧把 per-device 字节累加器折进行内
+/// ewma（下一个续期/反熵携带出去）。
+async fn ewma_tick_loop(lease: Arc<LeaseTable>) {
+    let mut tick = tokio::time::interval(crate::lease::EWMA_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        lease.tick_ewma(now_ms());
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 单条租约事件广播（publish/续期共用）。M7：消息携带行内 ewma/last_seen（持有者
+/// 权威值）；term 取刚 publish 落表的那条（消除旧实现「广播 term 与落表 term 各取
+/// 一次时钟」的毫秒级错位）。
+fn broadcast_publish(
+    ic: &Arc<Interconnect>,
+    lease: &Arc<LeaseTable>,
+    me: NodeId,
+    device: [u8; 32],
+) {
+    let Some(l) = lease.observe(&device) else {
+        return;
+    };
     let msg = crate::lease::GossipMsg::Publish {
         device,
         holder: me,
-        term_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
+        term_ms: l.term_ms,
+        tx_ewma: l.tx_ewma,
+        rx_ewma: l.rx_ewma,
+        last_seen_unix: l.last_seen_unix,
     };
     for peer in ic.node_ids() {
         if peer != me {
@@ -579,7 +613,7 @@ impl SyncNode {
     /// 发布本机设备租约（gossip 事件广播 ≤1s + 反熵兜底 + TTL/3 续期循环）。
     pub async fn publish_lease(&self, device: &[u8; 32]) -> Option<NodeId> {
         let prev = self.inner.lease.publish(device);
-        broadcast_publish(&self.inner.ic, self.inner.id, *device);
+        broadcast_publish(&self.inner.ic, &self.inner.lease, self.inner.id, *device);
         prev
     }
 
@@ -834,6 +868,23 @@ impl SyncNode {
     /// （评审项 13：原 `sm().oprf_b64()` 的白名单形态。）
     pub fn oprf_b64(&self) -> Option<String> {
         self.inner.sm.oprf_b64()
+    }
+
+    /// M7（§7-M7.4）：注册表快照——**本地已 apply 视图**（两级读缓存档即可，不强制
+    /// 线性一致读：名册是展示面，允许 follower 视图的秒级陈旧）。评审项 13 白名单
+    /// 方法（外部不经裸 SM 访问器取全表）。
+    pub fn devices_snapshot(&self) -> Vec<([u8; 32], crate::proto::DeviceRow)> {
+        self.inner
+            .sm
+            .with_data(|d| d.devices.iter().map(|(k, v)| (*k, v.clone())).collect())
+    }
+
+    /// M7（§7-M7.4）：server_keys 快照（本地已 apply 视图——名册 Server 条目的
+    /// vip/节点号数据源）。
+    pub fn server_keys_snapshot(&self) -> Vec<(NodeId, crate::proto::ServerKeyEntry)> {
+        self.inner
+            .sm
+            .with_data(|d| d.server_keys.iter().map(|(k, v)| (*k, v.clone())).collect())
     }
 
     /// 本机已 apply 视图内某服务器的 secrets-rewrap 封装副本（OPRF 封装面：

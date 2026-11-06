@@ -80,6 +80,7 @@ async fn two_devices(c: &TestCluster, writer: usize) -> ([u8; 32], [u8; 32]) {
             owner: "a".into(),
             x25519: [1; 32],
             ed25519: a_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -91,6 +92,7 @@ async fn two_devices(c: &TestCluster, writer: usize) -> ([u8; 32], [u8; 32]) {
             owner: "b".into(),
             x25519: [2; 32],
             ed25519: b_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -120,6 +122,7 @@ async fn src_vip_binding_violation_dropped_and_counted() {
             owner: "a".into(),
             x25519: [1; 32],
             ed25519: a_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -133,6 +136,7 @@ async fn src_vip_binding_violation_dropped_and_counted() {
             owner: "b".into(),
             x25519: [2; 32],
             ed25519: b_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -244,6 +248,7 @@ async fn forward_local_delivery_and_redirect_with_hop_guard() {
             owner: "a".into(),
             x25519: [1; 32],
             ed25519: a_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -257,6 +262,7 @@ async fn forward_local_delivery_and_redirect_with_hop_guard() {
             owner: "c".into(),
             x25519: [3; 32],
             ed25519: c_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -302,6 +308,9 @@ async fn forward_local_delivery_and_redirect_with_hop_guard() {
             device: id_c,
             holder: 2,
             term_ms: stale_term + 200,
+            tx_ewma: 0,
+            rx_ewma: 0,
+            last_seen_unix: 0,
         });
     let r = c.nodes[0].ingest_packet(&id_a, &pkt).await;
     assert!(
@@ -359,6 +368,7 @@ async fn unresolved_destination_drops_with_best_effort_icmp() {
             owner: "a".into(),
             x25519: [1; 32],
             ed25519: a_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -397,6 +407,7 @@ async fn unresolved_destination_drops_with_best_effort_icmp() {
             owner: "d".into(),
             x25519: [4; 32],
             ed25519: d_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -412,6 +423,9 @@ async fn unresolved_destination_drops_with_best_effort_icmp() {
             device: id_d,
             holder: 2,
             term_ms: now_ms() + 100, // 较新 term 使其胜出本地空表
+            tx_ewma: 0,
+            rx_ewma: 0,
+            last_seen_unix: 0,
         });
     let pkt2 = ip4(row_a.vip, row_d.vip, b"stale-lease");
     let r2 = c.nodes[0].ingest_packet(&id_a, &pkt2).await;
@@ -444,6 +458,7 @@ async fn lease_domain_semantics_and_locate_fanout() {
             owner: "e".into(),
             x25519: [5; 32],
             ed25519: d_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -526,4 +541,69 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// ============================================================================
+// M7（§7-M7.3）：per-device 字节计数点——「投递成功点计数」单点原则
+// ============================================================================
+
+/// 计数点断言：同服路径 src tx + dst rx 各由同机计一次；跨服路径 origin 只计
+/// src tx，dst rx 由**收端**计（origin 对 dst 的 rx 恒 0——不双计）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn traffic_counting_single_point_local_and_cross_server() {
+    let c = TestCluster::new(&NODES).await;
+    bootstrap(&c, 0).await;
+    let (leader_idx, _) = c.leader().await;
+    let writer = (leader_idx + 1) % 3;
+
+    let (id_a, id_c) = two_devices(&c, writer).await;
+    let n0 = &c.nodes[0];
+    let n1 = &c.nodes[1];
+    wait_local_row(n0, &id_a, "dev-a row").await;
+    wait_local_row(n0, &id_c, "dev-c row").await;
+    wait_local_row(n1, &id_c, "dev-c row @n1").await;
+    let vip_a = n0.forward().vip_of(&id_a).expect("vip a");
+    let vip_c = n0.forward().vip_of(&id_c).expect("vip c");
+
+    let sink_c_n1 = Arc::new(RecvSink::default());
+    n1.attach_session(id_c, sink_c_n1.clone());
+    n1.publish_lease(&id_c).await;
+    // A 接在 n0（真实流程由 serve_conn 发布——测试直发）。
+    n0.publish_lease(&id_a).await;
+
+    // —— 跨服：A 接在 n0（会话/租约持有），C 接在 n1 ——
+    let pkt = ip4(vip_a.octets(), vip_c.octets(), &[7u8; 100]);
+    n0.ingest_packet(&id_a, &pkt).await; // src tx @n0（接入点）+ FRWD → n1 计 dst rx
+    assert!(
+        matches!(
+            n0.ingest_packet(&id_a, &pkt).await,
+            IngestResult::Forwarded(_)
+        ),
+        "跨服转发通路在位（前置：C 的租约已扩散到 n0）"
+    );
+    // 等投递 + ewma 折叠循环（1s 窗）转过折叠轮（首 tick 定基准、次 tick 折出）。
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    let a_n0 = n0.lease().peer_stats(&id_a).expect("A 行在 n0");
+    assert!(a_n0.tx_ewma > 0, "src tx 由接入服务器计：{}", a_n0.tx_ewma);
+    let c_n0 = n0.lease().peer_stats(&id_c).expect("C 行在 n0（远端视图）");
+    assert_eq!(
+        c_n0.rx_ewma, 0,
+        "origin 不计 dst rx（收端单点计——n0 只有持有者发布的值，此处为 0 因 n1 尚未折出）"
+    );
+
+    // —— 同服：把 C 也接到 n0（本地投递路径）——
+    let sink_c_n0 = Arc::new(RecvSink::default());
+    n0.attach_session(id_c, sink_c_n0.clone());
+    n0.publish_lease(&id_c).await;
+    // 等 n0 的租约新者胜扩散（自发布覆盖 n1 视图不影响本断言）。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let pkt2 = ip4(vip_a.octets(), vip_c.octets(), &[9u8; 80]);
+    assert!(matches!(
+        n0.ingest_packet(&id_a, &pkt2).await,
+        IngestResult::DeliveredLocal
+    ));
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    let c_n0_after = n0.lease().peer_stats(&id_c).expect("C 行");
+    // 同服投递 ⇒ dst rx 由本机（= 持有者）计。注：A 的行现在由 n0 持有（publish 后）。
+    assert!(c_n0_after.rx_ewma > 0, "dst rx 由投递成功的服务器计");
 }
