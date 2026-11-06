@@ -58,11 +58,13 @@ pub const MAX_CTRL_MSG: usize = 256 * 1024;
 // 线上消息（postcard）
 // ============================================================================
 
-/// 设备静态公钥集（key-bind/redeem 携带）。
+/// 设备静态公钥集 + 入网上报主机名（key-bind/redeem 携带；M7——hostname 空串 ⇒
+/// 服务端落 "(unknown)"，客户端上报为后续客户端阶段）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePubs {
     pub x25519: [u8; 32],
     pub ed25519: [u8; 32],
+    pub hostname: String,
 }
 
 /// SR-SIG1 授权头（`SR-SIG1 user:ts:nonce:sig_b64url`，§1.3.2 逐字节同格式）。
@@ -139,6 +141,11 @@ pub enum CtrlRequest {
     DirPull {
         since_version: u64,
     },
+    /// M7（§7-M7.4）：成员名册拉取（登录票据保护——**票据校验先于名册数据装配**，
+    /// 契约序有测试断言）。
+    PeerListPull {
+        ticket: Option<TicketWire>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,10 +187,35 @@ pub enum CtrlResponse {
         dir_version: u64,
         bytes: Vec<u8>,
     },
+    /// M7（§7-M7.4）：成员名册（按 VIP 升序；契约逐字固化于 docs/design.md §7-M7.4）。
+    PeerList {
+        peers: Vec<PeerInfo>,
+    },
     Err {
         code: CtrlError,
         msg: String,
     },
+}
+
+/// 名册条目类型（设备 / 服务器自身——服务器也是 peer，§2.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerKind {
+    Device,
+    Server,
+}
+
+/// 名册条目（§7-M7.4 逐字契约）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub vip: [u8; 4],
+    pub hostname: String,
+    pub owner: String,
+    pub kind: PeerKind,
+    pub online: bool,
+    pub last_seen_unix: u64,
+    /// 设备视角 EWMA（bytes/s）：tx = 设备发出、rx = 设备收到。
+    pub tx_bps: u64,
+    pub rx_bps: u64,
 }
 
 /// 注册表行的线上形态。
@@ -617,7 +649,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                 return err(CtrlError::BindSigBad);
             }
             match net
-                .register_device(&user, device.x25519, device.ed25519)
+                .register_device(&user, device.x25519, device.ed25519, &device.hostname)
                 .await
             {
                 Ok(row) => {
@@ -635,6 +667,28 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                     CtrlResponse::KeyBound {
                         device_id: DeviceId::from_ed25519(&vk).0,
                         vip: row.vip,
+                    }
+                }
+                // M7 re-register：同设备（同公钥集）再次 key-bind ⇒ 更新 hostname，
+                // VIP 不变（窗口内重连同设备保持同 IP，§7-M7）。bind_token 已消费、
+                // 设备签名已验——与首注册同授权强度。
+                Err(NetError::InvalidState(m)) if m.contains("already registered") => {
+                    let dev_id = DeviceId::from_ed25519(&vk);
+                    match net.set_hostname(&dev_id, &device.hostname).await {
+                        Ok(row) => {
+                            if let Err(e) = net.add_user_sig_key(&user, sr_sig_pub).await {
+                                eprintln!(
+                                    "flock-server: key-bind(re): SR-SIG1 公钥登记失败\
+                                     （user={user}）: {e}"
+                                );
+                                return err(CtrlError::Internal);
+                            }
+                            CtrlResponse::KeyBound {
+                                device_id: dev_id.0,
+                                vip: row.vip,
+                            }
+                        }
+                        Err(e) => state_err(e),
                     }
                 }
                 Err(e) => state_err(e),
@@ -714,6 +768,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                             username: &username,
                             device_x25519: device.x25519,
                             device_ed25519: device.ed25519,
+                            hostname: &device.hostname,
                             expected_root_pub: *core.identity.root_pub.as_bytes(),
                             expected_cluster_id: core.identity.cluster_id.0,
                             now_unix,
@@ -800,6 +855,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                                 crate::netstate::DeviceStatus::Active => 1,
                                 crate::netstate::DeviceStatus::Disabled => 2,
                                 crate::netstate::DeviceStatus::Revoked => 3,
+                                crate::netstate::DeviceStatus::Expired => 4,
                             },
                         })
                         .collect();
@@ -822,7 +878,143 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                 bytes: dir.to_bytes(),
             }
         }
+
+        // —— M7：成员名册（票据保护；票据校验先于数据装配，§7-M7.4）——
+        CtrlRequest::PeerListPull { ticket } => {
+            let Some(ticket) = ticket else {
+                return err(CtrlError::TicketMissing);
+            };
+            // 契约序：票据（签名+TTL+epoch+设备态）通过之前**不触碰**名册装配——
+            // 坏票据 ⇒ TicketBad 且装配计数不动（tests 断言该顺序）。
+            if let Err(r) = core
+                .guard
+                .ticket_principal(net, &ctx.device, &ticket, now_unix)
+                .await
+            {
+                eprintln!("flock-server: peer-list ticket rejected: {r}");
+                return err(CtrlError::TicketBad);
+            }
+            CtrlResponse::PeerList {
+                peers: assemble_roster(core).await,
+            }
+        }
     }
+}
+
+// ============================================================================
+// M7：名册装配（§7-M7.4——注册表快照 ⋈ 本地租约视图；VIP 升序）
+// ============================================================================
+
+/// 名册装配累计（诊断/测试面——「票据先行」顺序断言的探针：坏票据 ⇒ 计数不动）。
+pub fn roster_assemblies() -> u64 {
+    ROSTER_ASSEMBLIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static ROSTER_ASSEMBLIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 装配名册：注册表快照（**本地已 apply 视图**——两级读缓存档即可，允许 follower
+/// 视图秒级陈旧）⋈ 本地租约视图（在线判定 + last_seen + EWMA）+ Server 条目。
+///
+/// - 设备条目：仅 `status == Active` 行（Disabled/Revoked/Expired 排除——名册 =
+///   现任成员；审计走 DeviceList）；
+/// - Server 条目：多主 = Raft server_keys 本地视图（vip）+ 根签目录 endpoint
+///   （hostname）+ 各服务器自发布租约（在线/流量）；单服 = 本机一条
+///   （vip = cfg.vip，hostname = advertise_endpoint，流量 = 本机 TrafficMeter）；
+/// - 输出按 VIP 升序。
+pub async fn assemble_roster(core: &ServerCore) -> Vec<PeerInfo> {
+    ROSTER_ASSEMBLIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut out: Vec<PeerInfo> = Vec::new();
+    match &core.net {
+        NetBackend::Single(store) => {
+            for (id, row) in store.devices_all() {
+                if row.status != crate::netstate::DeviceStatus::Active {
+                    continue;
+                }
+                let (tx, rx, last_seen) = core.traffic.stats(&row.vip).unwrap_or((0, 0, 0));
+                out.push(PeerInfo {
+                    vip: row.vip,
+                    hostname: row.hostname,
+                    owner: row.owner,
+                    kind: PeerKind::Device,
+                    online: core.sessions.online(&id.0) > 0,
+                    last_seen_unix: last_seen,
+                    tx_bps: tx,
+                    rx_bps: rx,
+                });
+            }
+            // 服务器自身（单服形态唯一 Server 条目）。
+            let (stx, srx, sls) = core
+                .traffic
+                .stats(crate::dataplane::SERVER_TRAFFIC_KEY)
+                .unwrap_or((0, 0, 0));
+            out.push(PeerInfo {
+                vip: core.cfg.vip.octets(),
+                hostname: core.cfg.advertise_endpoint.clone(),
+                owner: flock_sync::node::node_id_of(&core.identity.server_id).to_string(),
+                kind: PeerKind::Server,
+                online: true,
+                last_seen_unix: sls,
+                tx_bps: stx,
+                rx_bps: srx,
+            });
+        }
+        #[cfg(feature = "multi-primary")]
+        NetBackend::Sync(s) => {
+            let node = &s.node;
+            let leases = node.lease();
+            for (dev, row) in node.devices_snapshot() {
+                if row.status != crate::netstate::DeviceStatus::Active {
+                    continue;
+                }
+                let st = leases.peer_stats(&dev);
+                out.push(PeerInfo {
+                    vip: row.vip,
+                    hostname: row.hostname,
+                    owner: row.owner,
+                    kind: PeerKind::Device,
+                    online: st.is_some_and(|x| x.online),
+                    last_seen_unix: st.map_or(0, |x| x.last_seen_unix),
+                    tx_bps: st.map_or(0, |x| x.tx_ewma),
+                    rx_bps: st.map_or(0, |x| x.rx_ewma),
+                });
+            }
+            // Server 条目：server_keys（根签登记的 mesh VIP）+ 目录 endpoint（hostname）
+            // + 自发布租约（在线/流量经既有 gossip 同步）。
+            let dir_hosts: std::collections::BTreeMap<u64, String> = node
+                .directory()
+                .current()
+                .map(|d| {
+                    d.servers
+                        .iter()
+                        .map(|e| {
+                            (
+                                flock_sync::node::node_id_of(&e.server_id),
+                                e.relay_endpoint.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (node_id, entry) in node.server_keys_snapshot() {
+                let st = leases.peer_stats(&flock_sync::lease::server_self_device_id(node_id));
+                out.push(PeerInfo {
+                    vip: entry.vip,
+                    hostname: dir_hosts
+                        .get(&node_id)
+                        .cloned()
+                        .unwrap_or_else(|| flock_sync::HOSTNAME_UNKNOWN.to_string()),
+                    owner: node_id.to_string(),
+                    kind: PeerKind::Server,
+                    online: st.is_some_and(|x| x.online),
+                    last_seen_unix: st.map_or(0, |x| x.last_seen_unix),
+                    tx_bps: st.map_or(0, |x| x.tx_ewma),
+                    rx_bps: st.map_or(0, |x| x.rx_ewma),
+                });
+            }
+        }
+    }
+    out.sort_by_key(|p| p.vip);
+    out
 }
 
 async fn owner_of_device(net: &NetBackend, device: &DeviceId) -> Option<String> {
@@ -844,7 +1036,8 @@ pub fn keybind_canonical(
     device: &DevicePubs,
     sr_sig_pub: &[u8; 32],
 ) -> Vec<u8> {
-    let mut v = Vec::with_capacity(KEYBIND_LABEL.len() + 16 + 4 + user.len() + 116);
+    let mut v =
+        Vec::with_capacity(KEYBIND_LABEL.len() + 16 + 8 + user.len() + device.hostname.len() + 116);
     v.extend_from_slice(KEYBIND_LABEL);
     v.extend_from_slice(cluster_id);
     v.extend_from_slice(&(user.len() as u32).to_le_bytes());
@@ -852,6 +1045,9 @@ pub fn keybind_canonical(
     v.extend_from_slice(bind_token);
     v.extend_from_slice(&device.x25519);
     v.extend_from_slice(&device.ed25519);
+    // M7：hostname 进设备签名覆盖面（长度前缀定界——与 owner 同纪律，杜绝拼接歧义）。
+    v.extend_from_slice(&(device.hostname.len() as u32).to_le_bytes());
+    v.extend_from_slice(device.hostname.as_bytes());
     v.extend_from_slice(sr_sig_pub);
     v
 }
@@ -945,7 +1141,7 @@ mod tests {
         let store = std::sync::Arc::new(StateStore::open(&dir.path().join("n.redb")).unwrap());
         let vk = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
         store
-            .register_device("alice", [1; 32], *vk.as_bytes())
+            .register_device("alice", [1; 32], *vk.as_bytes(), "")
             .unwrap();
         let device = DeviceId::from_ed25519(&vk);
 
@@ -1034,5 +1230,217 @@ mod tests {
             device_x25519: PublicKey::from([0u8; 32]),
             device_ed25519: vk,
         });
+    }
+
+    // ------------------------------------------------------------------
+    // M7（§7-M7.4）：名册装配三态 + Server 条目 + 票据先行顺序
+    // ------------------------------------------------------------------
+
+    fn m7_cfg(state_dir: std::path::PathBuf) -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            state_dir,
+            bind: "127.0.0.1:9443".parse().unwrap(),
+            mode: "direct".into(),
+            advertise_endpoint: "127.0.0.1:9443".into(),
+            extra_endpoints: vec![],
+            dir_version: 1,
+            ticket_ttl_secs: 60,
+            peer_retention_days: 30,
+            admin_bind: "127.0.0.1:9444".parse().unwrap(),
+            max_sessions: 1024,
+            tun_name: "tun0".into(),
+            vip: "100.64.0.1".parse().unwrap(),
+            frp: None,
+            sync: None,
+        }
+    }
+
+    fn store_of(core: &crate::server::ServerCore) -> std::sync::Arc<StateStore> {
+        match &core.net {
+            NetBackend::Single(s) => s.clone(),
+            _ => panic!("single"),
+        }
+    }
+
+    /// 三态（在线/离线/过期）+ Server 条目 + VIP 升序 + hostname 默认值链路。
+    #[tokio::test]
+    async fn roster_three_states_and_server_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _) = crate::server::ServerCore::open_or_init(m7_cfg(dir.path().to_path_buf()))
+            .expect("core");
+        let store = store_of(&core);
+
+        let vk_on = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let vk_off = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
+        let vk_exp = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let row_on = store
+            .register_device(
+                "alice",
+                [1; 32],
+                *vk_on.verifying_key().as_bytes(),
+                "online-pad",
+            )
+            .unwrap();
+        let row_off = store
+            .register_device("bob", [2; 32], *vk_off.verifying_key().as_bytes(), "")
+            .unwrap();
+        let row_exp = store
+            .register_device(
+                "carol",
+                [3; 32],
+                *vk_exp.verifying_key().as_bytes(),
+                "expired-pad",
+            )
+            .unwrap();
+
+        // 在线设备：会话登记 + 喂流量（EWMA 两折收敛出非零）。
+        let id_on = DeviceId::from_ed25519(&vk_on.verifying_key());
+        let _kill = core.sessions.register(id_on.0);
+        let mut ms = 1_000_000u64;
+        for _ in 0..3 {
+            core.traffic.note_tx(&row_on.vip, 8192);
+            core.traffic.note_rx(&row_on.vip, 4096);
+            ms += 1000;
+            core.traffic.tick(ms);
+        }
+        // 过期设备。
+        let id_exp = DeviceId::from_ed25519(&vk_exp.verifying_key());
+        store.expire(&id_exp, 1_700_000_000).unwrap();
+
+        let peers = assemble_roster(&core).await;
+        // 三条：两台 Active 设备 + 本服务器；Expired 排除。
+        assert_eq!(peers.len(), 3, "{peers:?}");
+        // VIP 升序（服务器 .1 < 设备 .2/.3）。
+        let vips: Vec<[u8; 4]> = peers.iter().map(|p| p.vip).collect();
+        let mut sorted = vips.clone();
+        sorted.sort();
+        assert_eq!(vips, sorted, "VIP 升序");
+
+        let srv = peers
+            .iter()
+            .find(|p| p.kind == PeerKind::Server)
+            .expect("Server 条目");
+        assert_eq!(srv.vip, [100, 64, 0, 1]);
+        assert_eq!(
+            srv.hostname, "127.0.0.1:9443",
+            "单服 Server hostname = advertise"
+        );
+        assert!(!srv.owner.is_empty(), "owner = server_id 承载（node 号）");
+        assert!(srv.online, "服务器自身恒在线（本机视角）");
+
+        let p_on = peers.iter().find(|p| p.vip == row_on.vip).unwrap();
+        assert_eq!(p_on.hostname, "online-pad");
+        assert_eq!(p_on.owner, "alice");
+        assert!(p_on.online, "会话在册 ⇒ 在线");
+        assert!(
+            p_on.tx_bps > 0 && p_on.rx_bps > 0,
+            "EWMA 非零（tx={} rx={}）",
+            p_on.tx_bps,
+            p_on.rx_bps
+        );
+        assert!(p_on.last_seen_unix > 0);
+
+        let p_off = peers.iter().find(|p| p.vip == row_off.vip).unwrap();
+        assert!(!p_off.online, "无会话 ⇒ 离线");
+        assert_eq!(p_off.tx_bps, 0, "从未计到流量");
+        assert_eq!(
+            p_off.hostname,
+            flock_sync::HOSTNAME_UNKNOWN,
+            "空 hostname 默认值"
+        );
+
+        assert!(
+            peers.iter().all(|p| p.vip != row_exp.vip),
+            "Expired 设备不进名册"
+        );
+    }
+
+    /// 票据先行顺序：无票据 ⇒ TicketMissing；坏票据 ⇒ TicketBad 且**装配计数不动**
+    ///（坏票据 + 有效名册数据 ⇒ 拒——数据装配未发生）；好票据 ⇒ PeerList + 计数 +1。
+    #[tokio::test]
+    async fn peer_list_pull_ticket_checked_before_assembly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _) = crate::server::ServerCore::open_or_init(m7_cfg(dir.path().to_path_buf()))
+            .expect("core");
+        let store = store_of(&core);
+        let vk = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        store
+            .register_device("dave", [7; 32], *vk.verifying_key().as_bytes(), "")
+            .unwrap();
+        let device = DeviceId::from_ed25519(&vk.verifying_key());
+        let now = flock_protocol::trust::now_unix();
+        let good = core
+            .guard
+            .authority
+            .issue("dave", device, core.net.epoch().await, now, 60)
+            .expect("ticket");
+        let mut ctx = ConnCtx {
+            device,
+            pending_login: None,
+        };
+
+        // ① 无票据 ⇒ TicketMissing。
+        let r = dispatch(&core, &mut ctx, CtrlRequest::PeerListPull { ticket: None }).await;
+        assert!(
+            matches!(
+                r,
+                CtrlResponse::Err {
+                    code: CtrlError::TicketMissing,
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
+
+        // ② 坏票据（篡改 exp ⇒ BadSignature）⇒ TicketBad 且装配计数不动（顺序证明）。
+        let mut bad = match &good {
+            TicketWire::Local(s) => {
+                let mut c = s.clone();
+                c.exp += 100;
+                TicketWire::Local(c)
+            }
+            TicketWire::Sync(_) => panic!("single authority"),
+        };
+        let before = roster_assemblies();
+        let r = dispatch(
+            &core,
+            &mut ctx,
+            CtrlRequest::PeerListPull {
+                ticket: Some(bad.clone()),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                r,
+                CtrlResponse::Err {
+                    code: CtrlError::TicketBad,
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
+        assert_eq!(
+            roster_assemblies(),
+            before,
+            "坏票据 ⇒ 名册装配未发生（票据先行）"
+        );
+
+        // ③ 好票据 ⇒ PeerList（含 Server 条目）+ 计数 +1。
+        bad = good.clone();
+        let r = dispatch(
+            &core,
+            &mut ctx,
+            CtrlRequest::PeerListPull { ticket: Some(bad) },
+        )
+        .await;
+        match r {
+            CtrlResponse::PeerList { peers } => {
+                assert!(!peers.is_empty());
+                assert!(peers.iter().any(|p| p.kind == PeerKind::Server));
+            }
+            other => panic!("peer list: {other:?}"),
+        }
+        assert_eq!(roster_assemblies(), before + 1, "好票据才装配");
     }
 }

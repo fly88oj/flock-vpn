@@ -162,10 +162,14 @@ async fn submit_wrapped_oprf(
 ) {
     let entries: Vec<flock_sync::proto::ServerKeyEntry> = idents
         .iter()
-        .map(|i| flock_sync::proto::ServerKeyEntry {
-            server_id: flock_sync::node::node_id_of(&i.server_id),
-            identity_pub: *i.identity.verifying_key().as_bytes(),
-            hybrid_pub: i.static_hybrid.public().to_bytes().to_vec(),
+        .map(|i| {
+            let node_id = flock_sync::node::node_id_of(&i.server_id);
+            flock_sync::proto::ServerKeyEntry {
+                server_id: node_id,
+                identity_pub: *i.identity.verifying_key().as_bytes(),
+                hybrid_pub: i.static_hybrid.public().to_bytes().to_vec(),
+                vip: flock_sync::proto::server_vip_of(node_id).expect("node 1..=10"),
+            }
         })
         .collect();
     let resp = leader
@@ -247,6 +251,7 @@ fn sync_server_cfg(
         extra_endpoints,
         dir_version: 1,
         ticket_ttl_secs: 60,
+        peer_retention_days: 30,
         admin_bind: "127.0.0.1:0".parse().unwrap(),
         max_sessions: 1024,
         tun_name: "tun0".into(),
@@ -385,6 +390,7 @@ mod cli {
             let device = flock_server::control::DevicePubs {
                 x25519: dev.x25519_public().to_bytes(),
                 ed25519: *dev.ed25519_public().as_bytes(),
+                hostname: String::new(),
             };
             let sr_pub = *sr_sig::UserKey::from_pub_string(&sr.pub_string())
                 .unwrap()
@@ -510,6 +516,7 @@ async fn three_node_cluster_forward_and_revocation() {
             username: "mp-a",
             device_x25519: dev_a.x25519_public().to_bytes(),
             device_ed25519: *dev_a.ed25519_public().as_bytes(),
+            hostname: "",
             expected_root_pub: *c3.root.verifying_key().as_bytes(),
             expected_cluster_id: c3.cluster_id.0,
             now_unix: flock_protocol::trust::now_unix(),
@@ -526,6 +533,7 @@ async fn three_node_cluster_forward_and_revocation() {
             username: "mp-b",
             device_x25519: dev_b.x25519_public().to_bytes(),
             device_ed25519: *dev_b.ed25519_public().as_bytes(),
+            hostname: "",
             expected_root_pub: *c3.root.verifying_key().as_bytes(),
             expected_cluster_id: c3.cluster_id.0,
             now_unix: flock_protocol::trust::now_unix(),
@@ -560,6 +568,7 @@ async fn three_node_cluster_forward_and_revocation() {
             username: "mp-b",
             device_x25519: dev_b.x25519_public().to_bytes(),
             device_ed25519: *dev_b.ed25519_public().as_bytes(),
+            hostname: "",
             expected_root_pub: *c3.root.verifying_key().as_bytes(),
             expected_cluster_id: c3.cluster_id.0,
             now_unix: flock_protocol::trust::now_unix(),
@@ -787,7 +796,7 @@ async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
     let oprf_b64 = server_setup_new(&mut rand::rngs::OsRng);
     let leader = wait_leader(&c3.nodes).await;
     // 只封装节点 1/2（idents[0]/[1]——node 1/2；节点 3 无 wrap）。
-    submit_wrapped_oprf(&leader, &c3.root, &c3.idents[..2].to_vec(), &oprf_b64).await;
+    submit_wrapped_oprf(&leader, &c3.root, &c3.idents[..2], &oprf_b64).await;
 
     let tmp = tempfile::tempdir().expect("tmp");
     let state_dir = tmp.path().to_path_buf();
@@ -834,10 +843,14 @@ async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
     let entries: Vec<flock_sync::proto::ServerKeyEntry> = c3
         .idents
         .iter()
-        .map(|i| flock_sync::proto::ServerKeyEntry {
-            server_id: flock_sync::node::node_id_of(&i.server_id),
-            identity_pub: *i.identity.verifying_key().as_bytes(),
-            hybrid_pub: i.static_hybrid.public().to_bytes().to_vec(),
+        .map(|i| {
+            let node_id = flock_sync::node::node_id_of(&i.server_id);
+            flock_sync::proto::ServerKeyEntry {
+                server_id: node_id,
+                identity_pub: *i.identity.verifying_key().as_bytes(),
+                hybrid_pub: i.static_hybrid.public().to_bytes().to_vec(),
+                vip: flock_sync::proto::server_vip_of(node_id).expect("node 1..=10"),
+            }
         })
         .collect();
     let resp = leader
@@ -875,4 +888,183 @@ async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
     .expect("rewrap 补交后节点 3 可解封（OPAQUE 可用）");
     // 解封语义闭环：登录路径用的就是这个 OPRF（PwBegin/Login 的服务端 setup）。
     let _ = &core.oprf;
+}
+
+// ============================================================================
+// M7（§7-M7.6）：双客户端跨服时 roster 在任一服务器装配一致（含 ewma 非零）
+// ============================================================================
+
+/// 断言面：
+/// - **结构字段严格相等**（vip/hostname/owner/kind/online）——注册表快照与租约域
+///   视图在两台服务器上一致；
+/// - **ewma/last_seen 容差比较**（非零 + 双侧差 < 15s）——两服务器的本地视图来自
+///   不同时刻的反熵快照（5s 周期），逐字节相等不可实现也不必要（如实声明）；
+/// - 假流量泵（A→B 持续 ~2s）：A 的 tx 与 B 的 rx 在**两台服务器**的名册里都非零
+///   （持有者折叠 + gossip 传播）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_consistent_across_servers_with_traffic_pump() {
+    let c3 = build_cluster().await;
+    let s1 = serve_on(&c3, 0, vec![]).await;
+    let s2 = serve_on(&c3, 1, vec![]).await;
+
+    // 开户（hostname 经 redeem 上报——字段链路实证）。
+    let inv_a = m7_invite(&c3, rand::random()).await;
+    let dev_a = DeviceStaticKeys::generate();
+    let out_a = s1
+        .core
+        .net
+        .redeem_invite(RedeemRequest {
+            invite_bytes: &inv_a.to_bytes(),
+            username: "roster-a",
+            device_x25519: dev_a.x25519_public().to_bytes(),
+            device_ed25519: *dev_a.ed25519_public().as_bytes(),
+            hostname: "roster-a-pad",
+            expected_root_pub: *c3.root.verifying_key().as_bytes(),
+            expected_cluster_id: c3.cluster_id.0,
+            now_unix: flock_protocol::trust::now_unix(),
+        })
+        .await
+        .expect("redeem A");
+    let inv_b = m7_invite(&c3, rand::random()).await;
+    let dev_b = DeviceStaticKeys::generate();
+    let out_b = s2
+        .core
+        .net
+        .redeem_invite(RedeemRequest {
+            invite_bytes: &inv_b.to_bytes(),
+            username: "roster-b",
+            device_x25519: dev_b.x25519_public().to_bytes(),
+            device_ed25519: *dev_b.ed25519_public().as_bytes(),
+            hostname: "roster-b-pad",
+            expected_root_pub: *c3.root.verifying_key().as_bytes(),
+            expected_cluster_id: c3.cluster_id.0,
+            now_unix: flock_protocol::trust::now_unix(),
+        })
+        .await
+        .expect("redeem B");
+
+    // 接入（A→server-1、B→server-2）+ 包通道。
+    let pin1 = pin_for(&c3, 0, &s1.endpoint);
+    let pin2 = pin_for(&c3, 1, &s2.endpoint);
+    let ta = connect(&dev_a, &pin1).await;
+    let tb = connect(&dev_b, &pin2).await;
+    let ca = cli::Ctrl::open(ta).await;
+    let cb = cli::Ctrl::open(tb).await;
+    let mut cha = ca
+        .tunnel
+        .open_packet_channel()
+        .await
+        .expect("A packet channel");
+    let mut chb = cb
+        .tunnel
+        .open_packet_channel()
+        .await
+        .expect("B packet channel");
+
+    // 通道物化（惰性 SYN：双向各先发一包）。
+    let warm_b = icmp_echo(out_b.vip, out_a.vip, 8, 0xb000, 0);
+    chb.send(&warm_b).await.expect("B warmup");
+    let warm_a = icmp_echo(out_a.vip, out_b.vip, 8, 0xa000, 0);
+    cha.send(&warm_a).await.expect("A warmup");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // 假流量泵：A→B 持续 ~2s（每 20ms 一包 1200B ⇒ ~60KB/s 量级——EWMA 非零充分）。
+    let pump = icmp_echo(out_a.vip, out_b.vip, 8, 0xa001, 1);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut sent = 0u64;
+    while Instant::now() < deadline {
+        if cha.send(&pump).await.is_err() {
+            break;
+        }
+        sent += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(sent > 10, "泵出 {sent} 包");
+
+    // 等反熵（5s）+ 折叠窗（1s）传播：ewma 经持有者折叠 → publish/反熵到对端。
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // 双侧装配。
+    let r1 = flock_server::control::assemble_roster(&s1.core).await;
+    let r2 = flock_server::control::assemble_roster(&s2.core).await;
+
+    // 结构字段严格相等。
+    let shape = |r: &[flock_server::control::PeerInfo]| {
+        r.iter()
+            .map(|p| (p.vip, p.hostname.clone(), p.owner.clone(), p.kind, p.online))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        shape(&r1),
+        shape(&r2),
+        "任一服务器装配一致（结构字段严格相等）"
+    );
+    // 3 Server + 2 Device。
+    assert_eq!(r1.len(), 5, "{r1:?}");
+    assert_eq!(
+        r1.iter()
+            .filter(|p| p.kind == flock_server::control::PeerKind::Server)
+            .count(),
+        3,
+        "三台服务器各自在册"
+    );
+    let devices: Vec<_> = r1
+        .iter()
+        .filter(|p| p.kind == flock_server::control::PeerKind::Device)
+        .collect();
+    assert!(devices.iter().all(|p| p.online), "双客户端在线");
+
+    // ewma 非零（双侧）：A 的 tx（接入侧计）、B 的 rx（收端计）。
+    for (roster, tag) in [(&r1, "s1"), (&r2, "s2")] {
+        let a = roster.iter().find(|p| p.vip == out_a.vip).expect("A 条目");
+        assert!(
+            a.tx_bps > 0,
+            "{tag}: A 的 tx ewma 非零（持有者折叠 + 传播）: {}",
+            a.tx_bps
+        );
+        let b = roster.iter().find(|p| p.vip == out_b.vip).expect("B 条目");
+        assert!(
+            b.rx_bps > 0,
+            "{tag}: B 的 rx ewma 非零（收端计数 + 传播）: {}",
+            b.rx_bps
+        );
+        assert!(a.last_seen_unix > 0 && b.last_seen_unix > 0);
+    }
+    // last_seen 容差（< 15s）：两视图来自不同反熵时刻。
+    let ls = |r: &[flock_server::control::PeerInfo], vip: [u8; 4]| {
+        r.iter().find(|p| p.vip == vip).unwrap().last_seen_unix
+    };
+    for vip in [out_a.vip, out_b.vip] {
+        assert!(
+            ls(&r1, vip).abs_diff(ls(&r2, vip)) < 15,
+            "last_seen 双侧差 < 15s（反熵快照时差容差）"
+        );
+    }
+    // hostname 经 redeem 上报进名册。
+    assert!(r1
+        .iter()
+        .any(|p| p.vip == out_a.vip && p.hostname == "roster-a-pad"));
+    assert!(r1
+        .iter()
+        .any(|p| p.vip == out_b.vip && p.hostname == "roster-b-pad"));
+}
+
+/// M7 roster 测试的邀请 fixture（登记 + 根签签发）。
+async fn m7_invite(c3: &Node3, id: [u8; 16]) -> InviteFile {
+    let expiry = flock_protocol::trust::now_unix() + 3600;
+    c3.nodes[0]
+        .write(SyncRequest::RecordInvite {
+            invite_id: id,
+            expiry_unix: expiry,
+        })
+        .await
+        .expect("record invite");
+    InviteFile::issue(
+        &c3.root,
+        c3.cluster_id,
+        c3.directory.dir_version,
+        c3.directory.servers.clone(),
+        expiry,
+        id,
+    )
 }

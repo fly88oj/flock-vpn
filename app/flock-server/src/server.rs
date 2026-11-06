@@ -66,7 +66,8 @@ pub struct LiveSessions {
 }
 
 impl LiveSessions {
-    fn register(&self, device: [u8; 32]) -> tokio::sync::watch::Receiver<bool> {
+    /// 登记（会话任务）；`pub(crate)`——M7 名册单测驱动「在线」态。
+    pub(crate) fn register(&self, device: [u8; 32]) -> tokio::sync::watch::Receiver<bool> {
         let (tx, rx) = tokio::sync::watch::channel(false);
         self.inner
             .lock()
@@ -204,6 +205,9 @@ pub struct ServerCore {
     pub guard: CtrlGuard,
     /// 本地会话表（Arc：SyncHooks 装配侧共享——apply 回调杀会话/租约冲突踢出）。
     pub sessions: Arc<LiveSessions>,
+    /// M7：单服形态流量计（per-VIP EWMA/last_seen——名册数据源；多主形态走租约表，
+    /// 此计仅服务单服 PeerRouter 计数）。1s tick 由 [`run`] 装配的任务驱动。
+    pub traffic: Arc<flock_sync::lease::TrafficMeter>,
     /// 多主同步节点（feature `multi-primary`；单服 = None）。
     #[cfg(feature = "multi-primary")]
     pub sync: Option<Arc<flock_sync::SyncNode>>,
@@ -345,6 +349,7 @@ impl ServerCore {
                 TicketIssuer::from_seed(ticket_seed),
             ))),
             sessions: Arc::new(LiveSessions::default()),
+            traffic: flock_sync::lease::TrafficMeter::new(),
             #[cfg(feature = "multi-primary")]
             sync: None,
             router: RwLock::new(None),
@@ -440,6 +445,7 @@ impl ServerCore {
             oprf,
             guard: CtrlGuard::new(crate::ticket::TicketAuthority::Sync(node.clone())),
             sessions,
+            traffic: flock_sync::lease::TrafficMeter::new(),
             sync: Some(node),
             router: RwLock::new(None),
         };
@@ -775,6 +781,14 @@ pub async fn run(
     if core.router().is_none() {
         core.set_router(PeerRouter::open(&core.cfg.tun_name, core.cfg.vip).await);
     }
+    // M7：路由器挂流量计（单服形态计数）+ 折叠循环 + 回收器（§7-M7.3/§7-M7.5）。
+    if let Some(router) = core.router() {
+        router.set_traffic_meter(core.traffic.clone());
+    }
+    tokio::spawn(traffic_meter_loop(core.traffic.clone()));
+    if core.cfg.peer_retention_days > 0 {
+        tokio::spawn(reaper_loop(core.clone()));
+    }
     // admin loopback 端点（CLI 子命令的进程内单写者入口）。
     let admin = crate::admin::serve(core.clone(), core.cfg.admin_bind)
         .await
@@ -810,6 +824,96 @@ pub async fn run(
 /// 签名便利：根密钥对任意字节签名（邀请/目录扩展用；测试亦可断言）。
 pub fn root_sign(root: &SigningKey, bytes: &[u8]) -> [u8; 64] {
     root.sign(bytes).to_bytes()
+}
+
+// ============================================================================
+// M7：回收器（§7-M7.5——离线超过保留期的设备经 Raft/本地写操作置 Expired + VIP 归还池）
+// ============================================================================
+
+/// 回收器周期（低频任务，§7-M7.5：60s）。
+pub const REAPER_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+/// 保留期换算（天 → 秒）。
+const SECS_PER_DAY: u64 = 86_400;
+
+/// 回收单趟（注入时钟可测）：把「Active 且 last_seen 距今 > 保留期」的设备逐个提交
+/// Expire。`retention_days = 0` ⇒ 永不过期（空趟）。多台服务器并发回收幂等（状态机
+/// Expire 重放放行）。从未在线的设备 `last_seen = 0` ⇒ 按纪元 0 起算（注册即起算的
+/// 确定性近似）。返回本趟提交 Expire 的设备。
+pub async fn reap_once(core: &ServerCore, retention_days: u64, now_unix: u64) -> Vec<DeviceId> {
+    if retention_days == 0 {
+        return Vec::new();
+    }
+    let retention_secs = retention_days.saturating_mul(SECS_PER_DAY);
+    let cutoff = now_unix.saturating_sub(retention_secs);
+    // 候选 = 本地已 apply 视图的 Active 行（名册同款快照——展示面一致性档位）。
+    let rows: Vec<(DeviceId, flock_sync::proto::DeviceRow)> = match &core.net {
+        NetBackend::Single(s) => s.devices_all(),
+        #[cfg(feature = "multi-primary")]
+        NetBackend::Sync(s) => s
+            .node
+            .devices_snapshot()
+            .into_iter()
+            .map(|(id, row)| (DeviceId(id), row))
+            .collect(),
+    };
+    let mut expired = Vec::new();
+    for (id, row) in rows {
+        if row.status != crate::netstate::DeviceStatus::Active {
+            continue;
+        }
+        // last_seen：多主 = 本地租约视图；单服 = TrafficMeter（无条目 ⇒ 0）。
+        let last_seen = match &core.net {
+            NetBackend::Single(_) => core.traffic.stats(&row.vip).map_or(0, |(_, _, ls)| ls),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => s
+                .node
+                .lease()
+                .peer_stats(&id.0)
+                .map_or(0, |st| st.last_seen_unix),
+        };
+        if last_seen <= cutoff {
+            match core.net.expire(&id, now_unix).await {
+                Ok(_) => {
+                    // 本地会话兜底（多主的 apply 钩子亦会杀；单服即时）。
+                    core.sessions.kill(&id.0);
+                    expired.push(id);
+                }
+                Err(e) => eprintln!("flock-server: reaper: expire {id} 失败: {e}"),
+            }
+        }
+    }
+    expired
+}
+
+/// 回收循环（run 装配；`peer_retention_days = 0` 时不装配）。
+async fn reaper_loop(core: Arc<ServerCore>) {
+    let mut tick = tokio::time::interval(REAPER_PERIOD);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let now = flock_protocol::trust::now_unix();
+        let expired = reap_once(&core, core.cfg.peer_retention_days, now).await;
+        if !expired.is_empty() {
+            eprintln!(
+                "flock-server: reaper: {} 台设备过期（VIP 已归还池）",
+                expired.len()
+            );
+        }
+    }
+}
+
+/// M7：单服流量计折叠循环（1s 窗——与 flock-sync LeaseTable 同数学，§7-M7.3）。
+async fn traffic_meter_loop(meter: Arc<flock_sync::lease::TrafficMeter>) {
+    let mut tick = tokio::time::interval(flock_sync::lease::EWMA_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        meter.tick(now_ms);
+    }
 }
 
 #[cfg(all(test, feature = "multi-primary"))]
@@ -856,5 +960,126 @@ mod tests {
         assert!(open_oprf_wrap(&recipient, &tampered).is_err(), "篡改拒");
         // server_setup_load 接受解封产物（真实 OPRF 语义闭环）。
         assert!(flock_protocol::pake::server_setup_load(&oprf_b64).is_ok());
+    }
+}
+
+// ============================================================================
+// M7 单元测试：回收器窗口逻辑（注入时钟，§7-M7.5）
+// ============================================================================
+
+#[cfg(test)]
+mod reaper_tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::netstate::DeviceStatus;
+    use flock_protocol::session::DeviceId;
+
+    fn m7_cfg(state_dir: std::path::PathBuf, retention: u64) -> ServerConfig {
+        ServerConfig {
+            state_dir,
+            bind: "127.0.0.1:9443".parse().unwrap(),
+            mode: "direct".into(),
+            advertise_endpoint: "127.0.0.1:9443".into(),
+            extra_endpoints: vec![],
+            dir_version: 1,
+            ticket_ttl_secs: 60,
+            peer_retention_days: retention,
+            admin_bind: "127.0.0.1:9444".parse().unwrap(),
+            max_sessions: 1024,
+            tun_name: "tun0".into(),
+            vip: "100.64.0.1".parse().unwrap(),
+            frp: None,
+            sync: None,
+        }
+    }
+
+    fn dev_id(seed: u8) -> DeviceId {
+        use sha2::Digest as _;
+        DeviceId(sha2::Sha256::digest(ed_of(seed)).into())
+    }
+
+    fn ed_of(seed: u8) -> [u8; 32] {
+        let vk = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        *vk.verifying_key().as_bytes()
+    }
+
+    /// 窗口逻辑：保留期内不动；越界（last_seen 距今 > 保留期）⇒ Expire 提交 + 行置
+    /// Expired + VIP 归还池（新注册拿到该 VIP）；retention=0 ⇒ 永不过期。
+    #[tokio::test]
+    async fn reaper_window_logic_with_injected_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _) =
+            ServerCore::open_or_init(m7_cfg(dir.path().to_path_buf(), 30)).expect("core");
+        let store = match &core.net {
+            crate::backend::NetBackend::Single(s) => s.clone(),
+            _ => panic!("single"),
+        };
+        // 设备 A（活跃——流量计近期 last_seen）、B（从未在线——last_seen=0）、
+        // C（吊销——不可 Expire）。
+        let row_a = store.register_device("u", [1; 32], ed_of(1), "a").unwrap();
+        let row_b = store.register_device("u", [2; 32], ed_of(2), "b").unwrap();
+        let _row_c = store.register_device("u", [3; 32], ed_of(3), "c").unwrap();
+        store.revoke(&dev_id(3)).unwrap();
+        // A 的 last_seen = 真实墙钟「当前」（流量计——note 即抬）。
+        core.traffic.note_tx(&row_a.vip, 100);
+        let now_real = flock_protocol::trust::now_unix();
+
+        // ① 29 天后（A 在保留期内）：A 不过期；**从未在线的 B（last_seen=0）按纪元 0
+        // 起算 ⇒ 已越界**（确定性语义，§7-M7.5）；吊销的 C 不动。
+        let now1 = now_real + 29 * 86_400;
+        let expired = reap_once(&core, 30, now1).await;
+        assert_eq!(expired, vec![dev_id(2)], "{expired:?}");
+        let b = store.device_row(&dev_id(2)).unwrap();
+        assert_eq!(b.status, DeviceStatus::Expired);
+        assert_eq!(b.expired_at, Some(now1), "注入时钟确定性落 expired_at");
+        assert_eq!(
+            store.device_row(&dev_id(1)).unwrap().status,
+            DeviceStatus::Active,
+            "A（29d < 30d 保留期）不过期"
+        );
+        assert_eq!(
+            store.device_row(&dev_id(3)).unwrap().status,
+            DeviceStatus::Revoked,
+            "C 保持 Revoked（不转 Expired）"
+        );
+
+        // ② 31 天后：A 仍在保留期内（31d < now 到 last_seen 的 30d？不——31d > 30d ⇒
+        // A 现在越界被回收；对照③的 retention=0 语义）。
+        let now2 = now_real + 31 * 86_400;
+        let expired = reap_once(&core, 30, now2).await;
+        assert_eq!(
+            expired,
+            vec![dev_id(1)],
+            "A 越界（31d > 30d）被回收: {expired:?}"
+        );
+        assert_eq!(
+            store.device_row(&dev_id(1)).unwrap().status,
+            DeviceStatus::Expired
+        );
+        // 幂等：同窗再跑一趟 ⇒ 空趟。
+        let expired = reap_once(&core, 30, now2).await;
+        assert!(expired.is_empty(), "幂等（已 Expired 不再提交）");
+        // VIP 归还池：新注册从池取最小（A 的 .2 先于 B 的 .3 入池序无关——键序最小）。
+        let row_d = store.register_device("u", [4; 32], ed_of(4), "d").unwrap();
+        assert_eq!(row_d.vip, row_a.vip, "池内最小 VIP 重派（A 的 .2）");
+        // 池内剩余（B 的 .3）派给下一台。
+        let row_e = store.register_device("u", [5; 32], ed_of(5), "e").unwrap();
+        assert_eq!(row_e.vip, row_b.vip, "池序继续（B 的 .3）");
+
+        // ③ retention = 0 ⇒ 永不过期（空趟）——A 从此不再被回收。
+        let (core0, _) =
+            ServerCore::open_or_init(m7_cfg(tempfile::tempdir().unwrap().path().to_path_buf(), 0))
+                .expect("core0");
+        let store0 = match &core0.net {
+            crate::backend::NetBackend::Single(s) => s.clone(),
+            _ => panic!("single"),
+        };
+        store0.register_device("u", [1; 32], ed_of(1), "a").unwrap();
+        let expired = reap_once(&core0, 0, u64::MAX / 2).await;
+        assert!(expired.is_empty(), "0 = 永不过期（兼容旧行为）");
+        assert_eq!(
+            store0.device_row(&dev_id(1)).unwrap().status,
+            DeviceStatus::Active
+        );
     }
 }

@@ -158,6 +158,7 @@ async fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
                     username: &username,
                     device_x25519: device.x25519,
                     device_ed25519: device.ed25519,
+                    hostname: &device.hostname,
                     expected_root_pub: *core.identity.root_pub.as_bytes(),
                     expected_cluster_id: core.identity.cluster_id.0,
                     now_unix: flock_protocol::trust::now_unix(),
@@ -173,7 +174,7 @@ async fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
         }
         AdminRequest::DeviceAdd { username, device } => {
             match net
-                .register_device(&username, device.x25519, device.ed25519)
+                .register_device(&username, device.x25519, device.ed25519, &device.hostname)
                 .await
             {
                 Ok(row) => AdminResponse::DeviceAdded {

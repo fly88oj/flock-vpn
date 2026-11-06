@@ -230,6 +230,7 @@ fn parse_args() -> Result<Cli, String> {
                 device: DevicePubs {
                     x25519: b32(&dx.ok_or("redeem 需要 --device-x")?)?,
                     ed25519: b32(&de.ok_or("redeem 需要 --device-ed")?)?,
+                    hostname: String::new(),
                 },
             }
         }
@@ -250,6 +251,7 @@ fn parse_args() -> Result<Cli, String> {
                 device: DevicePubs {
                     x25519: b32(&dx.ok_or("device-add 需要 --device-x")?)?,
                     ed25519: b32(&de.ok_or("device-add 需要 --device-ed")?)?,
+                    hostname: String::new(),
                 },
             }
         }
@@ -409,15 +411,23 @@ fn run_cli() -> Result<(), String> {
                     let oprf_b64 = flock_protocol::pake::server_setup_new(
                         &mut flock_protocol::rand::rngs::OsRng,
                     );
-                    let entries: Vec<flock_sync::proto::ServerKeyEntry> = dir
+                    let entries: Result<Vec<flock_sync::proto::ServerKeyEntry>, String> = dir
                         .servers
                         .iter()
-                        .map(|e| flock_sync::proto::ServerKeyEntry {
-                            server_id: flock_sync::node::node_id_of(&e.server_id),
-                            identity_pub: *e.identity_pub.as_bytes(),
-                            hybrid_pub: e.static_hybrid_pub.to_bytes().to_vec(),
+                        .map(|e| {
+                            let node_id = flock_sync::node::node_id_of(&e.server_id);
+                            Ok(flock_sync::proto::ServerKeyEntry {
+                                server_id: node_id,
+                                identity_pub: *e.identity_pub.as_bytes(),
+                                hybrid_pub: e.static_hybrid_pub.to_bytes().to_vec(),
+                                // M7：服务器 mesh VIP 确定性推导（§6.2 服务器段 .1–.10；
+                                // 名册 Server 条目数据源）。
+                                vip: flock_sync::proto::server_vip_of(node_id)
+                                    .ok_or("服务器 node 号超出 VIP 保留段（1..=10）")?,
+                            })
                         })
                         .collect();
+                    let entries = entries?;
                     let n_servers = entries.len();
                     let server_keys =
                         flock_sync::proto::SyncRequest::server_keys_signed(&root, entries);

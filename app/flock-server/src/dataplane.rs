@@ -42,6 +42,9 @@ use flock_client::tun::TunSpec;
 /// 服务器自身 VIP（§2.2「服务端自身也是 peer，VIP 100.64.0.1」；netstate 分配从 .2 起）。
 pub const SERVER_VIP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
 
+/// M7：单服形态流量计里「服务器自身」条目的键（设备条目以 VIP 4B 为键）。
+pub const SERVER_TRAFFIC_KEY: &[u8] = b"flock-server-self";
+
 // 数据通道**不设**空闲超时（评审项 8 分层修正——M5 e2e 回归根因）。
 //
 // 会话层 PING/PONG 走记录层（整条连接），不产生 yamux 流帧：一条健康但无业务流量
@@ -162,6 +165,12 @@ pub struct PeerRouter {
     sessions: SessionIndex,
     /// 内核注入通道（tun 写泵；无 tun ⇒ None = 控制流-only 降级）。
     kernel_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// M7：per-VIP 流量计（EWMA/last_seen——名册单服形态数据源；计数点同 §7-M7.3
+    /// 单点原则：入站（源校验通过）= 该设备 tx，出站下发 = 该设备 rx；dst = 服务器
+    /// VIP 的入站 = 服务器 rx，内核回程路由 = 服务器 tx）。
+    traffic: Mutex<Option<Arc<flock_sync::lease::TrafficMeter>>>,
+    /// 本机服务器 VIP（M7：入站 dst 判服务器 rx 用；测试装配缺省 None）。
+    server_vip: Option<Ipv4Addr>,
 }
 
 impl PeerRouter {
@@ -191,13 +200,17 @@ impl PeerRouter {
                         tun: Some(Arc::new(tun)),
                         sessions: SessionIndex::new(),
                         kernel_tx: Some(kernel_tx),
+                        traffic: Mutex::new(None),
+                        server_vip: Some(vip),
                     }
-                    .with_kernel_router_task(sess)
+                    .with_kernel_router_task(sess, vip)
                 }
                 Err(()) => Arc::new(PeerRouter {
                     tun: None,
                     sessions: SessionIndex::new(),
                     kernel_tx: None,
+                    traffic: Mutex::new(None),
+                    server_vip: Some(vip),
                 }),
             }
         }
@@ -231,21 +244,37 @@ impl PeerRouter {
         }
     }
 
+    /// M7：注入流量计（run() 装配期；serve_stream/内核路由任务据此计数）。
+    pub fn set_traffic_meter(&self, meter: Arc<flock_sync::lease::TrafficMeter>) {
+        *self.traffic.lock().expect("router traffic") = Some(meter);
+    }
+
+    fn traffic_of(&self) -> Option<Arc<flock_sync::lease::TrafficMeter>> {
+        self.traffic.lock().expect("router traffic").clone()
+    }
+
     /// 内核回程路由任务：tun 读泵产出 → 按目标 VIP 分发到会话出站通道
     /// （无对应会话 ⇒ 丢弃——M4 前不做 ICMP unreachable/跨服转发，§2.2 容错策略）。
+    /// M7：内核回程 = 服务器自身 tx（计数点，§7-M7.3）。
     #[cfg(target_os = "linux")]
     fn with_kernel_router_task(
         self: PeerRouter,
         mut sess: flock_client::tun::TunSession,
+        self_vip: Ipv4Addr,
     ) -> Arc<Self> {
         let arc = Arc::new(self);
         let router = arc.clone();
         tokio::spawn(async move {
             //（TunSession 整体移入：rx 供路由；tx 存续使写泵常驻——服务端数据面不拆。）
             while let Some(pkt) = sess.rx.recv().await {
-                let Some((_, dst)) = ipv4_src_dst(&pkt) else {
+                let Some((src, dst)) = ipv4_src_dst(&pkt) else {
                     continue;
                 };
+                if src == self_vip.octets() {
+                    if let Some(m) = router.traffic_of() {
+                        m.note_tx(SERVER_TRAFFIC_KEY, pkt.len() as u64);
+                    }
+                }
                 if let Some(tx) = router.sessions.get(&dst) {
                     let _ = tx.send(pkt).await;
                 }
@@ -260,6 +289,8 @@ impl PeerRouter {
             tun: None,
             sessions: SessionIndex::new(),
             kernel_tx: None,
+            traffic: Mutex::new(None),
+            server_vip: None,
         })
     }
 
@@ -270,6 +301,8 @@ impl PeerRouter {
             tun: None,
             sessions: SessionIndex::new(),
             kernel_tx: Some(kernel_tx),
+            traffic: Mutex::new(None),
+            server_vip: None,
         })
     }
 
@@ -309,7 +342,15 @@ impl PeerRouter {
             // 已缓冲完整帧：第 0 步源 VIP 校验（§2.2）→ 内核注入 / 失配丢+计数。
             while let Some(pkt) = frames.take_frame() {
                 match ipv4_src_dst(&pkt) {
-                    Some((src, _)) if src == vip => {
+                    Some((src, dst)) if src == vip => {
+                        // M7 计数点（§7-M7.3 单点原则）：入站收进 mesh = 该设备 tx；
+                        // dst = 服务器自身 VIP ⇒ 服务器 rx（本机单点计）。
+                        if let Some(m) = self.traffic_of() {
+                            m.note_tx(&vip, pkt.len() as u64);
+                            if Some(dst) == self.server_vip.map(|v| v.octets()) {
+                                m.note_rx(SERVER_TRAFFIC_KEY, pkt.len() as u64);
+                            }
+                        }
                         if kernel_tx.send(pkt).await.is_err() {
                             self.sessions.unregister(&vip, gen); // tun 写泵已拆
                             return;
@@ -346,6 +387,11 @@ impl PeerRouter {
             .await;
             match step {
                 Step::Outbound(Some(pkt)) => {
+                    // M7 计数点：出站下发成功前计数（投递面——写失败即通道拆，该包
+                    // 未送达；EWMA 语义按「计入即发送」足够精确，失败路径罕见）。
+                    if let Some(m) = self.traffic_of() {
+                        m.note_rx(&vip, pkt.len() as u64);
+                    }
                     if send_packet(&mut stream, &pkt).await.is_err() {
                         break; // 通道拆（客户端会话结束）
                     }

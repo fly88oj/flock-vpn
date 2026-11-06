@@ -81,6 +81,7 @@ pub mod ticket;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)] // 唯一用例为 unix 段（Windows 构建下避免 unused import）
     use super::*;
 
     // 评审项 1：秘密文件创建即 0600（unix 段——Windows 无 POSIX 权限位）。

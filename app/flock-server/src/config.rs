@@ -95,6 +95,11 @@ pub struct ServerConfig {
     /// 计数。缺省 1024）。
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+    /// M7（§7-M7.2/§7-M7.5）：离线设备保留期（天）。超过 ⇒ 回收器置 Expired + VIP
+    /// 归还分配池（行保留审计、名册排除）。缺省 30；**0 = 永不过期**（兼容旧行为）。
+    /// u64 天然 ≥0（「校验 ≥0」由类型承担——负值在解析层即不可表达）。
+    #[serde(default = "default_peer_retention_days")]
+    pub peer_retention_days: u64,
     /// TUN 接口名（M3 数据面，§2.2/§3.12；缺省 "tun0"）。
     #[serde(default = "default_tun_name")]
     pub tun_name: String,
@@ -167,6 +172,9 @@ fn default_admin_bind() -> SocketAddr {
 }
 fn default_max_sessions() -> usize {
     1024
+}
+fn default_peer_retention_days() -> u64 {
+    30
 }
 fn default_tun_name() -> String {
     "tun0".into()

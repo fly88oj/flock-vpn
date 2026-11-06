@@ -155,6 +155,7 @@ impl CtrlClient {
         let device = DevicePubs {
             x25519: device_b.x25519_public().to_bytes(),
             ed25519: *device_b.ed25519_public().as_bytes(),
+            hostname: String::new(),
         };
         let sr_pub = *sr_sig::UserKey::from_pub_string(&sr_key.pub_string())
             .unwrap()
@@ -241,6 +242,7 @@ impl CtrlClient {
             device: DevicePubs {
                 x25519: device.x25519_public().to_bytes(),
                 ed25519: *device.ed25519_public().as_bytes(),
+                hostname: String::new(),
             },
         })
         .await
@@ -325,6 +327,7 @@ impl TestServer {
             extra_endpoints: vec![alt.clone()],
             dir_version: 1,
             ticket_ttl_secs,
+            peer_retention_days: 30,
             admin_bind: "127.0.0.1:0".parse().unwrap(),
             max_sessions: 1024,
             tun_name: "tun0".into(),
@@ -360,6 +363,7 @@ impl TestServer {
                 user,
                 device.x25519_public().to_bytes(),
                 *device.ed25519_public().as_bytes(),
+                "",
             )
             .await
             .expect("device add")
@@ -375,6 +379,7 @@ impl TestServer {
                 username: user,
                 device_x25519: device.x25519_public().to_bytes(),
                 device_ed25519: *device.ed25519_public().as_bytes(),
+                hostname: "",
                 expected_root_pub: *self.core.identity.root_pub.as_bytes(),
                 expected_cluster_id: self.core.identity.cluster_id.0,
                 now_unix: flock_protocol::trust::now_unix(),

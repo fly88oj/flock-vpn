@@ -1172,10 +1172,12 @@ pub struct PeerInfo {
     `tx_bps`/`rx_bps` 取租约行（无租约历史 ⇒ 0）。
   - **服务器自身也进名册**（kind=Server）：多主形态取 Raft `server_keys` 本地视图
     （`ServerKeyEntry` 增 `vip: [u8; 4]`——根签登记时随身份/混合公钥同签，canonical
-    字节随之扩展）；`owner` = 该服务器的 node_id 十进制串（server_id 的承载形态），
-    `hostname` = 根签 ClusterDirectory 内该服务器 `relay_endpoint`（客户端可见端点，
-    熟悉且唯一）；流量 = 本地租约视图内该服务器的自发布条目（`server_self_device_id
-    (node_id)` 合成设备键——node_id 大端居前 8B + 固定标记后缀，与真实设备 id
+    字节随之扩展；vip 值由节点号**确定性推导**：node 1..=10 → `100.64.0.<node_id>`
+    （§6.2 服务器段 .1–.10），越界拒登——全网同推导，无第二真相源）；`owner` = 该
+    服务器的 node_id 十进制串（server_id 的承载形态），`hostname` = 根签
+    ClusterDirectory 内该服务器 `relay_endpoint`（客户端可见端点，熟悉且唯一）；
+    流量 = 本地租约视图内该服务器的自发布条目（`server_self_device_id(node_id)`
+    合成设备键——node_id 大端居前 8B + 固定标记后缀，与真实设备 id
     （sha256(ed25519)）碰撞概率可忽略；各服务器在租约续期循环里自发布 + 内核路径
     计数）。单服形态：本机一条 Server 条目（vip = `cfg.vip`，hostname =
     `advertise_endpoint`，流量 = 本机 TrafficMeter）。

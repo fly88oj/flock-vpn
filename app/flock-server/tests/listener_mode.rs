@@ -21,6 +21,7 @@ fn cfg_for(mode: &str, state_dir: &std::path::Path) -> ServerConfig {
         extra_endpoints: vec![],
         dir_version: 1,
         ticket_ttl_secs: 60,
+        peer_retention_days: 30,
         admin_bind: "127.0.0.1:0".parse().unwrap(),
         max_sessions: 1024,
         sync: None,
