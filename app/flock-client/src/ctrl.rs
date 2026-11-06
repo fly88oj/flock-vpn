@@ -581,6 +581,25 @@ pub enum AuthPhase {
     },
 }
 
+impl AuthPhase {
+    /// 名册（IPC `Peers`）前置检查文案：`None` = 阶段就绪继续拉取。
+    ///
+    /// 评审项 5：`phase()==None` = 登录保持任务未装配（client.toml 无 `[auth]`）——
+    /// 返回 **login 引导**文案而非「稍候重试」（未配置不会随时间自愈；此前该形态
+    /// 落进「尚无登录票据（稍候重试）」误导文案，`Unconfigured` 分支为死代码）。
+    pub fn peers_block_reason(phase: Option<AuthPhase>) -> Option<String> {
+        match phase.unwrap_or(AuthPhase::Unconfigured) {
+            AuthPhase::Unconfigured => {
+                Some("client.toml 未配置 [auth]（flock-client login 引导）".into())
+            }
+            AuthPhase::WaitingSession => Some("隧道未连接（等待会话建立后自动登录）".into()),
+            AuthPhase::LoggingIn => Some("登录进行中（稍候重试）".into()),
+            AuthPhase::Failed { reason } => Some(reason),
+            AuthPhase::LoggedIn { .. } => None,
+        }
+    }
+}
+
 /// 登录态 + 当前票据（票据**只存内存**——daemon 生命周期内有效，§2.2）。
 #[derive(Debug, Default)]
 pub struct AuthShared {
@@ -1212,6 +1231,46 @@ mod tests {
             resolve_hostname(Some(&long)).len(),
             64,
             "64B 截断与服务端对齐"
+        );
+    }
+
+    /// 评审项 5 文案一：`phase()==None`（未装配登录保持任务 = client.toml 无
+    /// `[auth]`）⇒ **login 引导**——不得是「稍候重试」（未配置不随时间自愈）。
+    #[test]
+    fn peers_block_reason_none_is_unconfigured_guidance() {
+        let r = AuthPhase::peers_block_reason(None).expect("未装配 ⇒ 阻断文案");
+        assert!(r.contains("未配置 [auth]"), "{r}");
+        assert!(r.contains("flock-client login"), "{r}");
+        assert!(
+            !r.contains("稍候重试"),
+            "未配置形态不得落「稍候重试」: {r}"
+        );
+        // 显式 Unconfigured 同文案（分支激活——与 None 等价）。
+        assert_eq!(
+            AuthPhase::peers_block_reason(Some(AuthPhase::Unconfigured)),
+            AuthPhase::peers_block_reason(None)
+        );
+    }
+
+    /// 评审项 5 文案二：装配后的各阶段映射（等待/登录中给「稍候重试」类可自愈
+    /// 文案；LoggedIn 放行 None；Failed 透传原因）。
+    #[test]
+    fn peers_block_reason_maps_assembled_phases() {
+        let r = AuthPhase::peers_block_reason(Some(AuthPhase::WaitingSession)).unwrap();
+        assert!(r.contains("隧道未连接"), "{r}");
+        let r = AuthPhase::peers_block_reason(Some(AuthPhase::LoggingIn)).unwrap();
+        assert!(r.contains("稍候重试"), "{r}");
+        assert_eq!(
+            AuthPhase::peers_block_reason(Some(AuthPhase::Failed {
+                reason: "凭据文件: boom".into()
+            }))
+            .as_deref(),
+            Some("凭据文件: boom")
+        );
+        assert!(
+            AuthPhase::peers_block_reason(Some(AuthPhase::LoggedIn { user: "a".into() }))
+                .is_none(),
+            "LoggedIn 放行拉取"
         );
     }
 }

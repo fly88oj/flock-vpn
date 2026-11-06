@@ -296,23 +296,11 @@ async fn daemon_loop(
                 let pinger = pinger.clone();
                 Box::pin(async move {
                     // 阶段检查前置：未配置/未登录/隧道断的指引文案（不发起拉取）。
-                    if let Some(phase) = auth_shared.phase() {
-                        let reason: Option<String> = match phase {
-                            crate::ctrl::AuthPhase::Unconfigured => Some(
-                                "client.toml 未配置 [auth] username（M7 登录/名册需登录态）".into(),
-                            ),
-                            crate::ctrl::AuthPhase::WaitingSession => {
-                                Some("隧道未连接（等待会话建立后自动登录）".into())
-                            }
-                            crate::ctrl::AuthPhase::LoggingIn => {
-                                Some("登录进行中（稍候重试）".into())
-                            }
-                            crate::ctrl::AuthPhase::Failed { reason } => Some(reason),
-                            crate::ctrl::AuthPhase::LoggedIn { .. } => None,
-                        };
-                        if let Some(r) = reason {
-                            return CtrlResp::PeersUnavailable { reason: r };
-                        }
+                    // phase()==None = 登录保持任务未装配（无 [auth]）⇒ login 引导
+                    // 文案（评审项 5——此前该形态落进「尚无登录票据（稍候重试）」）。
+                    if let Some(r) = crate::ctrl::AuthPhase::peers_block_reason(auth_shared.phase())
+                    {
+                        return CtrlResp::PeersUnavailable { reason: r };
                     }
                     // 名册：缓存新鲜（≤5s）直接用；否则持当前票据拉取。
                     let peers = match roster.fresh() {
