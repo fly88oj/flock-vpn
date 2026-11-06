@@ -1158,13 +1158,21 @@ mod tests {
         assert_eq!(back.vip_index, d.vip_index, "重建后索引一致");
     }
 
-    /// M7 快照兼容性声明（如实断言）：DeviceRow 加字段（hostname/expired_at）后，
-    /// **旧格式快照不可解码**——postcard 无字段标签，from_bytes 对旧字节干净失败
-    /// （返回 None，节点从日志/重建路径恢复）。未发布窗口允许（§7-M7.1）；本测试
-    /// 固化「失败必须干净」（不得 panic/半解码）：旧行编码字节与任意截断字节均 None。
+    /// M7 快照兼容性声明（如实断言）：DeviceRow 加字段（hostname/expired_at/
+    /// registered_at）后，**旧格式快照不可解码**——postcard 无字段标签，from_bytes
+    /// 对旧字节干净失败（返回 None，节点从日志/重建路径恢复）。未发布窗口允许
+    /// （§7-M7.1）；本测试固化「失败必须干净」（不得 panic/半解码）：旧行编码字节
+    /// 与任意截断字节均 None。
+    ///
+    /// 「旧行字节」是**镜像近似**：`LegacyRow` 为手工维护的 pre-M7 形状 postcard
+    /// 镜像——非旧代码产物的真实采样（旧格式无法由当前代码再生成），其价值不在
+    /// 逐字节复刻，而在构造「合法 postcard 但字段布局错位」的字节流验证解码器的
+    /// 失败干净性。后续再加字段时同步更新该镜像即可（当前镜像 = pre-M7 形状；
+    /// M7 后的「旧」= 无 registered_at 的三字段前形状，同理适用）。
     #[test]
     fn legacy_snapshot_bytes_fail_clean() {
-        // 旧 DeviceRow 形状（无 hostname/expired_at）——postcard 编码镜像。
+        // 旧 DeviceRow 形状（无 hostname/expired_at/registered_at）——postcard 编码
+        // 镜像（来源见上：镜像近似，非真实采样）。
         #[derive(serde::Serialize)]
         struct LegacyRow {
             owner: String,

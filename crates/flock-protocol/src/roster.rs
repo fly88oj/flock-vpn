@@ -20,7 +20,8 @@
 //!
 //! 线格式纪律：全部类型为纯数据（serde/postcard），无平台面（wasm32 同编）；**postcard
 //! 无字段标签、enum 变体按声明序编码**——两端变体顺序与字段即冻结契约，任何变动都是
-//! 线上破坏性变更（与 `flock-sync` 快照兼容性同一纪律）。
+//! 线上破坏性变更（与 `flock-sync` 快照兼容性同一纪律）；`CtrlResponse` 的追加位纪律
+//! 见其文档（新变体只允许 Err 之后尾部追加）。
 //!
 //! `flock-server::{control,ticket}` 与 `flock-sync::proto` 以 `pub use` 再导出本模块
 //! 类型（既有引用路径不变）。
@@ -217,6 +218,10 @@ pub enum CtrlRequest {
     },
 }
 
+/// 控制面响应。**变体位纪律（append-only）**：postcard 按声明序编码判别位——`Err`
+/// **之前为冻结区**（变体不得插入/重排/复用判别位），新增变体一律在 `Err` **之后**
+/// 尾部追加。`PeerList` 自 Err 之前迁至其后是本纪律的第一次适用（会话态无持久
+/// 字节——控制面消息不落盘，两端同源重编译即可，无迁移面）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CtrlResponse {
     Hello {
@@ -256,13 +261,13 @@ pub enum CtrlResponse {
         dir_version: u64,
         bytes: Vec<u8>,
     },
-    /// M7（§7-M7.4）：成员名册（按 VIP 升序；契约逐字固化于 docs/design.md §7-M7.4）。
-    PeerList {
-        peers: Vec<PeerInfo>,
-    },
     Err {
         code: CtrlError,
         msg: String,
+    },
+    /// M7（§7-M7.4）：成员名册（按 VIP 升序；契约逐字固化于 docs/design.md §7-M7.4）。
+    PeerList {
+        peers: Vec<PeerInfo>,
     },
 }
 
@@ -489,6 +494,28 @@ mod tests {
         };
         let bytes = postcard::to_allocvec(&err).unwrap();
         assert_eq!(postcard::from_bytes::<CtrlResponse>(&bytes).unwrap(), err);
+    }
+
+    /// 变体位纪律（append-only）：Err 之前为冻结区，PeerList 位于 Err 之后（尾部）——
+    /// postcard 按声明序编码判别位（编码首字节即判别位），插入/重排即全体变体改码的
+    /// 破坏性变更。会话态无持久字节，两端同源重编译即可。
+    #[test]
+    fn ctrl_response_variant_order_discipline() {
+        let err = CtrlResponse::Err {
+            code: CtrlError::Internal,
+            msg: String::new(),
+        };
+        let peers = CtrlResponse::PeerList { peers: vec![] };
+        let e = postcard::to_allocvec(&err).unwrap();
+        let p = postcard::to_allocvec(&peers).unwrap();
+        assert!(
+            e[0] < p[0],
+            "Err 判别位 < PeerList（PeerList 在 Err 之后——追加位纪律）"
+        );
+        assert_eq!(
+            p[0], 11,
+            "PeerList = 尾变体（12 变体，判别位 11）——新变体只允许其后追加"
+        );
     }
 
     /// key-bind canonical：hostname 变化 ⇒ 覆盖面变化（签名锚定 hostname，M7）。

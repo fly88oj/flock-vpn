@@ -1110,8 +1110,9 @@ pub struct DeviceRow {
   池空回退水位线 `vip_next` 单调递增）；VIP 反查索引删除旧条目（Expired 行不进索引
   ——释放后的 VIP 单射性由「池内 VIP 不在索引」维持）。
 - **Expired 为终态**（同 Revoked）：不可 Enable（旧 VIP 可能已属他设备，复活会破
-  单射）；同设备身份复活 = 新 key-bind 注册新行新 VIP。单服形态（netstate.rs
-  StateStore）同语义：`expire()` + VIP 池表。
+  单射）；同钥匙同设备身份不可复活（DeviceId = hash(ed25519) ⇒ 重注册即 DeviceExists，
+  仅走 re-register 的 hostname 更新路径）——**新设备身份（新钥匙）注册新行新 VIP**。
+  单服形态（netstate.rs StateStore）同语义：`expire()` + VIP 池表。
 - 保留期 = server.toml `peer_retention_days`（缺省 30；**0 = 永不过期**，兼容旧行为；
   u64 天然 ≥0，解析即校验）。
 
@@ -1133,7 +1134,10 @@ pub struct DeviceRow {
   - **服务器自身条目**：dst = 本机 VIP 注内核成功 ⇒ 本机 rx；内核回程
     `route_outbound` ⇒ 本机 tx。
   - TTL 过期的租约行**保留**（不再删除）：`observe` 语义不变（过期 ⇒ None），但
-    行内 `last_seen_unix`/ewma 留存供名册离线设备展示（内存权衡：每行 ~60B）。
+    行内 `last_seen_unix`/ewma 留存供名册离线设备展示（内存权衡：每行 ~60B）；
+    **离线衰减（修订）**：TTL 过期且本窗无累加的行 ewma 按窗 ×4/5 衰减、<8B/s 置 0
+    （`tick_ewma` 的衰减支路——有累加器的行由零速率折叠同数学衰减）——名册不再
+    呈现离线非零流量。
 - `last_seen_unix` 更新点：publish/续期（持有者）、本机计到该设备流量（持有者）、
   收到对端 publish/反熵事件（远端条目以消息携带值为准）。
 - 同步通道：随**现有**租约 publish/事件（≤1s 语义；续期循环 10s 重发布携带最新
@@ -1422,3 +1426,4 @@ flock-protocol 门禁含 wasm32 check（roster 纯数据无平台面）。
   容器实测 `deploy/m7.yml`+`m7_assert.sh`（两 client + server：条目/延迟/iperf3
   流量列/JSON）；Windows/macOS raw ICMP 真机列 service-install.md §7 清单。
 - 2026-11-06 M6 第二阶段（托盘进程）：新增 §7-M6.7（§7-M6.4 tray 行同步）——`flock-client tray` 落地：三项菜单（连接状态/VPN IP 动态只读 + 退出动作），2s 轮询刷新、Denied/IPC 失败⇒「服务未运行」继续重试；退出=对 token Shutdown⇒托盘退出（服务保持已安装）/daemon 不在⇒仅退托盘/Denied⇒不退出+token 失效重载；程序化 32×32 RGBA 图标（零资产文件）；平台库 tray-icon（Windows 最小 Win32 消息泵/macOS 主线程 NSApp 排空循环）+ ksni（Linux DBus SNI，零 GTK 系统依赖），不引 winit/tauri/egui；GUI 探测（Linux DISPLAY/WAYLAND+会话 DBus 前置判定，win/mac 创建失败兜底）无 GUI 一律优雅退出码 0；M6.5 feature 门控兑现（GUI 依赖全部 target 门控 optional、dep: 引用不匹配 target no-op，--no-default-features 三平台零 GUI 依赖——门禁实测）。验证边界如实：核心单测 + Windows 真进程 mock-daemon 实测（存活/刷新日志/状态一致/Shutdown 停服后转显服务未运行）；图标目视/退出点击/真 daemon 联测（需 invite+管理员）列 service-install.md 托盘真机清单；macOS 无设备未验证（apple target 工具链下载过慢未及编译级核验，API 按 crate 源核对）；Linux 桌面真机未验证（容器编译面过）。
+- 2026-11-07 M6/M7 服务端/同步层评审修复（本批 6 项）：① 回收器 last_seen=0 语义缺陷（§7-M7.5 修正）——DeviceRow 增 `registered_at`（注册/兑换时提交方注入落库，无观测时作保留期起算锚）+ 重启/视图未就绪闸门（单服=流量计零观测跳过；多主=租约表空/无远端事件跳过，`LeaseTable::remote_events` 信号 + 反熵循环自过滤）；② server_vip_of 一致性双形态断言（多主 open_sync 断言 cfg.vip==推导值、错误给期望值；单服 VIP 撞设备分配段拒起）；③ NetError::DeviceExists 独立变体（消灭 "already registered" 字符串契约）+ KeyBind re-register owner 校验（跨户改 hostname ⇒ NotAuthorized）；④ systemd 单元路径修正（/etc/systemd → /etc/systemd/system，样例+文档；install.rs 常量由客户端侧同名项同步）+ launchd plist 补 StandardErrorPath 与 newsyslog 轮转建议；⑤ CtrlResponse 变体位纪律固化（Err 之前冻结区、新变体尾部追加；PeerList 迁至 Err 后）+ 租约 EWMA 离线衰减（过期且无累加按窗 ×4/5 至 <8B/s 置 0——名册不呈现离线非零流量）+ §7-M7.2 措辞修正（「同设备身份复活」→「新设备身份（新钥匙）注册新行新 VIP」，同钥匙重注册走 re-register 的 hostname 更新）。

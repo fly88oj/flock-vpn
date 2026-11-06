@@ -46,6 +46,23 @@ pub fn ewma_fold(prev: u64, rate: u64) -> u64 {
         / EWMA_ALPHA_DEN
 }
 
+/// M7（§7-M7.3 修订）：离线衰减因子——TTL 已过期且本窗无累加的行每窗 ×4/5
+/// （与 α 无关的独立常数：语义是「无累加证据时的指数遗忘」，非速率估计）。
+pub const EWMA_OFFLINE_DECAY_NUM: u64 = 4;
+pub const EWMA_OFFLINE_DECAY_DEN: u64 = 5;
+/// 离线衰减地板：按窗衰减至低于该速率（B/s）即置 0——名册不再呈现离线非零流量。
+pub const EWMA_OFFLINE_FLOOR_BPS: u64 = 8;
+
+/// 离线衰减单步：`v × 4/5`，低于 [`EWMA_OFFLINE_FLOOR_BPS`] 置 0。
+pub fn ewma_offline_decay(v: u64) -> u64 {
+    let d = v.saturating_mul(EWMA_OFFLINE_DECAY_NUM) / EWMA_OFFLINE_DECAY_DEN;
+    if d < EWMA_OFFLINE_FLOOR_BPS {
+        0
+    } else {
+        d
+    }
+}
+
 /// 服务器自身在租约域的合成设备键（M7：Server 名册条目的自发布/计数锚）。
 /// node_id 大端居前 8B + 固定标记后缀——真实设备 id 是 sha256(ed25519)，结构化前缀
 /// 碰撞概率可忽略；各服务器以该键自发布租约（携带自身 EWMA），全网名册可装配。
@@ -185,9 +202,14 @@ impl LeaseTable {
     /// M7：EWMA 折叠（1s 窗；node 装配的 tick 循环调用，`now_ms` 显式注入可测）。
     /// 只折本机持有的行——acc 里的远端设备流量（如本机作为 FRWD 收端代计前的瞬态）
     /// 不覆写持有者发布的值。
+    ///
+    /// 离线衰减（§7-M7.3 修订）：TTL 已过期且**无本地累加器**（远端行/从未计流的本机
+    /// 行——下方折叠循环触不到）的行按窗 ×4/5 衰减、<8B/s 置 0——名册不再呈现离线
+    /// 非零流量。有累加器的行由折叠循环的零速率折叠（同 ×4/5 数学）自然衰减至 0。
     pub fn tick_ewma(&self, now_ms_val: u64) {
         let mut acc = self.acc.lock().expect("lease acc");
         let mut st = self.st.lock().expect("lease table");
+        // ① 折叠：本机持有 + 有累加（既有逻辑）。
         for (dev, a) in acc.iter_mut() {
             if a.last_fold_ms == 0 {
                 a.last_fold_ms = now_ms_val;
@@ -210,6 +232,18 @@ impl LeaseTable {
             a.tx = 0;
             a.rx = 0;
             a.last_fold_ms = now_ms_val;
+        }
+        // ② 离线衰减：TTL 过期且折叠循环触不到（无 acc 条目）的行。
+        let now = Instant::now();
+        for (dev, l) in st.iter_mut() {
+            if l.expires_at > now {
+                continue;
+            }
+            if acc.contains_key(dev) {
+                continue;
+            }
+            l.tx_ewma = ewma_offline_decay(l.tx_ewma);
+            l.rx_ewma = ewma_offline_decay(l.rx_ewma);
         }
     }
 
@@ -753,6 +787,65 @@ mod tests {
             panic!()
         };
         assert!(entries.is_empty(), "过期行不进反熵摘要");
+    }
+
+    /// M7（§7-M7.3 修订）：TTL 过期后的离线衰减——**远端行**（无本地累加器，折叠
+    /// 循环触不到）按窗 ×4/5 衰减、<8B/s 置 0（名册不再呈现离线非零流量）；收敛
+    /// 单调非增且有限窗内到 0。本机累加行由零速率折叠（同数学）衰减。
+    #[test]
+    fn offline_ewma_decays_to_zero_after_ttl() {
+        // 远端行：远端发布携带非零 ewma → TTL 过期（短表 40ms）→ 无 acc ⇒ 衰减支路。
+        let t = LeaseTable::new(1, Duration::from_millis(40), HookRegistry::new());
+        let remote = [0x55; 32];
+        t.merge_remote(GossipMsg::Publish {
+            device: remote,
+            holder: 2,
+            term_ms: now_ms() + 100,
+            tx_ewma: 5_000,
+            rx_ewma: 0,
+            last_seen_unix: 100,
+        });
+        assert_eq!(t.peer_stats(&remote).unwrap().tx_ewma, 5_000);
+        std::thread::sleep(Duration::from_millis(60)); // TTL 过期（observe None，行保留）
+        assert!(t.observe(&remote).is_none());
+        let mut ms = 8_000_000u64;
+        let mut rounds = 0u32;
+        let mut prev = t.peer_stats(&remote).unwrap().tx_ewma;
+        while t.peer_stats(&remote).unwrap().tx_ewma > 0 {
+            ms += 1000;
+            t.tick_ewma(ms);
+            rounds += 1;
+            let cur = t.peer_stats(&remote).unwrap().tx_ewma;
+            assert!(cur <= prev, "衰减单调非减变（{prev}→{cur}）");
+            prev = cur;
+            assert!(rounds < 100, "有限窗内收敛到 0（{} 轮后 {}）", rounds, cur);
+        }
+        assert_eq!(t.peer_stats(&remote).unwrap().rx_ewma, 0);
+
+        // 本机持有 + 有累加的行：离线后由零速率折叠衰减（同 ×4/5 数学）——在线期先
+        // 收敛出非零，断流过期后同样归 0。
+        let t2 = LeaseTable::new(9, Duration::from_millis(40), HookRegistry::new());
+        let local = [0x66; 32];
+        t2.publish(&local);
+        let mut ms2 = 9_000_000u64;
+        for _ in 0..15 {
+            t2.note_tx(&local, 1000);
+            ms2 += 1000;
+            t2.tick_ewma(ms2);
+        }
+        assert!(
+            t2.peer_stats(&local).unwrap().tx_ewma > 100,
+            "在线期收敛非零（{}）",
+            t2.peer_stats(&local).unwrap().tx_ewma
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        let mut rounds = 0u32;
+        while t2.peer_stats(&local).unwrap().tx_ewma > 0 {
+            ms2 += 1000;
+            t2.tick_ewma(ms2);
+            rounds += 1;
+            assert!(rounds < 100, "本机行有限窗收敛到 0");
+        }
     }
 
     /// 服务器自身合成键：不同 node_id 不碰撞、与真实设备 id（sha256）结构可区分。
