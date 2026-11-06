@@ -13,7 +13,9 @@
 //! - [`service`]：daemon 装配（§7-M6.1：supervise 复用 + IPC 服务端 + 状态快照源 +
 //!   优雅停服 + Windows SCM 集成）；
 //! - [`install`]：服务安装/卸载 + 托盘自启注册（§7-M6.3：Windows SCM/事件日志源/
-//!   HKCU Run、systemd 单元、launchd plist）。
+//!   HKCU Run、systemd 单元、launchd plist）；
+//! - [`tray`]：托盘进程（§7-M6 第二阶段；`tray` feature 门控——平台无关核心 + 平台
+//!   后端：Windows/macOS tray-icon、Linux ksni）。
 //!
 //! 服务器（`flock-server`）以库形式复用 [`tun`]/[`route`]/dataplane 桥
 //! （§2.2「服务端自身也是 peer」、§3.11「对上挂 tun 适配器」）——`TunDevice` 接缝按
@@ -31,4 +33,6 @@ mod ipc_unix;
 mod ipc_windows;
 pub mod route;
 pub mod service;
+#[cfg(feature = "tray")]
+pub mod tray;
 pub mod tun;
