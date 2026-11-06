@@ -68,6 +68,7 @@ fn state_err(e: NetError) -> CtrlResponse {
     let code = match &e {
         NetError::NotFound => CtrlError::DeviceUnknown,
         NetError::InvalidState(_) => CtrlError::InvalidState,
+        NetError::DeviceExists => CtrlError::DeviceExists,
         NetError::IpExhausted => CtrlError::IpExhausted,
         NetError::Internal(_) => CtrlError::Internal,
     };
@@ -407,9 +408,24 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                 }
                 // M7 re-register：同设备（同公钥集）再次 key-bind ⇒ 更新 hostname，
                 // VIP 不变（窗口内重连同设备保持同 IP，§7-M7）。bind_token 已消费、
-                // 设备签名已验——与首注册同授权强度。
-                Err(NetError::InvalidState(m)) if m.contains("already registered") => {
+                // 设备签名已验——与首注册同授权强度。按 **DeviceExists 变体**分流
+                // （消灭 `contains("already registered")` 字符串契约）+ owner 校验：
+                // 目标行 owner != 票据 user ⇒ NotAuthorized（跨户改他人设备 hostname
+                // 被拒——设备签名只证明设备侧占有，不证明账户归属）。
+                Err(NetError::DeviceExists) => {
                     let dev_id = DeviceId::from_ed25519(&vk);
+                    match net.device_row(&dev_id).await {
+                        Some(row) if row.owner != user => {
+                            eprintln!(
+                                "flock-server: key-bind(re): 跨户重绑定被拒\
+                                 （device owner={} != ticket user={user}）",
+                                row.owner
+                            );
+                            return err(CtrlError::NotAuthorized);
+                        }
+                        Some(_) => {}
+                        None => return err(CtrlError::DeviceUnknown),
+                    }
                     match net.set_hostname(&dev_id, &device.hostname).await {
                         Ok(row) => {
                             if let Err(e) = net.add_user_sig_key(&user, sr_sig_pub).await {
@@ -1155,5 +1171,145 @@ mod tests {
             other => panic!("peer list: {other:?}"),
         }
         assert_eq!(roster_assemblies(), before + 1, "好票据才装配");
+    }
+
+    /// KeyBind re-register 的 owner 校验（DeviceExists 变体分流）：跨户对他人设备
+    /// 重绑定（改 hostname）⇒ NotAuthorized 且原行不动；本人 re-register ⇒ hostname
+    /// 更新 + VIP 不变。
+    #[tokio::test]
+    async fn keybind_reregister_rejects_cross_owner_hostname_change() {
+        use ed25519_dalek::Signer as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _) = crate::server::ServerCore::open_or_init(m7_cfg(dir.path().to_path_buf()))
+            .expect("core");
+        let store = store_of(&core);
+
+        // alice 的设备（已注册）；bob 的会话设备（票据主体）。
+        let vk_alice_dev = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let row_a = store
+            .register_device(
+                "alice",
+                [5; 32],
+                *vk_alice_dev.verifying_key().as_bytes(),
+                "alice-pad",
+            )
+            .unwrap();
+        let vk_bob = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
+        store
+            .register_device("bob", [6; 32], *vk_bob.verifying_key().as_bytes(), "")
+            .unwrap();
+        // 变体契约：同钥匙重注册 ⇒ NetError::DeviceExists（非 InvalidState 串）。
+        assert!(matches!(
+            store
+                .register_device("anyone", [5; 32], *vk_alice_dev.verifying_key().as_bytes(), "")
+                .unwrap_err(),
+            crate::netstate::NetError::DeviceExists
+        ));
+
+        let alice_dev = DeviceId::from_ed25519(&vk_alice_dev.verifying_key());
+        let bob_dev = DeviceId::from_ed25519(&vk_bob.verifying_key());
+        let now = flock_protocol::trust::now_unix();
+        let epoch = core.net.epoch().await;
+        let ticket_bob = match core
+            .guard
+            .authority
+            .issue("bob", bob_dev, epoch, now, 60)
+            .expect("bob ticket")
+        {
+            TicketWire::Local(t) => t,
+            other => panic!("local authority: {other:?}"),
+        };
+
+        // bob 携 alice 设备公钥重绑定：设备签名**可过**（由 alice 设备密钥签 bob 的
+        // canonical——占有证明是设备侧的），但目标行 owner=alice != 票据 user=bob ⇒
+        // NotAuthorized，hostname 不被篡改。
+        let bind_token = [0xA7u8; 16];
+        let pubs = DevicePubs {
+            x25519: [5; 32],
+            ed25519: *vk_alice_dev.verifying_key().as_bytes(),
+            hostname: "hijacked".into(),
+        };
+        let canon = keybind_canonical(&core.identity.cluster_id.0, "bob", &bind_token, &pubs, &[9; 32]);
+        let mut ctx = ConnCtx {
+            device: bob_dev,
+            pending_login: None,
+        };
+        let resp = dispatch(
+            &core,
+            &mut ctx,
+            CtrlRequest::KeyBind {
+                ticket: TicketWire::Local(ticket_bob),
+                bind_token,
+                device: pubs,
+                sr_sig_pub: [9; 32],
+                device_sig: vk_alice_dev.sign(&canon).to_bytes().to_vec(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                &resp,
+                CtrlResponse::Err {
+                    code: CtrlError::NotAuthorized,
+                    ..
+                }
+            ),
+            "跨户改 hostname 被拒: {resp:?}"
+        );
+        assert_eq!(
+            store.device_row(&alice_dev).unwrap().hostname,
+            "alice-pad",
+            "原行不被篡改"
+        );
+
+        // 对照：本人 re-register（alice 的票据 + alice 的设备）⇒ hostname 更新 +
+        // VIP 不变（DeviceExists 分流的正路径）。
+        let ticket_alice = match core
+            .guard
+            .authority
+            .issue("alice", alice_dev, epoch, now, 60)
+            .expect("alice ticket")
+        {
+            TicketWire::Local(t) => t,
+            other => panic!("local authority: {other:?}"),
+        };
+        let bind_token2 = [0xB7u8; 16];
+        let pubs2 = DevicePubs {
+            x25519: [5; 32],
+            ed25519: *vk_alice_dev.verifying_key().as_bytes(),
+            hostname: "renamed".into(),
+        };
+        let canon2 = keybind_canonical(
+            &core.identity.cluster_id.0,
+            "alice",
+            &bind_token2,
+            &pubs2,
+            &[9; 32],
+        );
+        let mut ctx2 = ConnCtx {
+            device: alice_dev,
+            pending_login: None,
+        };
+        let resp = dispatch(
+            &core,
+            &mut ctx2,
+            CtrlRequest::KeyBind {
+                ticket: TicketWire::Local(ticket_alice),
+                bind_token: bind_token2,
+                device: pubs2,
+                sr_sig_pub: [9; 32],
+                device_sig: vk_alice_dev.sign(&canon2).to_bytes().to_vec(),
+            },
+        )
+        .await;
+        match resp {
+            CtrlResponse::KeyBound { device_id, vip } => {
+                assert_eq!(device_id, alice_dev.0);
+                assert_eq!(vip, row_a.vip, "re-register 保持 VIP（§7-M7）");
+            }
+            other => panic!("本人 re-register: {other:?}"),
+        }
+        assert_eq!(store.device_row(&alice_dev).unwrap().hostname, "renamed");
     }
 }

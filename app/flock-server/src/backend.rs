@@ -467,7 +467,7 @@ mod adapter {
 fn net_err(e: &flock_sync::proto::StateError) -> NetError {
     use flock_sync::proto::StateError;
     match e {
-        StateError::DeviceExists => NetError::InvalidState("device already registered".into()),
+        StateError::DeviceExists => NetError::DeviceExists,
         StateError::DeviceNotFound => NetError::NotFound,
         StateError::RevokedIsTerminal => NetError::InvalidState("revoked is terminal".into()),
         StateError::ExpiredIsTerminal => NetError::InvalidState("expired is terminal".into()),

@@ -140,6 +140,11 @@ pub struct RedeemOutcome {
 pub enum NetError {
     NotFound,
     InvalidState(String),
+    /// 设备已注册（同 ed25519 ⇒ 同 DeviceId 的重注册）。独立变体（非 `InvalidState`
+    /// 串）——控制面 KeyBind 的 re-register 分流按变体判定，不认
+    /// `"already registered"` 字符串契约（flock-sync `StateError::DeviceExists` 的
+    /// 同形映射见 backend.rs）。
+    DeviceExists,
     IpExhausted,
     Internal(String),
 }
@@ -149,6 +154,7 @@ impl std::fmt::Display for NetError {
         match self {
             NetError::NotFound => write!(f, "netstate: not found"),
             NetError::InvalidState(m) => write!(f, "netstate: invalid state: {m}"),
+            NetError::DeviceExists => write!(f, "netstate: device already registered"),
             NetError::IpExhausted => write!(f, "netstate: VIP pool exhausted"),
             NetError::Internal(m) => write!(f, "netstate: internal: {m}"),
         }
@@ -704,7 +710,7 @@ impl StateStore {
                 .map_err(int_err)?
                 .is_some()
             {
-                return Err(NetError::InvalidState("device already registered".into()));
+                return Err(NetError::DeviceExists);
             }
             if users.get(owner).map_err(int_err)?.is_none() {
                 users
