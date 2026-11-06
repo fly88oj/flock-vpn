@@ -89,15 +89,16 @@ impl NetBackend {
         }
     }
 
-    /// 注册设备（分配 VIP，单调不复用）。
+    /// 注册设备（分配 VIP；M7 增 hostname——空串落 "(unknown)"）。
     pub async fn register_device(
         &self,
         owner: &str,
         x25519: [u8; 32],
         ed25519: [u8; 32],
+        hostname: &str,
     ) -> Result<DeviceRow, NetError> {
         match self {
-            NetBackend::Single(s) => s.register_device(owner, x25519, ed25519),
+            NetBackend::Single(s) => s.register_device(owner, x25519, ed25519, hostname),
             #[cfg(feature = "multi-primary")]
             NetBackend::Sync(s) => {
                 let resp = s
@@ -105,12 +106,57 @@ impl NetBackend {
                         owner: owner.to_string(),
                         x25519,
                         ed25519,
+                        hostname: hostname.to_string(),
                     })
                     .await?;
                 match resp {
                     sync_proto::SyncResponse::Device(row) => Ok(row),
                     sync_proto::SyncResponse::Error(e) => Err(net_err(&e)),
                     _ => Err(NetError::Internal("unexpected register response".into())),
+                }
+            }
+        }
+    }
+
+    /// M7：更新设备 hostname（re-register 路径；仅非终态行）。
+    pub async fn set_hostname(&self, id: &DeviceId, hostname: &str) -> Result<DeviceRow, NetError> {
+        match self {
+            NetBackend::Single(s) => s.set_hostname(id, hostname),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                match s
+                    .write(sync_proto::SyncRequest::SetHostname {
+                        device: id.0,
+                        hostname: hostname.to_string(),
+                    })
+                    .await?
+                {
+                    sync_proto::SyncResponse::Device(row) => Ok(row),
+                    sync_proto::SyncResponse::Error(e) => Err(net_err(&e)),
+                    _ => Err(NetError::Internal(
+                        "unexpected set_hostname response".into(),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// M7：过期设备（回收器提交；行保留审计 + VIP 归还池 + epoch 推进——幂等）。
+    pub async fn expire(&self, id: &DeviceId, now_unix: u64) -> Result<u64, NetError> {
+        match self {
+            NetBackend::Single(s) => s.expire(id, now_unix),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => {
+                match s
+                    .write(sync_proto::SyncRequest::Expire {
+                        device: id.0,
+                        now_unix,
+                    })
+                    .await?
+                {
+                    sync_proto::SyncResponse::Epoch(e) => Ok(e),
+                    sync_proto::SyncResponse::Error(e) => Err(net_err(&e)),
+                    _ => Err(NetError::Internal("unexpected expire response".into())),
                 }
             }
         }
@@ -137,6 +183,10 @@ impl NetBackend {
                 DeviceStatus::Revoked => s.revoke(id),
                 DeviceStatus::Disabled => s.disable(id),
                 DeviceStatus::Active => s.enable(id).map(|_| s.epoch()),
+                // Expired 走 [`NetBackend::expire`]（携带 now_unix——时间语义转移）。
+                DeviceStatus::Expired => Err(NetError::InvalidState(
+                    "expire 经 expire()（需 now_unix）".into(),
+                )),
             },
             #[cfg(feature = "multi-primary")]
             NetBackend::Sync(s) => {
@@ -144,6 +194,11 @@ impl NetBackend {
                     DeviceStatus::Revoked => sync_proto::SyncRequest::Revoke { device: id.0 },
                     DeviceStatus::Disabled => sync_proto::SyncRequest::Disable { device: id.0 },
                     DeviceStatus::Active => sync_proto::SyncRequest::Enable { device: id.0 },
+                    DeviceStatus::Expired => {
+                        return Err(NetError::InvalidState(
+                            "expire 经 expire()（需 now_unix）".into(),
+                        ))
+                    }
                 };
                 match s.write(req).await? {
                     sync_proto::SyncResponse::Epoch(e) => Ok(e),
@@ -154,7 +209,8 @@ impl NetBackend {
         }
     }
 
-    /// 邀请兑换（查重+吊销+expiry → 建用户/设备+分 VIP；Raft 单次提交 = 原子）。
+    /// 邀请兑换（查重+吊销+expiry → 建用户/设备+分 VIP；Raft 单次提交 = 原子；
+    /// M7 增 hostname）。
     pub async fn redeem_invite(
         &self,
         req: RedeemRequest<'_>,
@@ -170,6 +226,7 @@ impl NetBackend {
                         username: req.username.to_string(),
                         x25519: req.device_x25519,
                         ed25519: req.device_ed25519,
+                        hostname: req.hostname.to_string(),
                         now_unix: req.now_unix,
                     })
                     .await
@@ -411,6 +468,7 @@ fn net_err(e: &flock_sync::proto::StateError) -> NetError {
         StateError::DeviceExists => NetError::InvalidState("device already registered".into()),
         StateError::DeviceNotFound => NetError::NotFound,
         StateError::RevokedIsTerminal => NetError::InvalidState("revoked is terminal".into()),
+        StateError::ExpiredIsTerminal => NetError::InvalidState("expired is terminal".into()),
         StateError::IpExhausted => NetError::IpExhausted,
         StateError::PasswordExists => NetError::InvalidState("password already set".into()),
         StateError::NoSuchUser => NetError::NotFound,

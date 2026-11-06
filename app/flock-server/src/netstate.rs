@@ -4,13 +4,15 @@
 //! `UserRow` 以 flock-sync 的定义为唯一权威（Raft 状态机快照/线格式同源），本模块再导出；
 //! 语义纪律（§2.1/§1.3.3f，两形态同样成立）：
 //!
-//! - **VIP 100.64.0.0/10 池单调分配**：`100.64.0.1` 保留给服务器自身，从 `.2` 起单调递增，
-//!   **禁用不删除、IP 不复用**（innernet 先例，§2.1）——回收靠高位水位线永不动。
+//! - **VIP 100.64.0.0/10 分配**：`100.64.0.1` 保留给服务器自身。IP 复用策略（§2.1
+//!   M7 修订）：吊销/禁用 → 行保留、**IP 永不复用**；**Expired（离线超保留期）→
+//!   VIP 归还分配池**（`VIP_POOL` 表，分配时池优先取最小、池空回退单调水位线）——
+//!   过期行保留在册（审计），名册查询排除。
 //! - **邀请一次性**：`redeem_invite` = 查重（used ⇒ 拒）+ 吊销检查 + expiry 检查 →
 //!   同一事务内标记 used + 建用户/设备 + 分 VIP（§1.3.3f「邀请一生」；单机事务 =
 //!   Raft 状态机内的原子提交）。
-//! - **吊销推进全局 revocation_epoch**（§2.2 吊销传播界）：每次 revoke/disable 单调 +1，
-//!   票据层以「票据 epoch < 当前 epoch 即拒」消费它。
+//! - **吊销推进全局 revocation_epoch**（§2.2 吊销传播界）：每次 revoke/disable/expire
+//!   单调 +1，票据层以「票据 epoch < 当前 epoch 即拒」消费它。
 //! - redb 单文件嵌入、单写者（服务进程独占写；CLI/管理操作经 admin 端点进入本进程，
 //!   见 `admin.rs`——避免多进程写者）。
 
@@ -38,6 +40,8 @@ const USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
 const INVITES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("invites");
 /// bind_token 一次性消费表（§2.4：控制面关键一次性操作的线性一致查重）。
 const BIND_TOKENS: TableDefinition<&[u8], ()> = TableDefinition::new("bind_tokens");
+/// M7：Expired 归还的 VIP 分配池（键 = VIP 4B；分配取最小——redb 范围迭代首键）。
+const VIP_POOL: TableDefinition<&[u8], ()> = TableDefinition::new("vip_pool");
 /// 杂项 KV（epoch/vip 水位；server.rs 的集群身份材料也住这里）。
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
@@ -106,7 +110,8 @@ impl std::fmt::Display for RedeemError {
     }
 }
 
-/// 兑换入参（设备公钥随兑换入注册表，§1.3.3f 开户流程）。
+/// 兑换入参（设备公钥随兑换入注册表，§1.3.3f 开户流程；M7 增 hostname——空串落
+/// "(unknown)"，客户端上报为后续阶段）。
 ///
 /// `expected_root_pub`/`expected_cluster_id` = 本集群的身份（调用方从 ServerCore 注入）：
 /// 邀请文件自洽（内嵌根公钥可验自己的签名）**不够**——必须钉死「这个根签的」才算本集群
@@ -116,6 +121,7 @@ pub struct RedeemRequest<'a> {
     pub username: &'a str,
     pub device_x25519: [u8; 32],
     pub device_ed25519: [u8; 32],
+    pub hostname: &'a str,
     pub expected_root_pub: [u8; 32],
     pub expected_cluster_id: [u8; 16],
     pub now_unix: u64,
@@ -209,13 +215,22 @@ impl<'a> RowRd<'a> {
 }
 
 fn encode_device(row: &DeviceRow) -> Vec<u8> {
-    let mut v = Vec::with_capacity(32 + row.owner.len() + 86);
+    let mut v = Vec::with_capacity(32 + row.owner.len() + row.hostname.len() + 96);
     put_str(&mut v, &row.owner);
     v.extend_from_slice(&row.device_x25519);
     v.extend_from_slice(&row.device_ed25519);
     v.extend_from_slice(&row.vip);
     v.push(row.status.code());
     put_u64(&mut v, row.since_epoch);
+    // M7 字段：hostname（长度前缀串）+ expired_at（存在标志 + u64）。
+    put_str(&mut v, &row.hostname);
+    match row.expired_at {
+        Some(t) => {
+            v.push(1);
+            put_u64(&mut v, t);
+        }
+        None => v.push(0),
+    }
     v
 }
 
@@ -227,6 +242,12 @@ fn decode_device(b: &[u8]) -> Option<DeviceRow> {
     let vip: [u8; 4] = r.take(4)?.try_into().expect("4B");
     let status = DeviceStatus::from_code(r.u8()?)?;
     let since_epoch = r.u64()?;
+    let hostname = r.str()?;
+    let expired_at = match r.u8()? {
+        0 => None,
+        1 => Some(r.u64()?),
+        _ => return None,
+    };
     if !r.done() {
         return None;
     }
@@ -237,6 +258,8 @@ fn decode_device(b: &[u8]) -> Option<DeviceRow> {
         vip,
         status,
         since_epoch,
+        hostname,
+        expired_at,
     })
 }
 
@@ -368,6 +391,7 @@ impl StateStore {
             let _ = txn.open_table(USERS).map_err(int_err)?;
             let _ = txn.open_table(INVITES).map_err(int_err)?;
             let _ = txn.open_table(BIND_TOKENS).map_err(int_err)?;
+            let _ = txn.open_table(VIP_POOL).map_err(int_err)?;
             let _ = txn.open_table(META).map_err(int_err)?;
         }
         txn.commit()
@@ -411,8 +435,21 @@ impl StateStore {
         Ok(())
     }
 
-    /// VIP 水位分配（事务内单调 +1；首分配缺省 [`VIP_FIRST`]，越 [`VIP_LAST`] 即耗尽）。
-    fn alloc_vip_tx(meta: &mut redb::Table<'_, &str, &[u8]>) -> Result<u32, RedeemError> {
+    /// VIP 分配（M7 两级：**Expired 归还池优先**（`VIP_POOL` 取最小键），池空回退单调
+    /// 水位线（只进不退——吊销/禁用行的 VIP 永不进池，§2.1）；越 [`VIP_LAST`] 即耗尽）。
+    fn alloc_vip_tx(
+        meta: &mut redb::Table<'_, &str, &[u8]>,
+        pool: &mut redb::Table<'_, &[u8], ()>,
+    ) -> Result<u32, RedeemError> {
+        // 池内最小键（redb 有序迭代首键 = u32::from_be_bytes 最小）。
+        let pooled: Option<[u8; 4]> = match pool.first() {
+            Ok(Some(first)) => first.0.value().try_into().ok(),
+            _ => None,
+        };
+        if let Some(key) = pooled {
+            pool.remove(key.as_slice()).map_err(internal)?;
+            return Ok(u32::from_be_bytes(key));
+        }
         let cur = meta
             .get("vip_next")
             .map_err(internal)?
@@ -446,6 +483,10 @@ impl StateStore {
             if row.status == DeviceStatus::Revoked {
                 return Err(NetError::InvalidState("revoked is terminal".into()));
             }
+            if row.status == DeviceStatus::Expired {
+                // M7：Expired 终态不可逆（旧 VIP 可能已属他设备——复活破唯一性）。
+                return Err(NetError::InvalidState("expired is terminal".into()));
+            }
             if row.status != status {
                 // 仅「阻断性」转移（→ Disabled/Revoked）推进全局 revocation_epoch（§2.2）；
                 // Enable（→ Active）是恢复，不动 epoch——否则会无害地废掉全网在途票据。
@@ -469,6 +510,76 @@ impl StateStore {
         Ok(out)
     }
 
+    /// M7：过期转移（回收器提交）——语义与 flock-sync `apply_expire` 同源。
+    ///
+    /// 行保留审计 + `expired_at` 落库 + VIP 归还池 + epoch 推进（杀会话/票据失效由
+    /// 调用方按 epoch 语义消费）。幂等：已 Expired 放行；Revoked 拒（IP 永不复用）。
+    pub fn expire(&self, id: &DeviceId, now_unix: u64) -> Result<u64, NetError> {
+        let txn = self.db.begin_write().map_err(int_err)?;
+        let ret: Result<u64, NetError> = {
+            let mut devices = txn.open_table(DEVICES).map_err(int_err)?;
+            let mut meta = txn.open_table(META).map_err(int_err)?;
+            let mut pool = txn.open_table(VIP_POOL).map_err(int_err)?;
+            let raw = devices
+                .get(id.0.as_slice())
+                .map_err(int_err)?
+                .ok_or(NetError::NotFound)?
+                .value()
+                .to_vec();
+            let mut row = decode_device(&raw)
+                .ok_or_else(|| NetError::Internal(format!("corrupt device row for {id}")))?;
+            if row.status == DeviceStatus::Expired {
+                return meta_u64(&meta, "epoch").map_err(int_err);
+            }
+            if row.status == DeviceStatus::Revoked {
+                return Err(NetError::InvalidState("revoked is terminal".into()));
+            }
+            let epoch = meta_u64(&meta, "epoch").map_err(int_err)? + 1;
+            meta.insert("epoch", epoch.to_be_bytes().as_slice())
+                .map_err(int_err)?;
+            row.since_epoch = epoch;
+            row.status = DeviceStatus::Expired;
+            row.expired_at = Some(now_unix);
+            pool.insert(row.vip.as_slice(), ()).map_err(int_err)?;
+            devices
+                .insert(id.0.as_slice(), encode_device(&row).as_slice())
+                .map_err(int_err)?;
+            Ok(epoch)
+        };
+        let out = ret?;
+        txn.commit()
+            .map_err(|e| NetError::Internal(format!("redb commit: {e}")))?;
+        Ok(out)
+    }
+
+    /// M7：hostname 更新（re-register 路径；仅非终态行）。
+    pub fn set_hostname(&self, id: &DeviceId, hostname: &str) -> Result<DeviceRow, NetError> {
+        let txn = self.db.begin_write().map_err(int_err)?;
+        let ret: Result<DeviceRow, NetError> = {
+            let mut devices = txn.open_table(DEVICES).map_err(int_err)?;
+            let raw = devices
+                .get(id.0.as_slice())
+                .map_err(int_err)?
+                .ok_or(NetError::NotFound)?
+                .value()
+                .to_vec();
+            let mut row = decode_device(&raw)
+                .ok_or_else(|| NetError::Internal(format!("corrupt device row for {id}")))?;
+            if matches!(row.status, DeviceStatus::Revoked | DeviceStatus::Expired) {
+                return Err(NetError::InvalidState("terminal state".into()));
+            }
+            row.hostname = flock_sync::normalize_hostname(hostname);
+            devices
+                .insert(id.0.as_slice(), encode_device(&row).as_slice())
+                .map_err(int_err)?;
+            Ok(row)
+        };
+        let out = ret?;
+        txn.commit()
+            .map_err(|e| NetError::Internal(format!("redb commit: {e}")))?;
+        Ok(out)
+    }
+
     /// 兑换的邀请校验 + 建账（一个写事务：原子性 = M4 Raft 单次提交的本地对应物）。
     fn redeem_tx(
         &self,
@@ -482,6 +593,7 @@ impl StateStore {
             let mut users = txn.open_table(USERS).map_err(internal)?;
             let mut devices = txn.open_table(DEVICES).map_err(internal)?;
             let mut meta = txn.open_table(META).map_err(internal)?;
+            let mut pool = txn.open_table(VIP_POOL).map_err(internal)?;
 
             let raw = invites
                 .get(invite_id.as_slice())
@@ -519,8 +631,8 @@ impl StateStore {
                 .insert(req.username, encode_user(&UserRow::default()).as_slice())
                 .map_err(internal)?;
 
-            // VIP 单调分配（禁用不删除、不复用：水位线只进不退，§2.1）。
-            let vip = Self::alloc_vip_tx(&mut meta)?.to_be_bytes();
+            // VIP 分配（M7：Expired 归还池优先，池空回退单调水位线——§2.1 IP 复用策略）。
+            let vip = Self::alloc_vip_tx(&mut meta, &mut pool)?.to_be_bytes();
 
             let dev_row = DeviceRow {
                 owner: req.username.to_string(),
@@ -529,6 +641,8 @@ impl StateStore {
                 vip,
                 status: DeviceStatus::Active,
                 since_epoch: 0,
+                hostname: flock_sync::normalize_hostname(req.hostname),
+                expired_at: None,
             };
             devices
                 .insert(device_id.as_slice(), encode_device(&dev_row).as_slice())
@@ -564,12 +678,13 @@ impl StateStore {
 // ============================================================================
 
 impl StateStore {
-    /// 注册设备（分配 VIP，单调不复用）。
+    /// 注册设备（M7 增 hostname——空串落 "(unknown)"；VIP 分配池优先）。
     pub fn register_device(
         &self,
         owner: &str,
         x25519: [u8; 32],
         ed25519: [u8; 32],
+        hostname: &str,
     ) -> Result<DeviceRow, NetError> {
         let device_id: [u8; 32] = Sha256::digest(ed25519).into();
         let txn = self.db.begin_write().map_err(int_err)?;
@@ -577,6 +692,7 @@ impl StateStore {
             let mut devices = txn.open_table(DEVICES).map_err(int_err)?;
             let mut users = txn.open_table(USERS).map_err(int_err)?;
             let mut meta = txn.open_table(META).map_err(int_err)?;
+            let mut pool = txn.open_table(VIP_POOL).map_err(int_err)?;
             if devices
                 .get(device_id.as_slice())
                 .map_err(int_err)?
@@ -589,7 +705,7 @@ impl StateStore {
                     .insert(owner, encode_user(&UserRow::default()).as_slice())
                     .map_err(int_err)?;
             }
-            let cur = Self::alloc_vip_tx(&mut meta).map_err(|e| match e {
+            let cur = Self::alloc_vip_tx(&mut meta, &mut pool).map_err(|e| match e {
                 RedeemError::IpExhausted => NetError::IpExhausted,
                 RedeemError::Internal(m) => NetError::Internal(m),
                 other => NetError::Internal(other.to_string()),
@@ -601,6 +717,8 @@ impl StateStore {
                 vip: cur.to_be_bytes(),
                 status: DeviceStatus::Active,
                 since_epoch: 0,
+                hostname: flock_sync::normalize_hostname(hostname),
+                expired_at: None,
             };
             devices
                 .insert(device_id.as_slice(), encode_device(&row).as_slice())
@@ -645,9 +763,11 @@ impl StateStore {
                         _ => LookupVerdict::NotFound,
                     }
                 }
-                DeviceStatus::Disabled | DeviceStatus::Revoked => LookupVerdict::Revoked {
-                    since_epoch: row.since_epoch,
-                },
+                DeviceStatus::Disabled | DeviceStatus::Revoked | DeviceStatus::Expired => {
+                    LookupVerdict::Revoked {
+                        since_epoch: row.since_epoch,
+                    }
+                }
             },
             None => LookupVerdict::NotFound,
         }
@@ -683,11 +803,33 @@ impl StateStore {
         out
     }
 
+    /// M7：全量设备行（名册装配的注册表快照——本地读即可，§7-M7.4）。
+    pub fn devices_all(&self) -> Vec<(DeviceId, DeviceRow)> {
+        let mut out = Vec::new();
+        let Ok(txn) = self.db.begin_read() else {
+            return out;
+        };
+        let Ok(t) = txn.open_table(DEVICES) else {
+            return out;
+        };
+        let Ok(iter) = t.iter() else { return out };
+        for e in iter.flatten() {
+            let Ok(idb) = <[u8; 32]>::try_from(e.0.value()) else {
+                continue;
+            };
+            if let Some(row) = decode_device(e.1.value()) {
+                out.push((DeviceId(idb), row));
+            }
+        }
+        out
+    }
+
     pub fn allocate_ip(&self) -> Result<Ipv4Addr, NetError> {
         let txn = self.db.begin_write().map_err(int_err)?;
         let out = {
             let mut meta = txn.open_table(META).map_err(int_err)?;
-            let cur = Self::alloc_vip_tx(&mut meta).map_err(|e| match e {
+            let mut pool = txn.open_table(VIP_POOL).map_err(int_err)?;
+            let cur = Self::alloc_vip_tx(&mut meta, &mut pool).map_err(|e| match e {
                 RedeemError::IpExhausted => NetError::IpExhausted,
                 RedeemError::Internal(m) => NetError::Internal(m),
                 other => NetError::Internal(other.to_string()),
@@ -901,12 +1043,24 @@ mod tests {
         device_seed: u8,
         root: &SigningKey,
     ) -> RedeemRequest<'a> {
+        req_h(invite, username, device_seed, root, "")
+    }
+
+    /// 带 hostname 的兑换请求构造（M7）。
+    fn req_h<'a>(
+        invite: &'a [u8],
+        username: &'a str,
+        device_seed: u8,
+        root: &SigningKey,
+        hostname: &'a str,
+    ) -> RedeemRequest<'a> {
         let (x, ed) = dev_keys(device_seed);
         RedeemRequest {
             invite_bytes: invite,
             username,
             device_x25519: x,
             device_ed25519: ed,
+            hostname,
             expected_root_pub: *root.verifying_key().as_bytes(),
             expected_cluster_id: [9; 16],
             now_unix: 1000,
@@ -978,8 +1132,8 @@ mod tests {
     #[test]
     fn vip_pool_monotonic_never_reused_and_disable_keeps_row() {
         let s = store();
-        let a = s.register_device("u", [1; 32], [1; 32]).unwrap();
-        let b = s.register_device("u", [2; 32], [2; 32]).unwrap();
+        let a = s.register_device("u", [1; 32], [1; 32], "").unwrap();
+        let b = s.register_device("u", [2; 32], [2; 32], "").unwrap();
         let ip2 = u32::from_be_bytes(b.vip);
         let ip1 = u32::from_be_bytes(a.vip);
         assert!(ip2 > ip1, "单调递增");
@@ -987,7 +1141,7 @@ mod tests {
         let id_a = DeviceId(Sha256::digest([1u8; 32]).into());
         let epoch = s.revoke(&id_a).unwrap();
         assert!(epoch >= 1, "吊销推进 revocation_epoch");
-        let c = s.register_device("u", [3; 32], [3; 32]).unwrap();
+        let c = s.register_device("u", [3; 32], [3; 32], "").unwrap();
         assert_eq!(u32::from_be_bytes(c.vip), ip2 + 1, "IP 不复用");
         // 禁用不删除：行仍在、状态 Disabled、VIP 不回收；lookup 给 Revoked 判定。
         let id_b = DeviceId(Sha256::digest([2u8; 32]).into());
@@ -1006,10 +1160,75 @@ mod tests {
         assert!(s.enable(&id_a).is_err());
     }
 
+    /// M7：Expire 释放 VIP 回池（新设备拿到该 VIP）+ 幂等 + 终态 + Expired ≠ Revoked
+    /// （状态/expired_at 可区分）+ devices_all 快照 + hostname 落 "(unknown)"。
+    #[test]
+    fn expire_releases_vip_and_reassigns_single_form() {
+        let s = store();
+        let a = s.register_device("u", [1; 32], [1; 32], "").unwrap();
+        let _b = s.register_device("u", [2; 32], [2; 32], "host-b").unwrap();
+        assert_eq!(a.hostname, flock_sync::HOSTNAME_UNKNOWN, "空串 ⇒ (unknown)");
+        let id_a = DeviceId(Sha256::digest([1u8; 32]).into());
+        let e1 = s.expire(&id_a, 1_700_000_000).unwrap();
+        assert!(e1 >= 1, "expire 推进 epoch");
+        let row = s.device_row(&id_a).unwrap();
+        assert_eq!(row.status, DeviceStatus::Expired);
+        assert_eq!(row.expired_at, Some(1_700_000_000));
+        assert_eq!(row.vip, a.vip, "行保留（审计）");
+        // 幂等：二次 expire 不动 epoch/expired_at。
+        assert_eq!(s.expire(&id_a, 1_800_000_000).unwrap(), e1);
+        assert_eq!(s.device_row(&id_a).unwrap().expired_at, Some(1_700_000_000));
+        // 新设备拿到池内最小 = a 的 VIP。
+        let c = s.register_device("u", [3; 32], [3; 32], "").unwrap();
+        assert_eq!(c.vip, a.vip, "池内 VIP 重派");
+        // 终态：enable/expire-after-revoke 拒。
+        assert!(s.enable(&id_a).is_err(), "Expired 终态不可逆");
+        assert!(s.set_hostname(&id_a, "x").is_err(), "终态行不可更 hostname");
+        // devices_all 快照：三行（Expired 行含 hostname/expired_at 字段往返）。
+        let all = s.devices_all();
+        assert_eq!(all.len(), 3);
+        let expired = all
+            .iter()
+            .find(|(id, _)| *id == id_a)
+            .map(|(_, r)| r.clone())
+            .unwrap();
+        assert_eq!(expired.status, DeviceStatus::Expired);
+        // lookup：Expired 阻断（Revoked 判定外形）。
+        assert!(matches!(s.lookup(&id_a), LookupVerdict::Revoked { .. }));
+        // Revoked 不因 expire 转化为可重派。
+        let id_c = DeviceId(Sha256::digest([3u8; 32]).into());
+        s.revoke(&id_c).unwrap();
+        assert!(s.expire(&id_c, 9_999_999_999).is_err());
+    }
+
+    /// M7：set_hostname 更新（re-register 语义）+ 兑换路径 hostname 落库。
+    #[test]
+    fn hostname_update_and_redeem_carries_hostname() {
+        let s = store();
+        let root = SigningKey::from_bytes(&[3; 32]);
+        let bytes = invite_fixture(&root, 999_999, [7; 16]);
+        s.record_invite(&[7; 16], 999_999).unwrap();
+        let out = s
+            .redeem_invite(req_h(&bytes, "harry", 6, &root, "  harry-pad  "))
+            .expect("redeem");
+        let id = DeviceId(out.device_id);
+        assert_eq!(
+            s.device_row(&id).unwrap().hostname,
+            "harry-pad",
+            "兑换携带 hostname（trim 规范化）"
+        );
+        // re-register 更新。
+        let row = s.set_hostname(&id, "renamed").unwrap();
+        assert_eq!(row.hostname, "renamed");
+        assert_eq!(s.device_row(&id).unwrap().hostname, "renamed");
+        // 未知设备拒。
+        assert!(s.set_hostname(&DeviceId([9; 32]), "x").is_err());
+    }
+
     #[test]
     fn bind_token_single_use_and_user_keys() {
         let s = store();
-        s.register_device("u", [1; 32], [1; 32]).unwrap();
+        s.register_device("u", [1; 32], [1; 32], "").unwrap();
         let tok = [7u8; 16];
         assert!(s.consume_bind_token(&tok), "首次消费");
         assert!(!s.consume_bind_token(&tok), "二次拒绝");
