@@ -15,6 +15,11 @@
 # 凭据引导 = admin 开户路径（对齐 m3 既有脚本）：gen-keys → device-add → invite →
 # ingest → vip → `flock-client login`（设口令 + 登录验证 + hostname 入册）→ ready。
 #
+# re-login 窗重试：daemon 登录保持按 refresh_after 周期重登（server ticket_ttl=6s ⇒
+# 4s），LoggingIn 短窗内 peers 返回 PeersUnavailable（指引文案即「稍候重试」）——
+# peers 类查询经 flock_retry/sh_retry 有界重试（PEERS_RETRIES 次）对齐该 transient；
+# 断言门槛（条目数/在线/延迟/流量非 0）不随重试放宽。
+#
 # Windows 宿主不跑本实测（tun 需提权 + WSL2 后端）——真机清单：
 # docs/manual/service-install.md（M7 条目）。
 #
@@ -43,6 +48,13 @@ PASS_1="m7-pass-1"
 PASS_2="m7-pass-2"
 CFG_1="/var/lib/flock/client.toml"
 EWMA_SETTLE=12   # iperf 停流后等 EWMA 收敛展示（α=0.2/1s 折——10s 量级窗）
+# daemon 登录保持的 re-login 窗重试（M7 复跑实证：server ticket_ttl=6s ⇒ refresh_after
+# =4s 周期重登，phase=LoggingIn 的短暂窗口内 peers 返回 PeersUnavailable「登录进行中
+# （稍候重试）」——CLI 指引文案即「稍候重试」；断言脚本对**该语义 transient** 有界
+# 重试（单查询 ~5% 命中率，6 次×2s 退避后残余概率可忽略）。数值/语义门槛不变——
+# 仍对最终成功返回的输出做原断言（条目数/字段/流量列阈值一律不放宽）。
+PEERS_RETRIES=6
+PEERS_RETRY_SLEEP=2
 
 compose() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
@@ -159,11 +171,39 @@ bootstrap() {
 }
 
 # ============================================================================
+# peers 查询重试包装（daemon re-login 窗 transient；语义门槛不降——见文件头注）
+# ============================================================================
+
+flock_retry() { # flock_retry <n:1|2> <flock-client 子命令/参数...> → stdout（rc 随最终次）
+    local n="$1"; shift
+    local out="" rc=1
+    for _ in $(seq 1 "$PEERS_RETRIES"); do
+        out="$(compose exec -T "client-$n" flock-client --config "$CFG_1" "$@" 2>/dev/null)"; rc=$?
+        if [ "$rc" -eq 0 ] && [ -n "$out" ]; then break; fi
+        sleep "$PEERS_RETRY_SLEEP"
+    done
+    printf '%s\n' "$out"
+    return "$rc"
+}
+
+sh_retry() { # sh_retry <sh -c payload>（client-1 容器内）→ stdout；空输出 = re-login 窗
+    # （peers CLI 报错 ⇒ jq 无输入不出值）⇒ 有界重试后仍空 ⇒ 非零。
+    local payload="$1" out=""
+    for _ in $(seq 1 "$PEERS_RETRIES"); do
+        out="$(compose exec -T client-1 sh -c "$payload" 2>/dev/null | tr -d '\r')"
+        if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+        sleep "$PEERS_RETRY_SLEEP"
+    done
+    printf '%s' "$out"
+    return 1
+}
+
+# ============================================================================
 # P1：名册装配（server + client-2 + self 三类条目）
 # ============================================================================
 
-peers_table() { # peers_table <n:1|2> → stdout（表格）
-    compose exec -T "client-$1" flock-client --config "$CFG_1" peers 2>/dev/null
+peers_table() { # peers_table <n:1|2> → stdout（表格；re-login 窗重试见 flock_retry）
+    flock_retry "$1" peers
 }
 
 p1() {
@@ -248,23 +288,25 @@ p2() {
 p3() {
     log "P3 机读档：peers --json | jq（容器内）"
     local js
-    js="$(compose exec -T client-1 flock-client --config "$CFG_1" peers --json 2>/dev/null)"; local rc=$?
+    js="$(flock_retry 1 peers --json)"; local rc=$?
     printf '%s\n' "$js" | head -12 | sed 's/^/    /'
     if [ $rc -ne 0 ]; then
-        record FAIL P3 "peers --json 失败（rc=$rc）"
+        record FAIL P3 "peers --json 失败（rc=$rc；含 re-login 窗重试后仍失败）"
         return
     fi
     # jq 在容器内跑（宿主无 jq 依赖——镜像已装）；过滤值经 --arg 传（内层零双引号，
-    # 免 docker exec 跨 Windows 参数边界时被吃引号）。
+    # 免 docker exec 跨 Windows 参数边界时被吃引号）。查询经 sh_retry：re-login 窗
+    # transient 有界重试（见文件头注），字段断言不降。
     local ty n srv_online c2_lat
-    ty="$(compose exec -T client-1 sh -c "flock-client --config $CFG_1 peers --json | jq -r 'type'" 2>/dev/null | tr -d '\r')" \
-        || { record FAIL P3 "jq 解析失败"; return; }
+    ty="$(sh_retry "flock-client --config $CFG_1 peers --json | jq -r 'type'")" \
+        || { record FAIL P3 "jq 解析失败（含 re-login 窗重试后仍空）"; return; }
     [ "$ty" = "array" ] || { record FAIL P3 "顶层非 array（$ty）"; return; }
-    n="$(compose exec -T client-1 sh -c "flock-client --config $CFG_1 peers --json | jq 'length'" 2>/dev/null | tr -d '\r')"
+    n="$(sh_retry "flock-client --config $CFG_1 peers --json | jq 'length'")" \
+        || { record FAIL P3 "条目数查询空（含重试）"; return; }
     [ "${n:-0}" -ge 3 ] || { record FAIL P3 "条目数 ${n:-?} < 3"; return; }
-    srv_online="$(compose exec -T client-1 sh -c "flock-client --config $CFG_1 peers --json | jq -r --arg v 100.64.0.1 '.[] | select(.vip==\$v) | .online'" 2>/dev/null | tr -d '\r')"
+    srv_online="$(sh_retry "flock-client --config $CFG_1 peers --json | jq -r --arg v 100.64.0.1 '.[] | select(.vip==\$v) | .online'")"
     [ "$srv_online" = "true" ] || { record FAIL P3 "server 条目 online != true（$srv_online）"; return; }
-    c2_lat="$(compose exec -T client-1 sh -c "flock-client --config $CFG_1 peers --json | jq -r --arg h client-2 '.[] | select(.hostname==\$h) | .latency_ms'" 2>/dev/null | tr -d '\r')"
+    c2_lat="$(sh_retry "flock-client --config $CFG_1 peers --json | jq -r --arg h client-2 '.[] | select(.hostname==\$h) | .latency_ms'")"
     case "$c2_lat" in
         ''|null) record FAIL P3 "client-2 latency_ms 为空/null（$c2_lat）" ;;
         *) record PASS P3 "json 数组（$n 条）+ server online + client-2 latency=${c2_lat}ms" ;;
