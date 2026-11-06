@@ -22,6 +22,11 @@ pub struct ClientConfig {
     /// 端点覆盖（调试/断言钉死用；缺省 = 根签目录全部端点轮询，§2.3）。
     #[serde(default)]
     pub endpoints: Vec<String>,
+    /// 控制 IPC 组授权（§7-M6.2，仅 Unix）：token 文件与 socket 尝试 chgrp 到该组
+    ///（组名查本地 /etc/group 或数字 gid；Windows 忽略——管道 DACL 走 IU）。
+    /// 缺省 None ⇒ root:root（仅 root 可控，即装即用）。
+    #[serde(default)]
+    pub control_group: Option<String>,
 }
 
 fn default_tun_name() -> String {

@@ -292,6 +292,39 @@ pub fn ingest_invite(state_dir: &Path, invite: &InviteFile) -> Result<ClientStat
     Ok(state)
 }
 
+/// 端点覆盖（§3.12 配置面；run/service 共用）：仅接受目录内端点（材料必须匹配，
+/// §1.3.3f 端点↔材料同签）；重复项告警并去重（保首次出现序——不去重会让
+/// [`EndpointRing`] 轮询重复拨同一端点）。
+pub fn override_endpoints(mut state: ClientState, eps: &[String]) -> Result<ClientState, String> {
+    let known = state.endpoints();
+    let mut seen: Vec<String> = Vec::new();
+    for ep in eps {
+        if !known.contains(ep) {
+            return Err(format!(
+                "覆盖端点 {ep} 不在根签目录内（端点↔材料同签，拒绝未签名端点）"
+            ));
+        }
+        if seen.contains(ep) {
+            eprintln!("flock-client: 配置告警：覆盖端点列表重复项 {ep}（已去重，保留首次出现序）");
+        } else {
+            seen.push(ep.clone());
+        }
+    }
+    let mut servers = Vec::new();
+    for ep in &seen {
+        if let Some(e) = state
+            .directory
+            .servers
+            .iter()
+            .find(|s| &s.relay_endpoint == ep)
+        {
+            servers.push(e.clone());
+        }
+    }
+    state.directory.servers = servers;
+    Ok(state)
+}
+
 // ============================================================================
 // 退避与端点轮询
 // ============================================================================
@@ -430,8 +463,32 @@ pub async fn supervise(
     state: &ClientState,
     tun: &TunIo,
     tunnel_cfg: TunnelConfig,
+    backoff: Backoff,
+    events: impl FnMut(ConnEvent),
+) {
+    supervise_inner(state, tun, tunnel_cfg, backoff, events, None).await
+}
+
+/// [`supervise`] + 纪元观测（§7-M6 service 装配）：连接建立发当前纪元初值，此后每次
+/// rekey 推进都写入 `epoch_tx`（IPC Status 快照的 epoch 源；接收端失联仅忽略）。
+pub async fn supervise_with_epoch(
+    state: &ClientState,
+    tun: &TunIo,
+    tunnel_cfg: TunnelConfig,
+    backoff: Backoff,
+    events: impl FnMut(ConnEvent),
+    epoch_tx: tokio::sync::watch::Sender<u64>,
+) {
+    supervise_inner(state, tun, tunnel_cfg, backoff, events, Some(epoch_tx)).await
+}
+
+async fn supervise_inner(
+    state: &ClientState,
+    tun: &TunIo,
+    tunnel_cfg: TunnelConfig,
     mut backoff: Backoff,
     mut events: impl FnMut(ConnEvent),
+    epoch_tx: Option<tokio::sync::watch::Sender<u64>>,
 ) {
     let mut ring = EndpointRing::new(state.endpoints());
     loop {
@@ -481,9 +538,13 @@ pub async fn supervise(
                             });
                         }
                         // rekey 观测（A10）：订阅纪元 watch，每次推进上报（对数据面无感——
-                        // bridge 与本任务并行）。
+                        // bridge 与本任务并行）。epoch_tx 存在时同步外发（service 快照源）。
                         let mut epoch_rx = tunnel.epoch_watch();
+                        if let Some(tx) = &epoch_tx {
+                            let _ = tx.send(*epoch_rx.borrow());
+                        }
                         let ep_for_rekey = endpoint.clone();
+                        let epoch_fwd = epoch_tx.clone();
                         let rekey_watcher = tokio::spawn(async move {
                             loop {
                                 if epoch_rx.changed().await.is_err() {
@@ -494,6 +555,9 @@ pub async fn supervise(
                                     "flock-client: rekey epoch={} endpoint={ep_for_rekey}",
                                     *epoch_rx.borrow_and_update()
                                 );
+                                if let Some(tx) = &epoch_fwd {
+                                    let _ = tx.send(*epoch_rx.borrow_and_update());
+                                }
                             }
                         });
                         let mut sess = tun.session();
@@ -537,6 +601,107 @@ mod tests {
     use crate::dataplane::testutil::EchoPeer;
     use crate::tun::{MockTunDevice, TunDevice as _, TunIo, TunSpec};
     use flock_protocol::trust::PinStore;
+
+    fn state_with(endpoints: &[&str]) -> ClientState {
+        use flock_protocol::session::{ClusterId, ServerEntry, ServerId};
+        use flock_protocol::trust::ClusterDirectory;
+        let mut servers = Vec::new();
+        for (i, ep) in endpoints.iter().enumerate() {
+            let identity =
+                flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[i as u8 + 1; 32]);
+            servers.push(ServerEntry {
+                server_id: ServerId([i as u8 + 1; 16]),
+                relay_endpoint: (*ep).to_string(),
+                identity_pub: identity.verifying_key(),
+                static_hybrid_pub: flock_protocol::kem::HybridKeypair::generate(
+                    &mut rand::rngs::OsRng,
+                )
+                .public(),
+            });
+        }
+        let directory = ClusterDirectory {
+            cluster_id: ClusterId([7; 16]),
+            dir_version: 1,
+            servers,
+            root_sig: flock_protocol::ed25519_dalek::Signature::from_bytes(&[0; 64]),
+        };
+        ClientState {
+            device: flock_protocol::session::DeviceStaticKeys::generate(),
+            pins: PinStore::new(),
+            directory,
+        }
+    }
+
+    /// 覆盖端点去重（保序）+ 未签名端点拒绝（§1.3.3f 原语义不回归；M6 起
+    /// run/service 共用）。
+    #[test]
+    fn override_endpoints_dedups_repeats_and_keeps_gate() {
+        let state = state_with(&["a:1", "b:2", "c:3"]);
+        // 重复项：去重保首现序。
+        let eps = vec!["b:2".to_string(), "a:1".to_string(), "b:2".to_string()];
+        let out = override_endpoints(state, &eps).expect("合法覆盖");
+        assert_eq!(out.endpoints(), vec!["b:2".to_string(), "a:1".to_string()]);
+        // 未签名端点仍拒。
+        let state2 = state_with(&["a:1"]);
+        let bad = vec!["evil:9".to_string()];
+        assert!(
+            override_endpoints(state2, &bad).is_err(),
+            "未签名端点必须拒绝"
+        );
+    }
+
+    /// supervise_with_epoch：连接建立即发纪元初值（IPC Status 快照源语义，§7-M6.2）。
+    #[tokio::test]
+    async fn supervise_with_epoch_publishes_initial_epoch_on_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ep = listener.local_addr().unwrap().to_string();
+        let peer = std::sync::Arc::new(EchoPeer::new(&ep));
+        let peer_serve = peer.clone();
+        tokio::spawn(async move { peer_serve.serve(listener).await });
+
+        let device = DeviceStaticKeys::generate();
+        peer.register(&device);
+        let mut pins = PinStore::new();
+        pins.pin(&peer.directory.cluster_id, &peer.root.verifying_key());
+        let state = ClientState {
+            device,
+            pins,
+            directory: peer.directory.clone(),
+        };
+
+        let mock = std::sync::Arc::new(MockTunDevice::open(&TunSpec::default()).unwrap());
+        let tun = std::sync::Arc::new(TunIo::from_arc(mock.clone()));
+        let tun_sup = tun.clone();
+
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(99u64);
+        let sup = tokio::spawn(async move {
+            supervise_with_epoch(
+                &state,
+                tun_sup.as_ref(),
+                TunnelConfig::default(),
+                Backoff::new(Duration::from_millis(80), Duration::from_millis(300)),
+                |_| {},
+                epoch_tx,
+            )
+            .await;
+        });
+
+        // 连接建立 ⇒ 纪元被会话真值覆盖（不再是构造初值 99）。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let v = *epoch_rx.borrow();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "15s 内未见连接纪元（仍 {v}）"
+            );
+            if v != 99 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        sup.abort();
+        tun.shutdown();
+    }
 
     /// 守护循环集成：连接 → 数据面 → 对端拆链 → SessionEnded → 退避 → 重连成功
     /// （A9 客户端语义「检测进入重连」的宿主可跑对应物；静默死链计时在会话层 M1
