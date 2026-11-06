@@ -46,12 +46,15 @@ const L_BOOTSTRAP: &[u8] = b"flock-sync/bootstrap/v1";
 // 行类型（与 M2 netstate.rs 同语义；M4 后续批次做服务器装配侧的 trait 收敛）
 // ============================================================================
 
-/// 设备状态（禁用不删除：行保留、VIP 不回收，§2.1）。
+/// 设备状态（禁用不删除：行保留、VIP 不回收，§2.1；Expired = 离线超保留期的时间性
+/// 淘汰——行保留审计、VIP 归还分配池，§7-M7 IP 复用策略修订）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceStatus {
     Active,
     Disabled,
     Revoked,
+    /// M7：离线超过保留期（终态；Expired ≠ Revoked——名册/审计可区分）。
+    Expired,
 }
 
 impl DeviceStatus {
@@ -60,6 +63,7 @@ impl DeviceStatus {
             DeviceStatus::Active => 1,
             DeviceStatus::Disabled => 2,
             DeviceStatus::Revoked => 3,
+            DeviceStatus::Expired => 4,
         }
     }
     pub fn from_code(c: u8) -> Option<Self> {
@@ -67,12 +71,35 @@ impl DeviceStatus {
             1 => Some(DeviceStatus::Active),
             2 => Some(DeviceStatus::Disabled),
             3 => Some(DeviceStatus::Revoked),
+            4 => Some(DeviceStatus::Expired),
             _ => None,
         }
     }
 }
 
-/// 注册表设备行（§2.2：设备 = (DeviceId, owner, VIP, 静态公钥集, status)）。
+/// hostname 缺省占位（客户端入网未上报/空串 ⇒ 落此值，§7-M7）。
+pub const HOSTNAME_UNKNOWN: &str = "(unknown)";
+/// hostname 长度上限（入网上报超长截断——展示面字段不做长内容承载）。
+pub const HOSTNAME_MAX: usize = 64;
+
+/// hostname 规范化：trim + 空串 ⇒ [`HOSTNAME_UNKNOWN`] + 超长截断（char 边界安全）。
+pub fn normalize_hostname(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return HOSTNAME_UNKNOWN.to_string();
+    }
+    if t.len() <= HOSTNAME_MAX {
+        return t.to_string();
+    }
+    let mut cut = HOSTNAME_MAX;
+    while !t.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    t[..cut].to_string()
+}
+
+/// 注册表设备行（§2.2：设备 = (DeviceId, owner, VIP, 静态公钥集, status, hostname,
+/// expired_at)——后两字段 M7 增补）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRow {
     pub owner: String,
@@ -82,6 +109,10 @@ pub struct DeviceRow {
     pub status: DeviceStatus,
     /// 状态判定（禁用/吊销）生效的 revocation_epoch。
     pub since_epoch: u64,
+    /// M7：客户端入网上报的主机名（空 ⇒ "(unknown)"；re-register 可更新）。
+    pub hostname: String,
+    /// M7：置 Expired 的 unix 秒（审计）；非 Expired 恒 None。
+    pub expired_at: Option<u64>,
 }
 
 /// 用户行：OPAQUE 注册记录 + SR-SIG1 用户公钥集（§2.4）。
@@ -108,11 +139,14 @@ pub struct InviteRow {
 }
 
 /// 服务器密钥条目（server_keys 写操作记录；hybrid 1216B 以 Vec 承载）。
+/// `vip` = 该服务器的 mesh VIP（M7：名册 Server 条目数据源；与身份/混合公钥同签——
+/// 根签登记时确定，任意节点本地视图可读）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerKeyEntry {
     pub server_id: NodeId,
     pub identity_pub: [u8; 32],
     pub hybrid_pub: Vec<u8>,
+    pub vip: [u8; 4],
 }
 
 // ============================================================================
@@ -161,7 +195,8 @@ pub fn admin_canonical(op: &AdminOp) -> Vec<u8> {
     v
 }
 
-/// server_keys 写操作的 canonical 字节。
+/// server_keys 写操作的 canonical 字节（M7：条目增 `vip` 进签名覆盖面——同批
+/// 根签登记，签名/验签同源重算，无迁移面）。
 pub fn server_keys_canonical(entries: &[ServerKeyEntry]) -> Vec<u8> {
     let mut v = Vec::with_capacity(64 + entries.len() * 1280);
     v.extend_from_slice(L_SERVER_KEYS);
@@ -171,6 +206,7 @@ pub fn server_keys_canonical(entries: &[ServerKeyEntry]) -> Vec<u8> {
         v.extend_from_slice(&e.identity_pub);
         v.extend_from_slice(&(e.hybrid_pub.len() as u32).to_le_bytes());
         v.extend_from_slice(&e.hybrid_pub);
+        v.extend_from_slice(&e.vip);
     }
     v
 }
@@ -208,18 +244,25 @@ pub enum SyncRequest {
         #[serde(with = "arr64")]
         sig: [u8; 64],
     },
-    /// 注册设备（分配 VIP，单调不复用）。
+    /// 注册设备（分配 VIP，单调不复用；M7 增 hostname——空串落 "(unknown)"）。
     RegisterDevice {
         owner: String,
         x25519: [u8; 32],
         ed25519: [u8; 32],
+        hostname: String,
     },
     /// 吊销设备：状态置 Revoked（行保留、VIP 不回收）+ 全局 revocation_epoch +1（§2.2）。
     Revoke { device: [u8; 32] },
     /// 禁用设备（不删除；epoch 同步推进，票据随之失效）。
     Disable { device: [u8; 32] },
-    /// 重新启用（仅 Disabled → Active；Revoked 终态不可逆）。
+    /// 重新启用（仅 Disabled → Active；Revoked/Expired 终态不可逆）。
     Enable { device: [u8; 32] },
+    /// M7：过期设备（回收器提交；行保留审计 + VIP 归还分配池 + epoch 推进 +
+    /// 吊销传播钩子——Expired ≠ Revoked，§7-M2/§7-M7）。`now_unix` 由提交方注入
+    /// （确定性落 expired_at）。幂等：已 Expired 重放放行、不动 epoch。
+    Expire { device: [u8; 32], now_unix: u64 },
+    /// M7：更新设备 hostname（re-register 路径；仅 Active/Disabled 行）。
+    SetHostname { device: [u8; 32], hostname: String },
     /// VIP 分配（单调水位；不回收）。
     AllocateIp,
     /// 邀请登记（签发侧与 InviteFile 同刻落库）。
@@ -228,12 +271,13 @@ pub enum SyncRequest {
         expiry_unix: u64,
     },
     /// 邀请兑换（Raft 状态机内查重 + 吊销/expiry 检查 + 建用户/设备 + 分 VIP，单次提交
-    /// 原子完成，§1.3.3f「邀请一生」）。
+    /// 原子完成，§1.3.3f「邀请一生」；M7 增 hostname）。
     RedeemInvite {
         invite_bytes: Vec<u8>,
         username: String,
         x25519: [u8; 32],
         ed25519: [u8; 32],
+        hostname: String,
         now_unix: u64,
     },
     /// 设置用户口令记录（仅未设置时；控制流 PwCommit 的复制形态）。
@@ -314,6 +358,8 @@ pub enum StateError {
     DeviceExists,
     DeviceNotFound,
     RevokedIsTerminal,
+    /// Expired 为终态（同 Revoked：旧 VIP 可能已归还池子并派给新设备，复活破单射）。
+    ExpiredIsTerminal,
     UserExists,
     AlreadyUsed,
     InviteRevoked,
@@ -342,6 +388,7 @@ impl std::fmt::Display for StateError {
             StateError::DeviceExists => write!(f, "device already registered"),
             StateError::DeviceNotFound => write!(f, "device not found"),
             StateError::RevokedIsTerminal => write!(f, "revoked is terminal"),
+            StateError::ExpiredIsTerminal => write!(f, "expired is terminal"),
             StateError::UserExists => write!(f, "username already exists"),
             StateError::AlreadyUsed => write!(f, "invite already redeemed"),
             StateError::InviteRevoked => write!(f, "invite revoked"),
@@ -479,6 +526,8 @@ pub struct StateView {
     pub config_version: u64,
     pub devices: usize,
     pub revoked: usize,
+    /// M7：Expired 行数（VIP 已归还池；与 revoked 分列——审计/名册语义不同）。
+    pub expired: usize,
     pub invites_used: usize,
     pub server_keys: usize,
     pub wraps: Vec<(NodeId, usize)>,

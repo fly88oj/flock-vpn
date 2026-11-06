@@ -108,6 +108,7 @@ async fn learner_snapshot_add_voter_promotion() {
                 owner: format!("u{i}"),
                 x25519: [i; 32],
                 ed25519: [i; 32],
+                hostname: String::new(),
             })
             .await
             .expect("register");
@@ -266,6 +267,7 @@ async fn learner_snapshot_add_voter_promotion() {
             owner: "n4".into(),
             x25519: [7; 32],
             ed25519: [7; 32],
+            hostname: String::new(),
         })
         .await
         .expect("voter 写");
@@ -333,6 +335,7 @@ async fn rewrap_requires_root_and_targets_new_server() {
                 server_id: n,
                 identity_pub: *e.identity_pub.as_bytes(),
                 hybrid_pub: e.static_hybrid_pub.to_bytes().to_vec(),
+                vip: [100, 64, 0, n as u8],
             }
         })
         .collect();
@@ -340,6 +343,7 @@ async fn rewrap_requires_root_and_targets_new_server() {
         server_id: 4,
         identity_pub: *n4.entry.identity_pub.as_bytes(),
         hybrid_pub: n4.entry.static_hybrid_pub.to_bytes().to_vec(),
+        vip: [100, 64, 0, 4],
     });
     let resp = c.nodes[writer]
         .write(SyncRequest::server_keys_signed(&c.fx.root, entries))

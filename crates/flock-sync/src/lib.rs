@@ -59,8 +59,9 @@ pub use lease::LocateFanout;
 pub use network::{SyncNetFactory, SyncNetwork};
 pub use node::{SyncNode, SyncNodeBuilder, SyncSettings};
 pub use proto::{
-    AdminOp, NodeId, ReadQuery, ReadView, RootSigned, ServerKeyEntry, StateError, SyncRequest,
-    SyncResponse, VerdictW, VIP_FIRST, VIP_LAST,
+    normalize_hostname, AdminOp, NodeId, ReadQuery, ReadView, RootSigned, ServerKeyEntry,
+    StateError, SyncRequest, SyncResponse, VerdictW, HOSTNAME_MAX, HOSTNAME_UNKNOWN, VIP_FIRST,
+    VIP_LAST,
 };
 pub use sm::{LagInjector, RedbStateMachine, SmCore};
 pub use store::RedbLogStore;

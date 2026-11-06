@@ -176,6 +176,7 @@ async fn write_any_read_any_linearizable_within_2s() {
             owner: "alice".into(),
             x25519: [1; 32],
             ed25519: [1; 32],
+            hostname: String::new(),
         },
     )
     .await;
@@ -239,6 +240,7 @@ async fn kill_leader_reelects_within_15s_no_lost_writes() {
                 owner: format!("u{i}"),
                 x25519: [i; 32],
                 ed25519: [i + 1; 32],
+                hostname: String::new(),
             },
         )
         .await;
@@ -294,6 +296,7 @@ async fn kill_leader_reelects_within_15s_no_lost_writes() {
             owner: "post".into(),
             x25519: [9; 32],
             ed25519: [9; 32],
+            hostname: String::new(),
         },
     )
     .await;
@@ -371,6 +374,7 @@ async fn register_revoke_register_ip_never_reused() {
             owner: "u".into(),
             x25519: [1; 32],
             ed25519: [1; 32],
+            hostname: String::new(),
         },
     )
     .await;
@@ -388,6 +392,7 @@ async fn register_revoke_register_ip_never_reused() {
             owner: "u".into(),
             x25519: [2; 32],
             ed25519: [2; 32],
+            hostname: String::new(),
         },
     )
     .await;
@@ -400,6 +405,7 @@ async fn register_revoke_register_ip_never_reused() {
             owner: "u".into(),
             x25519: [1; 32],
             ed25519: [1; 32],
+            hostname: String::new(),
         })
         .await
         .expect("write ok");
@@ -426,6 +432,7 @@ async fn server_keys_rewrap_roundtrip() {
         server_id: 2,
         identity_pub: *target_entry.identity_pub.as_bytes(),
         hybrid_pub: target_entry.static_hybrid_pub.to_bytes().to_vec(),
+        vip: [100, 64, 0, 2],
     }];
 
     // 无根签名（他签）⇒ 状态机拒绝（被入侵的在册服务器没有根密钥，无法触发 rewrap）。
@@ -516,6 +523,7 @@ async fn revoke_apply_callback_epoch_and_kill_hook_within_2s() {
             owner: "bob".into(),
             x25519: [3; 32],
             ed25519: [3; 32],
+            hostname: String::new(),
         },
     )
     .await;
@@ -594,6 +602,7 @@ async fn apply_lag_breaker_rejects_cache_and_new_handshake() {
             owner: "carol".into(),
             x25519: [4; 32],
             ed25519: dev_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -692,6 +701,7 @@ async fn full_partition_breaker_blocks_revoked_cache_until_rejoin() {
             owner: "eve".into(),
             x25519: [6; 32],
             ed25519: dev_pub,
+            hostname: String::new(),
         },
     )
     .await;
@@ -765,6 +775,7 @@ async fn ticket_root_in_raft_cross_node_and_epoch_invalidation() {
             owner: "dave".into(),
             x25519: [5; 32],
             ed25519: [5; 32],
+            hostname: String::new(),
         },
     )
     .await;

@@ -1,10 +1,12 @@
 //! 纯状态机数据：NetState 的确定性执行核（docs/design.md §3.10/§2.2 语义纪律）。
 //!
 //! 语义纪律（与 M2 单服 StateStore 一致，M4 = 同语义的 Raft 复制形态）：
-//! - **VIP 100.64.0.0/10 单调分配**：`.1` 保留服务器自身，从 `.2` 起水位线只进不退
-//!   ——**禁用不删除、IP 不复用**（§2.1，innernet 先例）。
+//! - **VIP 100.64.0.0/10 分配**：`100.64.0.1`–`.10` 保留服务器自身，水位线只进不退。
+//!   IP 复用策略（§2.1 M7 修订）：**吊销/禁用 → IP 永不复用**（行保留）；**Expired
+//!   （离线超保留期）→ VIP 归还 `vip_pool` 分配池**，新设备可分到——过期行保留在册
+//!   （审计），名册查询排除。
 //! - **invite_id 单次消费**：redeem 在同一状态转移内查重 + 标记（Raft 单次提交 = 原子）。
-//! - **吊销推进全局 revocation_epoch**：仅阻断性转移（→Disabled/→Revoked）+1；
+//! - **吊销推进全局 revocation_epoch**：仅阻断性转移（→Disabled/→Revoked/→Expired）+1；
 //!   Enable 是恢复，不动 epoch（否则会无害地废掉全网在途票据）。
 //! - **票据密钥根在 Raft 内**（Bootstrap 落库，§4）。
 //!
@@ -70,10 +72,13 @@ pub struct NetStateData {
     pub vip_next: u32,
     pub config_version: u64,
     pub devices: BTreeMap<[u8; 32], DeviceRow>,
+    /// M7：Expired 归还的 VIP 分配池（有序——分配取最小；序列化进快照）。
+    pub vip_pool: BTreeSet<[u8; 4]>,
     /// VIP → 设备反查索引（`devices` 的**派生数据**，不序列化——快照/重放后由
     /// [`NetStateData::reindex_vips`] 重建，apply 注册路径增量维护）。每包转发热路径
-    /// （`sm::SmCore::device_by_vip`）从 O(N) 全表扫描降为 O(log N)——VIP 水位单调
-    /// 不复用 ⇒ 索引单射。
+    /// （`sm::SmCore::device_by_vip`）从 O(N) 全表扫描降为 O(log N)。单射性由
+    /// 「Expired 行不进索引（其 VIP 已归还池）」维持——池内 VIP 与索引键不相交，
+    /// 池重派即插入新行。
     #[serde(skip, default)]
     pub vip_index: BTreeMap<[u8; 4], [u8; 32]>,
     pub users: BTreeMap<String, UserRow>,
@@ -107,6 +112,7 @@ impl NetStateData {
     }
 
     /// 目录三态查询（session::DeviceDirectory 数据源；损坏行 fail-closed = NotFound）。
+    /// Expired 同为阻断态（离线超保留期的时间性淘汰——与 Revoked 同拒握手，§7-M7）。
     pub fn lookup(&self, id: &[u8; 32]) -> VerdictW {
         match self.devices.get(id) {
             Some(row) => match row.status {
@@ -114,9 +120,11 @@ impl NetStateData {
                     x25519: row.device_x25519,
                     ed25519: row.device_ed25519,
                 },
-                DeviceStatus::Disabled | DeviceStatus::Revoked => VerdictW::Revoked {
-                    since_epoch: row.since_epoch,
-                },
+                DeviceStatus::Disabled | DeviceStatus::Revoked | DeviceStatus::Expired => {
+                    VerdictW::Revoked {
+                        since_epoch: row.since_epoch,
+                    }
+                }
             },
             None => VerdictW::NotFound,
         }
@@ -127,11 +135,14 @@ impl NetStateData {
         self.epoch
     }
 
-    /// 全量重建 VIP 反查索引（恢复/快照安装/一致性自检用；幂等）。
+    /// 全量重建 VIP 反查索引（恢复/快照安装/一致性自检用；幂等）。**Expired 行不进
+    /// 索引**（其 VIP 已归还 `vip_pool`——池重派后同池 VIP 会出现在新行；索引只收
+    /// 非 Expired 行 ⇒ 键唯一）。
     pub fn reindex_vips(&mut self) {
         self.vip_index = self
             .devices
             .iter()
+            .filter(|(_, row)| row.status != DeviceStatus::Expired)
             .map(|(dev, row)| (row.vip, *dev))
             .collect();
     }
@@ -156,7 +167,12 @@ impl NetStateData {
             revoked: self
                 .devices
                 .values()
-                .filter(|r| r.status != DeviceStatus::Active)
+                .filter(|r| matches!(r.status, DeviceStatus::Disabled | DeviceStatus::Revoked))
+                .count(),
+            expired: self
+                .devices
+                .values()
+                .filter(|r| r.status == DeviceStatus::Expired)
                 .count(),
             invites_used: self
                 .invites
@@ -192,12 +208,17 @@ impl NetStateData {
                 owner,
                 x25519,
                 ed25519,
-            } => self.apply_register(owner, *x25519, *ed25519),
+                hostname,
+            } => self.apply_register(owner, *x25519, *ed25519, hostname),
             SyncRequest::Revoke { device } => self.apply_set_status(device, DeviceStatus::Revoked),
             SyncRequest::Disable { device } => {
                 self.apply_set_status(device, DeviceStatus::Disabled)
             }
             SyncRequest::Enable { device } => self.apply_set_status(device, DeviceStatus::Active),
+            SyncRequest::Expire { device, now_unix } => self.apply_expire(device, *now_unix),
+            SyncRequest::SetHostname { device, hostname } => {
+                self.apply_set_hostname(device, hostname)
+            }
             SyncRequest::AllocateIp => match self.alloc_vip() {
                 Ok(vip) => ApplyOutcome::ok(SyncResponse::Ip(vip)),
                 Err(e) => ApplyOutcome::err(e),
@@ -231,8 +252,16 @@ impl NetStateData {
                 username,
                 x25519,
                 ed25519,
+                hostname,
                 now_unix,
-            } => self.apply_redeem(invite_bytes, username, *x25519, *ed25519, *now_unix),
+            } => self.apply_redeem(
+                invite_bytes,
+                username,
+                *x25519,
+                *ed25519,
+                hostname,
+                *now_unix,
+            ),
             SyncRequest::SetPassword {
                 user,
                 record_b64,
@@ -358,7 +387,13 @@ impl NetStateData {
         }
     }
 
-    fn apply_register(&mut self, owner: &str, x25519: [u8; 32], ed25519: [u8; 32]) -> ApplyOutcome {
+    fn apply_register(
+        &mut self,
+        owner: &str,
+        x25519: [u8; 32],
+        ed25519: [u8; 32],
+        hostname: &str,
+    ) -> ApplyOutcome {
         let device_id: [u8; 32] = Sha256::digest(ed25519).into();
         if self.devices.contains_key(&device_id) {
             return ApplyOutcome::err(StateError::DeviceExists);
@@ -377,6 +412,8 @@ impl NetStateData {
             vip,
             status: DeviceStatus::Active,
             since_epoch: 0,
+            hostname: crate::proto::normalize_hostname(hostname),
+            expired_at: None,
         };
         self.devices.insert(device_id, row.clone());
         self.vip_index.insert(vip, device_id);
@@ -387,8 +424,12 @@ impl NetStateData {
         let Some(row) = self.devices.get_mut(device) else {
             return ApplyOutcome::err(StateError::DeviceNotFound);
         };
-        if row.status == DeviceStatus::Revoked && status != DeviceStatus::Revoked {
+        if matches!(row.status, DeviceStatus::Revoked) && status != DeviceStatus::Revoked {
             return ApplyOutcome::err(StateError::RevokedIsTerminal);
+        }
+        if matches!(row.status, DeviceStatus::Expired) && status != DeviceStatus::Expired {
+            // Expired 终态不可逆（旧 VIP 可能已属他设备——复活破索引单射，§7-M7）。
+            return ApplyOutcome::err(StateError::ExpiredIsTerminal);
         }
         let mut effect = None;
         if row.status != status {
@@ -409,12 +450,62 @@ impl NetStateData {
         }
     }
 
+    /// M7：过期转移（回收器提交）——**VIP 归还分配池**（Expired ≠ Revoked 的核心差异：
+    /// 行保留审计、池内 VIP 可重派；复用吊销的 epoch 推进 + 传播钩子路径，仅状态语义
+    /// 不同）。幂等：已 Expired 的重放放行（回收器多机并发提交的收敛路径）、不动 epoch。
+    fn apply_expire(&mut self, device: &[u8; 32], now_unix: u64) -> ApplyOutcome {
+        let Some(row) = self.devices.get_mut(device) else {
+            return ApplyOutcome::err(StateError::DeviceNotFound);
+        };
+        if row.status == DeviceStatus::Expired {
+            return ApplyOutcome::ok(SyncResponse::Epoch(self.epoch));
+        }
+        if row.status == DeviceStatus::Revoked {
+            // Revoked 行 VIP 永不复用（§2.1）——吊销不因时间推进转化为可重派。
+            return ApplyOutcome::err(StateError::RevokedIsTerminal);
+        }
+        // 阻断性转移：epoch 推进 + 吊销传播钩子（杀残留会话/废票据——与 Revoked 同
+        // 路径，§7-M2）。
+        self.epoch += 1;
+        row.since_epoch = self.epoch;
+        row.status = DeviceStatus::Expired;
+        row.expired_at = Some(now_unix);
+        let effect = RevocationEffect {
+            device: *device,
+            new_epoch: self.epoch,
+        };
+        // 释放 VIP：索引删旧条目 + 归还池（有序集合——重派取最小）。
+        let released = row.vip;
+        self.vip_index.remove(&released);
+        self.vip_pool.insert(released);
+        ApplyOutcome {
+            resp: SyncResponse::Epoch(self.epoch),
+            revoked: Some(effect),
+        }
+    }
+
+    /// M7：hostname 更新（re-register 路径；仅非终态行）。
+    fn apply_set_hostname(&mut self, device: &[u8; 32], hostname: &str) -> ApplyOutcome {
+        let Some(row) = self.devices.get_mut(device) else {
+            return ApplyOutcome::err(StateError::DeviceNotFound);
+        };
+        if matches!(row.status, DeviceStatus::Revoked) {
+            return ApplyOutcome::err(StateError::RevokedIsTerminal);
+        }
+        if matches!(row.status, DeviceStatus::Expired) {
+            return ApplyOutcome::err(StateError::ExpiredIsTerminal);
+        }
+        row.hostname = crate::proto::normalize_hostname(hostname);
+        ApplyOutcome::ok(SyncResponse::Device(row.clone()))
+    }
+
     fn apply_redeem(
         &mut self,
         invite_bytes: &[u8],
         username: &str,
         x25519: [u8; 32],
         ed25519: [u8; 32],
+        hostname: &str,
         now_unix: u64,
     ) -> ApplyOutcome {
         // 根签名/结构校验 + 本集群身份钉死，先于任何状态触碰（同 M2）。
@@ -473,6 +564,8 @@ impl NetStateData {
                 vip,
                 status: DeviceStatus::Active,
                 since_epoch: 0,
+                hostname: crate::proto::normalize_hostname(hostname),
+                expired_at: None,
             },
         );
         self.vip_index.insert(vip, device_id);
@@ -576,8 +669,14 @@ impl NetStateData {
             .and_then(|c| VerifyingKey::from_bytes(&c.root_pub).ok())
     }
 
-    /// VIP 水位分配（单调 +1；首分配 [`VIP_FIRST`]，越 [`VIP_LAST`] 即耗尽）。
+    /// VIP 分配（M7 两级：**Expired 归还池优先**（取最小——确定性），池空回退单调
+    /// 水位线 `vip_next`（只进不退，吊销/禁用行的 VIP 永不进池，§2.1）；越
+    /// [`VIP_LAST`] 即耗尽）。
     fn alloc_vip(&mut self) -> Result<[u8; 4], StateError> {
+        if let Some(pool_vip) = self.vip_pool.iter().next().copied() {
+            self.vip_pool.remove(&pool_vip);
+            return Ok(pool_vip);
+        }
         let cur = if self.vip_next == 0 {
             VIP_FIRST
         } else {
@@ -613,6 +712,10 @@ mod tests {
         d
     }
 
+    fn dev_id(ed: &[u8; 32]) -> [u8; 32] {
+        Sha256::digest(ed).into()
+    }
+
     #[test]
     fn vip_monotonic_and_never_reused() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
@@ -623,6 +726,7 @@ mod tests {
                     owner: "u".into(),
                     x25519: [1; 32],
                     ed25519: [1; 32],
+                    hostname: String::new(),
                 },
                 None,
             )
@@ -637,6 +741,7 @@ mod tests {
                     owner: "u".into(),
                     x25519: [2; 32],
                     ed25519: [2; 32],
+                    hostname: String::new(),
                 },
                 None,
             )
@@ -651,9 +756,10 @@ mod tests {
                 &SyncRequest::RegisterDevice {
                     owner: "u".into(),
                     x25519: [1; 32],
-                    ed25519: [1; 32]
+                    ed25519: [1; 32],
+                    hostname: String::new()
                 },
-                None
+                None,
             )
             .resp,
             SyncResponse::Error(StateError::DeviceExists)
@@ -670,6 +776,192 @@ mod tests {
         assert!(matches!(
             d.apply(&SyncRequest::Enable { device: id }, None).resp,
             SyncResponse::Error(StateError::RevokedIsTerminal)
+        ));
+        // hostname 空串落 "(unknown)"（M7 默认值链路）。
+        assert_eq!(a.hostname, crate::proto::HOSTNAME_UNKNOWN);
+    }
+
+    /// M7：Expired 释放 VIP 回池 + 新设备拿到该 VIP + Expired ≠ Revoked 可区分 +
+    /// 幂等重放放行 + 终态不可逆 + 索引单射维持。
+    #[test]
+    fn expire_releases_vip_to_pool_and_reassigns() {
+        let root = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let mut d = bootstrapped(&root);
+        let reg = |seed: u8, host: &str| SyncRequest::RegisterDevice {
+            owner: "u".into(),
+            x25519: [seed; 32],
+            ed25519: [seed; 32],
+            hostname: host.into(),
+        };
+        let a = d.apply(&reg(1, "laptop-a"), None).resp;
+        let SyncResponse::Device(a_row) = a else {
+            panic!()
+        };
+        let _b = d.apply(&reg(2, "laptop-b"), None).resp;
+        let id_a: [u8; 32] = Sha256::digest([1u8; 32]).into();
+
+        // Expire（注入时钟）：epoch 推进 + expired_at 落库 + VIP 归还池。
+        let e = d
+            .apply(
+                &SyncRequest::Expire {
+                    device: id_a,
+                    now_unix: 1_700_000_000,
+                },
+                None,
+            )
+            .resp;
+        assert!(
+            matches!(e, SyncResponse::Epoch(1)),
+            "expire 推进 epoch: {e:?}"
+        );
+        let row = d.devices.get(&id_a).unwrap();
+        assert_eq!(row.status, DeviceStatus::Expired, "Expired ≠ Revoked");
+        assert_eq!(row.expired_at, Some(1_700_000_000));
+        assert_eq!(row.vip, a_row.vip, "行保留（审计）：VIP 字段不动");
+        assert!(d.vip_pool.contains(&a_row.vip), "VIP 归还池");
+        assert_eq!(d.device_by_vip(&a_row.vip), None, "索引删旧条目");
+        assert!(
+            !d.vip_pool.contains(&d.devices[&dev_id(&[2u8; 32])].vip),
+            "未过期设备的 VIP 不进池"
+        );
+
+        // 幂等重放：已 Expired ⇒ 放行且不动 epoch。
+        let e2 = d
+            .apply(
+                &SyncRequest::Expire {
+                    device: id_a,
+                    now_unix: 1_700_100_000,
+                },
+                None,
+            )
+            .resp;
+        assert!(matches!(e2, SyncResponse::Epoch(1)));
+        assert_eq!(d.epoch, 1);
+        assert_eq!(
+            d.devices.get(&id_a).unwrap().expired_at,
+            Some(1_700_000_000),
+            "重放不刷新 expired_at"
+        );
+
+        // 新设备拿到被释放的 VIP（池优先于水位线）。
+        let c = d.apply(&reg(3, "laptop-c"), None).resp;
+        let SyncResponse::Device(c_row) = c else {
+            panic!()
+        };
+        assert_eq!(c_row.vip, a_row.vip, "池内 VIP 重派给新设备");
+
+        // 索引单射：同 VIP 现在只指向新设备；重建后一致（Expired 行不进索引）。
+        assert_eq!(d.device_by_vip(&a_row.vip), Some(dev_id(&[3u8; 32])));
+        let incremental = d.vip_index.clone();
+        d.reindex_vips();
+        assert_eq!(d.vip_index, incremental, "重建 == 增量（Expired 排除）");
+
+        // 终态不可逆：Enable/Disable/再 Expire 换时刻均拒或幂等。
+        assert!(matches!(
+            d.apply(&SyncRequest::Enable { device: id_a }, None).resp,
+            SyncResponse::Error(StateError::ExpiredIsTerminal)
+        ));
+        assert!(matches!(
+            d.apply(&SyncRequest::Disable { device: id_a }, None).resp,
+            SyncResponse::Error(StateError::ExpiredIsTerminal)
+        ));
+        // hostname 更新拒（终态行）。
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::SetHostname {
+                    device: id_a,
+                    hostname: "x".into()
+                },
+                None,
+            )
+            .resp,
+            SyncResponse::Error(StateError::ExpiredIsTerminal)
+        ));
+        // lookup：Expired 阻断握手（Revoked 判定外形）。
+        assert!(matches!(d.lookup(&id_a), VerdictW::Revoked { .. }));
+
+        // Revoked 不因时间转化为可重派：吊销后再 Expire ⇒ 拒。
+        let id_c: [u8; 32] = Sha256::digest([3u8; 32]).into();
+        d.apply(&SyncRequest::Revoke { device: id_c }, None);
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::Expire {
+                    device: id_c,
+                    now_unix: 1_800_000_000
+                },
+                None,
+            )
+            .resp,
+            SyncResponse::Error(StateError::RevokedIsTerminal)
+        ));
+        assert!(
+            !d.vip_pool.contains(&c_row.vip),
+            "吊销 VIP 不进池（永不复用）"
+        );
+    }
+
+    /// M7：hostname 规范化（空 ⇒ "(unknown)"；trim；超长截断）+ SetHostname 更新。
+    #[test]
+    fn hostname_normalize_and_set_update() {
+        let root = ed25519_dalek::SigningKey::from_bytes(&[10; 32]);
+        let mut d = bootstrapped(&root);
+        let out = d
+            .apply(
+                &SyncRequest::RegisterDevice {
+                    owner: "u".into(),
+                    x25519: [1; 32],
+                    ed25519: [1; 32],
+                    hostname: "  my-laptop  ".into(),
+                },
+                None,
+            )
+            .resp;
+        let SyncResponse::Device(row) = out else {
+            panic!()
+        };
+        assert_eq!(row.hostname, "my-laptop", "trim");
+        let id: [u8; 32] = Sha256::digest([1u8; 32]).into();
+
+        // 超长截断（char 边界安全）。
+        let long = "x".repeat(100);
+        let out = d
+            .apply(
+                &SyncRequest::SetHostname {
+                    device: id,
+                    hostname: long,
+                },
+                None,
+            )
+            .resp;
+        let SyncResponse::Device(row) = out else {
+            panic!()
+        };
+        assert_eq!(row.hostname.len(), crate::proto::HOSTNAME_MAX);
+
+        // re-register 更新（SetHostname）。
+        let out = d
+            .apply(
+                &SyncRequest::SetHostname {
+                    device: id,
+                    hostname: "renamed".into(),
+                },
+                None,
+            )
+            .resp;
+        assert!(matches!(out, SyncResponse::Device(_)));
+        assert_eq!(d.devices.get(&id).unwrap().hostname, "renamed");
+
+        // 未知设备拒。
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::SetHostname {
+                    device: [7; 32],
+                    hostname: "x".into()
+                },
+                None,
+            )
+            .resp,
+            SyncResponse::Error(StateError::DeviceNotFound)
         ));
     }
 
@@ -710,6 +1002,7 @@ mod tests {
                     username: "alice".into(),
                     x25519: [3; 32],
                     ed25519: [3; 32],
+                    hostname: "alice-phone".into(),
                     now_unix: 1000,
                 },
                 None,
@@ -724,6 +1017,7 @@ mod tests {
                     username: "bob".into(),
                     x25519: [4; 32],
                     ed25519: [4; 32],
+                    hostname: String::new(),
                     now_unix: 1000,
                 },
                 None,
@@ -748,6 +1042,7 @@ mod tests {
             server_id: 2,
             identity_pub: *other.verifying_key().as_bytes(),
             hybrid_pub: vec![7; 64],
+            vip: [100, 64, 0, 1],
         }];
         let sk = SyncRequest::server_keys_signed(&root, entries);
         assert!(matches!(
@@ -833,6 +1128,7 @@ mod tests {
                 owner: "u".into(),
                 x25519: [1; 32],
                 ed25519: [1; 32],
+                hostname: "host-rt".into(),
             },
             None,
         );
@@ -841,14 +1137,54 @@ mod tests {
         assert_eq!(back.devices.len(), 1);
         assert_eq!(back.epoch, d.epoch);
         assert_eq!(back.ticket_root, d.ticket_root);
+        // M7 新字段随快照往返。
+        let id: [u8; 32] = Sha256::digest([1u8; 32]).into();
+        assert_eq!(back.devices.get(&id).unwrap().hostname, "host-rt");
+        assert_eq!(back.devices.get(&id).unwrap().expired_at, None);
         // VIP 索引不序列化（派生数据）——重建后与原状态一致。
         assert!(back.vip_index.is_empty(), "索引不进快照字节");
         back.reindex_vips();
         assert_eq!(back.vip_index, d.vip_index, "重建后索引一致");
     }
 
+    /// M7 快照兼容性声明（如实断言）：DeviceRow 加字段（hostname/expired_at）后，
+    /// **旧格式快照不可解码**——postcard 无字段标签，from_bytes 对旧字节干净失败
+    /// （返回 None，节点从日志/重建路径恢复）。未发布窗口允许（§7-M7.1）；本测试
+    /// 固化「失败必须干净」（不得 panic/半解码）：旧行编码字节与任意截断字节均 None。
+    #[test]
+    fn legacy_snapshot_bytes_fail_clean() {
+        // 旧 DeviceRow 形状（无 hostname/expired_at）——postcard 编码镜像。
+        #[derive(serde::Serialize)]
+        struct LegacyRow {
+            owner: String,
+            device_x25519: [u8; 32],
+            device_ed25519: [u8; 32],
+            vip: [u8; 4],
+            status: u8,
+            since_epoch: u64,
+        }
+        let legacy_row = postcard::to_allocvec(&LegacyRow {
+            owner: "u".into(),
+            device_x25519: [1; 32],
+            device_ed25519: [2; 32],
+            vip: [100, 64, 0, 11],
+            status: 1,
+            since_epoch: 0,
+        })
+        .expect("legacy encode");
+        // 旧行字节对新解码器是错位流（hostname 读不到合法 varint/长度）⇒ None。
+        assert!(
+            NetStateData::from_bytes(&legacy_row).is_none(),
+            "旧格式字节必须干净失败（None）"
+        );
+        // 截断的新格式字节同样 None（不 panic、不半解码）。
+        let fresh = NetStateData::new().to_bytes();
+        assert!(NetStateData::from_bytes(&fresh[..fresh.len() - 1]).is_none());
+        assert!(NetStateData::from_bytes(b"\x01\x00").is_none());
+    }
+
     /// VIP 反查索引一致性：apply 维护（注册/兑换/吊销后行保留不删除）+ 全量重建
-    /// 幂等 + 查询结果与全表扫描等价。
+    /// 幂等 + 查询结果与全表扫描等价（M7：Expired 行不进索引——吊销行保留）。
     #[test]
     fn vip_index_consistency_across_apply_and_rebuild() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
@@ -861,6 +1197,7 @@ mod tests {
                         owner: format!("u{i}"),
                         x25519: [i; 32],
                         ed25519: [i; 32],
+                        hostname: String::new(),
                     },
                     None,
                 )
@@ -875,9 +1212,17 @@ mod tests {
             None,
         );
         // 一致性：索引 ↔ devices 全表扫描（对每个 VIP 查询结果等价；条目数相等）。
-        let expect: Vec<([u8; 4], [u8; 32])> =
-            d.devices.iter().map(|(dev, row)| (row.vip, *dev)).collect();
-        assert_eq!(d.vip_index.len(), d.devices.len(), "吊销不删行 ⇒ 索引不缩");
+        let expect: Vec<([u8; 4], [u8; 32])> = d
+            .devices
+            .iter()
+            .filter(|(_, r)| r.status != DeviceStatus::Expired)
+            .map(|(dev, row)| (row.vip, *dev))
+            .collect();
+        assert_eq!(
+            d.vip_index.len(),
+            expect.len(),
+            "吊销不删行 ⇒ 索引不缩（Expired 排除）"
+        );
         for (vip, dev) in &expect {
             assert_eq!(d.device_by_vip(vip), Some(*dev), "索引查询 = 全表扫描");
         }

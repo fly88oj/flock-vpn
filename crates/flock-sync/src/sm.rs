@@ -445,6 +445,7 @@ mod tests {
                     owner: "u".into(),
                     x25519: [1; 32],
                     ed25519: [1; 32],
+                    hostname: String::new(),
                 },
             ),
             entry(
@@ -502,6 +503,7 @@ mod tests {
                         owner: "u".into(),
                         x25519: [1; 32],
                         ed25519: [1; 32],
+                        hostname: String::new(),
                     },
                 ),
             ])
