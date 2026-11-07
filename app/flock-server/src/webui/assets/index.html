@@ -80,7 +80,7 @@
               <h1 x-text="t('nav.dashboard')"></h1>
               <div class="page-sub" x-text="t('dash.subtitle', {cluster: shortId(bootstrap && bootstrap.cluster_id)})"></div>
             </div>
-            <button class="btn btn-outline btn-sm" @click="loadDashboard()" :disabled="dashBusy">
+            <button class="btn btn-outline" @click="loadDashboard()" :disabled="dashBusy">
               <span class="spin" x-show="dashBusy"></span><span x-text="t('app.refresh')"></span></button>
           </div>
 
@@ -197,7 +197,7 @@
               <h1 x-text="t('nav.peers')"></h1>
               <div class="page-sub" x-text="t('peers.subtitle')"></div>
             </div>
-            <button class="btn btn-outline btn-sm" @click="loadPeers()" :disabled="peersBusy">
+            <button class="btn btn-outline" @click="loadPeers()" :disabled="peersBusy">
               <span class="spin" x-show="peersBusy"></span><span x-text="t('app.refresh')"></span></button>
           </div>
 
@@ -287,7 +287,7 @@
               <h1 x-text="t('nav.users')"></h1>
               <div class="page-sub" x-text="t('users.subtitle')"></div>
             </div>
-            <button class="btn btn-outline btn-sm" @click="loadUsers()" :disabled="usersBusy">
+            <button class="btn btn-outline" @click="loadUsers()" :disabled="usersBusy">
               <span class="spin" x-show="usersBusy"></span><span x-text="t('app.refresh')"></span></button>
           </div>
 
@@ -372,7 +372,7 @@
               <h1 x-text="t('nav.audit')"></h1>
               <div class="page-sub" x-text="t('audit.subtitle')"></div>
             </div>
-            <button class="btn btn-outline btn-sm" @click="loadAudit()" :disabled="auditBusy">
+            <button class="btn btn-outline" @click="loadAudit()" :disabled="auditBusy">
               <span class="spin" x-show="auditBusy"></span><span x-text="t('app.refresh')"></span></button>
           </div>
 

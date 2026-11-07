@@ -112,7 +112,9 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .btn-success:hover { background: var(--success-dim); }
 .btn-ghost { background: transparent; color: var(--muted); }
 .btn-ghost:hover { background: var(--surface-2); color: var(--fg); }
-/* 描边中性按钮（页头「刷新」等——按钮化而非文字链，🟡 UI 评审项 3） */
+/* 描边中性按钮（页头「刷新」等——按钮化而非文字链，🟡 UI 评审项 3）。
+   刷新按钮三档统一（round2 评审项 3）：一律 .btn 基准（桌面/平板 36px、
+   手机档 44px 触控规则）——不再桌面 30px / 手机 44px 参差。 */
 .btn-outline { background: transparent; color: var(--muted); border-color: var(--border-strong); }
 .btn-outline:hover { color: var(--fg); border-color: var(--accent); background: var(--surface-2); }
 .btn-sm { min-height: 30px; padding: 4px 10px; font-size: var(--fs-xs); }
@@ -514,6 +516,13 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 
   .toast-stack { left: var(--sp-3); right: var(--sp-3); top: calc(var(--topbar-h) + var(--sp-2)); width: auto; }
   .chart-box { min-height: 180px; }
+}
+
+/* 平板（768–1199）行内操作按钮 ≥44px 命中（round2 评审项 3）：与手机档同一
+   触控标准——按钮本体抬到 44px（::after 外扩仍在，覆盖横向余量）；换行堆叠
+   时 row-actions 的 gap（12px）≥12px 间距要求。 */
+@media (max-width: 1199.98px) and (min-width: 768px) {
+  .table .row-actions .btn-sm { min-height: 44px; }
 }
 
 /* 触控目标兜底（手机档与桌面窄指针一致 ≥44px 的交互件） */
