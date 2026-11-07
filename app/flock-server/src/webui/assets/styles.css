@@ -103,9 +103,15 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .btn-success:hover { background: var(--success-dim); }
 .btn-ghost { background: transparent; color: var(--muted); }
 .btn-ghost:hover { background: var(--surface-2); color: var(--fg); }
+/* 描边中性按钮（页头「刷新」等——按钮化而非文字链，🟡 UI 评审项 3） */
+.btn-outline { background: transparent; color: var(--muted); border-color: var(--border-strong); }
+.btn-outline:hover { color: var(--fg); border-color: var(--accent); background: var(--surface-2); }
 .btn-sm { min-height: 30px; padding: 4px 10px; font-size: var(--fs-xs); }
 .btn-block { width: 100%; }
 .btn .spin { width: 14px; height: 14px; }
+/* 占位禁用形（终态行「吊销」置灰——操作列不锯齿，🔴 UI 评审项 5） */
+.btn.is-placeholder { opacity: 0.35; border-style: dashed; cursor: not-allowed; }
+.btn.is-placeholder:hover { background: transparent; }
 
 /* 触控目标 ≥44px（粗指针设备 / 手机档） */
 @media (pointer: coarse) {
@@ -165,7 +171,13 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .table tbody tr:hover { background: rgba(255, 255, 255, 0.025); }
 .table .num { font-variant-numeric: tabular-nums; }
 .table .ellipsis { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.table .row-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+/* 行操作（🟡 UI 评审项 3）：描边小按钮 ≥36px 视觉高度，::after 外扩命中区至
+   ≥44px；组间距 ≥12px；高危动作经 .acts-sep 竖分隔线与普通动作分区。 */
+.table .row-actions { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+.row-actions .btn-sm { min-height: 36px; padding: 5px 12px; position: relative; }
+.row-actions .btn-sm::after { content: ""; position: absolute; inset: -4px -3px; }
+.acts-sep { width: 1px; align-self: stretch; min-height: 20px; background: var(--border-strong); margin: 0 2px; }
+.actions-none { color: var(--faint); padding: 0 6px; }
 
 /* —— 可复制标识芯片（node_id 等 >2^53 u64 标识：字符串往返，截断展示 +
       title 全值 4 位分组 + 点击复制；🔴 UI 评审项 1）—— */
@@ -192,6 +204,9 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .badge-danger { background: var(--danger-dim); color: var(--danger); }
 .badge-muted { background: rgba(138, 148, 168, 0.14); color: var(--muted); }
 .badge-accent { background: var(--accent-dim); color: var(--accent); }
+/* 角色徽标语义分离（🟡 UI 评审项 10）：管理员=中性紫，与 leader 的蓝
+   （--accent）区分；琥珀（badge-warn）仅用于警示操作，拒绝/错误一律红。 */
+.badge-admin { background: rgba(157, 140, 255, 0.16); color: #b4a5ff; }
 .badge-info { background: rgba(88, 166, 201, 0.14); color: var(--info); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
 .dot-on { background: var(--success); box-shadow: 0 0 0 3px var(--success-dim); }
@@ -342,6 +357,12 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .auth-sub { color: var(--muted); font-size: var(--fs-sm); text-align: center; margin: 0 0 var(--sp-6); }
 .auth-foot { margin-top: var(--sp-5); text-align: center; font-size: var(--fs-xs); color: var(--faint); }
 .auth-alt { margin-top: var(--sp-4); text-align: center; font-size: var(--fs-sm); }
+/* 认证页切换链接：触控区 ≥44px（🟡 UI 评审项 3——文字链不做「裸点击面」） */
+.auth-alt .auth-link {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 44px; padding: 6px 14px; margin: 0 -6px;
+  border-radius: var(--r-md); font-weight: 550;
+}
 
 /* —— 图表 —— */
 .chart-box { position: relative; width: 100%; min-height: 220px; }
@@ -388,6 +409,18 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
     content: attr(data-label);
     color: var(--muted); font-size: var(--fs-xs); flex: none; font-weight: 550;
   }
+  /* VIP 行升格为卡片标题行（🟡 UI 评审项 2）：不渲染 ::before 标签，值以
+     「VIP」胶囊前缀自述（表头列名即 VIP——proper noun 保留原文）。 */
+  .table td.cell-vip::before { content: none; }
+  .table td.cell-vip { padding-top: 10px; padding-bottom: 4px; }
+  .table td.cell-vip .v-vip { font-weight: 650; font-size: var(--fs-md); font-variant-numeric: tabular-nums; }
+  .table td.cell-vip .v-vip::before {
+    content: "VIP"; font-size: 10px; color: var(--muted); font-weight: 600;
+    letter-spacing: 0.8px; margin-right: 8px; padding: 2px 8px;
+    border: 1px solid var(--border-strong); border-radius: var(--r-full);
+  }
+  /* 手机档行内按钮本体已 ≥44px——关闭桌面档 ::after 命中外扩（防相邻命中区重叠） */
+  .row-actions .btn-sm::after { display: none; }
   .table td:last-child { padding-top: var(--sp-2); }
   .table td:last-child::before { content: none; }
   .table .row-actions { width: 100%; }

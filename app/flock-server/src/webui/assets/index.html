@@ -78,7 +78,7 @@
               <h1 x-text="t('nav.dashboard')"></h1>
               <div class="page-sub" x-text="t('dash.subtitle', {cluster: shortId(bootstrap && bootstrap.cluster_id)})"></div>
             </div>
-            <button class="btn btn-ghost btn-sm" @click="loadDashboard()" :disabled="dashBusy">
+            <button class="btn btn-outline btn-sm" @click="loadDashboard()" :disabled="dashBusy">
               <span class="spin" x-show="dashBusy"></span><span x-text="t('app.refresh')"></span></button>
           </div>
 
@@ -181,7 +181,7 @@
               <h1 x-text="t('nav.peers')"></h1>
               <div class="page-sub" x-text="t('peers.subtitle')"></div>
             </div>
-            <button class="btn btn-ghost btn-sm" @click="loadPeers()" :disabled="peersBusy">
+            <button class="btn btn-outline btn-sm" @click="loadPeers()" :disabled="peersBusy">
               <span class="spin" x-show="peersBusy"></span><span x-text="t('app.refresh')"></span></button>
           </div>
 
@@ -214,9 +214,9 @@
                 <tbody>
                   <template x-for="p in peers" :key="p.device_id">
                     <tr :title="p.device_id">
-                      <td data-label="VIP"><span class="mono" x-text="p.vip"></span></td>
-                      <td data-label="hostname" class="ellipsis" x-text="p.hostname || '—'"></td>
-                      <td data-label="owner" class="ellipsis">
+                      <td :data-label="t('peers.col.vip')" class="cell-vip"><span class="mono v-vip" x-text="p.vip"></span></td>
+                      <td :data-label="t('peers.col.hostname')" class="ellipsis" x-text="p.hostname || '—'"></td>
+                      <td :data-label="t('peers.col.owner')" class="ellipsis">
                         <template x-if="isNumId(p.owner)">
                           <button type="button" class="id-chip mono" :title="idChipTitle(p.owner)"
                                   @click="copyText(p.owner)" x-text="shortNum(p.owner)"></button>
@@ -225,18 +225,25 @@
                           <span x-text="p.owner"></span>
                         </template>
                       </td>
-                      <td data-label="kind"><span class="badge" :class="p.kind==='server' ? 'badge-info' : 'badge-muted'" x-text="p.kind==='server' ? t('app.server') : t('app.device')"></span></td>
-                      <td data-label="status"><span style="display:inline-flex;align-items:center;gap:6px">
+                      <td :data-label="t('peers.col.kind')"><span class="badge" :class="p.kind==='server' ? 'badge-info' : 'badge-muted'" x-text="p.kind==='server' ? t('app.server') : t('app.device')"></span></td>
+                      <td :data-label="t('peers.col.status')"><span style="display:inline-flex;align-items:center;gap:6px">
                         <span class="dot" :class="p.online && 'dot-on'"></span>
                         <span class="badge" :class="statusBadge(p.status)" x-text="t('peers.status.' + p.status)"></span></span></td>
-                      <td data-label="lastseen" class="num hide-narrow" x-text="fmtAgo(p.last_seen_unix)"></td>
-                      <td data-label="traffic" class="num mono" x-text="'↑ ' + fmtBps(p.tx_bps) + '  ↓ ' + fmtBps(p.rx_bps)"></td>
+                      <td :data-label="t('peers.col.lastseen')" class="num hide-narrow" x-text="fmtAgo(p.last_seen_unix)"></td>
+                      <td :data-label="t('peers.col.traffic')" class="num mono" x-text="'↑ ' + fmtBps(p.tx_bps) + '  ↓ ' + fmtBps(p.rx_bps)"></td>
                       <td data-label="" x-show="isAdmin">
+                        <!-- 稳定控件集（🔴 评审项 5）：server 行无 吊销/禁用/启用；
+                             终态行「吊销」置灰占位——操作列不锯齿；高危动作
+                             （禁用/吊销）经 .acts-sep 与普通动作分区。 -->
                         <div class="row-actions">
-                          <button class="btn btn-danger btn-sm" x-show="p.status==='active'" @click="confirmPeer(p, 'revoke')" x-text="t('peers.act.revoke')"></button>
-                          <button class="btn btn-warn btn-sm" x-show="p.status==='active'" @click="confirmPeer(p, 'disable')" x-text="t('peers.act.disable')"></button>
-                          <button class="btn btn-success btn-sm" x-show="p.status==='disabled'" @click="confirmPeer(p, 'enable')" x-text="t('peers.act.enable')"></button>
-                          <button class="btn btn-ghost btn-sm" x-show="p.kind==='device'" @click="confirmPeer(p, 'kick')" x-text="t('peers.act.kick')"></button>
+                          <span class="actions-none" x-show="p.kind==='server'">—</span>
+                          <button class="btn btn-success btn-sm" x-show="p.kind==='device' && p.status==='disabled'" @click="confirmPeer(p, 'enable')" x-text="t('peers.act.enable')"></button>
+                          <button class="btn btn-ghost btn-sm" x-show="p.kind==='device' && p.status==='active'" @click="confirmPeer(p, 'kick')" x-text="t('peers.act.kick')"></button>
+                          <span class="acts-sep" x-show="p.kind==='device' && (p.status==='active' || p.status==='disabled')"></span>
+                          <button class="btn btn-warn btn-sm" x-show="p.kind==='device' && p.status==='active'" @click="confirmPeer(p, 'disable')" x-text="t('peers.act.disable')"></button>
+                          <button class="btn btn-danger btn-sm" x-show="p.kind==='device' && (p.status==='active' || p.status==='disabled')" @click="confirmPeer(p, 'revoke')" x-text="t('peers.act.revoke')"></button>
+                          <button class="btn btn-danger btn-sm is-placeholder" x-show="p.kind==='device' && (p.status==='revoked' || p.status==='expired')"
+                                  disabled :title="t('peers.act.terminal')" x-text="t('peers.act.revoke')"></button>
                         </div>
                       </td>
                     </tr>
@@ -254,7 +261,7 @@
               <h1 x-text="t('nav.users')"></h1>
               <div class="page-sub" x-text="t('users.subtitle')"></div>
             </div>
-            <button class="btn btn-ghost btn-sm" @click="loadUsers()" :disabled="usersBusy">
+            <button class="btn btn-outline btn-sm" @click="loadUsers()" :disabled="usersBusy">
               <span class="spin" x-show="usersBusy"></span><span x-text="t('app.refresh')"></span></button>
           </div>
 
@@ -303,18 +310,20 @@
                     <tbody>
                       <template x-for="u in users" :key="u.username">
                         <tr>
-                          <td data-label="username"><span x-text="u.username"></span>
+                          <td :data-label="t('users.col.username')"><span x-text="u.username"></span>
                             <span class="field-hint" x-show="me && u.username === me.user" x-text="t('users.me')"></span></td>
-                          <td data-label="role"><span class="badge" :class="u.admin ? 'badge-accent' : 'badge-muted'" x-text="u.admin ? t('users.role.admin') : t('users.role.plain')"></span></td>
-                          <td data-label="disabled"><span class="badge" :class="u.disabled ? 'badge-danger' : 'badge-success'" x-text="u.disabled ? t('users.disabled.yes') : t('users.disabled.no')"></span></td>
-                          <td data-label="password" class="hide-narrow"><span class="badge badge-muted" x-text="u.has_password ? t('users.password.set') : t('users.password.none')"></span></td>
-                          <td data-label="devices" class="num" x-text="u.devices"></td>
+                          <td :data-label="t('users.col.role')"><span class="badge" :class="u.admin ? 'badge-admin' : 'badge-muted'" x-text="u.admin ? t('users.role.admin') : t('users.role.plain')"></span></td>
+                          <td :data-label="t('users.col.disabled')"><span class="badge" :class="u.disabled ? 'badge-danger' : 'badge-success'" x-text="u.disabled ? t('users.disabled.yes') : t('users.disabled.no')"></span></td>
+                          <td :data-label="t('users.col.password')" class="hide-narrow"><span class="badge badge-muted" x-text="u.has_password ? t('users.password.set') : t('users.password.none')"></span></td>
+                          <td :data-label="t('users.col.devices')" class="num td-num" x-text="u.devices"></td>
                           <td data-label="">
                             <div class="row-actions">
-                              <button class="btn btn-warn btn-sm" x-show="!u.disabled" :disabled="busyKey !== ''" @click="confirmUserDisable(u)" x-text="t('users.act.disable')"></button>
                               <button class="btn btn-success btn-sm" x-show="u.disabled" :disabled="busyKey !== ''" @click="userEnable(u)" x-text="t('users.act.enable')"></button>
-                              <button class="btn btn-ghost btn-sm" :disabled="busyKey !== ''" @click="userResetPw(u)" x-text="t('users.act.resetpw')"></button>
                               <button class="btn btn-ghost btn-sm" :disabled="busyKey !== ''" @click="confirmUserAdmin(u, !u.admin)" x-text="u.admin ? t('users.act.unsetadmin') : t('users.act.setadmin')"></button>
+                              <span class="acts-sep"></span>
+                              <button class="btn btn-ghost btn-sm" :disabled="busyKey !== ''" @click="userResetPw(u)" x-text="t('users.act.resetpw')"></button>
+                              <button class="btn btn-warn btn-sm" x-show="!u.disabled" :disabled="busyKey !== ''" @click="confirmUserDisable(u)" x-text="t('users.act.disable')"></button>
+                              <button class="btn btn-warn btn-sm is-placeholder" x-show="u.disabled" disabled :title="t('users.act.disabled.disabled')" x-text="t('users.act.disable')"></button>
                             </div>
                           </td>
                         </tr>
@@ -334,7 +343,7 @@
               <h1 x-text="t('nav.audit')"></h1>
               <div class="page-sub" x-text="t('audit.subtitle')"></div>
             </div>
-            <button class="btn btn-ghost btn-sm" @click="loadAudit()" :disabled="auditBusy">
+            <button class="btn btn-outline btn-sm" @click="loadAudit()" :disabled="auditBusy">
               <span class="spin" x-show="auditBusy"></span><span x-text="t('app.refresh')"></span></button>
           </div>
 
@@ -363,12 +372,12 @@
                 <tbody>
                   <template x-for="(e, i) in audit" :key="i">
                     <tr>
-                      <td data-label="time" class="num mono" x-text="fmtTime(e.ts)"></td>
-                      <td data-label="user" class="ellipsis" x-text="e.user"></td>
-                      <td data-label="action" x-text="t('audit.action.' + e.action)"></td>
-                      <td data-label="target" class="mono ellipsis" x-text="shortTarget(e.target)"></td>
-                      <td data-label="origin" class="hide-narrow" x-text="e.origin"></td>
-                      <td data-label="result"><span class="badge" :class="resultBadge(e.result)" x-text="t('audit.result.' + e.result)"></span></td>
+                      <td :data-label="t('audit.col.time')" class="num mono" x-text="fmtTime(e.ts)"></td>
+                      <td :data-label="t('audit.col.user')" class="ellipsis" x-text="e.user"></td>
+                      <td :data-label="t('audit.col.action')" x-text="t('audit.action.' + e.action)"></td>
+                      <td :data-label="t('audit.col.target')" class="mono ellipsis" x-text="shortTarget(e.target)"></td>
+                      <td :data-label="t('audit.col.origin')" class="hide-narrow" x-text="e.origin"></td>
+                      <td :data-label="t('audit.col.result')"><span class="badge" :class="resultBadge(e.result)" x-text="t('audit.result.' + e.result)"></span></td>
                     </tr>
                   </template>
                 </tbody>
@@ -432,7 +441,7 @@
           <span x-text="loginBusy ? t('login.busy') : t('login.submit')"></span></button>
       </form>
       <div class="auth-alt"><span x-text="t('login.setpw')"></span>
-        <a href="#/set-password" x-text="t('login.setpw.go')"></a></div>
+        <a class="auth-link" href="#/set-password" x-text="t('login.setpw.go')"></a></div>
     </div>
   </div>
 
@@ -465,7 +474,7 @@
           <span class="spin" x-show="pwBusy"></span>
           <span x-text="pwBusy ? t('setpw.busy') : t('setpw.submit')"></span></button>
       </form>
-      <div class="auth-alt"><a href="#/login" x-text="t('setpw.go.login')"></a></div>
+      <div class="auth-alt"><a class="auth-link" href="#/login" x-text="t('setpw.go.login')"></a></div>
     </div>
   </div>
 
