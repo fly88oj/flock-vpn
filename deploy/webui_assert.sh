@@ -202,14 +202,16 @@ w4_bootstrap_client() {
   echo "  client-1 开户完成（vip=$vip）"
 }
 
-# 把 webui_login 从 server 容器拷进 client 容器（镜外二进制、经宿主中转）。
-cp_webui_login() { # cp_webui_login <src-service> <dst-service>
-  local tmp
+# 把 webui_login 从 server 容器拷进 client 容器（镜外二进制、经宿主中转；
+# compose 命令显式传入——W4 单服档 / W6 dual 档各用各的项目）。
+cp_webui_login() { # cp_webui_login <compose-cmd> <src-service> <dst-service>
+  local CC tmp
+  CC="$1"
   tmp=$(mktemp)
   [ -n "$(command -v cygpath)" ] && tmp=$(cygpath -w "$tmp")
-  $COMPOSE cp "$1:/usr/local/bin/webui_login" "$tmp" >/dev/null 2>&1 || return 1
-  $COMPOSE cp "$tmp" "$2:/usr/local/bin/webui_login" >/dev/null 2>&1 || return 1
-  $COMPOSE exec -T "$2" chmod +x /usr/local/bin/webui_login || return 1
+  $CC cp "$2:/usr/local/bin/webui_login" "$tmp" >/dev/null 2>&1 || return 1
+  $CC cp "$tmp" "$3:/usr/local/bin/webui_login" >/dev/null 2>&1 || return 1
+  $CC exec -T "$3" chmod +x /usr/local/bin/webui_login || return 1
   rm -f "$tmp"
 }
 
@@ -238,7 +240,7 @@ w4() {
     bad "W4 登录页可达（code=$code）"; return
   fi
   # ③ 登录链通（webui_login 载具指向 VIP 端点；W2 的 w2admin）。
-  cp_webui_login server-a client-1 || { bad "W4 webui_login 拷载"; return; }
+  cp_webui_login "$COMPOSE" server-a client-1 || { bad "W4 webui_login 拷载"; return; }
   local WV
   WV="$COMPOSE exec -T client-1 webui_login --base http://100.64.0.1:9800"
   $WV --user w2admin --pass W2Boss-Pw login | grep -q "login=ok" \
@@ -433,7 +435,7 @@ w6() {
     [ "$code" = "200" ] && echo "  curl http://$vip:9800/ 200 OK" || { bad "W6 登录页 $vip（$code）"; return; }
   done
   # ③ 双 VIP 各自登录（cookie 按 host 域隔离——各自独立登录）。
-  cp_webui_login dual-a dual-client || { bad "W6 webui_login 拷载"; return; }
+  cp_webui_login "$DUAL --profile dual" dual-a dual-client || { bad "W6 webui_login 拷载"; return; }
   local WA WB
   WA="ed dual-client webui_login --base http://100.64.0.1:9800"
   WB="ed dual-client webui_login --base http://100.64.0.2:9800"
