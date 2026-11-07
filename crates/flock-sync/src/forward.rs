@@ -271,9 +271,10 @@ impl ForwardPlane {
                 }
             },
         };
-        // 源占位 [0;32]：非任何注册设备 ⇒ 失败路径（drop_with_icmp）找不到源会话，
-        // 自然纯丢（内核出向的尽力语义）。
-        let _ = self.deliver_or_forward_fwd(&[0u8; 32], dst_dev, pkt).await;
+        // 源 = 本服务器 server-self 合成键（收端源绑定按 origin 的确定性 VIP 校验；
+        // 失败路径 drop_with_icmp 找不到该键的会话 ⇒ 自然纯丢，内核出向尽力语义）。
+        let src_dev = server_self_device_id(self.me);
+        let _ = self.deliver_or_forward_fwd(&src_dev, dst_dev, pkt).await;
     }
 
     /// 设备注册 VIP（源绑定校验数据源 = NetState 强一致注册表）。
@@ -477,8 +478,20 @@ impl ForwardPlane {
             return ForwardOutcome::Rejected(RejectReason::Hop);
         }
         // 收端源绑定交叉校验：envelope.src_dev 的注册 VIP == 内层包源地址。
+        // 例外面：src_dev = 发端服务器的 server-self 合成键（route_outbound 的
+        // 服务器内核回程，非注册设备）⇒ 期望内层源 = 该服务器的确定性 VIP
+        //（server_vip_of——服务器对自身内核流量背书，mesh 信任域内）。
         let ok = match self.vip_of(&env.src_dev) {
             Some(expect) => matches!(ipv4_src(&env.payload), Some(src) if src == expect),
+            None if env.src_dev == server_self_device_id(env.origin_server) => {
+                matches!(
+                    (
+                        crate::proto::server_vip_of(env.origin_server),
+                        ipv4_src(&env.payload)
+                    ),
+                    (Some(expect), Some(src)) if Ipv4Addr::from(expect) == src
+                )
+            }
             None => false,
         };
         if !ok {
@@ -846,6 +859,58 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, 2);
         assert_eq!(sent[0].1.dst_dev, server_self_device_id(2));
+        assert_eq!(
+            sent[0].1.src_dev,
+            server_self_device_id(1),
+            "服务器内核回程的源 = 本机 server-self 合成键（收端可校验）"
+        );
+        assert_eq!(sent[0].1.origin_server, 1);
+    }
+
+    /// receive：src_dev = 发端服务器 server-self（内核回程面）、dst = 本机会话设备
+    /// ⇒ 源绑定按 origin 的确定性 VIP 校验通过并投会话。
+    #[tokio::test]
+    async fn receive_from_remote_server_kernel_delivers_to_session() {
+        let (plane, dev, sess, _t) = plane_with_device().await;
+        let pkt = ip4(
+            "100.64.0.2".parse().unwrap(), // node 2 的确定性服务器 VIP
+            "100.64.0.11".parse().unwrap(),
+            b"reply",
+        );
+        let env = ForwardEnvelope {
+            ver: FORWARD_VER,
+            src_dev: server_self_device_id(2),
+            dst_dev: dev,
+            origin_server: 2,
+            hop: 1,
+            payload: pkt,
+        };
+        assert!(matches!(plane.receive(env), ForwardOutcome::Delivered));
+        assert_eq!(sess.0.lock().unwrap().len(), 1, "回程包入客户端会话");
+    }
+
+    /// receive：server-self 源但内层 src ≠ 该服务器确定性 VIP ⇒ Rejected（回程面
+    /// 不放松源绑定）。
+    #[tokio::test]
+    async fn receive_from_server_kernel_bad_src_rejected() {
+        let (plane, dev, _sess, _t) = plane_with_device().await;
+        let pkt = ip4(
+            "100.64.0.3".parse().unwrap(), // ≠ node 2 的 .2
+            "100.64.0.11".parse().unwrap(),
+            b"x",
+        );
+        let env = ForwardEnvelope {
+            ver: FORWARD_VER,
+            src_dev: server_self_device_id(2),
+            dst_dev: dev,
+            origin_server: 2,
+            hop: 1,
+            payload: pkt,
+        };
+        assert!(matches!(
+            plane.receive(env),
+            ForwardOutcome::Rejected(RejectReason::SrcBinding)
+        ));
     }
 
     /// server_vip_of / server_vip_node 往返（段内/段外界点）。

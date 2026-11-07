@@ -159,30 +159,44 @@ w3() {
 #     （VPN 段路径实证：peer → E2E 隧道 → server-a tun0 → VIP:9800）
 # =====================================================================
 
-# client-1 开户（单服面：device-add → invite → login → ready；幂等——ready 标记）。
+# client-1 开户（单服面：device-add → invite → login → ready；幂等——ready 标记 +
+# 已注册残留的 peers VIP 回取）。endpoints 钉死 compose 服务名（server 侧
+# advertise_endpoint=127.0.0.1:9443 对 client 容器不可达）。
 w4_bootstrap_client() {
   if $COMPOSE exec -T client-1 sh -c 'test -f /var/lib/flock/ready' 2>/dev/null; then
     echo "  client-1 已就绪（幂等跳过）"
     return 0
   fi
-  # 卷内配置（[auth] username——daemon 登录态与 login 子命令共用，m7 同法）。
-  $COMPOSE exec -T client-1 sh -c 'printf "state_dir = \"/var/lib/flock\"\ntun_name = \"tun0\"\nmtu = 1280\n\n[auth]\nusername = \"w4client\"\n" > /var/lib/flock/client.toml' || return 1
-  local keys dx de out vip
+  # 卷内配置（[auth] username + endpoints 钉死——daemon 与 login 子命令共用）。
+  $COMPOSE exec -T client-1 sh -c 'printf "state_dir = \"/var/lib/flock\"\ntun_name = \"tun0\"\nmtu = 1280\n\nendpoints = [\"server-a:9443\"]\n\n[auth]\nusername = \"w4client\"\n" > /var/lib/flock/client.toml' || return 1
+  local keys dx de devid out vip
   keys=$($COMPOSE exec -T client-1 flock-client --config /var/lib/flock/client.toml gen-keys 2>/dev/null) || return 1
   dx=$(printf '%s\n' "$keys" | sed -n 's/^device-x=//p')
   de=$(printf '%s\n' "$keys" | sed -n 's/^device-ed=//p')
+  devid=$(printf '%s\n' "$keys" | sed -n 's/^device-id=//p')
   [ -n "$dx" ] && [ -n "$de" ] || { echo "  gen-keys 输出异常"; return 1; }
   out=$($COMPOSE exec -T server-a flock-server --config /etc/flock/server.toml \
-      device-add --user w4client --device-x "$dx" --device-ed "$de" 2>&1) || { echo "  device-add 失败：$out"; return 1; }
+      device-add --user w4client --device-x "$dx" --device-ed "$de" 2>&1)
   vip=$(printf '%s\n' "$out" | sed -n 's/^vip=//p' | tr -d '\r')
-  case "$vip" in 100.64.*) ;; *) echo "  VIP 异常：$out"; return 1;; esac
+  if [ -z "$vip" ] && printf '%s' "$out" | grep -q "already registered"; then
+    # 幂等回取：前次失败跑的残留设备——经 webui peers 按 device_id 回取 VIP
+    #（w2admin；W2 前置已建）。
+    vip=$($COMPOSE exec -T server-a webui_login --base http://127.0.0.1:9800 \
+        --user w2admin --pass W2Boss-Pw peers 2>/dev/null \
+      | grep "device_id=$devid" | sed -n 's/^peers \([0-9.]*\) .*/\1/p')
+    echo "  device 已注册（残留）——peers 回取 vip=$vip"
+  fi
+  case "$vip" in
+    100.64.*) ;;
+    *) echo "  device-add/VIP 异常：$out"; return 1;;
+  esac
   $COMPOSE exec -T server-a flock-server --config /etc/flock/server.toml \
-      invite --ttl-secs 86400 2>/dev/null | $COMPOSE exec -T client-1 sh -c 'cat > /var/lib/flock/invite.b64' || return 1
+      invite --ttl-secs 86400 2>/dev/null | $COMPOSE exec -T client-1 sh -c 'cat > /var/lib/flock/invite.b64' || { echo "  invite 签发/落盘失败"; return 1; }
   $COMPOSE exec -T client-1 flock-client --config /var/lib/flock/client.toml \
-      invite /var/lib/flock/invite.b64 >/dev/null 2>&1 || return 1
+      invite /var/lib/flock/invite.b64 >/dev/null 2>&1 || { echo "  invite ingest 失败"; return 1; }
   printf '%s\n' "$vip" | $COMPOSE exec -T client-1 sh -c 'cat > /var/lib/flock/vip' || return 1
   printf 'W4-Client-Pw\nW4-Client-Pw\n' | $COMPOSE exec -T client-1 \
-      flock-client --config /var/lib/flock/client.toml login >/dev/null 2>&1 || return 1
+      flock-client --config /var/lib/flock/client.toml login >/dev/null 2>&1 || { echo "  client login 失败"; return 1; }
   $COMPOSE exec -T client-1 sh -c 'touch /var/lib/flock/ready' || return 1
   $COMPOSE restart client-1 >/dev/null 2>&1 || return 1
   echo "  client-1 开户完成（vip=$vip）"
@@ -217,7 +231,7 @@ w4() {
   # ② curl 登录页可达（VPN 段内 GET /）。
   local code body
   code=$($COMPOSE exec -T client-1 curl -s -o /dev/null -w '%{http_code}' http://100.64.0.1:9800/ 2>/dev/null)
-  body=$($COMPOSE exec -T client-1 curl -s http://100.64.0.1:9800/ 2>/dev/null | head -c 400)
+  body=$($COMPOSE exec -T client-1 curl -s http://100.64.0.1:9800/ 2>/dev/null | head -c 4096)
   if [ "$code" = "200" ] && printf '%s' "$body" | grep -q "flockApp"; then
     echo "  curl VIP:9800 登录页 200 OK"
   else
