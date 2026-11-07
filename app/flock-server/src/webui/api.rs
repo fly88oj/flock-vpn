@@ -218,7 +218,8 @@ impl WebState {
         tab.map.remove(user).map(|p| p.state)
     }
 
-    /// 在册行数（测试/诊断面）。
+    /// 在册行数（测试/诊断面——仅测试引用）。
+    #[cfg(test)]
     fn pending_len(&self) -> usize {
         self.pending
             .lock()
