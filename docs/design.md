@@ -443,6 +443,10 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
      膨胀）。设备上线/迁移的事件推送（≤1s）使该窗口通常短于租约 TTL。
   - Linux 路由配 rtnetlink（VPN-14）。
 - `flock-frpc` 托管（§5）：配置生成 + 进程守护 + 健康探测。
+- **Web UI 管理面（§7-M8）**：进程内嵌 HTTP（`127.0.0.1:port` + 本机 tun VIP:port
+  双绑定，缺省 9800，不绑 LAN/公网）——管理登录账号 + Dashboard；认证 = OPAQUE
+  （pake 复用）+ admin 角色 + HttpOnly 会话 cookie；集群中每台服务器各自内嵌，
+  数据经 Raft/租约/EWMA 天然一致（任意 VIP 均可访问）。
 
 ### 2.3 客户端（`app/flock-client`）
 
@@ -608,8 +612,10 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
   修订）。
 
 ### 3.11 `app/flock-server`（服务端装配）
-- **接口**：`flock-server --config server.toml` / `init-cluster` / `enroll`（进程入口）
-  + 控制流消息协议（版本化，票据强制契约见 §2.2；含 dir_pull/开户兑换流程 §1.3.3f）。
+- **接口**：`flock-server --config server.toml` / `init-cluster` / `enroll` /
+  `web-admin-add`（进程入口；web-admin-add = M8 Web UI 首 admin 引导，§7-M8.3）
+  + 控制流消息协议（版本化，票据强制契约见 §2.2；含 dir_pull/开户兑换流程 §1.3.3f）
+  + Web UI HTTP API（§7-M8.4 契约逐字）。
 - **接缝**：`ListenerMode`（接入端点形态，server.toml `listener.mode`，**Direct 缺省**）：
   ```rust
   enum ListenerMode {
@@ -625,7 +631,9 @@ Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
   **仅 Frp 模式下的** flock-frpc（装配期按 mode 分派，Direct 分支无 flock-frpc 类型引用）。
 - **实现要点**：tokio 运行时；每入连一会话任务；转发面 = **第 0 步源 VIP 绑定校验** →
   租约表定位 → 本机投递或 ForwardEnvelope 跨服转发（NOT_HERE → 一次性 location_query
-  重定向 + hop=1 防环 + 失败丢包/ICMP，§2.2）；吊销在 apply 回调内本地执行（无额外广播依赖）。
+  重定向 + hop=1 防环 + 失败丢包/ICMP，§2.2）；吊销在 apply 回调内本地执行（无额外广播依赖）；
+  M8：内嵌 Web UI 管理面（loopback + tun VIP 双绑定 :9800，OPAQUE 登录 + 会话 cookie，
+  自研最小 HTTP/1.1——§7-M8）。
 
 ### 3.12 `app/flock-client`（客户端装配）
 - **接口**：`flock-client --config client.toml` / `flock-client invite <file>`。
@@ -1264,6 +1272,413 @@ flock-protocol 门禁含 wasm32 check（roster 纯数据无平台面）。
 4. 门禁：两 crate clippy `-D warnings`、workspace check、fmt；容器 linux 档 check
    （涉及 cfg 的仅数据面计数路径，不新增平台分支）。
 
+### M8 服务端 Web UI（管理登录 + 现代 Dashboard）
+
+需求（用户原话）：服务端需要有 Web UI 管理登录账号和完整现代的 Dashboard；默认仅服务端
+本机可以访问，有权限的账户从 VPN 服务端的内网 IP 访问；如果是多个服务端集群，则任意
+服务端 VPN 内网 IP 都可以访问。
+
+#### M8.1 形态与选型定型（进程内嵌 / HTTP 框架 / 前端三案 / 资产内嵌 / i18n）
+
+- **形态：flock-server 进程内嵌 HTTP 服务**（webui 模块，§M8.8 文件落位），与既有
+  接入端点（:9443）、admin loopback（:9444）并列的第三个监听面。集群 = 每台 server
+  各自内嵌同一套 UI 与 API；数据面（注册表/Raft、租约/EWMA、epoch）经既有机制天然
+  一致 ⇒「任意服务端 VPN 内网 IP 都可访问」不需要任何新增同步逻辑。**会话表是
+  per-server 进程内存**（不进 Raft）：在 server-a 的 VIP 登录得到的 cookie 对
+  server-b 无效（cookie 本就按 host 域隔离）——在 b 上重新登录即可，行为写明文档。
+- **HTTP 框架：自研最小 HTTP/1.1（`webui::http`）而非 axum**。裁决理由：
+  1. 依赖树现状：Cargo.lock（364 包）不含 hyper/tower/http 任何构件；axum 最小装配
+     需引入 ~40–60 个新 crate（hyper 1.x + tower + http-body + matchit + mime…），
+     为一个仅 loopback+VIP 可达、约 20 个 JSON 端点的管理面付出整条 tower 栈，与
+     仓库既有纪律相悖（§3.6「一个适配器=假想缝」；admin.rs/session 均为自研帧协议
+     先例）。
+  2. 暴露面极小 ⇒ HTTP 子集极小：HTTP/1.1、GET/POST、keep-alive、单 cookie 解析、
+     `Content-Length` 定长体——**拒绝 Transfer-Encoding/chunked 与重复
+     Content-Length**（防请求走私的根本手法是不实现歧义特性）；请求行 ≤2KiB、头
+     ≤8KiB、体 ≤64KiB，超限 400/413 并关连接；并发上限 = 独立信号量（缺省 64）。
+  3. 解析器带畸形请求测试向量（§M8.9），拒绝路径全部有断言。
+  代价（如实声明）：无 HTTP/2、无分块上传、无 Range——管理面不需要；未来需要时
+  `webui::http` 是唯一调用方，可整体替换（缝在 handler 分发函数上）。
+- **前端选型（三案评估，择 A）**：
+  - **A（选定）**：手写 fetch + Alpine.js 3.14（vendored，~15KB gz）+ 自写现代 CSS
+    设计系统（深色主题）+ **uPlot 1.6.9**（vendored ~48KB min）画流量曲线；
+  - B（否决）：htmx 服务端渲染片段——图表与轮询仍需 JS（uPlot 不因 htmx 消失），
+    却把 HTML 拼装移进 Rust 模板面，且 wasm OPAQUE 客户端照样要浏览器 JS——两头不省；
+  - C（否决）：Vue ESM vendored——无 node 工具链即无 SFC 编译，只能以模板字符串写
+    组件（可维护性差），~34KB gz 运行时对 6 个页面的表单/列表交互属过剩。
+  图表库 uPlot vs Chart.js：流量时间序列是 uPlot 甜区（canvas、120 点每分钟重绘无感、
+  ~12KB gz vs Chart.js ~65KB gz），**定 uPlot**。
+- **资产内嵌：`include_dir`**（定死）。vs rust-embed：include_dir 零运行时依赖、
+  行为确定；rust-embed 的 debug 档 fs 回读对本资产集（<15 文件）无增量价值。
+  资产 `Cache-Control`：API `no-store`、资产 `no-cache`（单二进制升级即全量刷新，
+  无指纹文件名需求）。
+- **i18n：中文先行**（定死）。v1 单语 zh-CN；全部文案集中 `assets/i18n.js` 单字典
+  对象（后补英文只加文件，API 不随语言变化）。
+- **wasm：flock-protocol 以 wasm32 目标编译 OPAQUE 客户端函数**——不引 wasm-bindgen
+  （showroom §8.3 约束同源），沿用 showroom `wasm_shim.rs` 的 **C-ABI 垫片**手法 +
+  本仓 `wasm_bridge.rs` 已就位的 getrandom custom 后端（`.cargo/config.toml` 的
+  `getrandom_backend="custom"`）。新垫片 `crates/flock-protocol/src/webauth_shim.rs`
+  （契约 §M8.6）。构建档：`cargo build -p flock-protocol --target
+  wasm32-unknown-unknown --no-default-features --features wasm,anchor`（无 zstd ⇒
+  零 C 依赖）；产物 + 手写 JS 胶水（~120 行）一并 include_dir 内嵌进 server 二进制。
+
+#### M8.2 监听、绑定与访问矩阵（断言表）
+
+- **双绑定（重试逻辑定死）**：`[webui] port`（缺省 **9800**）派生两个监听地址——
+  `127.0.0.1:9800` 与 `cfg.vip:9800`。**配置不暴露任何 bind 字段**（0.0.0.0 误配在
+  结构上不可能，而非靠校验拦截）。loopback 监听启动即绑定；**VIP 绑定由重试任务
+  补上**（周期 5s：tun 未就绪/地址未配 ⇒ 绑定失败重试；失败记日志一次、状态变化时
+  再记，永不 crash——loopback 面不受影响）。数据路径：peer → 接入服务器 E2E 会话 →
+  （跨服则 ForwardEnvelope，收端投内核 `fwd_delivered_kernel` 路径）→ 目标服务器
+  tun0 → 内核 TCP 栈 → VIP:9800 listener——与「peer ping 服务器 VIP」同路径，无需
+  新转发面。
+- **server.toml 增节（§3.11 ServerConfig 扩展）**：
+  ```toml
+  [webui]
+  enabled = true            # 缺省；false = 不装配 webui
+  port = 9800               # 校验 1..=65535，且不与 bind/admin_bind/admin_bind+1/raft_bind 冲突（拒起服）
+  session_ttl_secs = 28800  # 缺省 8h；校验 60..=86400
+  series_points = 120       # 流量环形缓冲点数（§M8.5）
+  series_interval_secs = 60 # 采样间隔
+  ```
+- **访问矩阵（来源中间件逐请求判定，测试锚定 W-A1–W-A4）**：
+
+| # | 来源（RemoteAddr） | 结果 | 机制 |
+|---|---|---|---|
+| W-A1 | 127.0.0.0/8（含 ::1） | **可达**：静态页 + 登录；登录后按角色授权 | loopback 绑定 + 来源中间件放行 |
+| W-A2 | 100.64.0.0/10（经 tun VIP 入） | **可达**：同上（任一 VPN peer 可打开登录页；无角色账户登录后只读/403） | VIP 绑定 + 来源中间件放行 |
+| W-A3 | 其它（LAN/公网接口） | **不可达**（连接层） | 根本机制：未绑定任何 LAN/公网地址；纵深防御：来源中间件对越界 RemoteAddr 回 403 `forbidden_origin` |
+| W-A4 | 反向代理/LB 之后 | **不承诺** | `X-Forwarded-For` 一律忽略（客户端可伪造）；代理 IP 不在放行段即 403——不支持反代部署，文档明示 |
+
+- **远程运维既定路径**：SSH 隧道（`ssh -L 9800:127.0.0.1:9800 …`，与 admin 端点同
+  建议，§3.11 校验文案）；把 webui 放到 TLS 反代后属于未定义行为（RemoteAddr 将是
+  代理地址，触发 W-A4 拒绝）。
+
+#### M8.3 认证与授权（OPAQUE 复用形态 + 会话 + 与既有授权面的裁决）
+
+**登录流 = HTTP 同语义新端点（不复用控制流消息，复用 pake 原语）**——显式裁决：
+- 控制流 `LoginBegin/Finish` 的授权前提是「会话设备 owner == user」（隧道内已认证，
+  control.rs 现行实现）；Web 登录无隧道会话 ⇒ **为 HTTP 定义同语义端点**
+  `/api/login-begin|finish`，服务端调同一组 `pake::{server_login_start,
+  server_login_finish}` + 同一 OPRF（单服=本地 / 多主=Raft 封装解封后的共享 key）+
+  同一注册表口令记录。ke1/ke2/ke3 线上形态 = 同 b64 字符串（协议同构）。
+- **anchor 保留**：login-begin 响应携带 `{server_id, bind_token, anchor_sig}`（与
+  控制流同 canonical：`anchor_canonical_bytes`）；页面启动 `GET /api/bootstrap` 取
+  本服务器 `identity_pub`，wasm 内 `login_finish_anchored` 验签。语义边界（如实）：
+  浏览器没有钉扎的集群根公钥，此验证绑定「登录 transcript ↔ 本服务器身份」（防
+  错集群/错服务器响应混装），**不提供 MITM 防护**——传输完整性由信任域承担
+  （loopback / VPN 逐跳 E2E，§M8.7）。
+- **profile 约束**：Web 登录客户端恒用 `Profile::Owasp19MiB`（=default）；记录侧
+  profile ≠ 0 ⇒ login-finish 客户端本地 Err ⇒ 401 `login_failed`（与错口令同表现，
+  不泄漏原因）。系统内全部口令记录均以 default 档创建（控制流 PwBegin/CLI
+  web-admin-add 同档），不构成实际限制。
+- **防枚举**：未知用户走 pake dummy 路径（ke2 同形）；login-finish 统一 401。
+
+**会话（服务端内存表 + HttpOnly cookie）**：
+- SessionId = 32B 随机（`flock_protocol::rand`）hex 64 字符；表 =
+  `HashMap<sid, Session{user, admin, origin: Loopback|Vpn, iat_unix, exp_unix}>`；
+  TTL = `session_ttl_secs`（缺省 28800）；**上限 256 条**，超限按 iat 淘汰最旧
+  （断言）；惰性过期（命中即验 exp）+ 60s 周期清扫。origin 在 login-finish 时按
+  RemoteAddr 定档（loopback / VPN 段），**两类都合法、都记录**（不拒绝跨段重用
+  cookie——按需求原语义；/api/me 与审计行回显 origin）。
+- Cookie（逐字）：
+  `Set-Cookie: flock_session=<64hex>; HttpOnly; SameSite=Strict; Path=/; Max-Age=<session_ttl_secs>`；
+  logout 回 `Max-Age=0` 同名删除。**无 Secure**（无 TLS，§M8.7）。cookie 按 host 域
+  隔离 ⇒ 127.0.0.1 与 VIP、VIP-a 与 VIP-b 各自独立登录（文档写明）。
+- **角色模型**：`UserRow.admin: bool`（下文）决定角色。**未登录：除公共端点
+  （login-begin/finish、pw-begin/commit、bootstrap、静态资产）外一切 API 401
+  `not_logged_in`**；非 admin：只读端点可用（peers/dashboard/config——这些数据本就经
+  M7 名册对任何成员可见），管理端点 403 `forbidden`。逐端点角色矩阵定死于 §M8.4。
+
+**Web 会话 ↔ 既有授权面的显式裁决（三条，堵住歧义）**：
+1. Web 会话**不复用、不映射**控制流 60s 票据：票据绑设备、隧道内短期凭据；web 会话
+   绑用户、HTTP 面 8h 凭据——两套凭据两套生命周期，不桥接、互不可用。
+2. Web 变更类写操作**走既有 Raft 普通写路径**（与控制流 DeviceOp 同型）：授权在
+   handler 层（会话 user 须 admin）裁决后由本服务器经 `NetBackend` 提交。**不经过
+   也不放宽 `admin_op` 根签操作**：`add_voter/rewrap/revoke_invite` 与
+   `cluster-bootstrap/cluster-invite`（根密钥语境）**不在 Web UI 暴露**，仍走 CLI +
+   root.seed（§4-3 红线不变）。
+3. 与 admin loopback（:9444，无认证本机单写者）并存分工：CLI 运维面继续走 9444；
+   `web-admin-add` 走 9444 的扩展变体（首 admin 引导，下文）。两端点都不承诺远程。
+
+**注册表扩展（Raft 静态面）**：`UserRow`（flock-sync/src/proto.rs；单服 netstate 同源
+再导出）增三字段——**postcard 无字段标签 ⇒ 旧快照/旧日志不可解码，未发布窗口允许**
+（§7-M7.1 同一纪律；升级残留旧库重建）：
+
+```rust
+pub struct UserRow {
+    pub opaque_record: Option<String>,  // 既有
+    pub opaque_profile: u16,            // 既有
+    pub sr_sig_pubs: Vec<[u8; 32]>,     // 既有
+    pub admin: bool,                    // 新（M8）：Web 管理角色
+    pub disabled: bool,                 // 新（M8）：禁用 ⇒ 阻断 Web 与控制流登录
+                                        //   （不追溯断开已建会话；设备级断离走 disable/revoke）
+    pub pw_bootstrap: Option<[u8; 16]>, // 新（M8）：初始/重置口令一次性引导令牌（消费即置 None）
+}
+```
+
+`SyncRequest` **尾部追加**五个普通写（无根签要求——授权在提交方 handler/CLI 层，与
+SetPassword/AddUserSigKey 同型）+ `StateError` 尾部追加 `BadBootstrapToken`：
+
+```rust
+CreateUser { username: String, pw_bootstrap: [u8; 16] }      // UserExists 拒
+SetPasswordBootstrap { user: String, token: [u8; 16],
+                       record_b64: String, profile: u16 }    // 原子：令牌匹配 且 记录为空 ⇒ 落记录 + 清令牌
+ResetPassword { user: String, new_token: [u8; 16] }          // 清记录 + 置新令牌（管理员发起；旧口令即刻失效）
+SetUserAdmin { user: String, admin: bool }
+SetUserDisabled { user: String, disabled: bool }
+```
+
+- **禁用语义**：disabled 用户 Web login-finish 401 `user_disabled`（login-begin 仍
+  dummy 同形不泄漏）、控制流 `LoginBegin` 增同一判定（**唯一动到既有控制流分发的
+  点**，测试覆盖）；已建数据面/控制流会话不追溯断开（设备级处置走既有
+  disable/revoke）——文档写明。
+- **口令设置流（创建/重置共用）**：管理员 `POST /api/users`（或 reset-password）⇒
+  响应一次性返回 `pw_bootstrap_token`（32hex，仅此一次，线下交付用户）⇒ 用户浏览器
+  `POST /api/pw-begin {user, token, m1_b64}`（令牌预检只读、不消费）⇒
+  `POST /api/pw-commit {user, token, record_b64, profile}`（Raft 原子消费 + 落记录）。
+  令牌 = 16B 随机一次性凭据，与 invite_id 同信任级（Raft 状态内可读、单次消费）。
+
+**首个 admin 引导（CLI 子命令，复用 credentials/OPAQUE 注册路径）**：
+`flock-server web-admin-add <用户名>`——stdin 交互读口令两遍（tty 有回显，本地信任域
+取舍，与 `flock-client login` 同语义）；进程内跑原生 OPAQUE 注册（`reg_start` →
+admin 端点 m1→m2 → `reg_finish` → 提交）。admin 端点（:9444）**尾部追加**两个变体：
+`AdminRequest::WebPwBegin { user, m1_b64 }` → m2（loopback 绑定 = 认证边界，与既有
+invite/revoke 同级信任）；`AdminRequest::WebPwCommit { user, token, record_b64,
+profile, admin: bool }`——服务在跑 ⇒ 经端点提交（多主：CreateUser（UserExists 幂等
+忽略）+ SetPasswordBootstrap + SetUserAdmin；token 由 CLI 生成随消息携带）；服务未跑
+⇒ 单服可直写状态库（Cmd::Invite 的 fallback 先例），**多主必须经在跑服务提交
+（Raft）**，否则明确报错。目标用户已存在且已有口令 ⇒ 拒绝并指引走 Web 重置。
+
+**登录失败退避 + 限速（进程内存，注入时钟可测）**：按用户名计失败（15min 滑窗）：
+第 5 次失败起锁定 30s，每再失败翻倍、封顶 900s；成功或窗净空即清零。另按 RemoteAddr
+令牌桶限 login-begin/pw-begin 频率（10 次/min，突发 10）——防枚举压测。429 响应带
+`retry_after_secs`。
+
+#### M8.4 API 契约（逐字定死）
+
+**通用约定**：
+- Base = `http://127.0.0.1:9800` 或 `http://<VIP>:9800`；API 前缀 `/api/`；资产在根
+  与 `/static/`。请求/响应体一律 `application/json; charset=utf-8`（资产/wasm 除外）。
+- **CSRF 双门槛（变更类 = 全部 POST）**：必须携带请求头 `X-Flock-Web: 1` **且**
+  `Content-Type: application/json`——浏览器跨站表单/顶级导航/fetch 均不可能同时满足
+  （无 CORS 面时自定义头必触发预检且预检无响应即失败）⇒ 与 SameSite=Strict 叠加
+  闭合 CSRF。缺头 ⇒ 400 `bad_request`（不泄漏是 CSRF 拦截）。
+- **统一错误信封（逐字）**：
+  ```json
+  {"error": {"code": "<code>", "message": "<白名单文案，不含路径/内部错误串>"}}
+  ```
+  code → HTTP 映射（定死）：`bad_request` 400 / `not_logged_in` 401 / `login_failed`
+  401 / `user_disabled` 401 / `bad_token` 401 / `forbidden` 403 / `forbidden_origin`
+  403 / `not_found` 404 / `method_not_allowed` 405 / `user_exists` 409 /
+  `password_exists` 409 / `invalid_state` 409 / `cannot_demote_self` 409 /
+  `payload_too_large` 413 / `rate_limited` 429（另带 `retry_after_secs` 字段）/
+  `internal` 500。
+- 上限与走私拒绝：请求行 2KiB、头 8KiB、体 64KiB；存在 `Transfer-Encoding` 或重复
+  `Content-Length` ⇒ 400 关连接。
+
+**端点契约**（请求体 → 200 响应体逐字；角色列 = 会话要求；错误码列仅列业务项）：
+
+| 端点 | 方法 | 角色 | 请求 → 200 响应 | 业务错误 |
+|---|---|---|---|---|
+| `/api/bootstrap` | GET | 公共 | → `{"cluster_id":"<hex32>","server_id":"<hex32>","identity_pub":"<b64-32B>","lang":"zh-CN"}` | — |
+| `/api/login-begin` | POST | 公共 | `{"user":"alice","ke1_b64":"…"}` → `{"ke2_b64":"…","bind_token":"<hex16B>","anchor_sig":"<hex64B>","server_id":"<hex32>"}`（未知用户 dummy 同形） | 400；429 |
+| `/api/login-finish` | POST | 公共 | `{"user":"alice","ke3_b64":"…"}` → `{"user":"alice","admin":true}` + Set-Cookie | 401 login_failed；401 user_disabled；429 |
+| `/api/logout` | POST | 登录 | `{}` → `{"ok":true}` + 清 cookie | 401 |
+| `/api/me` | GET | 登录 | → `{"user":"alice","admin":true,"origin":"vpn"‖"loopback","expires_unix":1760000000}` | 401 |
+| `/api/users` | GET | **admin** | → `{"users":[{"username":"bob","admin":false,"disabled":false,"has_password":true,"devices":2}]}`（username 升序） | 403 |
+| `/api/users` | POST | **admin** | `{"username":"bob"}` → `{"username":"bob","pw_bootstrap_token":"<hex32B>"}`（用户名约束 1..=32B、`[A-Za-z0-9_.-]`） | 409 user_exists；400 |
+| `/api/users/{u}/disable` | POST | **admin** | `{}` → `{"ok":true}` | 404 |
+| `/api/users/{u}/enable` | POST | **admin** | `{}` → `{"ok":true}` | 404 |
+| `/api/users/{u}/reset-password` | POST | **admin** | `{}` → `{"pw_bootstrap_token":"<hex32B>"}`（旧口令即刻失效） | 404 |
+| `/api/users/{u}/admin` | POST | **admin** | `{"admin":false}` → `{"ok":true}` | 409 cannot_demote_self（目标==会话用户且 admin=false） |
+| `/api/pw-begin` | POST | 公共（令牌） | `{"user":"bob","token":"<hex32B>","m1_b64":"…"}` → `{"m2_b64":"…"}` | 401 bad_token；409 password_exists；429 |
+| `/api/pw-commit` | POST | 公共（令牌） | `{"user":"bob","token":"<hex32B>","record_b64":"…","profile":0}` → `{"ok":true}` | 401 bad_token；409 password_exists |
+| `/api/peers` | GET | 登录（只读） | → `{"peers":[{"device_id":"<hex64B>","vip":"100.64.0.11","hostname":"box","owner":"alice","kind":"device"‖"server","online":true,"status":"active"‖"disabled"‖"revoked"‖"expired","last_seen_unix":1760000000,"tx_bps":120,"rx_bps":80}]}`（VIP 升序） | 401 |
+| `/api/peers/{device_id}/revoke` | POST | **admin** | `{}` → `{"ok":true,"epoch":43}`（Raft Revoke + apply 钩子杀会话，§2.2 吊销传播界） | 404 |
+| `/api/peers/{device_id}/disable` | POST | **admin** | `{}` → `{"ok":true,"epoch":44}` | 404 |
+| `/api/peers/{device_id}/enable` | POST | **admin** | `{}` → `{"ok":true}` | 404；409 invalid_state（Revoked/Expired 终态） |
+| `/api/peers/{device_id}/kick` | POST | **admin** | `{}` → `{"ok":true}`（语义：**尽力本地**——杀本机会话 + detach 本机租约；多主下他机会话不追溯（对方租约 30s TTL 过期后 online 判定转 false；设备自动重连会重新上线——kick ≠ 封禁，确定断离用 disable/revoke）；UI 二次确认文案同义） | 404 |
+| `/api/dashboard/summary` | GET | 登录（只读） | → `{"cluster":{"cluster_id":"<hex32>","epoch":42,"sync_mode":"single"‖"raft"},"servers":[{"node_id":1,"vip":"100.64.0.1","endpoint":"ep:9443","leader":true,"epoch":42,"online":true}],"totals":{"devices":7,"devices_active":5,"devices_online":3,"users":4,"tx_bps_sum":0,"rx_bps_sum":0},"self":{"server_id":"<hex32>","uptime_secs":3600}}` | 401 |
+| `/api/dashboard/series?vip=100.64.0.11` | GET | 登录（只读） | → `{"vip":"100.64.0.11","interval_secs":60,"points":[{"t":1760000000,"tx_bps":100,"rx_bps":50},…≤120 项，旧→新]}` | 401；404（VIP 既无序列也不在注册表） |
+| `/api/config` | GET | 登录（只读） | → `{"listen_mode":"direct"‖"frp","advertise_endpoint":"…","sync_mode":"single"‖"raft","ticket_ttl_secs":60,"peer_retention_days":30,"max_sessions":1024,"webui":{"port":9800,"session_ttl_secs":28800}}`（**字段白名单：无密钥/无 srvmesh 对端表/无根材料**） | 401 |
+| `/api/audit` | GET | **admin** | → `{"entries":[{"ts":1760000000,"user":"alice","action":"user.create","target":"bob","origin":"vpn","result":"ok"},…≤200 项，新→旧]}` | 403 |
+
+- **action 词表（定死）**：`session.login / session.logout / user.create / user.disable
+  / user.enable / user.reset_password / user.set_admin / peer.revoke / peer.disable /
+  peer.enable / peer.kick`；result ∈ `ok|denied|error`（denied 也记录——含 403 尝试，
+  不记口令/令牌/票据字节）。
+- **装配语义**：`/api/peers` = 注册表全行（含 status/device_id）⋈ 本地租约视图
+  （online/last_seen/EWMA）——与 §7-M7.4 名册同装配源、不同投影（名册仅 Active 且
+  无 device_id；web 面全状态 + device_id 供操作寻址）。`/api/dashboard/summary`：
+  多主 = server_keys 本地视图（node/vip）+ 根签目录 endpoint + 自发布租约 online +
+  `current_leader`；单服 = 本机一条（leader=true、online=true）；totals.users =
+  UserRow 计数（本地已 apply 视图——展示面档位，同名册 §7-M7.4）。
+- **静态资产**：`GET /`（index.html）、`GET /static/*`；content-type：`.html`=
+  text/html、`.js`=text/javascript、`.css`=text/css、`.wasm`=application/wasm；
+  未知 `/api/*` → 404 JSON，其余 → 404 页。
+
+#### M8.5 Dashboard 数据面：流量时间序列（内存环形缓冲）
+
+- 服务端内存环形缓冲（**不进 Raft、不进 gossip**——本机展示面）：per-VIP
+  `VecDeque<(unix_minute, tx_bps, rx_bps)>`，容量 `series_points`（缺省 120）×
+  `series_interval_secs`（缺省 60）⇒ **2 小时窗**。采样任务随 webui 装配：每
+  interval 取本机流量源的当前 EWMA 快照——单服 = `TrafficMeter::stats(vip)`（服务器
+  自身走 SERVER_TRAFFIC_KEY）；多主 = `LeaseTable::peer_stats(device)`（服务器自身走
+  `server_self_device_id`；本机不持有租约的行以最近 gossip 值参与——与名册同视图）。
+  VIP↔Device 映射来自注册表本地快照；行消失（吊销/过期）后序列保留至自然环出。
+- **重启清零（写明、可接受）**——环形缓冲纯内存，进程重启后曲线从零开始；无样本但
+  在册的 VIP 返回空 points 数组（非 404）。
+- 内存预算：每 peer ~3KB（120×24B）× 1k 设备 ≈ 3MB——接受。
+
+#### M8.6 前端（页面 / wasm C-ABI 契约 / 资产清单）
+
+**页面**（SPA、hash 路由手写、无路由库）：
+1. `#/login`：登录页（用户名/口令；失败文案与锁定倒计时）。
+2. `#/set-password`：初始/重置口令页（引导令牌 + 新口令两遍；走 pw-begin/commit）。
+3. `#/dashboard`：Server 卡片（node/VIP/endpoint/leader/epoch/online）+ 汇总卡片 +
+   每设备流量曲线（uPlot，tx/rx 双序列；60s 轮询 series+summary）。
+4. `#/peers`：设备表（全字段 + 状态徽章 + 在线点）+ 行操作：吊销（**二次确认
+   modal**，Esc/取消可退）/禁用/启用/强制下线（kick 语义文案与 §M8.4 一致）。
+5. `#/users`：账号表（admin 徽章/禁用态/设备数）+ 创建（引导令牌**仅弹窗展示一次**
+   + 复制按钮）/禁用/重置口令（同令牌语义）/设 admin。
+6. `#/settings`：配置只读摘要 + 审计日志表（admin）。
+非 admin 登录后：dashboard/peers 可见；users/settings 隐藏且直击 API 403 → 前端转
+「无权限」页。设计系统：自写深色主题（CSS custom properties：背景/表面/边框/主色/
+语义色）、**系统字体栈（零 webfont）**、组件 = 卡片/表格/按钮/徽章/modal/表单校验态。
+
+**wasm C-ABI 契约**（`webauth_shim.rs`，`#[cfg(all(feature = "wasm",
+target_arch = "wasm32"))]`；全部 `#[no_mangle] pub extern "C"`；返回值 0=ok、负数=
+错误码）：
+
+```text
+sr_wasm_inject_entropy(ptr: *const u8, len: usize)              // JS 启动即调（crypto.getRandomValues ≥32B）
+sr_wasm_alloc(len: usize) -> *mut u8 / sr_wasm_free(ptr, len)   // JS 写参/读返回的缓冲分配
+sr_web_login_begin(user_ptr, user_len, pw_ptr, pw_len, out_ptr, out_cap) -> i32
+    // WasmRng（GLOBAL_RNG 适配器）驱动 pake::login_start；ClientLogin 状态存模块级
+    // 单槽（Mutex<Option<..>>，后一次 begin 覆盖前一次）；out 写 ke1_b64（NUL 结尾）
+sr_web_login_finish(ke2_ptr, ke2_len, server_id_ptr(16B), identity_pub_ptr(32B),
+                    bind_token_ptr(16B), anchor_sig_ptr(64B), out_ptr, out_cap) -> i32
+    // pake::login_finish_anchored（anchor 验签）→ out 写 ke3_b64
+sr_web_pw_begin(user_ptr, user_len, pw_ptr, pw_len, out_ptr, out_cap) -> i32   // reg_start → m1_b64（状态单槽同上）
+sr_web_pw_finish(m2_ptr, m2_len, out_ptr, out_cap) -> i32                      // reg_finish → record_b64
+错误码：-1 未注入熵；-2 pake 失败（错口令/坏报文同码）；-3 anchor 验签拒；-4 out 容量不足
+```
+
+JS 胶水 `assets/flock_pake.js`（手写 ~120 行）：`WebAssembly.instantiate` → 注入熵 →
+暴露 Promise API `loginBegin(user,pw)` / `loginFinish(ke2,anchor)→ke3` /
+`pwBegin/pwFinish`（内部 sr_wasm_alloc 拷参/读返回/sr_wasm_free）。argon2
+（m=19MiB t=2）在主线程 ~100ms 量级——按钮 spinner 态承担，不引 worker（v1 如实
+声明）。
+
+**资产清单**（`app/flock-server/src/webui/assets/`，全部 include_dir 内嵌 + vendored
+LICENSE 文件同库）：
+
+```text
+index.html  app.js  i18n.js  style.css  flock_pake.js  flock_pake.wasm  vendor/{alpine.min.js, uplot.min.js, uplot.css}
+```
+
+构建：wasm 产物由 `deploy/build-wasm.sh` 产出后拷入 assets/（**产物提交进库**——CI 无
+wasm 工具链也能出完整二进制；门禁另跑 wasm check + 产物一致性校验防源码/产物漂移）。
+
+#### M8.7 安全清单（定死）
+
+1. **Cookie/传输**：HttpOnly + SameSite=Strict + Path=/ + Max-Age=TTL；**无 Secure、
+   不做 TLS**——信任域声明（如实）：loopback 上**本机其它用户/进程可嗅探明文与
+   cookie**（具备本机抓包权即已等效半沦陷；多用户机器上 loopback 管理是知情取舍）；
+   VPN 段上传输 = 逐跳 E2E（peer↔接入服务器 + 服务器间 FRWD，§2.2/§2.5）——其它
+   peer 不可见；**服务器端点本身可见（同 §2.5-1 边界，不新增安全主张）**。
+2. **CSRF**：SameSite=Strict + 变更类 POST 双门槛（`X-Flock-Web: 1` + JSON
+   content-type，§M8.4）。
+3. **速率限制**：§M8.3 登录退避 + per-IP 令牌桶；429 带 retry_after_secs。
+4. **审计**：变更类与登录失败留痕——stderr（journald 接管，与既有 `flock-server:`
+   日志同通道）+ 内存最近 **200** 条（`/api/audit`，admin）；字段 ts/user/action/
+   target/origin/result，**不记口令/令牌/票据字节**。
+5. **不泄密**：错误 message 白名单文案（§M8.4 信封）；`/api/config` 字段白名单；
+   日志不打印 ke1/ke2/ke3/record 全文（仅长度与前 8 字符诊断位）。
+6. **会话面**：sid 256bit 随机、内存表、logout 即删；v1 已知残余（如实）：重置口令
+   不强制踢其它在途会话（旧 sid 可用至 TTL，TTL 8h 封顶暴露）——「敏感操作后旋转
+   sid」列后补档期。
+
+#### M8.8 文件落位（定死）
+
+```text
+app/flock-server/src/webui/mod.rs        装配：loopback 先行 + VIP 绑定重试任务（5s）；挂进 server::run / sync::run_raft
+app/flock-server/src/webui/http.rs       最小 HTTP/1.1（解析/响应/keep-alive/上限/走私拒绝）
+app/flock-server/src/webui/session.rs    会话表（issue/lookup/logout/256 上限淘汰/清扫）
+app/flock-server/src/webui/access.rs     来源矩阵 + CSRF 双门槛 + 角色矩阵 + 登录退避 + 令牌桶 + 审计环
+app/flock-server/src/webui/api.rs        路由分发 + 全部 handler（调 NetBackend / pake / roster 装配）
+app/flock-server/src/webui/series.rs     流量环形缓冲 + 采样任务
+app/flock-server/src/webui/assets.rs     include_dir 嵌入 + content-type + Cache-Control
+app/flock-server/src/webui/assets/…      前端资产（§M8.6 清单）
+app/flock-server/tests/webui.rs          HTTP e2e（Rust 原生 OPAQUE 驱动登录——绕过 wasm，协议同构）
+app/flock-server/examples/webui_login.rs HTTP-OPAQUE 驱动器（webui_assert.sh 的 CLI 载具：登录/CRUD 探针）
+crates/flock-protocol/src/webauth_shim.rs wasm C-ABI 垫片（feature wasm+anchor 门控）
+deploy/build-wasm.sh                     wasm 构建 + 产物拷入 assets/ + 一致性校验
+deploy/webui.yml / webui_assert.sh       容器集成断言（§M8.9 W1–W7）
+docs/manual/webui-checklist.md           浏览器真机清单（M8c）
+```
+
+依赖变更：flock-server 增 `serde_json`（workspace 锁内已有）与 `include_dir`（新，
+proc-macro 级小 crate）；flock-protocol 不新增依赖（feature 组合使用）。代码触点：
+config.rs `[webui]` 节 + 端口冲突校验；main.rs `web-admin-add` 子命令；admin.rs 尾部
+追加 `WebPwBegin/WebPwCommit`；control.rs `LoginBegin` 增 disabled 判定（§M8.3）。
+
+#### M8.9 测试计划（可验证断言）
+
+**单测**（`cargo test -p flock-server` / `-p flock-sync`）：
+- session.rs：签发/命中/过期拒/logout 删/**256 上限淘汰最旧**/惰性+周期清扫；
+- access.rs：来源矩阵（127.0.0.1、127.3.2.1、[::1] 放行；100.64.0.11 放行；
+  192.168.x.x、8.8.8.8 ⇒ 403 forbidden_origin）；CSRF（POST 缺自定义头 400、有头
+  缺 JSON content-type 400）；**角色矩阵逐端点三态枚举**（未登录 401 / 非 admin 403
+  / admin 200，含 401 与 403 的先后——先会话后角色）；登录退避（注入时钟：5 锁
+  30s、翻倍、900 封顶、成功清零）；
+- http.rs：请求向量（合法 GET/POST 往返；坏请求行/超长头/超体 413/Transfer-Encoding
+  400/重复 Content-Length 400/半包超时关连接）；
+- series.rs：注入时钟定点采样 → 环出上限 120 → 新实例为空（重启语义）→ 行消失后
+  序列保留；
+- flock-sync：UserRow 往返（新字段）、五新写变体语义（UserExists / 令牌错
+  BadBootstrapToken / 令牌重放拒 / ResetPassword 后旧口令记录失效 / 终态设备 enable
+  拒）、旧快照不可解码干净失败。
+
+**集成**（tests/webui.rs，进程内真 HTTP + 原生 pake 客户端——协议同构，绕过 wasm）：
+未登录除公共端点外全 401（枚举全部端点）；首 admin 引导（web-admin-add 路径函数）→
+reg/login（anchor 验签过）→ cookie 会话 → me/peers/dashboard/series/config/audit
+读写全链；非 admin 403 矩阵；cannot_demote_self；user_exists/password_exists/
+bad_token/令牌重放；审计环出现（含 denied 行）；logout 后原 sid 401。wasm 门禁：
+`cargo check -p flock-protocol --target wasm32-unknown-unknown --no-default-features
+--features wasm,anchor`。
+
+**容器集成**（deploy/webui.yml：复用 multinode 双 server + client 拓扑；
+webui_assert.sh 断言）：
+
+| # | 断言 |
+|---|---|
+| W1 | 未登录：管理 API 全 401（server-a 容器内 curl 127.0.0.1:9800） |
+| W2 | loopback 登录 → CRUD 全链：`web-admin-add`（管道喂口令）引导首 admin → examples/webui_login 驱动 HTTP-OPAQUE 登录 → users 创建/禁用/重置/设 admin → peers 列表/吊销 → dashboard/series → audit 含对应行 |
+| W3 | 非 admin 账户：只读端点 200、users*/revoke/kick/audit 403 |
+| W4 | client-1 容器（flockpub 网络，flock-client 的网络命名空间）内 `curl http://100.64.0.1:9800`（server-a VIP）可达且登录链可用（VPN 段路径实证） |
+| W5 | client-1 内 curl server-a 的 flockpub/LAN 地址 :9800 **不可达**（timeout/refused——未绑定面的连接层证明） |
+| W6 | 双 server VIP（100.64.0.1 / 100.64.0.2）均可访问且**数据一致**：各自登录后 /api/peers 的 (device_id, vip, owner, status) 集合严格一致（ewma/last_seen 容差比较——§7-M7.6 同档）；/api/users 列表一致（Raft 收敛后） |
+| W7 | 配置校验：`[webui] port=9443`（与 bind 冲突）拒起服；配置面不存在 bind 键（结构防误配——toml 未知键忽略不生效，webui 节用显式白名单键集） |
+
+**浏览器目视 = 真机清单**（docs/manual/webui-checklist.md，M8c）：登录/建号（令牌
+一次展示）/Dashboard 曲线刷新/吊销确认 modal/深色主题过 Chrome/Edge/Firefox；可选
+headless 冒烟（资产 content-type + wasm 可下载）进 CI。
+
+#### M8.10 里程碑切分与完成标准
+
+- **M8a 服务端 + API + 内嵌壳页**：webui 模块全部（http/session/access/api/series/
+  assets 骨架壳页）、UserRow/Raft 扩展与五写变体、CLI web-admin-add、tests/webui.rs。
+  浏览器面仅壳页（无 wasm——登录暂不可用，全部行为由 Rust 客户端验证）。完成标准：
+  单测+集成全绿；clippy/fmt/门禁；容器 W1–W3、W5、W7 全 PASS。
+- **M8b 前端 + wasm**：webauth_shim + build-wasm + 全部页面 + vendored 资产内嵌。
+  完成标准：wasm check 门禁绿；浏览器真机清单（登录/建号/dashboard/吊销）全通；
+  W4、W6 PASS（W4 的登录链可用 client 容器内 webui_login 代行）。
+- **M8c 评审 + 实测**：安全清单逐项复核（§M8.7）、多主三机 W6 扩展（含 follower
+  视图陈旧档）、120 点轮询的 CPU/内存抽样、部署文档段（端口/访问方式/信任边界/
+  反代不承诺）。
+
 ---
 
 ## 8. 风险与对策
@@ -1296,6 +1711,7 @@ flock-protocol 门禁含 wasm32 check（roster 纯数据无平台面）。
 | R24 | follower 落后（分区恢复/追赶）时本地缓存放行已吊销设备 | §4 读与缓存的陈旧读边界披露 | apply-lag >2s 熔断本地缓存、降级线性一致读 + 票据 epoch/TTL 60s 兜底；M4 落后 5s 用例 | 熔断阈值内的 ≤2s 放行窗口与 A6 预算一致（健康前提显式化） |
 | R25 | 多服务器钉扎模型三选一的坑（共享密钥毁逐服务器封装/逐台 TOFU 不可扩展/切换降 2-RTT） | §1.3.3f 定型理由（第三轮评审 blocking） | 方案②：客户端锚定集群根公钥 + 根签 ClusterDirectory 全套材料（端点↔材料映射同签防拼接）；换钥=根签新条目+dir_pull，任意端点 1-RTT | 根密钥泄露=全网重引导（与 R19 同灾难路径） |
 | R26 | 架构强绑 frp 致直连场景多余进程/故障面（可直连的服务器被迫跑 frpc：多余子进程、配置生成、ChmlFrp 三退守护、中转带宽瓶颈与故障点） | 用户硬约束（第四轮，§0）——**已消除**：ListenerMode `Direct` 缺省、Direct 代码路径不触碰 flock-frpc；frp 降级为「无公网 IP/不可直连」场景的可选适配器（§2.1/§2.2/§3.11/§5） | 守门断言：M2 `m2-direct.yml` 直连冒烟（无 frps、容器内无 frp 进程）+ M5 A16（Direct/Frp 同拓扑混布） | — |
+| R27 | M8 Web 管理面扩大攻击面：无 TLS（loopback 可嗅探/VPN 段明文于端点）、口令暴力破解、CSRF、自研 HTTP 解析器缺陷 | §7-M8.2/M8.7（访问矩阵与安全清单） | 双绑定结构性排除 LAN/公网（配置无 bind 字段）；OPAQUE（口令不上线）+ 登录退避 + per-IP 令牌桶；SameSite=Strict + 自定义头双门槛；HTTP 子集化（拒 chunked/重复 Content-Length——不实现歧义特性即无走私面）+ 畸形请求测试向量；审计 + 错误白名单文案；反代不承诺 | loopback 多用户机器上嗅探（知情取舍，文档明示）；VPN 段内端点可见（同 §2.5-1 服务器边界） |
 
 ---
 
@@ -1427,3 +1843,4 @@ flock-protocol 门禁含 wasm32 check（roster 纯数据无平台面）。
   流量列/JSON）；Windows/macOS raw ICMP 真机列 service-install.md §7 清单。
 - 2026-11-06 M6 第二阶段（托盘进程）：新增 §7-M6.7（§7-M6.4 tray 行同步）——`flock-client tray` 落地：三项菜单（连接状态/VPN IP 动态只读 + 退出动作），2s 轮询刷新、Denied/IPC 失败⇒「服务未运行」继续重试；退出=对 token Shutdown⇒托盘退出（服务保持已安装）/daemon 不在⇒仅退托盘/Denied⇒不退出+token 失效重载；程序化 32×32 RGBA 图标（零资产文件）；平台库 tray-icon（Windows 最小 Win32 消息泵/macOS 主线程 NSApp 排空循环）+ ksni（Linux DBus SNI，零 GTK 系统依赖），不引 winit/tauri/egui；GUI 探测（Linux DISPLAY/WAYLAND+会话 DBus 前置判定，win/mac 创建失败兜底）无 GUI 一律优雅退出码 0；M6.5 feature 门控兑现（GUI 依赖全部 target 门控 optional、dep: 引用不匹配 target no-op，--no-default-features 三平台零 GUI 依赖——门禁实测）。验证边界如实：核心单测 + Windows 真进程 mock-daemon 实测（存活/刷新日志/状态一致/Shutdown 停服后转显服务未运行）；图标目视/退出点击/真 daemon 联测（需 invite+管理员）列 service-install.md 托盘真机清单；macOS 无设备未验证（apple target 工具链下载过慢未及编译级核验，API 按 crate 源核对）；Linux 桌面真机未验证（容器编译面过）。
 - 2026-11-07 M6/M7 服务端/同步层评审修复（本批 6 项）：① 回收器 last_seen=0 语义缺陷（§7-M7.5 修正）——DeviceRow 增 `registered_at`（注册/兑换时提交方注入落库，无观测时作保留期起算锚）+ 重启/视图未就绪闸门（单服=流量计零观测跳过；多主=租约表空/无远端事件跳过，`LeaseTable::remote_events` 信号 + 反熵循环自过滤）；② server_vip_of 一致性双形态断言（多主 open_sync 断言 cfg.vip==推导值、错误给期望值；单服 VIP 撞设备分配段拒起）；③ NetError::DeviceExists 独立变体（消灭 "already registered" 字符串契约）+ KeyBind re-register owner 校验（跨户改 hostname ⇒ NotAuthorized）；④ systemd 单元路径修正（/etc/systemd → /etc/systemd/system，样例+文档；install.rs 常量由客户端侧同名项同步）+ launchd plist 补 StandardErrorPath 与 newsyslog 轮转建议；⑤ CtrlResponse 变体位纪律固化（Err 之前冻结区、新变体尾部追加；PeerList 迁至 Err 后）+ 租约 EWMA 离线衰减（过期且无累加按窗 ×4/5 至 <8B/s 置 0——名册不呈现离线非零流量）+ §7-M7.2 措辞修正（「同设备身份复活」→「新设备身份（新钥匙）注册新行新 VIP」，同钥匙重注册走 re-register 的 hostname 更新）。
+- 2026-11-07 M8（服务端 Web UI·设计增补）：新增 §7-M8——进程内嵌 HTTP 管理面（**自研最小 HTTP/1.1，非 axum**：Cargo.lock 无 tower 系构件，暴露面仅 loopback+VIP，子集化拒 chunked/重复 Content-Length）；**双绑定 127.0.0.1:9800 + cfg.vip:9800**（配置不暴露 bind 字段——0.0.0.0 误配结构不可能；tun 未就绪 loopback 先行、VIP 5s 重试补绑）；访问矩阵 W-A1–A4（loopback/100.64.0.0/10 放行、其余 403 纵深、反代不承诺）；认证 = **OPAQUE 复用（HTTP 同语义新端点，不复用控制流消息）**+ anchor 保留（bootstrap 自证，不主张 MITM 防护）+ `UserRow.admin/disabled/pw_bootstrap` 三字段（Raft 行扩展，未发布窗口纪律）+ HttpOnly/SameSite=Strict 会话（32B sid、TTL 8h、上限 256、记录 loopback/vpn 来源）；**授权裁决**：Web 会话不映射控制流票据、写操作走 Raft 普通写（handler 层 admin 裁决）、`admin_op` 根签操作与 cluster-* 不进 UI；API 契约 §M8.4 逐字定死（22 端点/统一错误信封/CSRF 双门槛 X-Flock-Web+JSON）；口令创建/重置 = 一次性 `pw_bootstrap` 令牌（Raft 原子消费）；首 admin = `flock-server web-admin-add`（admin 端点尾部两变体，多主须经在跑服务）；流量时间序列 = 内存环形缓冲 120×60s（重启清零如实声明）；前端 = Alpine.js 3.14 + uPlot 1.6.9 + 自写深色设计系统，include_dir 内嵌，中文先行；wasm = C-ABI 垫片 `webauth_shim.rs`（showroom wasm_shim 手法 + 既有 getrandom custom 后端，无 wasm-bindgen）；测试 W1–W7 容器断言 + Rust 原生 OPAQUE 驱动 e2e；R 表增 R27。
