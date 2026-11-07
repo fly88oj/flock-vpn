@@ -10,7 +10,9 @@
 //! - 上限：请求行 ≤ 2KiB、头块 ≤ 8KiB、体 ≤ 64KiB——超限 400/413 并关连接；
 //! - 头名大小写不敏感查读；无 cookie 解析（cookie 的单键解析在 api.rs——
 //!   [`super::api`] 的会话判定）；
-//! - 读超时（半开/慢速攻击）⇒ 静默关连接。
+//! - 读超时双层：单 read 15s（半开连接）+ **单请求总时限 30s**（head+body 整体
+//!   读循环——逐字节滴注每 read 都在单读超时内也绕不过总预算）⇒ 超时静默关连接
+//!   （总时限到期关连接并计数）。
 //!
 //! 解析器与连接循环分离：[`parse_head`] 是纯函数（畸形向量单测面），
 //! [`serve_conn`] 是带超时/上限/keep-alive 的连接循环。
@@ -28,8 +30,20 @@ pub const MAX_REQUEST_LINE: usize = 2 * 1024;
 pub const MAX_HEAD: usize = 8 * 1024;
 /// 请求体上限（64KiB）。
 pub const MAX_BODY: usize = 64 * 1024;
-/// 单连接读超时（半开/慢速请求行——超时静默关连接，不占并发许可）。
+/// 单次 read 超时（半开连接——超时静默关连接，不占并发许可）。
 pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// 单请求总时限（head+body 整体读循环）：逐字节滴注每 read 都在 READ_TIMEOUT 内
+/// 也可无限期持连接耗尽 MAX_CONCURRENCY 许可（VIP 面任一 VPN 成员可 DoS 管理面）
+/// ⇒ 总预算到期关连接 + 计数（[`slow_request_kills`]）。keep-alive 每请求重置预算。
+pub const REQUEST_TOTAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// REQUEST_TOTAL 到期关连接的累计计数（诊断/测试面——慢速攻击向量被断的观测）。
+static SLOW_KILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 读取 [`SLOW_KILLS`] 当前值。
+pub fn slow_request_kills() -> u64 {
+    SLOW_KILLS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 // ============================================================================
 // 请求/响应类型
@@ -278,7 +292,7 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 // ============================================================================
-// 连接循环（读超时/上限/keep-alive）
+// 连接循环（单读超时 + 请求总时限/上限/keep-alive）
 // ============================================================================
 
 /// handler 类型（api 分发；remote = 连接对端——访问矩阵的判定输入）。
@@ -286,46 +300,45 @@ pub type HandlerReturn = Pin<Box<dyn Future<Output = Response> + Send>>;
 pub type Handler = Box<dyn Fn(Request, SocketAddr) -> HandlerReturn + Send + Sync>;
 
 /// 服务一条连接直到关闭（keep-alive 循环；畸形 ⇒ 400/413 并关连接）。
+///
+/// 每请求（head+body 整体读循环）套 [`REQUEST_TOTAL`] 总时限预算——逐字节滴注
+/// 可使每次 read 都落在单读超时内而无限期占用并发许可；预算到期关连接并计数
+/// （[`slow_request_kills`]）。分发/写响应不计入预算（读面才是攻击者控速面）。
 pub async fn serve_conn(io: &mut TcpStream, remote: SocketAddr, handler: Handler) {
+    serve_conn_with_budget(io, remote, handler, REQUEST_TOTAL).await
+}
+
+/// [`serve_conn`] 的预算注入变体（测试用短预算驱动慢速滴注向量）。
+pub async fn serve_conn_with_budget(
+    io: &mut TcpStream,
+    remote: SocketAddr,
+    handler: Handler,
+    total_budget: std::time::Duration,
+) {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     loop {
-        // ① head 累积（上限内找不到头块结束 ⇒ 400 关连接）。
-        let head = loop {
-            match parse_head(&buf) {
-                Ok(Some(h)) => break h,
-                Ok(None) => {}
-                Err(e) => {
-                    let status = match e {
-                        ParseError::PayloadTooLarge => 413,
-                        _ => 400,
-                    };
-                    let _ =
-                        write_response(io, &Response::json(status, &err_envelope(status)), false)
-                            .await;
-                    return;
-                }
+        // ①② head 累积 + body 补齐，整体套总时限预算。
+        let outcome =
+            tokio::time::timeout(total_budget, read_request(io, &mut buf, &mut chunk)).await;
+        let (head, body) = match outcome {
+            // 总预算到期（慢速滴注）：静默关连接 + 计数。
+            Err(_) => {
+                SLOW_KILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
             }
-            match tokio::time::timeout(READ_TIMEOUT, io.read(&mut chunk)).await {
-                Ok(Ok(0)) | Err(_) => return, // EOF / 读超时：静默关
-                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-                Ok(Err(_)) => return,
+            Ok(ReadOutcome::Closed) => return, // EOF / 单读超时 / 读错误：静默关
+            Ok(ReadOutcome::Bad(e)) => {
+                let status = match e {
+                    ParseError::PayloadTooLarge => 413,
+                    _ => 400,
+                };
+                let _ =
+                    write_response(io, &Response::json(status, &err_envelope(status)), false).await;
+                return;
             }
+            Ok(ReadOutcome::Request { head, body }) => (head, body),
         };
-        // 消费 head 字节（含结尾 \r\n\r\n）；剩余字节属于 body（或下一请求——
-        // 管道化场景自然衔接）。
-        let head_len = find_sub(&buf, b"\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-        buf.drain(..head_len);
-        // ② body 按 Content-Length 补齐。
-        let want = head.content_length.unwrap_or(0) as usize;
-        while buf.len() < want {
-            match tokio::time::timeout(READ_TIMEOUT, io.read(&mut chunk)).await {
-                Ok(Ok(0)) | Err(_) => return, // 半包超时/EOF：关连接
-                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-                Ok(Err(_)) => return,
-            }
-        }
-        let body: Vec<u8> = buf.drain(..want).collect();
         let req = Request {
             method: head.method.clone(),
             path: head.path.clone(),
@@ -343,6 +356,53 @@ pub async fn serve_conn(io: &mut TcpStream, remote: SocketAddr, handler: Handler
             return;
         }
     }
+}
+
+/// 单请求读循环产物（head 解析 + body 补齐的状态归并）。
+enum ReadOutcome {
+    /// 完整请求（head + body 齐备）。
+    Request { head: ParsedHead, body: Vec<u8> },
+    /// 致命畸形（调用方回 400/413 并关连接）。
+    Bad(ParseError),
+    /// EOF / 单读超时 / 读错误（静默关连接）。
+    Closed,
+}
+
+/// 读一个完整请求（head 累积 → body 按 Content-Length 补齐）；`buf` 跨请求复用
+/// （管道化剩余字节自然衔接）。
+async fn read_request(
+    io: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    chunk: &mut [u8; 4096],
+) -> ReadOutcome {
+    // ① head 累积（上限内找不到头块结束 ⇒ 400 关连接）。
+    let head = loop {
+        match parse_head(buf) {
+            Ok(Some(h)) => break h,
+            Ok(None) => {}
+            Err(e) => return ReadOutcome::Bad(e),
+        }
+        match tokio::time::timeout(READ_TIMEOUT, io.read(chunk)).await {
+            Ok(Ok(0)) | Err(_) => return ReadOutcome::Closed, // EOF / 读超时：静默关
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) => return ReadOutcome::Closed,
+        }
+    };
+    // 消费 head 字节（含结尾 \r\n\r\n）；剩余字节属于 body（或下一请求——
+    // 管道化场景自然衔接）。
+    let head_len = find_sub(buf, b"\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    buf.drain(..head_len);
+    // ② body 按 Content-Length 补齐。
+    let want = head.content_length.unwrap_or(0) as usize;
+    while buf.len() < want {
+        match tokio::time::timeout(READ_TIMEOUT, io.read(chunk)).await {
+            Ok(Ok(0)) | Err(_) => return ReadOutcome::Closed, // 半包超时/EOF：关连接
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) => return ReadOutcome::Closed,
+        }
+    }
+    let body: Vec<u8> = buf.drain(..want).collect();
+    ReadOutcome::Request { head, body }
 }
 
 /// 写响应（补 Content-Length/Connection；handler 设置的 Connection 头被剥离——
@@ -703,6 +763,59 @@ mod tests {
         // 对端关闭（EOF）⇒ 服务端静默收尾（无响应写出——不 panic）。
         drop(io);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// 慢速滴注向量（🔴 评审项 1）：每字节间隔 25ms（单 read 远未超 READ_TIMEOUT=15s）
+    /// 但 head 永不完整、总时长超总预算 ⇒ 连接被总时限切断 + 计数递增
+    /// （否则可无限期占用 MAX_CONCURRENCY=64 许可——VIP 面 DoS 管理面）。
+    /// 预算注入 300ms（serve_conn_with_budget）驱动——生产档 REQUEST_TOTAL=30s 的
+    /// 同一机制。
+    #[tokio::test]
+    async fn conn_slow_drip_killed_by_request_total_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut io, remote)) = listener.accept().await else {
+                    return;
+                };
+                let handler: Handler = Box::new(|_req: Request, _r: SocketAddr| {
+                    Box::pin(async { Response::new(200) })
+                });
+                tokio::spawn(async move {
+                    serve_conn_with_budget(
+                        &mut io,
+                        remote,
+                        handler,
+                        std::time::Duration::from_millis(300),
+                    )
+                    .await;
+                });
+            }
+        });
+        let mut io = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let before = slow_request_kills();
+        // 逐字节滴注：永不完整的 head（22B × 25ms = 550ms > 300ms 预算）。
+        let drip = b"GET / HTTP/1.1\r\nHost: x\r\n";
+        for b in drip.iter() {
+            if io.write_all(&[*b]).await.is_err() {
+                break; // 服务端已断（预期路径——Windows 半关闭后写即 RST）
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // 断言被断：读侧 EOF 或错误（2s 内），且计数器递增。
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(std::time::Duration::from_secs(2), io.read(&mut probe)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {} // EOF / 连接重置——均为「被断」
+            Ok(Ok(n)) => panic!("慢速滴注不应得到 {n}B 响应数据"),
+            Err(_) => panic!("慢速滴注连接未被总时限切断（许可仍被占用）"),
+        }
+        assert!(
+            slow_request_kills() > before,
+            "总时限到期关连接必须计数（{} → {}）",
+            before,
+            slow_request_kills()
+        );
     }
 
     /// 辅助：非阻塞探测——短窗内读到 0 字节（无数据且未关）即认为连接仍开。
