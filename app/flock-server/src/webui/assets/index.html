@@ -420,7 +420,9 @@
                       <td :data-label="t('audit.col.action')" x-text="t('audit.action.' + e.action)"></td>
                       <td :data-label="t('audit.col.target')" class="mono ellipsis" x-text="shortTarget(e.target)"></td>
                       <td :data-label="t('audit.col.origin')" class="hide-narrow" x-text="e.origin"></td>
-                      <td :data-label="t('audit.col.result')"><span class="badge" :class="resultBadge(e.result)" x-text="t('audit.result.' + e.result)"></span></td>
+                      <!-- 结果徽标（round2 评审项 7）：高危 action（吊销/禁用/重置
+                           口令/角色变更）的「成功」用琥珀档；拒绝/错误仍红。 -->
+                      <td :data-label="t('audit.col.result')"><span class="badge" :class="auditResultBadge(e)" x-text="t('audit.result.' + e.result)"></span></td>
                     </tr>
                   </template>
                 </tbody>

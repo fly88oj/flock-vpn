@@ -729,6 +729,22 @@
         return { ok: 'badge-success', denied: 'badge-danger', error: 'badge-danger' }[r] || 'badge-muted';
       },
 
+      // 审计高危 action 词表（round2 评审项 7）：吊销/禁用/重置口令/角色变更等
+      // 破坏性或敏感操作即使结果「成功」也用琥珀档——绿色只留给常规/低危操作
+      //（登录/登出/创建/启用等）。set_admin 覆盖设/取消两个方向（词表不区分，
+      // 权限变更本身即高危）。
+      auditHighRisk(action) {
+        return !!{
+          'peer.revoke': 1, 'peer.disable': 1, 'user.disable': 1,
+          'user.reset_password': 1, 'user.set_admin': 1,
+        }[action];
+      },
+
+      auditResultBadge(e) {
+        if (e && e.result === 'ok' && this.auditHighRisk(e.action)) { return 'badge-warn'; }
+        return this.resultBadge(e && e.result);
+      },
+
       // 统计卡速率值：数值 + 小一号弱化单位（🟡 UI 评审项 6：<small>Mbps</small>）。
       // 自产 HTML（无用户输入面）——x-html 安全。
       fmtBpsStat(v) {
