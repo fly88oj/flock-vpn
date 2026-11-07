@@ -148,8 +148,9 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .input.input-error { border-color: var(--danger); }
 .input.input-error:focus { border-color: var(--danger); box-shadow: 0 0 0 3px var(--danger-dim); }
 .field-error { color: var(--danger); font-size: var(--fs-xs); min-height: 1em; }
-/* 认证表单错误区（🟡 UI 评审项 7）：预置两行高 + 上下 12px——错误出现/消失不跳动 */
-.field-error-fixed { min-height: 36px; margin: 12px 0; }
+/* 认证表单错误区（🟡 UI 评审项 7 + round2 评审项 9）：固定一行高 + 紧凑上下距
+   （8/12）——错误出现/消失不跳动，也不把口令框与登录按钮的默认间距撑大。 */
+.field-error-fixed { min-height: 20px; margin: 8px 0 12px; }
 .field-hint { color: var(--faint); font-size: var(--fs-xs); }
 @media (pointer: coarse) { .input { min-height: 44px; } }
 
@@ -219,7 +220,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   border: none; border-radius: var(--r-sm); background: transparent;
   color: var(--fg); font: inherit; font-weight: 650; cursor: copy;
   text-decoration: underline dotted rgba(138, 148, 168, 0.55);
-  text-underline-offset: 3px;
+  text-underline-offset: 2px; /* round2 评审项 9：虚线下沿贴近正文基线 */
 }
 .id-chip:hover { color: var(--accent); }
 .id-chip.mono { font-variant-numeric: tabular-nums; letter-spacing: 0.3px; }
@@ -264,6 +265,11 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   animation: pop-in 0.16s ease;
 }
 .modal h3 { font-size: var(--fs-lg); margin-bottom: var(--sp-3); }
+/* 模态标题行（round2 评审项 9）：警示图标与标题文字同行居中 */
+.modal-title { display: flex; align-items: center; gap: var(--sp-2); }
+.modal-title-ico { display: inline-flex; flex: none; }
+.modal-title-ico.ico-danger { color: var(--danger); }
+.modal-title-ico.ico-warn { color: var(--warn); }
 .modal p { color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--sp-5); overflow-wrap: anywhere; }
 /* 模态动作行（🟡 UI 评审项 14）：两按钮等高 40px、底边对齐 */
 .modal-actions { display: flex; gap: var(--sp-3); align-items: center; justify-content: flex-end; flex-wrap: wrap; }
@@ -281,7 +287,9 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   margin: var(--sp-3) 0 var(--sp-5); padding: 10px var(--sp-3);
   background: var(--warn-dim); color: var(--warn);
   border-radius: var(--r-md); font-size: var(--fs-xs); line-height: 1.6;
-  overflow-wrap: anywhere;
+  /* 中文词内不断行（round2 评审项 9：「新口令」等词组保持完整）；
+     overflow-wrap:anywhere 仍兜底超长 latin 串（用户名/令牌）。 */
+  word-break: keep-all; overflow-wrap: anywhere;
 }
 .token-notice-ico { flex: none; font-weight: 700; }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
@@ -361,7 +369,9 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .content { flex: 1; padding: var(--sp-6) var(--pad-content); max-width: 1320px; width: 100%; margin: 0 auto; min-width: 0; }
 /* 区块纵向节奏（🟡 UI 评审项 8）：dashboard 区块间距统一 24px（4/8 阶） */
 .stack > * + * { margin-top: var(--sp-6); }
-.page-head { margin-bottom: var(--sp-5); display: flex; align-items: flex-end; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap; }
+/* 页头（round2 评审项 9）：基线对齐——右缘刷新按钮的文字基线与左侧首行（H1
+   标题）基线对齐（flex baseline 取各 item 首行文本基线）。 */
+.page-head { margin-bottom: var(--sp-5); display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap; }
 .page-head h1 { font-size: var(--fs-2xl); }
 .page-head .page-sub { color: var(--muted); font-size: var(--fs-sm); margin-top: 2px; }
 
@@ -432,6 +442,10 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 /* 服务器卡（🟡 UI 评审项 11）：桌面与集群卡 2 列对称；平板/手机单卡全宽 */
 .servers-grid { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fill, minmax(min(100%, 460px), 1fr)); }
 .kv { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-2) var(--sp-6); }
+/* settings 卡内边距平衡（round2 评审项 9）：首/末行自身 padding 归零——
+   卡顶/卡底留白收敛为纯 card padding（20px），上下对称。 */
+.kv > .kv-row:first-child { padding-top: 0; }
+.kv > .kv-row:last-child { padding-bottom: 0; }
 .kv-row { display: flex; justify-content: space-between; gap: var(--sp-4); padding: var(--sp-2) 0; border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
 .kv-row:last-child { border-bottom: none; }
 .kv-row .k { color: var(--muted); flex: none; }

@@ -545,7 +545,15 @@
        ================================================================ -->
   <div class="modal-overlay" x-show="confirmModal" x-cloak @click.self="confirmModal=null">
     <div class="modal" role="dialog" aria-modal="true">
-      <h3 x-text="confirmModal && confirmModal.title"></h3>
+      <!-- 标题警示图标（round2 评审项 9）：吊销=红 / 禁用与降权=琥珀；
+           动作行两按钮经 .modal-actions .btn 统一 40px 等高。 -->
+      <h3 class="modal-title">
+        <span class="modal-title-ico" x-show="confirmModal && confirmModal.level" x-cloak
+              :class="confirmModal && confirmModal.level === 'danger' ? 'ico-danger' : 'ico-warn'" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4 2.8 20h18.4L12 4z"/><path d="M12 10v4.5"/><path d="M12 17.6v.01"/></svg>
+        </span>
+        <span x-text="confirmModal && confirmModal.title"></span>
+      </h3>
       <p x-text="confirmModal && confirmModal.body"></p>
       <div class="modal-actions">
         <button class="btn btn-ghost" @click="confirmModal=null" x-text="t('app.cancel')"></button>
@@ -560,7 +568,7 @@
   <!-- 模态：一次性引导令牌 -->
   <div class="modal-overlay" x-show="tokenModal" x-cloak @click.self="tokenModal=null">
     <div class="modal" role="dialog" aria-modal="true">
-      <h3 x-text="tokenModal && t(tokenModal.title)"></h3>
+      <h3 class="modal-title" x-text="tokenModal && t(tokenModal.title)"></h3>
       <p x-text="t('users.token.body')"></p>
       <div class="token-box"><span class="mono" style="flex:1" x-text="tokenModal && tokenModal.token"></span>
         <button class="btn btn-sm" @click="copyToken()" x-text="copied ? t('app.copied') : t('app.copy')"></button></div>

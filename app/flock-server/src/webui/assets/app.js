@@ -546,7 +546,7 @@
           await this.loadPeers();
           if (this.route === 'dashboard') { await this.loadPeersQuiet(); }
         } catch (e) {
-          if (!this.handleAuthErr(e)) { this.toast('err', t('err.' + (e.code || 'network'))); }
+          if (!this.handleAuthErr(e)) { this.toast('err', this.errText(e)); }
         }
       },
 
@@ -619,7 +619,7 @@
           this.toast('info', t('users.token.title.reset'));
           await this.loadUsers();
         } catch (e) {
-          if (!this.handleAuthErr(e)) { this.toast('err', t('err.' + (e.code || 'network'))); }
+          if (!this.handleAuthErr(e)) { this.toast('err', this.errText(e)); }
         } finally {
           this.busyKey = '';
         }
@@ -631,7 +631,7 @@
           this.toast('ok', t('peers.result.ok'));
           await this.loadUsers();
         } catch (e) {
-          if (!this.handleAuthErr(e)) { this.toast('err', t('err.' + (e.code || 'network'))); }
+          if (!this.handleAuthErr(e)) { this.toast('err', this.errText(e)); }
         }
       },
 
