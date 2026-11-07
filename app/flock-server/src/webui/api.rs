@@ -51,6 +51,16 @@ fn valid_username(u: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
 }
 
+/// 公开认证端点（login-begin/finish、pw-begin/commit）的 `user` 入参校验
+/// （🟡 评审项 4 + 🟢 评审项 7 对齐）：1..=64B 且拒 ASCII 控制字符（含 `\n`/`\r`
+/// ——审计 stderr 行注入面；login-begin 的 ≤64 上限对齐到其余三个端点）。
+/// 不复用 [`valid_username`] 的 32B/[A-Za-z0-9_.-] 全集：控制流 device owner 名
+/// 不受该字符集约束（reset-password 后此类用户同样走 Web 登录链）——以「长度上限
+/// + 拒控制字符」为四端点一致下界（纵深第二层在 `AuditLog::record` 输出清洗）。
+fn sane_user_param(u: &str) -> bool {
+    !u.is_empty() && u.len() <= 64 && !u.bytes().any(|b| b.is_ascii_control())
+}
+
 // ============================================================================
 // 错误信封（§M8.4 逐字）
 // ============================================================================
@@ -352,7 +362,7 @@ impl WebState {
         let (Some(user), Some(ke1_b64)) = (body["user"].as_str(), body["ke1_b64"].as_str()) else {
             return err("bad_request");
         };
-        if user.is_empty() || user.len() > 64 || ke1_b64.len() > 64 * 1024 {
+        if !sane_user_param(user) || ke1_b64.len() > 64 * 1024 {
             return err("bad_request");
         }
         // per-IP 令牌桶（login-begin/pw-begin 共用档）。
@@ -406,6 +416,9 @@ impl WebState {
         let (Some(user), Some(ke3_b64)) = (body["user"].as_str(), body["ke3_b64"].as_str()) else {
             return err("bad_request");
         };
+        if !sane_user_param(user) {
+            return err("bad_request");
+        }
         if let Some(retry) = self.backoff.check(user, self.now()) {
             return err_with("rate_limited", Some(retry));
         }
@@ -448,6 +461,9 @@ impl WebState {
         ) else {
             return err("bad_request");
         };
+        if !sane_user_param(user) {
+            return err("bad_request");
+        }
         let Ok(token) = hex::decode(token_hex) else {
             return err("bad_token");
         };
@@ -491,6 +507,9 @@ impl WebState {
         ) else {
             return err("bad_request");
         };
+        if !sane_user_param(user) {
+            return err("bad_request");
+        }
         let profile = body["profile"].as_u64().unwrap_or(0) as u16;
         let Ok(token) = hex::decode(token_hex) else {
             return err("bad_token");
@@ -1137,5 +1156,102 @@ mod tests {
         assert_eq!(st.pending_len(), 1);
         assert_eq!(st.take_pending("fresh"), Some(vec![1]));
         assert_eq!(st.pending_len(), 0);
+    }
+
+    fn remote() -> SocketAddr {
+        "127.0.0.1:40000".parse().unwrap()
+    }
+
+    /// extra 对象合并 user 字段（serde_json 宏无 struct-update 语法）。
+    fn user_body(extra: &serde_json::Value, user: &str) -> serde_json::Value {
+        let mut v = extra.clone();
+        v["user"] = json!(user);
+        v
+    }
+
+    /// 公共认证端点 CSRF 双门槛齐备的 POST 载具。
+    fn post_req(path: &str, body: &serde_json::Value) -> Request {
+        Request {
+            method: "POST".into(),
+            path: path.into(),
+            query: String::new(),
+            headers: vec![
+                ("X-Flock-Web".into(), "1".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            body: serde_json::to_vec(body).unwrap(),
+        }
+    }
+
+    fn code_of(resp: &Response) -> String {
+        serde_json::from_slice::<serde_json::Value>(&resp.body)
+            .unwrap_or_default()
+            .pointer("/error/code")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// 审计 stderr 行注入向量被拒（🟡 评审项 4）：user 含 \n/\r/NUL/超长（>64B）⇒
+    /// 四个公共认证端点 400 bad_request（第二层清洗在 access.rs 单测）；恰 64B 的
+    /// 合法 user 过形状关——login-begin（真 ke1）⇒ 200、其余 ⇒ 401（非 400，
+    /// 证明拒绝确因 user 形状而非后续业务档）。
+    #[tokio::test]
+    async fn auth_endpoints_reject_control_char_and_overlong_user() {
+        let st = state().await;
+        let inject = "evil\n2026-01-01 user=root action=peer.revoke";
+        // 真 ke1（64B user 走 dummy 同形路径 ⇒ 200——形状关的放行证据）。
+        let user64 = "u".repeat(64);
+        let (_, ke1) = flock_protocol::pake::login_start(
+            &mut flock_protocol::rand::rngs::OsRng,
+            "pw",
+            &user64,
+        )
+        .unwrap();
+        for (path, extra, pass_status) in [
+            ("/api/login-begin", json!({"ke1_b64": ke1}), 200u16),
+            (
+                "/api/login-finish",
+                json!({"ke3_b64": "AAAA"}),
+                401, // 无在途 begin ⇒ login_failed
+            ),
+            (
+                "/api/pw-begin",
+                json!({"token": "00".repeat(16), "m1_b64": "AAAA"}),
+                401, // 未知用户同 bad_token（不枚举）
+            ),
+            (
+                "/api/pw-commit",
+                json!({"token": "00".repeat(16), "record_b64": "AAAA"}),
+                401, // NoSuchUser ⇒ bad_token
+            ),
+        ] {
+            // \n / \r / NUL 注入向量 ⇒ 400。
+            for bad in [inject, "evil\rx", "u\u{0}x"] {
+                let resp = st
+                    .dispatch(post_req(path, &user_body(&extra, bad)), remote())
+                    .await;
+                assert_eq!(resp.status, 400, "{path} 拒 {bad:?}");
+                assert_eq!(code_of(&resp), "bad_request");
+            }
+            // > 64B ⇒ 400（四端点对齐 login-begin 的长度上限）。
+            let resp = st
+                .dispatch(
+                    post_req(path, &user_body(&extra, &"u".repeat(65))),
+                    remote(),
+                )
+                .await;
+            assert_eq!(resp.status, 400, "{path} 拒 65B user");
+            // 恰 64B ⇒ 过形状关（业务档接管——非 400）。
+            let resp = st
+                .dispatch(post_req(path, &user_body(&extra, &user64)), remote())
+                .await;
+            assert_eq!(
+                resp.status,
+                pass_status,
+                "{path} 64B user 过形状关: {}",
+                String::from_utf8_lossy(&resp.body)
+            );
+        }
     }
 }

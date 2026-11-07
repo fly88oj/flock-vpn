@@ -281,12 +281,22 @@ pub struct AuditLog {
     inner: std::sync::Mutex<VecDeque<AuditEntry>>,
 }
 
+/// 审计字段清洗（🟡 评审项 4）：user/target 含换行/回车（或其它控制字符）时，
+/// stderr 单行格式可被伪造出「新的审计行」（行注入）。输出前把控制字符替换为
+/// 可视化占位（stderr 与内存环同清洗——API 面回显与留痕一致）。
+fn audit_sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '␀' } else { c })
+        .collect()
+}
+
 impl AuditLog {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 记一行（stderr 同步留痕 + 内存环；环满挤最旧）。
+    /// 记一行（stderr 同步留痕 + 内存环；环满挤最旧；user/target 输出前清洗
+    /// 控制字符——防 stderr 行注入伪造审计行）。
     pub fn record(
         &self,
         ts: u64,
@@ -297,20 +307,27 @@ impl AuditLog {
         result: &'static str,
     ) {
         debug_assert!(AUDIT_ACTIONS.contains(&action), "action 词表外: {action}");
+        let user = audit_sanitize(user);
+        let target = audit_sanitize(target);
         let entry = AuditEntry {
             ts,
-            user: user.to_string(),
+            user,
             action: action.to_string(),
-            target: target.to_string(),
+            target,
             origin,
             result,
         };
         // stderr（journald）：固定单行格式，诊断可 grep；不打印凭据字节。
         eprintln!(
-            "flock-server: webui audit ts={ts} user={user} action={action} target={target} origin={} result={result}",
-            origin.as_str()
+            "flock-server: webui audit ts={} user={} action={} target={} origin={} result={}",
+            entry.ts,
+            entry.user,
+            entry.action,
+            entry.target,
+            entry.origin.as_str(),
+            entry.result
         );
-        let mut g = self.inner.lock().expect("audit poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.len() >= AUDIT_CAP {
             g.pop_front();
         }
@@ -319,12 +336,12 @@ impl AuditLog {
 
     /// 快照（新→旧，§M8.4 `/api/audit`）。
     pub fn entries_newest_first(&self) -> Vec<AuditEntry> {
-        let g = self.inner.lock().expect("audit poisoned");
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.iter().rev().cloned().collect()
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("audit poisoned").len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -557,5 +574,36 @@ mod tests {
         }
         assert_eq!(a.len(), AUDIT_CAP, "环上限 200");
         assert_eq!(a.entries_newest_first()[0].ts, t0 + AUDIT_CAP as u64 + 38);
+    }
+
+    /// 审计输出清洗（🟡 评审项 4）：user/target 含 \n/\r/其它控制字符 ⇒ 输出前
+    /// 替换为可视化占位——stderr 单行格式不可被伪造出新的审计行（行注入）。
+    #[test]
+    fn audit_sanitizes_control_chars_in_user_and_target() {
+        let a = AuditLog::new();
+        a.record(
+            7,
+            "evil\n2026-01-01 user=root action=peer.revoke target=all result=ok",
+            "user.create",
+            "bob\r\ninjected",
+            Origin::Vpn,
+            "ok",
+        );
+        let e = &a.entries_newest_first()[0];
+        assert!(
+            !e.user.contains('\n') && !e.user.contains('\r'),
+            "user 无裸换行"
+        );
+        assert!(
+            !e.target.contains('\n') && !e.target.contains('\r'),
+            "target 无裸换行"
+        );
+        assert!(e.user.contains("evil"), "内容保留（可追溯）");
+        assert!(e.user.contains('␀'), "控制字符可视化占位");
+        // NUL/Tab 同清洗。
+        a.record(8, "u\u{0}x\t", "session.login", "t\u{1}", Origin::Vpn, "ok");
+        let e2 = &a.entries_newest_first()[0];
+        assert!(!e2.user.bytes().any(|b| b.is_ascii_control()));
+        assert!(!e2.target.bytes().any(|b| b.is_ascii_control()));
     }
 }
