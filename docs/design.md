@@ -1389,6 +1389,12 @@ flock-protocol 门禁含 wasm32 check（roster 纯数据无平台面）。
   （login-begin/finish、pw-begin/commit、bootstrap、静态资产）外一切 API 401
   `not_logged_in`**；非 admin：只读端点可用（peers/dashboard/config——这些数据本就经
   M7 名册对任何成员可见），管理端点 403 `forbidden`。逐端点角色矩阵定死于 §M8.4。
+- **降权/禁用生效 = 会话即时回收（评审修订）**：dispatch 会话档在会话表 lookup 后
+  **回读 `UserRow`**（Raft 形态用本地已 apply 视图、不必 linearizable——本机提交
+  写后回读立即可见，他机提交在本机 apply 后亚秒~秒级生效，与名册/peers 同视图档）：
+  `set_admin=false` 后旧会话**下一次请求即 403**（会话行内 admin 快照不作准，
+  `/api/me` 回显同步）；`disabled` 用户任何登录档端点**下一请求即 401
+  `user_disabled`**——均不等 TTL（旧行为的 8h 越权滞留窗口消除）。
 
 **Web 会话 ↔ 既有授权面的显式裁决（三条，堵住歧义）**：
 1. Web 会话**不复用、不映射**控制流 60s 票据：票据绑设备、隧道内短期凭据；web 会话
@@ -1414,7 +1420,8 @@ pub struct UserRow {
     pub sr_sig_pubs: Vec<[u8; 32]>,     // 既有
     pub admin: bool,                    // 新（M8）：Web 管理角色
     pub disabled: bool,                 // 新（M8）：禁用 ⇒ 阻断 Web 与控制流登录
-                                        //   （不追溯断开已建会话；设备级断离走 disable/revoke）
+                                        //   （Web 会话下一请求即 401 user_disabled——评审修订；
+                                        //   已建数据面/控制流会话不追溯断开，设备级断离走 disable/revoke）
     pub pw_bootstrap: Option<[u8; 16]>, // 新（M8）：初始/重置口令一次性引导令牌（消费即置 None）
 }
 ```
@@ -1437,6 +1444,14 @@ SetUserDisabled { user: String, disabled: bool }
   `user_disabled`；禁用判定发生在口令证明成立之后，不泄漏额外信息）、控制流
   `LoginBegin` 增同一判定（**唯一动到既有控制流分发的点**，测试覆盖）；已建数据面/
   控制流会话不追溯断开（设备级处置走既有 disable/revoke）——文档写明。
+  **如实声明（评审修订）：禁用账号存在口令正确性 oracle**——finish 阶段口令正确 ⇒
+  `user_disabled`、错误 ⇒ `login_failed`（两者可区分）；该 oracle 仅在能对口令做
+  在线验证时可用，且受 §M8.3 登录退避（15min 滑窗、第 5 次起指数锁定封顶 900s）与
+  per-IP 令牌桶（10 次/min）节流——与「ke2 同形防枚举」的目标（不泄漏账号存在性/
+  禁用态于 begin 阶段）不冲突；代价换取诚实客户端的明确错误语义（否则禁用用户与
+  错口令不可区分，运维无法区分两者）。**Web 会话面**：disabled 用户已持有的 Web
+  会话在下一请求即 401 `user_disabled`（dispatch 回读 UserRow，见上「降权/禁用
+  生效 = 会话即时回收」）。
 - **口令设置流（创建/重置共用）**：管理员 `POST /api/users`（或 reset-password）⇒
   响应一次性返回 `pw_bootstrap_token`（32hex，仅此一次，线下交付用户）⇒ 用户浏览器
   `POST /api/pw-begin {user, token, m1_b64}`（令牌预检只读、不消费）⇒
@@ -1479,7 +1494,10 @@ profile, admin: bool }`——服务在跑 ⇒ 经端点提交（多主：CreateU
   `payload_too_large` 413 / `rate_limited` 429（另带 `retry_after_secs` 字段）/
   `internal` 500。
 - 上限与走私拒绝：请求行 2KiB、头 8KiB、体 64KiB；存在 `Transfer-Encoding` 或重复
-  `Content-Length` ⇒ 400 关连接。
+  `Content-Length` ⇒ 400 关连接。**慢速攻击双层读超时（评审修订）**：单 read 15s
+  （半开）+ **单请求总时限 30s**（head+body 整体——逐字节滴注每 read 均在单读超时
+  内也绕不过总预算；到期关连接并计数，keep-alive 每请求重置）——否则可无限期占用
+  并发许可（64）耗尽管理面。
 
 **端点契约**（请求体 → 200 响应体逐字；角色列 = 会话要求；错误码列仅列业务项）：
 
@@ -1596,14 +1614,19 @@ wasm 工具链也能出完整二进制；门禁另跑 wasm check + 产物一致�
 2. **CSRF**：SameSite=Strict + 变更类 POST 双门槛（`X-Flock-Web: 1` + JSON
    content-type，§M8.4）。
 3. **速率限制**：§M8.3 登录退避 + per-IP 令牌桶；429 带 retry_after_secs。
+   两表容量上限 4096 + 60s 周期清扫（评审修订——未认证面注入任意 user/IP 名不构成
+   无界内存增长）。
 4. **审计**：变更类与登录失败留痕——stderr（journald 接管，与既有 `flock-server:`
    日志同通道）+ 内存最近 **200** 条（`/api/audit`，admin）；字段 ts/user/action/
-   target/origin/result，**不记口令/令牌/票据字节**。
+   target/origin/result，**不记口令/令牌/票据字节**；user/target 输出前清洗控制
+   字符（评审修订——stderr 单行格式不可被行注入伪造审计行；入参层四公共认证端点
+   拒含控制字符/超长 user）。
 5. **不泄密**：错误 message 白名单文案（§M8.4 信封）；`/api/config` 字段白名单；
    日志不打印 ke1/ke2/ke3/record 全文（仅长度与前 8 字符诊断位）。
-6. **会话面**：sid 256bit 随机、内存表、logout 即删；v1 已知残余（如实）：重置口令
-   不强制踢其它在途会话（旧 sid 可用至 TTL，TTL 8h 封顶暴露）——「敏感操作后旋转
-   sid」列后补档期。
+6. **会话面**：sid 256bit 随机、内存表、logout 即删；授权判定回读 UserRow——
+   降权/禁用对旧会话下一请求即生效（§M8.3，评审修订）；v1 已知残余（如实）：重置
+   口令不强制踢其它在途会话（旧 sid 可用至 TTL，TTL 8h 封顶暴露——重置不置
+   disabled，不触发 6 的即时回收路径）——「敏感操作后旋转 sid」列后补档期。
 
 #### M8.8 文件落位（定死）
 
@@ -1851,3 +1874,27 @@ headless 冒烟（资产 content-type + wasm 可下载）进 CI。
 - 2026-11-07 M8（服务端 Web UI·设计增补）：新增 §7-M8——进程内嵌 HTTP 管理面（**自研最小 HTTP/1.1，非 axum**：Cargo.lock 无 tower 系构件，暴露面仅 loopback+VIP，子集化拒 chunked/重复 Content-Length）；**双绑定 127.0.0.1:9800 + cfg.vip:9800**（配置不暴露 bind 字段——0.0.0.0 误配结构不可能；tun 未就绪 loopback 先行、VIP 5s 重试补绑）；访问矩阵 W-A1–A4（loopback/100.64.0.0/10 放行、其余 403 纵深、反代不承诺）；认证 = **OPAQUE 复用（HTTP 同语义新端点，不复用控制流消息）**+ anchor 保留（bootstrap 自证，不主张 MITM 防护）+ `UserRow.admin/disabled/pw_bootstrap` 三字段（Raft 行扩展，未发布窗口纪律）+ HttpOnly/SameSite=Strict 会话（32B sid、TTL 8h、上限 256、记录 loopback/vpn 来源）；**授权裁决**：Web 会话不映射控制流票据、写操作走 Raft 普通写（handler 层 admin 裁决）、`admin_op` 根签操作与 cluster-* 不进 UI；API 契约 §M8.4 逐字定死（22 端点/统一错误信封/CSRF 双门槛 X-Flock-Web+JSON）；口令创建/重置 = 一次性 `pw_bootstrap` 令牌（Raft 原子消费）；首 admin = `flock-server web-admin-add`（admin 端点尾部两变体，多主须经在跑服务）；流量时间序列 = 内存环形缓冲 120×60s（重启清零如实声明）；前端 = Alpine.js 3.14 + uPlot 1.6.9 + 自写深色设计系统，include_dir 内嵌，中文先行；wasm = C-ABI 垫片 `webauth_shim.rs`（showroom wasm_shim 手法 + 既有 getrandom custom 后端，无 wasm-bindgen）；测试 W1–W7 容器断言 + Rust 原生 OPAQUE 驱动 e2e；R 表增 R27。
 - 2026-11-07 M8a 落地（服务端全量·本批）：flock-sync 五写 + BadBootstrapToken（令牌判定先于记录——错令牌不泄漏是否已有口令；重放同错）+ users_snapshot；webui 模块七文件（http/session/access/api/series/assets/mod——文件落位 §M8.8 逐字）；netstate/backend 用户操作双臂（redb 行尾追加三字段、pre-M8 旧行宽容解码——与 postcard 快照干净失败是不同编码面）；admin 尾部 WebPwBegin/WebPwCommit（web_pw_commit 单一语义源，CLI 直写 fallback 共用）；控制流 LoginBegin 增 disabled 判定；CLI web-admin-add；[webui] 配置节（deny_unknown_fields 白名单键集 + 四面端口冲突拒起）；tests/webui.rs 4 项 + examples/webui_login 载具（cookie 缓存复用——逐子命令登录会耗尽 per-IP 桶）；deploy/webui.yml + webui_assert.sh + Dockerfile.webui（**W1/W2/W3/W5/W7 容器实测全 PASS**，W4/W6 留 M8b）。实现措辞澄清：disabled 用户 login-begin 用真记录（ke2 同形不泄漏禁用态，user_disabled 在口令证明成立后的 finish 返回——否则该错误码对诚实客户端不可达）。顺带清偿存量 clippy 债（新工具链 -D warnings 下的 dataplane 测试锁/unreachable 臂/needless return）。
 - 2026-11-07 M8b 落地（前端+wasm·本批）：webauth_shim C-ABI 垫片（§M8.6 契约逐字——熵注入/alloc/free/login_begin/login_finish/pw_begin/pw_finish，错误码 -1..-4；编译门在字面 wasm+wasm32 上扩展 anchor feature + native test——单测直调垫片跑通 OPAQUE 全程，注入熵固定断言确定性 ke1）；deploy/build-wasm.sh（wasm32 构建+产物提交进库+幂等 sha256 复核；flock-protocol [lib] 增 cdylib 档）；JS 胶水 vendor/flock_pake.js（yamux→web-time 传递依赖的 wasm-bindgen 占位导入按 Module.imports 动态建惰性 stub——pake 路径不可达）；SPA 全量（Alpine 3.14.9 + uPlot 1.6.9 vendored 含 LICENSE、自写深色设计系统、中文 i18n 单字典、hash 路由 7 段——audit 独立成页为 M8b 拆分、响应式三档全功能 + 44px 触控 + 无横向滚动）；SPA fallback（未知非 /api 路径回 index.html，§M8.4 静态资产行同步修订）；webui_assert.sh W4（client VIP:9800 登录页可达 + webui_login VIP 端点登录链 + origin=vpn）与 W6（--profile dual 双 voter Raft：双 VIP 各自登录 + peers/users/summary 集合一致）；webui.yml dual 档（dual-a/b + operator init-cluster + dual-client，独立项目名 flock-webui-dual 与单服拓扑并行）；docs/manual/webui-checklist.md 骨架（M8c 填充）。实测：本机内嵌浏览器 wasm 登录全链（建号→令牌→设口令→双角色）+ 三档布局核验；容器 W1–W7 全 PASS 见批次回报。W6 实测暴露并修复转发面两处存量缺口（flock-sync forward.rs）：① 服务器段 VIP（§6.2 .1–.10）不在设备注册表 ⇒ 远端服务器 VIP 包落 drop_with_icmp——ingest/route_outbound 增 server_vip_node 回退映射（ForwardEnvelope 至收端 server-self 合成键）、receive 增「dst=本服务器 server-self ⇒ 注内核」分支（§7-M8.2 承诺的 fwd_delivered_kernel 路径此前未实现）；② route_outbound 的 src_dev=[0;32] 占位符使服务器内核回程在收端源绑定必拒——改用 server-self 合成键 + receive 按 origin 的确定性 VIP 校验该面（防伪语义不降）。单测 8 项新增于 forward.rs。
+- 2026-11-07 M8 评审修复批（安全加固·8 项，全部含新增单测、cargo 门禁全绿）：
+  ① 🔴 慢速攻击——http.rs 增**单请求总时限 REQUEST_TOTAL=30s**（head+body 整体读循环
+  抽为 read_request 套总预算；到期关连接 + SLOW_KILLS 计数；keep-alive 每请求重置；
+  测试用 serve_conn_with_budget 注入 300ms 预算驱动逐字节滴注向量）——旧 READ_TIMEOUT
+  是逐 read 超时，逐字节滴注可无限期占用 64 并发许可（VIP 面 DoS 管理面）；
+  ② 🟡 loopback accept 错误分类——瞬态（WouldBlock/Interrupted/ConnAborted/ConnReset/
+  EMFILE/ENFILE）记日志 + 250ms 退避续跑，致命才退出（与 VIP 面 5s 重绑语义对齐）；
+  ③ 🟡 pending 登录态满载逐出改按 (exp_unix, 插入序) 最旧 + put/take 惰性清过期行
+  （旧 keys().min() 字典序最小 ≠ 最旧——admin 等小字典序名的 login-finish 无故失败）；
+  ④ 🟡 审计 stderr 行注入——四公共认证端点 user 入参统一 1..=64B + 拒 ASCII 控制字符
+  （sane_user_param；不复用 valid_username 全集——控制流 device owner 名不受该字符集
+  约束），AuditLog::record 对 user/target 输出前控制字符清洗（stderr 与内存环同清洗）；
+  ⑤ 🟡 LoginBackoff/IpBuckets 容量上限 4096 + 60s 周期清扫（SWEEP_PERIOD 同档复用；
+  写路径先清惰性/idle 行、仍满逐出最旧——未认证面注入任意 user/IP 名不再无界增行）；
+  ⑥ 🟡 降权/禁用会话即时回收——dispatch 会话档回读 UserRow（本地已 apply 视图、
+  不必 linearizable，取舍注释写明）：set_admin=false 后旧会话下一请求 403、disabled
+  下一请求 401 user_disabled（旧行为 admin 快照滞留 8h TTL）；§M8.3/§M8.7 措辞同步
+  （含「禁用账号存在口令正确性 oracle（受退避节流）」如实声明）；
+  ⑦ 🟢 小项——方法错档统一 405（path_known 路径形状分流，对齐错误码表）；flock_pake.js
+  decHex/decB64 期望长度校验 + writeParam 0 长度短路（纯 JS 资产，.wasm 产物不变）；
+  series vip_in_registry 含远端服务器 VIP（多主 server_keys 视图——重启后首样本前
+  不 404，multi-primary 集成测试覆盖）；config.rs admin_bind+1 用 checked_add
+  （65535 溢出不再 debug panic）；session/access 系列 Mutex poison 改 into_inner；
+  ⑧ 本变更日志条目即第 8 项（design.md 措辞与实现行为同步）。
