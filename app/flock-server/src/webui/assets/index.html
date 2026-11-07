@@ -347,11 +347,17 @@
                           <td :data-label="t('users.col.devices')" class="num td-num" x-text="u.devices"></td>
                           <td data-label="">
                             <div class="row-actions">
+                              <!-- 自身行防护（round2 评审项 4）：取消管理员/禁用置灰禁用
+                                   （title 提示；后端 409 已兜底）；重置口令保留可用。 -->
                               <button class="btn btn-success btn-sm" x-show="u.disabled" :disabled="busyKey !== ''" @click="userEnable(u)" x-text="t('users.act.enable')"></button>
-                              <button class="btn btn-ghost btn-sm" :disabled="busyKey !== ''" @click="confirmUserAdmin(u, !u.admin)" x-text="u.admin ? t('users.act.unsetadmin') : t('users.act.setadmin')"></button>
+                              <button class="btn btn-ghost btn-sm" :disabled="busyKey !== '' || (isSelf(u) && u.admin)"
+                                      :title="isSelf(u) && u.admin ? t('users.act.self.blocked') : null"
+                                      @click="confirmUserAdmin(u, !u.admin)" x-text="u.admin ? t('users.act.unsetadmin') : t('users.act.setadmin')"></button>
                               <span class="acts-sep"></span>
                               <button class="btn btn-ghost btn-sm" :disabled="busyKey !== ''" @click="userResetPw(u)" x-text="t('users.act.resetpw')"></button>
-                              <button class="btn btn-warn btn-sm" x-show="!u.disabled" :disabled="busyKey !== ''" @click="confirmUserDisable(u)" x-text="t('users.act.disable')"></button>
+                              <button class="btn btn-warn btn-sm" x-show="!u.disabled" :disabled="busyKey !== '' || isSelf(u)"
+                                      :title="isSelf(u) ? t('users.act.self.blocked') : null"
+                                      @click="confirmUserDisable(u)" x-text="t('users.act.disable')"></button>
                               <button class="btn btn-warn btn-sm is-placeholder" x-show="u.disabled" disabled :title="t('users.act.disabled.disabled')" x-text="t('users.act.disable')"></button>
                             </div>
                           </td>

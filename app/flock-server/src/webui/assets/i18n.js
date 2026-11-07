@@ -176,6 +176,8 @@
     'users.act.resetpw': '重置口令',
     'users.act.setadmin': '设为管理员',
     'users.act.unsetadmin': '取消管理员',
+    // 自身行防护（round2 评审项 4）：取消管理员/禁用按钮置灰的 title 提示
+    'users.act.self.blocked': '不能对当前登录账户执行',
     'users.confirm.disable.title': '禁用账户',
     'users.confirm.disable.body': '禁用后 {user} 的 Web 与控制流登录将被阻断（已建立会话不追溯）。确定禁用？',
     'users.confirm.setadmin.title': '变更管理员角色',

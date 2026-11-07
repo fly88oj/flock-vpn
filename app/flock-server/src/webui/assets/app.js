@@ -127,6 +127,10 @@
 
       get isAdmin() { return !!(this.me && this.me.admin); },
 
+      // 当前登录用户自身行判定（round2 评审项 4）：取消管理员/禁用对自身
+      // 前端置灰（后端 409 cannot_demote_self 已兜底）；重置口令保留可用。
+      isSelf(u) { return !!(this.me && u && u.username === this.me.user); },
+
       // ================= 启动与路由 =================
       async boot() {
         window.addEventListener('hashchange', () => this.navigate());
