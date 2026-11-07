@@ -828,6 +828,11 @@ pub async fn run(
     let admin = crate::admin::serve(core.clone(), core.cfg.admin_bind)
         .await
         .map_err(|e| format!("admin bind {}: {e}", core.cfg.admin_bind))?;
+    // M8（§7-M8.2）：Web UI 管理面——loopback 即绑（失败拒起）+ VIP 5s 重试任务。
+    // （sync::run_raft 的多主装配最终也经本 run() ⇒ 两形态同一接入点。）
+    if core.cfg.webui.enabled {
+        crate::webui::serve(core.clone()).await?;
+    }
     match mode {
         ListenerMode::Direct { bind } => {
             // Direct 装配路径：bind 即监听——零 frp 逻辑（§2.1/§3.11 硬约束）。

@@ -64,6 +64,19 @@ pub enum AdminRequest {
     /// RecordInvite——签名验证在 Raft 状态机内，admin 只透传）。
     #[cfg(feature = "multi-primary")]
     SignedWrite { req: flock_sync::proto::SyncRequest },
+    /// M8（§7-M8.3）：`web-admin-add` 的服务端半边——OPAQUE 注册 m1 → m2
+    ///（loopback 绑定 = 认证边界，与既有 invite/revoke 同级信任）。目标用户已有
+    /// 口令 ⇒ Err 指引走 Web 重置。
+    WebPwBegin { user: String, m1_b64: String },
+    /// M8：注册收尾提交（CreateUser（UserExists 幂等忽略）+ SetPasswordBootstrap +
+    /// SetUserAdmin；token 由 CLI 生成随消息携带——复用 Raft 五写语义）。
+    WebPwCommit {
+        user: String,
+        token: [u8; 16],
+        record_b64: String,
+        profile: u16,
+        admin: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -89,6 +102,14 @@ pub enum AdminResponse {
     /// SignedWrite 的回执（Debug 文本形态——`Ok`/`Error(..)` 的可读化）。
     WriteReceipt {
         text: String,
+    },
+    /// M8：WebPwBegin 的 m2（OPAQUE 注册第二步）。
+    WebPwM2 {
+        m2_b64: String,
+    },
+    /// M8：WebPwCommit 的回执。
+    WebPwDone {
+        username: String,
     },
     Err {
         msg: String,
@@ -202,6 +223,37 @@ async fn dispatch(core: &ServerCore, req: AdminRequest) -> AdminResponse {
         AdminRequest::Stats => AdminResponse::StatsText {
             lines: stats_lines(core).await,
         },
+        AdminRequest::WebPwBegin { user, m1_b64 } => {
+            // 已有口令 ⇒ 拒并指引（CLI 侧同样检查；此处兜底）。
+            if net
+                .user_row(&user)
+                .await
+                .is_some_and(|r| r.opaque_record.is_some())
+            {
+                return AdminResponse::Err {
+                    msg: format!(
+                        "用户 {user} 已设置口令——web-admin-add 仅用于首次设置；
+                           已有口令的账户请经 Web UI 重置（管理员 /api/users/{user}/reset-password）"
+                    ),
+                };
+            }
+            match flock_protocol::pake::server_reg_start(&core.oprf, &m1_b64, &user) {
+                Ok(m2_b64) => AdminResponse::WebPwM2 { m2_b64 },
+                Err(e) => AdminResponse::Err {
+                    msg: format!("OPAQUE reg_start: {e}"),
+                },
+            }
+        }
+        AdminRequest::WebPwCommit {
+            user,
+            token,
+            record_b64,
+            profile,
+            admin,
+        } => match web_pw_commit(core, &user, token, &record_b64, profile, admin).await {
+            Ok(()) => AdminResponse::WebPwDone { username: user },
+            Err(e) => AdminResponse::Err { msg: e },
+        },
         #[cfg(feature = "multi-primary")]
         AdminRequest::SignedWrite { req } => {
             use crate::netstate::NetError;
@@ -289,6 +341,60 @@ async fn stats_lines(core: &ServerCore) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// M8：`web-admin-add` 的提交半边（admin 端点与「服务未跑 ⇒ 单服直写」的 CLI
+/// fallback 共用——语义单一真相源）。
+///
+/// 步骤（§7-M8.3）：目标已有口令 ⇒ 拒并指引；用户不存在 ⇒ CreateUser（UserExists
+/// 幂等忽略）；令牌不匹配（此前半途流程残留）⇒ ResetPassword 覆写（记录本就为空）；
+/// SetPasswordBootstrap 落记录 + 清令牌；`admin=true` ⇒ SetUserAdmin。
+pub async fn web_pw_commit(
+    core: &ServerCore,
+    user: &str,
+    token: [u8; 16],
+    record_b64: &str,
+    profile: u16,
+    admin: bool,
+) -> Result<(), String> {
+    use crate::netstate::UserOpError;
+    let map = |e: UserOpError| e.to_string();
+    // 记录规范化（解码验证）——坏 b64 不进写路径。
+    let canonical = flock_protocol::pake::server_reg_canonical(record_b64)
+        .map_err(|e| format!("record_b64: {e}"))?;
+    match core.net.user_row(user).await {
+        Some(row) if row.opaque_record.is_some() => {
+            return Err(format!(
+                "用户 {user} 已设置口令——web-admin-add 仅用于首次设置；
+                   已有口令的账户请经 Web UI 重置（管理员 /api/users/{user}/reset-password）"
+            ));
+        }
+        None => {
+            // 建户（携令牌）；已存在（并发/重试）⇒ 幂等忽略（下方令牌对齐）。
+            match core.net.create_user(user, token).await {
+                Ok(()) | Err(UserOpError::UserExists) => {}
+                Err(e) => return Err(map(e)),
+            }
+        }
+        Some(_) => {}
+    }
+    // 令牌对齐（半途流程残留的旧令牌 ⇒ 覆写；记录为空 ⇒ ResetPassword 无损）。
+    if !core
+        .net
+        .user_row(user)
+        .await
+        .is_some_and(|r| r.pw_bootstrap == Some(token))
+    {
+        core.net.reset_password(user, token).await.map_err(map)?;
+    }
+    core.net
+        .set_password_bootstrap(user, token, &canonical, profile)
+        .await
+        .map_err(map)?;
+    if admin {
+        core.net.set_user_admin(user, true).await.map_err(map)?;
+    }
+    Ok(())
 }
 
 /// admin 客户端（CLI 子命令用；一请求一连接）。

@@ -286,6 +286,12 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             if owner != user {
                 return err(CtrlError::NotAuthorized);
             }
+            // M8（§7-M8.3）：禁用判定——disabled 用户阻断控制流登录（会话设备 owner
+            // 已认证，此处的 NotAuthorized 不构成匿名枚举面；已建会话不追溯断开）。
+            if net.user_row(&user).await.is_some_and(|r| r.disabled) {
+                eprintln!("flock-server: login rejected (user disabled): {user}");
+                return err(CtrlError::NotAuthorized);
+            }
             let record = net
                 .password(&user)
                 .await
@@ -1173,6 +1179,75 @@ mod tests {
             other => panic!("peer list: {other:?}"),
         }
         assert_eq!(roster_assemblies(), before + 1, "好票据才装配");
+    }
+
+    /// M8（§7-M8.3）：控制流 LoginBegin 的 disabled 判定——禁用 ⇒ NotAuthorized
+    ///（登录链在 begin 即断，不进 OPAQUE）；enable 后恢复。
+    #[tokio::test]
+    async fn login_begin_rejects_disabled_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _) = crate::server::ServerCore::open_or_init(m7_cfg(dir.path().to_path_buf()))
+            .expect("core");
+        let store = store_of(&core);
+        // dave 的会话设备（owner 面）。
+        let vk = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        store
+            .register_device("dave", [11; 32], *vk.verifying_key().as_bytes(), "")
+            .unwrap();
+        let device = DeviceId::from_ed25519(&vk.verifying_key());
+        // 建户（RegisterDevice 自动建空户）+ 设口令 + 禁用。
+        store.set_password("dave", "rec-dave", 0).unwrap();
+        store.set_user_disabled("dave", true).unwrap();
+
+        let mut ctx = ConnCtx {
+            device,
+            pending_login: None,
+        };
+        let mut ke1 = String::new();
+        // 非法 ke1 无所谓——判定在 OPAQUE 之前。
+        ke1.push_str("AAAA");
+        let resp = dispatch(
+            &core,
+            &mut ctx,
+            CtrlRequest::LoginBegin {
+                user: "dave".into(),
+                ke1_b64: ke1,
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                &resp,
+                CtrlResponse::Err {
+                    code: CtrlError::NotAuthorized,
+                    ..
+                }
+            ),
+            "禁用用户登录 begin 即拒: {resp:?}"
+        );
+        assert!(ctx.pending_login.is_none(), "未进 OPAQUE 在途态");
+
+        // enable 后恢复（坏 ke1 走 LoginFailed——判定推进到 OPAQUE 层）。
+        store.set_user_disabled("dave", false).unwrap();
+        let resp = dispatch(
+            &core,
+            &mut ctx,
+            CtrlRequest::LoginBegin {
+                user: "dave".into(),
+                ke1_b64: "AAAA".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                &resp,
+                CtrlResponse::Err {
+                    code: CtrlError::LoginFailed,
+                    ..
+                }
+            ),
+            "恢复后推进到 OPAQUE（坏 ke1 ⇒ LoginFailed）: {resp:?}"
+        );
     }
 
     /// KeyBind re-register 的 owner 校验（DeviceExists 变体分流）：跨户对他人设备
