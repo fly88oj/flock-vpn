@@ -20,6 +20,10 @@ flock-client = { path = "../flock-client" }
 # 控制流消息编码（§2.2：yamux stream0 postcard）与 server.toml 反序列化。
 postcard = { workspace = true }
 serde = { workspace = true }
+# M8 webui（§7-M8.4）：统一 JSON 错误信封/端点请求响应体。
+serde_json = { workspace = true }
+# M8 webui（§7-M8.1/§M8.8）：前端资产内嵌（include_dir 定死；壳页阶段仅 index.html）。
+include_dir = { workspace = true }
 toml = { workspace = true }
 redb = { workspace = true }
 base64 = { workspace = true }

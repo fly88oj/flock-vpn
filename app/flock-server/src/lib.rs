@@ -78,6 +78,7 @@ pub mod server;
 #[cfg(feature = "multi-primary")]
 pub mod sync;
 pub mod ticket;
+pub mod webui;
 
 #[cfg(test)]
 mod tests {
