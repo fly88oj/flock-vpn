@@ -580,6 +580,20 @@ async fn traffic_counting_single_point_local_and_cross_server() {
     // A 接在 n0（真实流程由 serve_conn 发布——测试直发）。
     n0.publish_lease(&id_a).await;
 
+    // 前置显式化：等 C 的租约经 gossip（事件推送/反熵）扩散到 n0 的远端视图——
+    // 原实现 publish 后立即 ingest，隐式依赖事件推送 ≤1s 的时序，并行负载下抖动
+    //（ingest 撞上「租约未达」即 Dropped 而非 Forwarded）。上限 5s（反熵周期）。
+    for _ in 0..200 {
+        if n0.lease().peer_stats(&id_c).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        n0.lease().peer_stats(&id_c).is_some(),
+        "前置失败：C 的租约 5s 内未扩散到 n0"
+    );
+
     // —— 跨服：A 接在 n0（会话/租约持有），C 接在 n1 ——
     let pkt = ip4(vip_a.octets(), vip_c.octets(), &[7u8; 100]);
     n0.ingest_packet(&id_a, &pkt).await; // src tx @n0（接入点）+ FRWD → n1 计 dst rx
