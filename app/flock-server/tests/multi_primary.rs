@@ -1280,3 +1280,70 @@ async fn m7_invite(c3: &Node3, id: [u8; 16]) -> InviteFile {
         id,
     )
 }
+
+// ============================================================================
+// M8 webui（多主形态）：dashboard/series 的远端服务器 VIP 注册表判定
+// ============================================================================
+
+/// 🟢 评审项 7（series vip_in_registry 含远端服务器 VIP）：Series 重启清零 ⇒
+/// 重启后首样本前 knows()=false——远端服务器 VIP 的 series 查询须命中注册表支
+///（server_keys 本地视图）返回空 points，而非 404；不在任何注册表面的 VIP 仍 404。
+#[tokio::test]
+async fn webui_series_remote_server_vip_known_before_first_sample() {
+    let c3 = build_cluster().await;
+    // 节点 0 的 ServerCore（Sync backend；server_keys 已在 build_cluster 根签登记）。
+    let server_a = serve_on(&c3, 0, vec![]).await;
+    let state = std::sync::Arc::new(flock_server::webui::api::WebState::new(
+        server_a.core.clone(),
+    ));
+
+    // 登录档会话（dispatch 回读 UserRow——评审项 6 语义；直接经会话表签发）。
+    server_a
+        .core
+        .net
+        .create_user("probe", [0xAB; 16])
+        .await
+        .expect("create_user");
+    server_a
+        .core
+        .net
+        .set_user_admin("probe", true)
+        .await
+        .expect("set_user_admin");
+    let now = flock_protocol::trust::now_unix();
+    use flock_server::webui::session::Origin;
+    let sid = state
+        .sessions
+        .issue("probe", true, Origin::Loopback, now, 3600);
+
+    // 远端服务器（节点 2）VIP = server_vip_of 的确定性推导。
+    let node2 = flock_sync::node::node_id_of(&c3.idents[2].server_id);
+    let vip2 = flock_sync::proto::server_vip_of(node2).expect("node 1..=10");
+    let vip_str = format!("{}.{}.{}.{}", vip2[0], vip2[1], vip2[2], vip2[3]);
+    let remote: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+
+    // DBG：server_keys 本地视图与判定输入。
+    let mk_req = |query: String| flock_server::webui::http::Request {
+        method: "GET".into(),
+        path: "/api/dashboard/series".into(),
+        query,
+        headers: vec![("Cookie".into(), format!("flock_session={sid}"))],
+        body: vec![],
+    };
+    // 远端服务器 VIP：无样本（新 Series——重启语义）但在册 ⇒ 200 空 points。
+    let resp = state
+        .dispatch(mk_req(format!("vip={vip_str}")), remote)
+        .await;
+    assert_eq!(resp.status, 200, "远端服务器 VIP 命中注册表支（非 404）");
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(
+        body["points"].as_array().map(Vec::len),
+        Some(0),
+        "重启后首样本前空 points"
+    );
+    // 不在任何注册表面的 VIP ⇒ 404。
+    let resp = state
+        .dispatch(mk_req("vip=100.64.0.99".into()), remote)
+        .await;
+    assert_eq!(resp.status, 404, "未登记 VIP 仍 404");
+}

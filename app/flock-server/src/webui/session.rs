@@ -6,6 +6,9 @@
 //!
 //! 时钟注入：全部方法收 `now_unix`（清扫任务/登录 handler 注入真实墙钟；单测注入
 //! 定点时钟——退避/过期曲线确定性可测）。
+//!
+//! Mutex poison：webui 系列表锁一律 `unwrap_or_else(|e| e.into_inner())`——持锁
+//! panic 的污染不级联为整面 500/进程死亡（表数据本身完好；🟢 评审项 7）。
 
 use std::collections::HashMap;
 
@@ -64,7 +67,7 @@ impl Sessions {
         now_unix: u64,
         ttl_secs: u64,
     ) -> String {
-        let mut g = self.inner.lock().expect("sessions poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         evict_to_cap(&mut g);
         // 32B 随机（256bit）；hex 64 字符。碰撞（2^-256）不构成现实路径——重取即可。
         let sid = loop {
@@ -88,7 +91,7 @@ impl Sessions {
 
     /// 查会话（惰性过期：命中即验 exp——过期返回 None 但行仍在，待清扫/复用槽位）。
     pub fn lookup(&self, sid: &str, now_unix: u64) -> Option<Session> {
-        let g = self.inner.lock().expect("sessions poisoned");
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.get(sid).filter(|s| s.exp_unix > now_unix).cloned()
     }
 
@@ -96,14 +99,14 @@ impl Sessions {
     pub fn logout(&self, sid: &str) -> bool {
         self.inner
             .lock()
-            .expect("sessions poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(sid)
             .is_some()
     }
 
     /// 清扫过期行（60s 周期任务；返回清出条数——测试面）。
     pub fn sweep(&self, now_unix: u64) -> usize {
-        let mut g = self.inner.lock().expect("sessions poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before = g.len();
         g.retain(|_, s| s.exp_unix > now_unix);
         before - g.len()
@@ -111,7 +114,7 @@ impl Sessions {
 
     /// 在册行数（含未过期的惰性行——诊断/测试面）。
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("sessions poisoned").len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {

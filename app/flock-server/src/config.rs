@@ -318,8 +318,13 @@ impl ServerConfig {
                 if self.admin_bind.port() == webui_port {
                     conflicts.push((self.admin_bind.port(), "admin_bind"));
                 }
-                if self.admin_bind.port() + 1 == webui_port {
-                    conflicts.push((self.admin_bind.port() + 1, "admin_bind+1（集群引导端点）"));
+                // admin_bind+1（集群引导端点）：u16 加法经 checked_add——65535+1
+                // 溢出（debug 构建直接 panic / release 回绕为 0）不存在可冲突的
+                // +1 端点（🟢 评审项 7）。
+                if let Some(boot) = self.admin_bind.port().checked_add(1) {
+                    if boot == webui_port {
+                        conflicts.push((boot, "admin_bind+1（集群引导端点）"));
+                    }
                 }
             }
             if let Some(sync) = &self.sync {
@@ -632,6 +637,23 @@ port = 9800
 ";
         let cfg: ServerConfig = toml::from_str(text).unwrap();
         assert!(cfg.validate().is_ok());
+    }
+
+    /// admin_bind=65535 的 +1 派生经 checked_add（🟢 评审项 7）：u16 溢出不 panic
+    ///（debug 构建旧实现 `65535 + 1` 直接 overflow panic）、不误判 0 端口冲突。
+    #[test]
+    fn webui_port_conflict_admin_bind_65535_no_overflow_panic() {
+        let text = "state_dir = \"/tmp/s\"
+advertise_endpoint = \"x\"
+admin_bind = \"127.0.0.1:65535\"
+[webui]
+port = 9800
+";
+        let cfg: ServerConfig = toml::from_str(text).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "65535+1 溢出即无集群引导端口可冲突——放行且不 panic"
+        );
     }
 
     /// 键集白名单（W7 结构防误配）：[webui] 出现 bind 等未知键 ⇒ 解析层即拒

@@ -282,7 +282,9 @@ mod tests {
         }
     }
 
-    /// wasm 胶水契约：默认 wasm 路径、C-ABI 导出全名、错误码映射、熵注入。
+    /// wasm 胶水契约：默认 wasm 路径、C-ABI 导出全名、错误码映射、熵注入；定长
+    /// anchor 材料的期望长度校验 + 0 长度写参短路（🟢 评审项 7——短 hex/b64 不
+    /// 越界、空参不触 dangling 指针）。
     #[test]
     fn pake_glue_c_abi_anchors() {
         let js = text("vendor/flock_pake.js");
@@ -306,6 +308,24 @@ mod tests {
         for code in ["no_entropy", "pake", "anchor", "capacity"] {
             assert!(js.contains(code), "错误码 {code}");
         }
+        // 定长材料的期望长度校验（server_id 16B / identity_pub 32B / bind 16B /
+        // sig 64B——垫片 fixed::<N>() 定长拷贝，短输入越界读）。
+        assert!(js.contains("decHex(a.server_id_hex, 16)"), "server_id 16B");
+        assert!(
+            js.contains("decB64(a.identity_pub_b64, 32)"),
+            "identity_pub 32B"
+        );
+        assert!(
+            js.contains("decHex(a.bind_token_hex, 16)"),
+            "bind_token 16B"
+        );
+        assert!(
+            js.contains("decHex(a.anchor_sig_hex, 64)"),
+            "anchor_sig 64B"
+        );
+        assert!(js.contains("hex.length !== expect * 2"), "短/长 hex 报错");
+        // writeParam 0 长度短路（sr_wasm_alloc(0) = dangling 指针）。
+        assert!(js.contains("bytes.length === 0"), "writeParam 0 长度短路");
     }
 
     /// /static 查找：存在文件命中（含 vendor/ 子目录）；不存在走 SPA fallback 由

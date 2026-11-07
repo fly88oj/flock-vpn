@@ -27,11 +27,14 @@
 
   // —— 内存工具（每次重建视图：buffer 可增长/detach）——
   function writeParam(bytes) {
+    if (bytes.length === 0) {
+      return { ptr: 0, len: 0 }; // 0 长度短路：sr_wasm_alloc(0) 返回 dangling 指针，
+    }                            // Uint8Array 构造会 RangeError——空参直接传 null 哨兵
     var ptr = exports().sr_wasm_alloc(bytes.length);
     new Uint8Array(exports().memory.buffer, ptr, bytes.length).set(bytes);
     return { ptr: ptr, len: bytes.length };
   }
-  function freeParam(p) { exports().sr_wasm_free(p.ptr, p.len); }
+  function freeParam(p) { if (p.ptr !== 0) { exports().sr_wasm_free(p.ptr, p.len); } }
   function readCStr(ptr) {
     var mem = new Uint8Array(exports().memory.buffer);
     var end = ptr;
@@ -41,16 +44,21 @@
     return new TextDecoder('utf-8').decode(out);
   }
   function encUtf8(s) { return new TextEncoder().encode(s); }
-  function decHex(hex) {
-    if (hex.length % 2 !== 0) { throw new Error('bad hex'); }
-    var out = new Uint8Array(hex.length / 2);
-    for (var i = 0; i < out.length; i++) {
+  // decHex/decB64 期望长度校验：垫片侧 fixed::<N>() 按定长拷贝——短输入会越界
+  // 读相邻内存，此处先验「恰 expect 字节」（奇长/非 hex 字符/短 hex 报错不越界）。
+  function decHex(hex, expect) {
+    if (hex.length !== expect * 2 || /[^0-9a-fA-F]/.test(hex)) {
+      throw new Error('bad hex (want ' + expect * 2 + ' chars)');
+    }
+    var out = new Uint8Array(expect);
+    for (var i = 0; i < expect; i++) {
       out[i] = parseInt(hex.substr(i * 2, 2), 16);
     }
     return out;
   }
-  function decB64(b64) {
+  function decB64(b64, expect) {
     var s = atob(b64);
+    if (s.length !== expect) { throw new Error('bad b64 (want ' + expect + ' bytes)'); }
     var out = new Uint8Array(s.length);
     for (var i = 0; i < s.length; i++) { out[i] = s.charCodeAt(i); }
     return out;
@@ -76,10 +84,10 @@
 
   function loginFinish(a) {
     var ke2 = writeParam(encUtf8(a.ke2_b64));
-    var sid = writeParam(decHex(a.server_id_hex));
-    var pub = writeParam(decB64(a.identity_pub_b64));
-    var bind = writeParam(decHex(a.bind_token_hex));
-    var sig = writeParam(decHex(a.anchor_sig_hex));
+    var sid = writeParam(decHex(a.server_id_hex, 16));      // server_id 16B
+    var pub = writeParam(decB64(a.identity_pub_b64, 32));   // Ed25519 验签公钥 32B
+    var bind = writeParam(decHex(a.bind_token_hex, 16));    // bind_token 16B
+    var sig = writeParam(decHex(a.anchor_sig_hex, 64));     // anchor 签名 64B
     var out = exports().sr_wasm_alloc(OUT_CAP);
     var rc;
     try {

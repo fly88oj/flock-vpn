@@ -112,27 +112,63 @@ pub fn required_role(method: &str, path: &str) -> Role {
             // /api/peers/{device_id}/revoke|disable|enable|kick（POST，Admin）
             if m_post {
                 if let Some(rest) = path.strip_prefix("/api/users/") {
-                    if rest.contains('/')
-                        && matches!(
-                            rest.rsplit('/').next().unwrap_or(""),
-                            "disable" | "enable" | "reset-password" | "admin"
-                        )
-                    {
+                    if user_action_known(rest) {
                         return Role::Admin;
                     }
                 }
                 if let Some(rest) = path.strip_prefix("/api/peers/") {
-                    if rest.contains('/')
-                        && matches!(
-                            rest.rsplit('/').next().unwrap_or(""),
-                            "revoke" | "disable" | "enable" | "kick"
-                        )
-                    {
+                    if peer_action_known(rest) {
                         return Role::Admin;
                     }
                 }
             }
             Role::Unknown
+        }
+    }
+}
+
+/// `/api/users/{u}/<action>` 的动作档（与 method 无关的路径形状判定）。
+fn user_action_known(rest: &str) -> bool {
+    rest.contains('/')
+        && matches!(
+            rest.rsplit('/').next().unwrap_or(""),
+            "disable" | "enable" | "reset-password" | "admin"
+        )
+}
+
+/// `/api/peers/{id}/<action>` 的动作档（与 method 无关的路径形状判定）。
+fn peer_action_known(rest: &str) -> bool {
+    rest.contains('/')
+        && matches!(
+            rest.rsplit('/').next().unwrap_or(""),
+            "revoke" | "disable" | "enable" | "kick"
+        )
+}
+
+/// 路径已知（与 method 无关的路径形状）：已知路径 + 方法错档 ⇒ 分发层 405
+/// `method_not_allowed`（§M8.4 错误码表），未知路径才 404（🟢 评审项 7——
+/// 旧实现方法错档并入 Unknown ⇒ 404，与错误码表的 405 档不一致）。
+pub fn path_known(path: &str) -> bool {
+    match path {
+        "/api/bootstrap"
+        | "/api/login-begin"
+        | "/api/login-finish"
+        | "/api/logout"
+        | "/api/me"
+        | "/api/pw-begin"
+        | "/api/pw-commit"
+        | "/api/users"
+        | "/api/audit"
+        | "/api/peers"
+        | "/api/dashboard/summary"
+        | "/api/dashboard/series"
+        | "/api/config" => true,
+        _ => {
+            path.strip_prefix("/api/users/")
+                .is_some_and(user_action_known)
+                || path
+                    .strip_prefix("/api/peers/")
+                    .is_some_and(peer_action_known)
         }
     }
 }

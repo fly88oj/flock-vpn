@@ -33,7 +33,9 @@ use crate::netstate::{DeviceStatus, NetError, UserOpError};
 use crate::server::ServerCore;
 
 use super::access::AuditLog;
-use super::access::{classify_origin, csrf_gate_ok, required_role, IpBuckets, LoginBackoff, Role};
+use super::access::{
+    classify_origin, csrf_gate_ok, path_known, required_role, IpBuckets, LoginBackoff, Role,
+};
 use super::assets;
 use super::http::{Request, Response};
 use super::series::Series;
@@ -238,12 +240,18 @@ impl WebState {
         if !req.path.starts_with("/api/") {
             return self.static_route(&req);
         }
-        // ③ 路由档（未知 /api/* → 404）。
+        // ③ 路由档（未知 /api/* → 404）+ ④ 方法（已知路径方法错档 → 405——
+        // required_role 把方法并入档位判定，Unknown 需再分流：路径形状已知 ⇒
+        // 方法错档 405 method_not_allowed（§M8.4 错误码表对齐，🟢 评审项 7），
+        // 否则 404 not_found）。
         let role = required_role(&req.method, &req.path);
         if role == Role::Unknown {
-            return err("not_found");
+            return err(if path_known(&req.path) {
+                "method_not_allowed"
+            } else {
+                "not_found"
+            });
         }
-        // ④ 方法（required_role 已含方法匹配——不匹配即 Unknown；此处不再 405）。
         // ⑤ CSRF 双门槛（变更类 = 全部 POST）。
         if !csrf_gate_ok(
             &req.method,
@@ -1027,11 +1035,27 @@ impl WebState {
         }))
     }
 
+    /// 404 判定的注册表支：本机 VIP + 设备全状态 +（多主）远端服务器 VIP
+    ///（server_keys 本地视图——🟢 评审项 7：Series 重启清零 ⇒ 重启后首样本前
+    /// knows()=false，远端服务器 VIP 查询须命中本支返回空 points 而非 404）。
     async fn vip_in_registry(&self, vip: &[u8; 4]) -> bool {
         if *vip == self.core.cfg.vip.octets() {
             return true;
         }
-        self.all_devices().await.iter().any(|(_, r)| r.vip == *vip)
+        if self.all_devices().await.iter().any(|(_, r)| r.vip == *vip) {
+            return true;
+        }
+        #[cfg(feature = "multi-primary")]
+        if let NetBackend::Sync(s) = &self.core.net {
+            if s.node
+                .server_keys_snapshot()
+                .iter()
+                .any(|(_, e)| e.vip == *vip)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn h_config(&self) -> Response {
@@ -1172,6 +1196,57 @@ mod tests {
         assert_eq!(st.pending_len(), 1);
         assert_eq!(st.take_pending("fresh"), Some(vec![1]));
         assert_eq!(st.pending_len(), 0);
+    }
+
+    /// 方法错档 405（🟢 评审项 7）：已知路径异方法 ⇒ 405 method_not_allowed
+    ///（对齐 §M8.4 错误码表；先于 CSRF/会话——未登录亦 405）；未知路径/未知
+    /// 动作 ⇒ 404（不误吞）。
+    #[tokio::test]
+    async fn method_mismatch_returns_405_not_404() {
+        let st = state().await;
+        for (method, path) in [
+            ("GET", "/api/login-begin"),
+            ("GET", "/api/login-finish"),
+            ("GET", "/api/pw-begin"),
+            ("GET", "/api/pw-commit"),
+            ("POST", "/api/bootstrap"),
+            ("POST", "/api/me"),
+            ("POST", "/api/peers"),
+            ("PUT", "/api/users"),
+            ("DELETE", "/api/audit"),
+            ("GET", "/api/logout"),
+            ("GET", "/api/users/bob/disable"),
+            ("GET", "/api/peers/abcd/revoke"),
+        ] {
+            let r = Request {
+                method: method.into(),
+                path: path.into(),
+                query: String::new(),
+                headers: vec![],
+                body: vec![],
+            };
+            let resp = st.dispatch(r, remote()).await;
+            assert_eq!(resp.status, 405, "{method} {path}");
+            assert_eq!(code_of(&resp), "method_not_allowed", "{method} {path}");
+        }
+        // 未知路径 / 未知动作后缀 ⇒ 404 not_found。
+        for (method, path) in [
+            ("GET", "/api/nope"),
+            ("POST", "/api/peers/abcd/rename"),
+            ("PUT", "/api/users/bob/rename"),
+            ("GET", "/api/users/bob"),
+        ] {
+            let r = Request {
+                method: method.into(),
+                path: path.into(),
+                query: String::new(),
+                headers: vec![],
+                body: vec![],
+            };
+            let resp = st.dispatch(r, remote()).await;
+            assert_eq!(resp.status, 404, "{method} {path}");
+            assert_eq!(code_of(&resp), "not_found", "{method} {path}");
+        }
     }
 
     fn remote() -> SocketAddr {
