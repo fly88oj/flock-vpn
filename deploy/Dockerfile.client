@@ -41,10 +41,11 @@ FROM debian:bookworm-slim
 # 工具面：iproute2/iputils-ping/iperf3/procps（A2/A3/A4 断言与诊断）；
 # netcat-openbsd/tcpdump/iptables/hping3：M5 断言（A1 字节透传 nc echo、A11 压缩
 # 默认关的 iptables 字节计数对照、A14 伪造源的 hping3 + tcpdump 收包面）；
-# jq：M7 断言（peers --json 机读档解析）。
+# jq：M7 断言（peers --json 机读档解析）；
+# curl：M8 W4 断言（client 容器内 curl VIP:9800 登录页可达——VPN 段路径实证）。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends iproute2 iputils-ping iperf3 procps \
-      netcat-openbsd tcpdump iptables hping3 jq \
+      netcat-openbsd tcpdump iptables hping3 jq curl \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/flock-client /usr/local/bin/flock-client
 RUN mkdir -p /var/lib/flock

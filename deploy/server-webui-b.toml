@@ -1,0 +1,33 @@
+# server-webui-b.toml —— M8b W6 dual 档 server-b（双 voter Raft + webui，
+# VIP 100.64.0.2；其余同 server-webui-a.toml 头注）。
+
+state_dir = "/var/lib/flock"
+bind = "0.0.0.0:9443"
+admin_bind = "127.0.0.1:9444"
+
+advertise_endpoint = "dual-b:9443"
+extra_endpoints = []
+dir_version = 1
+
+ticket_ttl_secs = 60
+peer_retention_days = 30
+max_sessions = 1024
+
+tun_name = "tun0"
+vip = "100.64.0.2"
+
+[sync]
+mode = "raft"
+bundle = "/var/lib/flock/bundle.bin"
+raft_bind = "0.0.0.0:9500"
+raft_peers = [
+    "1=dual-a:9500",
+    "2=dual-b:9500",
+]
+
+[webui]
+enabled = true
+port = 9800
+session_ttl_secs = 28800
+series_points = 120
+series_interval_secs = 60

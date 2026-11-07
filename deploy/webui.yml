@@ -1,18 +1,26 @@
 # webui.yml —— M8 Web UI 容器集成（docs/design.md §7-M8.9 W1–W7 的拓扑承载）。
 #
-#   docker compose -f deploy/webui.yml up -d --build
-#   bash deploy/webui_assert.sh            # W1/W2/W3/W5/W7（W4/W6 留 M8b 全链）
+#   单服拓扑（W1–W5/W7）：
+#     docker compose -f deploy/webui.yml up -d --build
+#     bash deploy/webui_assert.sh
+#   双服 Raft 拓扑（W6；独立项目名隔离——与单服拓扑并行不撞端口/卷/网）：
+#     docker compose -p flock-webui-dual -f deploy/webui.yml --profile dual up -d --build
+#     bash deploy/webui_assert.sh          # W6 检测到 dual-b 在跑即执行
 #
-# 拓扑（单服 Direct 形态 + 一 client 容器 + 可选第二 server——W6 双 VIP 一致为 M8b
-# 多主批次，profile 先备好槽位）：
-#   server-a（Dockerfile.webui：flock-server + webui_login 驱动器 + curl/jq；
-#     Direct 9443 + admin 9444 + webui 双绑定 127.0.0.1:9800/tun VIP:9800；
-#     cap NET_ADMIN + /dev/net/tun——VIP 面随 tun 就绪补绑）
-#   client-1（flock-client 镜像；W5 的连接层不可达探针——bash /dev/tcp，无 curl 依赖）
-#   server-b（profile "second"；同镜像独立状态卷。单服形态各自独立状态——W6 的
-#     「双 VIP 数据一致」需多主（Raft）装配，M8b 接入 [sync] mode=raft + 编排）
+# 拓扑：
+#   server-a（Dockerfile.webui 缺省档：单服 Direct；flock-server + webui_login
+#     驱动器 + curl/jq；Direct 9443 + admin 9444 + webui 双绑定 127.0.0.1:9800/
+#     tun VIP:9800；cap NET_ADMIN + /dev/net/tun——VIP 面随 tun 就绪补绑）
+#   client-1（flock-client 镜像 + curl；W4 的 VPN 段登录链载具 / W5 的连接层
+#     不可达探针——bash /dev/tcp 兜底）
+#   dual-a / dual-b（profile "dual"：multi-primary 构建档 + server-webui-{a,b}.toml
+#     双 voter Raft，VIP 100.64.0.1/.2；enroll 捆绑与 cluster-bootstrap 由
+#     webui_assert.sh W6 幂等驱动）
+#   dual-client（profile "dual"：flock-client，经 cluster-invite 入网——W6 从
+#     VPN 段同时可达双 VIP）
+#   operator（profile "dual"：一次性 init-cluster --voters 2 → /mat 卷）
 #
-# 网络单 flockpub：server-a 的容器网地址（如 172.x.y.z）**不绑 9800**——webui 只绑
+# 网络单 flockpub：server 的容器网地址（如 172.x.y.z）**不绑 9800**——webui 只绑
 # loopback + tun VIP ⇒ W5 从 client-1 探 server-a:9800（flockpub 地址）必 refused。
 
 name: flock-webui
@@ -34,25 +42,6 @@ services:
       - server-a-state:/var/lib/flock
     restart: unless-stopped
 
-  server-b:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.webui
-    image: flock/server:webui
-    profiles: ["second"]
-    cap_add: [NET_ADMIN]
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    sysctls:
-      net.ipv4.conf.all.rp_filter: "1"
-      net.ipv4.conf.default.rp_filter: "1"
-    networks: [flockpub]
-    volumes:
-      - server-b-state:/var/lib/flock
-    # 同镜像 VIP 缺省 100.64.0.1 与 server-a 撞——独立 compose 网内各自 tun 命名空间
-    # 隔离（不同 netns 同 VIP 合法）；W6 接入时改多主配置（bundle + raft_bind）。
-    restart: unless-stopped
-
   client-1:
     build:
       context: ..
@@ -72,10 +61,104 @@ services:
       - client-1-state:/var/lib/flock
     restart: unless-stopped
 
+  # —— dual 档（W6）：双 voter Raft ——
+  dual-a:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.webui
+      args:
+        server_features: multi-primary
+        server_conf: server-webui-a.toml
+    image: flock/server:webui-mp
+    profiles: [dual]
+    hostname: dual-a
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    networks: [flockpub]
+    volumes:
+      - dual-a-state:/var/lib/flock
+      - cluster-mat:/mat:ro
+    restart: unless-stopped
+
+  dual-b:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.webui
+      args:
+        server_features: multi-primary
+        server_conf: server-webui-b.toml
+    image: flock/server:webui-mp
+    profiles: [dual]
+    hostname: dual-b
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    networks: [flockpub]
+    volumes:
+      - dual-b-state:/var/lib/flock
+      - cluster-mat:/mat:ro
+    restart: unless-stopped
+
+  dual-client:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.client
+    image: flock/client:webui
+    profiles: [dual]
+    depends_on: [dual-a, dual-b]
+    hostname: dual-client
+    command: ["--config", "/var/lib/flock/client.toml", "service"]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "1"
+      net.ipv4.conf.default.rp_filter: "1"
+    networks: [flockpub]
+    volumes:
+      - dual-client-state:/var/lib/flock
+    restart: unless-stopped
+
+  # —— dual 档：一次性运维容器（init-cluster --voters 2，幂等）——
+  operator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.webui
+      args:
+        server_features: multi-primary
+        server_conf: server-webui-a.toml
+    image: flock/server:webui-mp
+    profiles: [dual]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ -f /mat/root.seed ]; then
+          echo "operator: cluster material already present (skip init-cluster)"
+        else
+          flock-server --config /etc/flock/server.toml init-cluster \
+            --voters 2 --out /mat \
+            --endpoints "dual-a:9443,dual-b:9443"
+        fi
+    volumes:
+      - cluster-mat:/mat
+    networks: [flockpub]
+    restart: "no"
+
 networks:
   flockpub:
 
 volumes:
   server-a-state:
-  server-b-state:
   client-1-state:
+  dual-a-state:
+  dual-b-state:
+  dual-client-state:
+  cluster-mat:

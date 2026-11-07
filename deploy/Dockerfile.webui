@@ -2,10 +2,17 @@
 # flock-webui —— M8 Web UI 断言镜像（docs/design.md §7-M8.9 deploy/webui.yml 的 server 面）。
 #
 # 与 Dockerfile.server-direct 的差异：① 运行段带 curl/jq（W1 断言）；② 额外构建并
-# 安装 examples/webui_login（W2/W3 的 HTTP-OPAQUE 驱动器）。构建模式沿用
+# 安装 examples/webui_login（W2/W3/W4/W6 的 HTTP-OPAQUE 驱动器）。构建模式沿用
 # manifest+stub 依赖层缓存；glibc 两侧同钉 bookworm。
+#
+# build args（M8b W6 dual 档）：
+#   server_features 缺省 ""        —— 单服 Direct（W1–W5/W7 拓扑）
+#   server_features "multi-primary" —— 双 voter Raft（server_conf 用
+#   server-webui-{a,b}.toml；W6 双 VIP 一致断言）
 
 FROM rust:1.98-slim-bookworm AS builder
+ARG server_features=""
+ARG server_conf="server-webui.toml"
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc \
  && rm -rf /var/lib/apt/lists/*
@@ -40,12 +47,13 @@ COPY crates/flock-sync/src crates/flock-sync/src
 COPY app/flock-client/src app/flock-client/src
 COPY app/flock-server/src app/flock-server/src
 COPY app/flock-server/examples app/flock-server/examples
-RUN touch crates/flock-protocol/src/lib.rs crates/flock-frpc/src/lib.rs \
+RUN if [ -n "$server_features" ]; then FEAT="--features $server_features"; else FEAT=""; fi \
+ && touch crates/flock-protocol/src/lib.rs crates/flock-frpc/src/lib.rs \
       crates/flock-sync/src/lib.rs \
       app/flock-client/src/lib.rs app/flock-client/src/main.rs \
       app/flock-server/src/lib.rs app/flock-server/src/main.rs \
       app/flock-server/examples/webui_login.rs \
- && cargo build --release --locked -p flock-server --bins --example webui_login
+ && cargo build --release --locked -p flock-server --bins --example webui_login $FEAT
 
 FROM debian:bookworm-slim
 # curl/jq：W1 未登录 401 断言与响应解析（本机容器内 127.0.0.1:9800）。
@@ -55,6 +63,6 @@ RUN apt-get update \
 COPY --from=builder /src/target/release/flock-server /usr/local/bin/flock-server
 COPY --from=builder /src/target/release/examples/webui_login /usr/local/bin/webui_login
 RUN mkdir -p /var/lib/flock
-COPY deploy/server-webui.toml /etc/flock/server.toml
+COPY deploy/$server_conf /etc/flock/server.toml
 ENTRYPOINT ["/usr/local/bin/flock-server"]
 CMD ["--config", "/etc/flock/server.toml"]

@@ -671,12 +671,13 @@ fn print_list(r: Resp, key: &str) -> Result<u32, String> {
             .as_str()
             .unwrap_or_else(|| item["vip"].as_str().unwrap_or(""));
         println!(
-            "{key} {name} admin={} disabled={} online={} status={} device_id={}",
+            "{key} {name} admin={} disabled={} online={} status={} device_id={} owner={}",
             item["admin"].as_bool().unwrap_or(false),
             item["disabled"].as_bool().unwrap_or(false),
             item["online"].as_bool().unwrap_or(false),
             item["status"].as_str().unwrap_or(""),
             item["device_id"].as_str().unwrap_or(""),
+            item["owner"].as_str().unwrap_or(""),
         );
     }
     Ok(0)

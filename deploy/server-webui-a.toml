@@ -1,0 +1,37 @@
+# server-webui-a.toml —— M8b W6 dual 档 server-a（双 voter Raft + webui）。
+#
+# `docker compose -p flock-webui-dual -f deploy/webui.yml --profile dual up -d --build`
+# 的双服拓扑：a=100.64.0.1 / b=100.64.0.2，raft_peers 走 compose 网络服务名；
+# enroll 捆绑（/mat/node-0.bundle）与 cluster-bootstrap 由 webui_assert.sh W6
+# 幂等驱动（operator 容器先 init-cluster --voters 2）。
+
+state_dir = "/var/lib/flock"
+bind = "0.0.0.0:9443"
+admin_bind = "127.0.0.1:9444"
+
+advertise_endpoint = "dual-a:9443"
+extra_endpoints = []
+dir_version = 1
+
+ticket_ttl_secs = 60
+peer_retention_days = 30
+max_sessions = 1024
+
+tun_name = "tun0"
+vip = "100.64.0.1"
+
+[sync]
+mode = "raft"
+bundle = "/var/lib/flock/bundle.bin"
+raft_bind = "0.0.0.0:9500"
+raft_peers = [
+    "1=dual-a:9500",
+    "2=dual-b:9500",
+]
+
+[webui]
+enabled = true
+port = 9800
+session_ttl_secs = 28800
+series_points = 120
+series_interval_secs = 60
