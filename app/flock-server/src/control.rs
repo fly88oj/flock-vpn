@@ -981,6 +981,7 @@ mod tests {
             vip: "100.64.0.1".parse().unwrap(),
             frp: None,
             sync: None,
+            webui: Default::default(),
         }
     }
 

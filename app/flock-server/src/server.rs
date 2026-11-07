@@ -1069,6 +1069,7 @@ mod reaper_tests {
             vip: "100.64.0.1".parse().unwrap(),
             frp: None,
             sync: None,
+            webui: Default::default(),
         }
     }
 
@@ -1255,6 +1256,7 @@ mod vip_guard_tests {
             vip: vip.parse().unwrap(),
             frp: None,
             sync: None,
+            webui: Default::default(),
         }
     }
 

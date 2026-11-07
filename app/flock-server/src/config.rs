@@ -113,6 +113,61 @@ pub struct ServerConfig {
     /// 多主同步（§2.2/§3.11 M4 批次；缺省 None = 单服形态——m2/m2-direct 部署不变）。
     #[serde(default)]
     pub sync: Option<SyncSection>,
+    /// M8 Web UI 管理面（§7-M8.2；缺省 enabled=true/port=9800——双绑定
+    /// 127.0.0.1:port + cfg.vip:port，**不暴露任何 bind 字段**）。
+    #[serde(default)]
+    pub webui: WebUiSection,
+}
+
+/// `[webui]` 配置节（§7-M8.2 定死；**显式白名单键集**——`deny_unknown_fields` 使
+/// `bind` 等误配键在解析层即拒，结构上排除 0.0.0.0 误配）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebUiSection {
+    /// false = 不装配 webui。
+    #[serde(default = "default_webui_enabled")]
+    pub enabled: bool,
+    /// 双绑定端口（127.0.0.1:port + cfg.vip:port）；校验 1..=65535 且不与
+    /// bind/admin_bind/admin_bind+1/raft_bind 冲突（拒起服）。
+    #[serde(default = "default_webui_port")]
+    pub port: u16,
+    /// 会话 TTL 秒（缺省 8h；校验 60..=86400）。
+    #[serde(default = "default_webui_session_ttl")]
+    pub session_ttl_secs: u64,
+    /// 流量环形缓冲点数（§M8.5；缺省 120）。
+    #[serde(default = "default_webui_series_points")]
+    pub series_points: usize,
+    /// 采样间隔秒（缺省 60）。
+    #[serde(default = "default_webui_series_interval")]
+    pub series_interval_secs: u64,
+}
+
+impl Default for WebUiSection {
+    fn default() -> Self {
+        WebUiSection {
+            enabled: default_webui_enabled(),
+            port: default_webui_port(),
+            session_ttl_secs: default_webui_session_ttl(),
+            series_points: default_webui_series_points(),
+            series_interval_secs: default_webui_series_interval(),
+        }
+    }
+}
+
+fn default_webui_enabled() -> bool {
+    true
+}
+fn default_webui_port() -> u16 {
+    9800
+}
+fn default_webui_session_ttl() -> u64 {
+    28_800
+}
+fn default_webui_series_points() -> usize {
+    120
+}
+fn default_webui_series_interval() -> u64 {
+    60
 }
 
 /// `[sync]` 配置节。
@@ -237,6 +292,47 @@ impl ServerConfig {
                 self.ticket_ttl_secs,
                 crate::ticket::TICKET_TTL_SECS
             ));
+        }
+        // M8（§M8.2）：[webui] 校验——端口与 TTL 档位 + 与既有监听面冲突拒起服。
+        if self.webui.enabled {
+            if self.webui.port == 0 {
+                return Err("[webui] port 为 0（1..=65535）".into());
+            }
+            if !(60..=86_400).contains(&self.webui.session_ttl_secs) {
+                return Err(format!(
+                    "[webui] session_ttl_secs {} 超出档位 60..=86400（缺省 8h）",
+                    self.webui.session_ttl_secs
+                ));
+            }
+            if self.webui.series_points == 0 || self.webui.series_interval_secs == 0 {
+                return Err("[webui] series_points/series_interval_secs 须 ≥ 1".into());
+            }
+            // 端口冲突面：bind / admin_bind / admin_bind+1（集群引导端点）/ raft_bind。
+            // （webui 自身的双绑定 127.0.0.1:port 与 vip:port 同 port——不参与自冲突。）
+            let webui_port = self.webui.port;
+            let mut conflicts: Vec<(u16, &str)> = Vec::new();
+            if self.bind.port() != 0 && self.bind.port() == webui_port {
+                conflicts.push((self.bind.port(), "bind"));
+            }
+            if self.admin_bind.port() != 0 {
+                if self.admin_bind.port() == webui_port {
+                    conflicts.push((self.admin_bind.port(), "admin_bind"));
+                }
+                if self.admin_bind.port() + 1 == webui_port {
+                    conflicts.push((self.admin_bind.port() + 1, "admin_bind+1（集群引导端点）"));
+                }
+            }
+            if let Some(sync) = &self.sync {
+                if sync.raft_bind.port() != 0 && sync.raft_bind.port() == webui_port {
+                    conflicts.push((sync.raft_bind.port(), "sync.raft_bind"));
+                }
+            }
+            if let Some((port, face)) = conflicts.first() {
+                return Err(format!(
+                    "[webui] port {webui_port} 与 {face}（:{port}）冲突——webui 双绑定\
+                     （127.0.0.1:{webui_port} + vip:{webui_port}）需独立端口，拒绝起服",
+                ));
+            }
         }
         Ok(())
     }
@@ -412,5 +508,155 @@ serverPort = 7000
         let err = cfg_with_ttl(61).validate().unwrap_err();
         assert!(err.contains("60"), "错误点名硬顶: {err}");
         assert!(err.contains("只可调小"), "{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // M8（§M8.2/W7）：[webui] 节——缺省值/档位校验/端口冲突拒起服/键集白名单
+    // ------------------------------------------------------------------
+
+    fn cfg_with_webui(webui: &str) -> ServerConfig {
+        let text = format!(
+            "state_dir = \"/tmp/s\"
+advertise_endpoint = \"127.0.0.1:9443\"
+{webui}"
+        );
+        toml::from_str(&text).unwrap()
+    }
+
+    /// 缺省：enabled=true/port=9800/TTL 8h/series 120×60。
+    #[test]
+    fn webui_section_defaults() {
+        let cfg = cfg_with_webui("");
+        assert_eq!(cfg.webui.port, 9800);
+        assert!(cfg.webui.enabled);
+        assert_eq!(cfg.webui.session_ttl_secs, 28_800);
+        assert_eq!(cfg.webui.series_points, 120);
+        assert_eq!(cfg.webui.series_interval_secs, 60);
+        assert!(cfg.validate().is_ok());
+        // 显式覆盖往返。
+        let cfg = cfg_with_webui(
+            "[webui]
+enabled = false
+port = 9900
+session_ttl_secs = 3600
+series_points = 60
+series_interval_secs = 30
+",
+        );
+        assert!(!cfg.webui.enabled);
+        assert_eq!(cfg.webui.port, 9900);
+        assert_eq!(cfg.webui.session_ttl_secs, 3600);
+        assert!(cfg.validate().is_ok(), "enabled=false 不做端口冲突面");
+    }
+
+    /// TTL 档位（60..=86400）与 port 0 拒。
+    #[test]
+    fn webui_range_validation() {
+        assert!(cfg_with_webui(
+            "[webui]
+session_ttl_secs = 60
+"
+        )
+        .validate()
+        .is_ok());
+        assert!(cfg_with_webui(
+            "[webui]
+session_ttl_secs = 86400
+"
+        )
+        .validate()
+        .is_ok());
+        for bad_ttl in ["59", "86401"] {
+            let err = cfg_with_webui(&format!(
+                "[webui]
+session_ttl_secs = {bad_ttl}
+"
+            ))
+            .validate()
+            .unwrap_err();
+            assert!(err.contains("60..=86400"), "{bad_ttl}: {err}");
+        }
+        let err = cfg_with_webui(
+            "[webui]
+port = 0
+",
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("port"), "{err}");
+    }
+
+    /// 端口冲突拒起服（W7）：与 bind / admin_bind / admin_bind+1 / raft_bind 撞 ⇒
+    /// 错误点名冲突面；不冲突放行。
+    #[test]
+    fn webui_port_conflicts_reject() {
+        let mk = |extra: &str, webui_port: u16| {
+            let text = format!(
+                "state_dir = \"/tmp/s\"
+advertise_endpoint = \"127.0.0.1:9443\"
+{extra}
+[webui]
+port = {webui_port}
+"
+            );
+            toml::from_str::<ServerConfig>(&text).unwrap()
+        };
+        // 与 bind（9443）撞。
+        let err = mk("", 9443).validate().unwrap_err();
+        assert!(err.contains("bind") && err.contains("拒绝起服"), "{err}");
+        // 与 admin_bind（9444）撞。
+        let err = mk("", 9444).validate().unwrap_err();
+        assert!(err.contains("admin_bind"), "{err}");
+        // 与 admin_bind+1（9445 集群引导端点）撞。
+        let err = mk("", 9445).validate().unwrap_err();
+        assert!(err.contains("集群引导端点"), "{err}");
+        // 与 raft_bind 撞。
+        let err = mk(
+            "[sync]
+mode = \"raft\"
+",
+            9500,
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("raft_bind"), "{err}");
+        // 独立端口放行（bind 0.0.0.0:9443 / admin 9444 / raft 缺省 9500 都不撞 9800）。
+        assert!(mk("", 9800).validate().is_ok());
+        // bind 端口 0（测试 ephemeral 形态）不参与冲突面。
+        let text = "state_dir = \"/tmp/s\"
+advertise_endpoint = \"x\"
+bind = \"127.0.0.1:0\"
+admin_bind = \"127.0.0.1:0\"
+[webui]
+port = 9800
+";
+        let cfg: ServerConfig = toml::from_str(text).unwrap();
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// 键集白名单（W7 结构防误配）：[webui] 出现 bind 等未知键 ⇒ 解析层即拒
+    ///（deny_unknown_fields——0.0.0.0 误配在结构上不可能，而非靠校验拦截）。
+    #[test]
+    fn webui_unknown_keys_rejected_at_parse() {
+        let err = toml::from_str::<ServerConfig>(
+            "state_dir = \"/tmp/s\"
+advertise_endpoint = \"x\"
+[webui]
+bind = \"0.0.0.0:9800\"
+",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bind"), "未知键点名: {err}");
+        assert!(
+            toml::from_str::<ServerConfig>(
+                "state_dir = \"/tmp/s\"
+advertise_endpoint = \"x\"
+[webui]
+listen = \"0.0.0.0\"
+"
+            )
+            .is_err(),
+            "任何白名单外键拒"
+        );
     }
 }

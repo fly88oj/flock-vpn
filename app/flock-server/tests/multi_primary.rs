@@ -264,6 +264,7 @@ fn sync_server_cfg(
         vip,
         frp: None,
         sync: None,
+        webui: Default::default(),
     }
 }
 

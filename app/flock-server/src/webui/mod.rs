@@ -5,4 +5,5 @@
 
 pub mod access;
 pub mod http;
+pub mod series;
 pub mod session;

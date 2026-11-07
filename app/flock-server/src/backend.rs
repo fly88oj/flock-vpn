@@ -576,7 +576,7 @@ impl NetBackend {
 use crate::netstate::UserRow as StateStoreUserRow;
 
 #[cfg(feature = "multi-primary")]
-fn sync_op_int(e: sync_proto::SyncError) -> UserOpError {
+fn sync_op_int(e: NetError) -> UserOpError {
     UserOpError::Internal(format!("sync: {e}"))
 }
 
