@@ -343,4 +343,91 @@ mod tests {
             "嵌套遍历拒"
         );
     }
+
+    /// round2 双评审修复锚（🔴 图表/抽屉 + 确认项 3–9）：每项至少一个稳定锚点，
+    /// 防回归——改动这些面时同步更新本表。
+    #[test]
+    fn round2_review_fix_anchors() {
+        let js = text("app.js");
+        let css = text("styles.css");
+        let html = std::str::from_utf8(index()).expect("utf-8");
+        let i18n = text("i18n.js");
+
+        // 🔴 1 图表：显式时间刻度（恒 4–6 个）、Y 恒 0 起点值域、完整单位、
+        // 双系列图例（DOM 自绘 + 线色单点定义 + 实时读数）。
+        assert!(js.contains("timeTickSplits"), "X 轴显式刻度面");
+        assert!(
+            js.contains("[0, hi - lo < 1 ? hi + 1 : hi]"),
+            "Y 值域恒 0 起点（0 值抬头不挤掉 0）"
+        );
+        assert!(js.contains("CHART_TX_COLOR"), "线色单点定义");
+        assert!(js.contains("legendTx"), "图例实时读数");
+        assert!(html.contains("chart-legend"), "自绘图例 DOM");
+        assert!(css.contains(".chart-legend"), "图例样式");
+        assert!(
+            !js.contains("fmtBpsAxis"),
+            "紧凑单位形（60.0 M）已弃用——Y 轴/tooltip/统计卡同源 fmtBps"
+        );
+
+        // 🔴 2 抽屉：面板层级高于遮罩（真缺陷：旧 sidebar z50 < scrim z55，
+        // 遮罩盖面板致内容全黑）+ 右缘 12px 圆角 + 更明显开态投影。
+        assert!(css.contains("z-index: 56"), "抽屉 56 > 遮罩 55");
+        assert!(css.contains("0 12px 12px 0"), "右缘 12px 圆角");
+        assert!(
+            css.contains("box-shadow: 12px 0 40px rgba(0, 0, 0, 0.55)"),
+            "开态右向投影"
+        );
+
+        // 3 平板（768–1199）行内操作 ≥44px 命中 + 刷新按钮三档统一（弃 btn-sm）。
+        assert!(
+            css.contains("max-width: 1199.98px) and (min-width: 768px)"),
+            "平板断点行内操作 44px"
+        );
+        assert!(
+            !html.contains("btn-outline btn-sm"),
+            "刷新按钮不再桌面 30/手机 44 参差"
+        );
+
+        // 4 账号页自身行防护（取消管理员/禁用置灰；重置口令保留）。
+        assert!(js.contains("isSelf(u)"), "自身行判定");
+        assert!(html.contains("users.act.self.blocked"), "置灰 title 提示");
+        assert!(i18n.contains("'users.act.self.blocked'"), "i18n 键");
+
+        // 5 状态列三形态：列名「状态/在线」+ 图例说明（圆点=在线/文字=生命周期）。
+        assert!(i18n.contains("'peers.col.status.legend'"), "图例说明键");
+        assert!(
+            html.contains("t('peers.col.status.legend')"),
+            "表头/单元格 title 图例"
+        );
+
+        // 6 口令徽标：「未设置」琥珀描边胶囊。
+        assert!(
+            css.contains(".badge-outline-warn") && html.contains("badge-outline-warn"),
+            "琥珀描边胶囊"
+        );
+
+        // 7 审计高危 action 的「成功」徽标用琥珀档。
+        assert!(
+            js.contains("auditHighRisk") && js.contains("auditResultBadge"),
+            "高危词表 + 徽标分流"
+        );
+
+        // 8 桌面 dashboard：集群卡与服务器区两列并排 + 集群卡三段等距三列。
+        assert!(
+            css.contains(".dash-top") && html.contains("dash-top"),
+            "顶部两列"
+        );
+        assert!(html.contains("kv-cols"), "集群卡三段三列");
+        assert!(i18n.contains("'dash.cluster.id'"), "集群标识键");
+
+        // 9 微项批：词内不断行 / ID 芯片下划线偏移 / Toast 带原因透传 / 模态
+        // 警示图标（tabular-nums 由既有 .num 规则覆盖，无新增面）。
+        assert!(css.contains("word-break: keep-all"), "中文词内不断行");
+        assert!(
+            css.contains("text-underline-offset: 2px"),
+            "ID 芯片下划线偏移"
+        );
+        assert!(js.contains("serverMessage"), "错误信封 message 透传");
+        assert!(html.contains("modal-title-ico"), "模态标题警示图标");
+    }
 }
