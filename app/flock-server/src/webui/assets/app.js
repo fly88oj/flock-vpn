@@ -305,18 +305,26 @@
         this.dashBusy = true;
         this.dashError = false;
         try {
-          this.summary = await api('GET', '/api/dashboard/summary');
-          if (!this.chartVip) {
-            const ps = this.chartPeers();
-            this.chartVip = ps.length ? ps[0].vip : '';
-          }
+          // 先加载 peers（图表候选源）再取 summary——修复登录后首进 dashboard 的
+          // chartVip 空竞态（🔴 UI 评审项 4：旧行为在 peers 未就绪时取默认选中，
+          // chartVip 永不回填 → 图表空态直至手动刷新）。
           await this.loadPeersQuiet();
+          this.summary = await api('GET', '/api/dashboard/summary');
+          this.pickDefaultChartVip();
           await this.loadSeries();
         } catch (e) {
           if (!this.handleAuthErr(e)) { this.dashError = true; }
         } finally {
           this.dashBusy = false;
         }
+      },
+
+      // 默认选中：第一台在线设备（无在线则第一台候选）；已有有效选中保持不变。
+      pickDefaultChartVip() {
+        const ps = this.chartPeers();
+        if (this.chartVip && ps.some((p) => p.vip === this.chartVip)) { return; }
+        const pick = ps.find((p) => p.kind === 'device' && p.online) || ps[0];
+        this.chartVip = pick ? pick.vip : '';
       },
 
       startPolling() {
@@ -372,39 +380,63 @@
         const isNarrow = window.matchMedia('(max-width: 767.98px)').matches;
         const height = isNarrow ? 190 : 250;
         const tooltip = document.getElementById('chart-tooltip');
+        const hhmm = (v) => {
+          const d = new Date(v * 1000);
+          return d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+        };
+        const hhmmss = (v) => {
+          const d = new Date(v * 1000);
+          const p = (n) => n.toString().padStart(2, '0');
+          return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+        };
 
         const opts = {
           width: el.clientWidth || 600,
           height: height,
           padding: [8, 8, 0, 8],
           cursor: { drag: { x: false, y: false } },
-          legend: { show: true },
+          legend: { show: true, live: true },
           plugins: [uplotTooltip(tooltip, this)],
-          scales: { x: { time: true }, y: {} },
+          scales: {
+            x: { time: true },
+            // 平坦/全 0 序列给 1 单位抬头——0 值基线不贴画布底边
+            //（🟡 UI 评审项 12：0 值系列保持 ≥1.5px 可见）。
+            y: { range: (u, lo, hi) => (hi - lo < 1 ? [lo, hi + 1] : [lo, hi]) },
+          },
           axes: [
             {
               time: true,
-              stroke: '#8a94a8',
+              stroke: '#8a93a1',
               grid: { show: true, stroke: 'rgba(255,255,255,0.05)' },
               ticks: { stroke: '#303a4e' },
               // 本地时区：unix 秒 → Date 本地格式化（uPlot 数值轴默认 UTC 面——显式覆写）。
-              values: (u, vals) => vals.map((v) => {
-                const d = new Date(v * 1000);
-                return d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
-              }),
+              // 刻度标签按「唯一分钟」去重（🟡 UI 评审项 12：60s 采样下相邻刻度
+              // 可能落同一分钟，重复标签只留首个）。
+              values: (u, vals) => {
+                const seen = {};
+                return vals.map((v) => {
+                  if (v == null) { return ''; }
+                  const s = hhmm(v);
+                  if (seen[s]) { return ''; }
+                  seen[s] = true;
+                  return s;
+                });
+              },
             },
             {
-              stroke: '#8a94a8',
-              size: 56,
+              stroke: '#8a93a1',
+              size: 60,
               grid: { show: true, stroke: 'rgba(255,255,255,0.05)' },
               ticks: { stroke: '#303a4e' },
-              values: (u, vals) => vals.map((v) => fmtBps(v, true)),
+              // Y 轴刻度带紧凑单位（🟡 UI 评审项 12：补 bps / K/M/G）。
+              values: (u, vals) => vals.map((v) => fmtBpsAxis(v)),
             },
           ],
           series: [
-            {},
-            { label: t('dash.chart.tx'), stroke: '#4f8cff', width: 1.6, fill: 'rgba(79,140,255,0.10)', points: { show: false } },
-            { label: t('dash.chart.rx'), stroke: '#3fb972', width: 1.6, fill: 'rgba(63,185,114,0.08)', points: { show: false } },
+            // x 系列标签：uPlot 默认 "Time" →「时间」（🟡 UI 评审项 12）。
+            { label: t('dash.chart.time'), values: (u, v) => (v == null ? '--' : hhmmss(v)) },
+            { label: t('dash.chart.tx'), stroke: '#4f8cff', width: 1.6, fill: 'rgba(79,140,255,0.10)', points: { show: false }, values: (u, v) => (v == null ? '--' : fmtBps(v)) },
+            { label: t('dash.chart.rx'), stroke: '#3fb972', width: 1.6, fill: 'rgba(63,185,114,0.08)', points: { show: false }, values: (u, v) => (v == null ? '--' : fmtBps(v)) },
           ],
         };
 
@@ -655,13 +687,18 @@
   }
 
   // —— uPlot tooltip 插件（鼠标 + 触控统一；本地时区）——
+  // uPlot 1.6.9 的实例**不暴露 u.over**（u-select 挂载点在库内闭包）——旧实现读
+  // u.over.getBoundingClientRect() 恒抛 TypeError，tooltip 卡在图表盒左上角
+  //（🔴 UI 评审项 4）。正确 API 面：u.root（根节点）+ u.bbox（绘图区盒，相对
+  // root 的 CSS 像素）+ u.cursor.left/top（相对绘图区）——三者合成 .chart-box
+  // 内坐标，与自管 div 定位一致。
   function uplotTooltip(el, ctx) {
     return {
       hooks: {
         setCursor: (u) => {
           if (!el) { return; }
           const idx = u.cursor.idx;
-          if (idx == null || !u.data[0] || u.data[0].length === 0) {
+          if (idx == null || u.cursor.left == null || !u.data[0] || u.data[0].length === 0) {
             el.style.display = 'none';
             return;
           }
@@ -675,9 +712,13 @@
             t('dash.chart.tx') + ' ' + fmtBps(tx) + '<br>' +
             t('dash.chart.rx') + ' ' + fmtBps(rx);
           el.style.display = 'block';
-          const box = u.over.getBoundingClientRect();
-          const left = Math.min(Math.max(u.cursor.left + 12, 4), box.width - el.offsetWidth - 4);
-          const top = Math.min(Math.max(u.cursor.top - el.offsetHeight - 10, 4), box.height - el.offsetHeight - 4);
+          const host = el.parentElement; // .chart-box（tooltip 与图同容器）
+          const hostRect = host.getBoundingClientRect();
+          const rootRect = u.root.getBoundingClientRect();
+          const plotLeft = rootRect.left - hostRect.left + (u.bbox ? u.bbox.left : 0) + u.cursor.left;
+          const plotTop = rootRect.top - hostRect.top + (u.bbox ? u.bbox.top : 0) + u.cursor.top;
+          const left = Math.min(Math.max(plotLeft + 12, 4), hostRect.width - el.offsetWidth - 4);
+          const top = Math.min(Math.max(plotTop - el.offsetHeight - 10, 4), hostRect.height - el.offsetHeight - 4);
           el.style.left = left + 'px';
           el.style.top = Math.max(top, 4) + 'px';
         },
@@ -695,6 +736,17 @@
     let x = v;
     do { x /= 1000; u++; } while (x >= 1000 && u < units.length - 1);
     return (x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2)) + (axis ? '' : ' ' + units[u]);
+  }
+
+  // Y 轴刻度紧凑单位形：「500 bps」「82.3 M」「1.2 G」（🟡 UI 评审项 12）。
+  function fmtBpsAxis(v) {
+    v = Number(v) || 0;
+    if (v < 1000) { return Math.round(v) + ' bps'; }
+    const units = ['K', 'M', 'G', 'T'];
+    let u = -1;
+    let x = v;
+    do { x /= 1000; u++; } while (x >= 1000 && u < units.length - 1);
+    return (x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2)) + ' ' + units[u];
   }
 
   function fmtDur(secs) {

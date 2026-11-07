@@ -111,6 +111,7 @@
     'dash.self.server_id': '服务器标识',
     'dash.chart': '设备流量',
     'dash.chart.select': '选择设备（VIP）',
+    'dash.chart.time': '时间',
     'dash.chart.tx': '发送',
     'dash.chart.rx': '接收',
     'dash.chart.empty': '该设备暂无流量样本（服务重启后曲线重新累计）。',
