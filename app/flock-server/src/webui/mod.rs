@@ -350,7 +350,11 @@ mod tests {
         let resp = st.dispatch(r.clone(), remote("127.0.0.1")).await;
         assert_eq!(resp.status, 401);
         // ③ 有会话非 admin ⇒ 403（先会话后角色：注入非 admin 会话；iat 取真实
-        // 墙钟——惰性过期按 lookup 时的 now 校验）。
+        // 墙钟——惰性过期按 lookup 时的 now 校验。会话 user 须在注册表在册——
+        // 评审项 6 起 dispatch 会话档回读 UserRow）。
+        st.core.net.create_user("plain", [2; 16]).await.unwrap();
+        st.core.net.create_user("boss", [3; 16]).await.unwrap();
+        st.core.net.set_user_admin("boss", true).await.unwrap();
         let now = flock_protocol::trust::now_unix();
         let sid = st
             .sessions

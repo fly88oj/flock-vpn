@@ -3,6 +3,8 @@
 //! 分发序（定死，测试断言「先会话后角色」）：
 //! **来源矩阵（403 forbidden_origin）→ 路由（404）→ 方法（405）→ CSRF 双门槛
 //!（400）→ 会话（401 not_logged_in）→ 角色（403 forbidden）→ handler**。
+//! 会话档在 lookup 后**回读 UserRow**（本地已 apply 视图）：降权/禁用对旧会话
+//! 即刻生效（403/401 user_disabled）——不滞留至 TTL（🟡 评审项 6）。
 //!
 //! 写操作双臂（§M8.3 裁决 2）：Raft 普通写（多主）/ 单服直写——全部经
 //! [`crate::backend::NetBackend`]（与控制流 DeviceOp 同型）；授权在 handler 层
@@ -257,8 +259,22 @@ impl WebState {
                 let Some(sid) = req.session_cookie() else {
                     return err("not_logged_in");
                 };
-                match self.sessions.lookup(sid, self.now()) {
-                    Some(s) => Some(s),
+                let Some(mut s) = self.sessions.lookup(sid, self.now()) else {
+                    return err("not_logged_in");
+                };
+                // 降权/禁用即时生效（🟡 评审项 6——会话权限不滞留至 TTL 8h）：
+                // 授权判定回读 UserRow。Raft 形态用本地已 apply 视图即可，**不必
+                // linearizable**——取舍：本机提交的 demote/disable 写后回读立即可见；
+                // 他机提交的变更在本机 apply 后（亚秒~秒级，与名册/peers 同视图档）
+                // 生效。相比旧行为（admin 快照滞留在 8h 会话行内）是数量级收敛。
+                // disabled 用户任何登录档端点同路径拒绝（401 user_disabled）。
+                match self.core.net.user_row(&s.user).await {
+                    Some(row) if !row.disabled => {
+                        // 会话行内 admin 快照不作准——以注册表当前值为准。
+                        s.admin = row.admin;
+                        Some(s)
+                    }
+                    Some(_) => return err("user_disabled"),
                     None => return err("not_logged_in"),
                 }
             }
@@ -1190,6 +1206,57 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// 降权/禁用对旧会话即刻生效（🟡 评审项 6）：会话行内 admin 快照不作准、
+    /// disabled 不等 TTL——dispatch 会话档回读 UserRow（本地已 apply 视图）。
+    #[tokio::test]
+    async fn demote_and_disable_take_effect_on_next_request() {
+        let st = state().await;
+        st.core.net.create_user("boss", [1; 16]).await.unwrap();
+        st.core.net.set_user_admin("boss", true).await.unwrap();
+        let now = flock_protocol::trust::now_unix();
+        let sid = st
+            .sessions
+            .issue("boss", true, Origin::Loopback, now, 28_800);
+        let cookie = format!("flock_session={sid}");
+        let get = |path: &str| Request {
+            method: "GET".into(),
+            path: path.into(),
+            query: String::new(),
+            headers: vec![("Cookie".into(), cookie.clone())],
+            body: vec![],
+        };
+
+        // 基线：admin 会话可用。
+        let resp = st.dispatch(get("/api/users"), remote()).await;
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+
+        // 降权（set_admin=false）：旧会话下一次请求即 403（不等 8h TTL）。
+        st.core.net.set_user_admin("boss", false).await.unwrap();
+        let resp = st.dispatch(get("/api/users"), remote()).await;
+        assert_eq!(resp.status, 403, "降权后旧会话即刻 403");
+        assert_eq!(code_of(&resp), "forbidden");
+        // /api/me 仍可达（登录档），且 admin 回显以注册表为准（false）。
+        let resp = st.dispatch(get("/api/me"), remote()).await;
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["admin"], false, "me.admin 以回读 UserRow 为准");
+        // 恢复 admin。
+        st.core.net.set_user_admin("boss", true).await.unwrap();
+        assert_eq!(st.dispatch(get("/api/users"), remote()).await.status, 200);
+
+        // 禁用：任何登录档端点 401 user_disabled（先于角色判定——admin 端点同码）。
+        st.core.net.set_user_disabled("boss", true).await.unwrap();
+        let resp = st.dispatch(get("/api/me"), remote()).await;
+        assert_eq!(resp.status, 401, "禁用后旧会话即刻 401");
+        assert_eq!(code_of(&resp), "user_disabled");
+        let resp = st.dispatch(get("/api/users"), remote()).await;
+        assert_eq!(resp.status, 401, "禁用对 admin 端点同路径拒绝");
+        assert_eq!(code_of(&resp), "user_disabled");
+        // enable 恢复。
+        st.core.net.set_user_disabled("boss", false).await.unwrap();
+        assert_eq!(st.dispatch(get("/api/users"), remote()).await.status, 200);
     }
 
     /// 审计 stderr 行注入向量被拒（🟡 评审项 4）：user 含 \n/\r/NUL/超长（>64B）⇒
