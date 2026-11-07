@@ -19,6 +19,7 @@ use flock_protocol::session::{DeviceId, LookupVerdict};
 
 use crate::netstate::{
     DeviceRow, DeviceStatus, NetError, RedeemError, RedeemOutcome, RedeemRequest, StateStore,
+    UserOpError,
 };
 
 #[cfg(feature = "multi-primary")]
@@ -419,6 +420,175 @@ impl NetBackend {
                 "单服形态无 SignedWrite（管理操作走 invite/redeem/device-add/revoke）".into(),
             )),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // M8（§7-M8.3）：Web 管理面用户操作（与 DeviceOp 同型双臂：Single = 本地 redb
+    // 直写；Sync = Raft 五写。授权在提交方 handler/CLI 层——与控制流 DeviceOp 同型）
+    // ------------------------------------------------------------------
+
+    /// 用户行（admin/disabled/pw_bootstrap；登录 disabled 判定 + webui 列表面）。
+    pub async fn user_row(&self, user: &str) -> Option<StateStoreUserRow> {
+        match self {
+            NetBackend::Single(s) => s.user_row(user),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => match s
+                .node
+                .read_linearizable(flock_sync::proto::ReadQuery::User(user.to_string()))
+                .await
+            {
+                Ok(sync_proto::ReadView::User(row)) => row,
+                _ => None,
+            },
+        }
+    }
+
+    /// 全部用户行（本地已 apply 视图——展示面档位，与名册同 §7-M7.4 档位）。
+    pub async fn users_all(&self) -> Vec<(String, StateStoreUserRow)> {
+        match self {
+            NetBackend::Single(s) => s.users_all(),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => s.node.users_snapshot(),
+        }
+    }
+
+    /// 创建用户（携一次性引导令牌）；已存在 ⇒ [`UserOpError::UserExists`]（提交方
+    /// 按需幂等忽略——`web-admin-add` 的多主路径）。
+    pub async fn create_user(&self, username: &str, token: [u8; 16]) -> Result<(), UserOpError> {
+        match self {
+            NetBackend::Single(s) => s.create_user(username, token),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => match s
+                .write(sync_proto::SyncRequest::CreateUser {
+                    username: username.to_string(),
+                    pw_bootstrap: token,
+                })
+                .await
+                .map_err(sync_op_int)?
+            {
+                sync_proto::SyncResponse::Ok => Ok(()),
+                sync_proto::SyncResponse::Error(e) => Err(user_op_err(&e)),
+                _ => Err(UserOpError::Internal(
+                    "unexpected create_user response".into(),
+                )),
+            },
+        }
+    }
+
+    /// 引导令牌落口令记录（原子消费：令牌匹配且记录为空 ⇒ 落记录 + 清令牌）。
+    pub async fn set_password_bootstrap(
+        &self,
+        user: &str,
+        token: [u8; 16],
+        record_b64: &str,
+        profile: u16,
+    ) -> Result<(), UserOpError> {
+        match self {
+            NetBackend::Single(s) => s.set_password_bootstrap(user, token, record_b64, profile),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => match s
+                .write(sync_proto::SyncRequest::SetPasswordBootstrap {
+                    user: user.to_string(),
+                    token,
+                    record_b64: record_b64.to_string(),
+                    profile,
+                })
+                .await
+                .map_err(sync_op_int)?
+            {
+                sync_proto::SyncResponse::Ok => Ok(()),
+                sync_proto::SyncResponse::Error(e) => Err(user_op_err(&e)),
+                _ => Err(UserOpError::Internal(
+                    "unexpected set_password_bootstrap response".into(),
+                )),
+            },
+        }
+    }
+
+    /// 管理员重置口令（清记录 + 置新令牌——旧口令即刻失效）。
+    pub async fn reset_password(&self, user: &str, new_token: [u8; 16]) -> Result<(), UserOpError> {
+        match self {
+            NetBackend::Single(s) => s.reset_password(user, new_token),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => match s
+                .write(sync_proto::SyncRequest::ResetPassword {
+                    user: user.to_string(),
+                    new_token,
+                })
+                .await
+                .map_err(sync_op_int)?
+            {
+                sync_proto::SyncResponse::Ok => Ok(()),
+                sync_proto::SyncResponse::Error(e) => Err(user_op_err(&e)),
+                _ => Err(UserOpError::Internal(
+                    "unexpected reset_password response".into(),
+                )),
+            },
+        }
+    }
+
+    /// 设/撤 Web 管理角色。
+    pub async fn set_user_admin(&self, user: &str, admin: bool) -> Result<(), UserOpError> {
+        match self {
+            NetBackend::Single(s) => s.set_user_admin(user, admin),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => match s
+                .write(sync_proto::SyncRequest::SetUserAdmin {
+                    user: user.to_string(),
+                    admin,
+                })
+                .await
+                .map_err(sync_op_int)?
+            {
+                sync_proto::SyncResponse::Ok => Ok(()),
+                sync_proto::SyncResponse::Error(e) => Err(user_op_err(&e)),
+                _ => Err(UserOpError::Internal(
+                    "unexpected set_user_admin response".into(),
+                )),
+            },
+        }
+    }
+
+    /// 禁用/启用用户（阻断登录；不追溯断开已建会话）。
+    pub async fn set_user_disabled(&self, user: &str, disabled: bool) -> Result<(), UserOpError> {
+        match self {
+            NetBackend::Single(s) => s.set_user_disabled(user, disabled),
+            #[cfg(feature = "multi-primary")]
+            NetBackend::Sync(s) => match s
+                .write(sync_proto::SyncRequest::SetUserDisabled {
+                    user: user.to_string(),
+                    disabled,
+                })
+                .await
+                .map_err(sync_op_int)?
+            {
+                sync_proto::SyncResponse::Ok => Ok(()),
+                sync_proto::SyncResponse::Error(e) => Err(user_op_err(&e)),
+                _ => Err(UserOpError::Internal(
+                    "unexpected set_user_disabled response".into(),
+                )),
+            },
+        }
+    }
+}
+
+/// 用户行类型再导出（netstate 与 flock-sync 同源定义；避免在 backend 顶头引两个名）。
+use crate::netstate::UserRow as StateStoreUserRow;
+
+#[cfg(feature = "multi-primary")]
+fn sync_op_int(e: sync_proto::SyncError) -> UserOpError {
+    UserOpError::Internal(format!("sync: {e}"))
+}
+
+#[cfg(feature = "multi-primary")]
+fn user_op_err(e: &sync_proto::StateError) -> UserOpError {
+    use sync_proto::StateError;
+    match e {
+        StateError::UserExists => UserOpError::UserExists,
+        StateError::PasswordExists => UserOpError::PasswordExists,
+        StateError::BadBootstrapToken => UserOpError::BadBootstrapToken,
+        StateError::NoSuchUser => UserOpError::NoSuchUser,
+        other => UserOpError::Internal(format!("state: {other}")),
     }
 }
 

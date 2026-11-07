@@ -274,7 +274,7 @@ fn decode_device(b: &[u8]) -> Option<DeviceRow> {
 }
 
 fn encode_user(row: &UserRow) -> Vec<u8> {
-    let mut v = Vec::with_capacity(64);
+    let mut v = Vec::with_capacity(96);
     match &row.opaque_record {
         Some(rec) => {
             v.push(1);
@@ -286,6 +286,16 @@ fn encode_user(row: &UserRow) -> Vec<u8> {
     put_u16(&mut v, row.sr_sig_pubs.len() as u16);
     for k in &row.sr_sig_pubs {
         v.extend_from_slice(k);
+    }
+    // M8 三字段（§7-M8.3）：admin/disabled/pw_bootstrap（存在标志 + 16B）。
+    v.push(u8::from(row.admin));
+    v.push(u8::from(row.disabled));
+    match row.pw_bootstrap {
+        Some(t) => {
+            v.push(1);
+            v.extend_from_slice(&t);
+        }
+        None => v.push(0),
     }
     v
 }
@@ -306,6 +316,27 @@ fn decode_user(b: &[u8]) -> Option<UserRow> {
     for _ in 0..n {
         sr_sig_pubs.push(r.arr32()?);
     }
+    // M8 三字段：**pre-M8 旧行（三字段尾部不存在）宽容解码**——admin/disabled 缺省
+    // false、pw_bootstrap 缺省 None（与 flock-sync postcard 快照的「干净失败」纪律
+    // 不同面：redb 行编码是本模块自持布局，旧库行尾截断即合法的旧形状，宽容保留
+    // 既有部署；写路径一经触碰即升格为新布局）。
+    if r.done() {
+        return Some(UserRow {
+            opaque_record,
+            opaque_profile,
+            sr_sig_pubs,
+            admin: false,
+            disabled: false,
+            pw_bootstrap: None,
+        });
+    }
+    let admin = r.u8()? != 0;
+    let disabled = r.u8()? != 0;
+    let pw_bootstrap = match r.u8()? {
+        0 => None,
+        1 => Some(r.take(16)?.try_into().expect("16B")),
+        _ => return None,
+    };
     if !r.done() {
         return None;
     }
@@ -313,6 +344,9 @@ fn decode_user(b: &[u8]) -> Option<UserRow> {
         opaque_record,
         opaque_profile,
         sr_sig_pubs,
+        admin,
+        disabled,
+        pw_bootstrap,
     })
 }
 
@@ -997,6 +1031,174 @@ impl StateStore {
         }
         txn.commit().map(|_| true).unwrap_or(false)
     }
+
+    // ------------------------------------------------------------------
+    // M8（§7-M8.3）：Web 管理面用户操作（单服直写臂；Raft 臂 = SyncRequest 五写，
+    // 两臂同语义经 backend::NetBackend 收敛）
+    // ------------------------------------------------------------------
+
+    /// 用户行（admin/disabled/pw_bootstrap 含在内；无 ⇒ None）。
+    pub fn user_row(&self, user: &str) -> Option<UserRow> {
+        let txn = self.db.begin_read().ok()?;
+        let t = txn.open_table(USERS).ok()?;
+        let raw = t.get(user).ok()??;
+        decode_user(raw.value())
+    }
+
+    /// 全部用户行（`/api/users`·summary totals；用户名序由调用方排）。
+    pub fn users_all(&self) -> Vec<(String, UserRow)> {
+        let Ok(txn) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(t) = txn.open_table(USERS) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Ok(range) = t.iter() {
+            for entry in range.flatten() {
+                let (k, v) = (entry.0.value().to_string(), entry.1.value());
+                if let Some(row) = decode_user(v) {
+                    out.push((k, row));
+                }
+            }
+        }
+        out
+    }
+
+    /// 创建用户（无口令记录，携一次性引导令牌）；已存在 ⇒ [`UserOpError::UserExists`]
+    ///（语义与 Raft `CreateUser` 同——提交方按需幂等忽略）。
+    pub fn create_user(&self, username: &str, pw_bootstrap: [u8; 16]) -> Result<(), UserOpError> {
+        let txn = self.db.begin_write().map_err(op_int)?;
+        {
+            let mut users = txn.open_table(USERS).map_err(op_int)?;
+            if users.get(username).map_err(op_int)?.is_some() {
+                return Err(UserOpError::UserExists);
+            }
+            let row = UserRow {
+                pw_bootstrap: Some(pw_bootstrap),
+                ..UserRow::default()
+            };
+            users
+                .insert(username, encode_user(&row).as_slice())
+                .map_err(op_int)?;
+        }
+        txn.commit().map_err(|e| op_int(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 引导令牌落口令记录（原子：令牌匹配且记录为空 ⇒ 落记录 + 清令牌；判定序与
+    /// Raft `SetPasswordBootstrap` 逐字一致——令牌先于记录，不泄漏是否已有口令）。
+    pub fn set_password_bootstrap(
+        &self,
+        user: &str,
+        token: [u8; 16],
+        record_b64: &str,
+        profile: u16,
+    ) -> Result<(), UserOpError> {
+        let txn = self.db.begin_write().map_err(op_int)?;
+        {
+            let mut users = txn.open_table(USERS).map_err(op_int)?;
+            let mut row = user_row_tx(&users, user)?;
+            if row.pw_bootstrap != Some(token) {
+                return Err(UserOpError::BadBootstrapToken);
+            }
+            if row.opaque_record.is_some() {
+                return Err(UserOpError::PasswordExists);
+            }
+            row.opaque_record = Some(record_b64.to_string());
+            row.opaque_profile = profile;
+            row.pw_bootstrap = None;
+            users
+                .insert(user, encode_user(&row).as_slice())
+                .map_err(op_int)?;
+        }
+        txn.commit().map_err(|e| op_int(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 管理员重置口令：清记录 + 置新引导令牌（旧口令即刻失效）。
+    pub fn reset_password(&self, user: &str, new_token: [u8; 16]) -> Result<(), UserOpError> {
+        let txn = self.db.begin_write().map_err(op_int)?;
+        {
+            let mut users = txn.open_table(USERS).map_err(op_int)?;
+            let mut row = user_row_tx(&users, user)?;
+            row.opaque_record = None;
+            row.opaque_profile = 0;
+            row.pw_bootstrap = Some(new_token);
+            users
+                .insert(user, encode_user(&row).as_slice())
+                .map_err(op_int)?;
+        }
+        txn.commit().map_err(|e| op_int(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 设/撤 Web 管理角色（cannot_demote_self 的会话侧裁决在 webui handler 层）。
+    pub fn set_user_admin(&self, user: &str, admin: bool) -> Result<(), UserOpError> {
+        let txn = self.db.begin_write().map_err(op_int)?;
+        {
+            let mut users = txn.open_table(USERS).map_err(op_int)?;
+            let mut row = user_row_tx(&users, user)?;
+            row.admin = admin;
+            users
+                .insert(user, encode_user(&row).as_slice())
+                .map_err(op_int)?;
+        }
+        txn.commit().map_err(|e| op_int(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 禁用/启用用户（阻断 Web 与控制流登录；不追溯断开已建会话）。
+    pub fn set_user_disabled(&self, user: &str, disabled: bool) -> Result<(), UserOpError> {
+        let txn = self.db.begin_write().map_err(op_int)?;
+        {
+            let mut users = txn.open_table(USERS).map_err(op_int)?;
+            let mut row = user_row_tx(&users, user)?;
+            row.disabled = disabled;
+            users
+                .insert(user, encode_user(&row).as_slice())
+                .map_err(op_int)?;
+        }
+        txn.commit().map_err(|e| op_int(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// M8 用户操作错误面（单服/Raft 两臂同语义；webui/admin 共用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserOpError {
+    UserExists,
+    PasswordExists,
+    /// 令牌不匹配/已消费（与 flock-sync `StateError::BadBootstrapToken` 同语义）。
+    BadBootstrapToken,
+    NoSuchUser,
+    Internal(String),
+}
+
+impl std::fmt::Display for UserOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserOpError::UserExists => write!(f, "username already exists"),
+            UserOpError::PasswordExists => write!(f, "password already set"),
+            UserOpError::BadBootstrapToken => write!(f, "bad or consumed bootstrap token"),
+            UserOpError::NoSuchUser => write!(f, "no such user"),
+            UserOpError::Internal(m) => write!(f, "internal: {m}"),
+        }
+    }
+}
+
+fn op_int(e: impl std::fmt::Display) -> UserOpError {
+    UserOpError::Internal(format!("redb: {e}"))
+}
+
+fn user_row_tx(users: &redb::Table<'_, &str, &[u8]>, user: &str) -> Result<UserRow, UserOpError> {
+    let raw = users
+        .get(user)
+        .map_err(op_int)?
+        .ok_or(UserOpError::NoSuchUser)?
+        .value()
+        .to_vec();
+    decode_user(&raw).ok_or_else(|| UserOpError::Internal("corrupt user row".into()))
 }
 
 /// session::DeviceDirectory 适配（respond 侧注入，§3.5 lookup 接缝）。
@@ -1279,5 +1481,121 @@ mod tests {
             std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
             0o600
         );
+    }
+    // ------------------------------------------------------------------
+    // M8（§7-M8.3）：单服直写臂的用户操作语义（与 Raft 五写同语义——判定序/错误面
+    // 逐字一致；Raft 臂语义在 flock-sync state::tests）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn m8_user_ops_single_store_semantics() {
+        let s = store();
+        // 建户：令牌随建户落库；重名拒且不动原行。
+        s.create_user("admin", [0xA1; 16]).unwrap();
+        let row = s.user_row("admin").unwrap();
+        assert_eq!(row.pw_bootstrap, Some([0xA1; 16]));
+        assert!(!row.admin && !row.disabled && row.opaque_record.is_none());
+        assert_eq!(
+            s.create_user("admin", [0xB2; 16]),
+            Err(UserOpError::UserExists)
+        );
+        assert_eq!(s.user_row("admin").unwrap().pw_bootstrap, Some([0xA1; 16]));
+
+        // 引导落记录：令牌错 ⇒ BadBootstrapToken（不泄漏是否已有口令）；正确 ⇒
+        // 落记录 + 清令牌；重放 ⇒ BadBootstrapToken。
+        assert_eq!(
+            s.set_password_bootstrap("admin", [0xB2; 16], "r", 0),
+            Err(UserOpError::BadBootstrapToken)
+        );
+        s.set_password_bootstrap("admin", [0xA1; 16], "rec", 0)
+            .unwrap();
+        let row = s.user_row("admin").unwrap();
+        assert_eq!(row.opaque_record.as_deref(), Some("rec"));
+        assert_eq!(row.pw_bootstrap, None);
+        assert_eq!(
+            s.set_password_bootstrap("admin", [0xA1; 16], "r2", 0),
+            Err(UserOpError::BadBootstrapToken),
+            "令牌重放拒"
+        );
+
+        // 未知用户四写同拒。
+        assert_eq!(
+            s.set_password_bootstrap("ghost", [0; 16], "r", 0),
+            Err(UserOpError::NoSuchUser)
+        );
+        assert_eq!(
+            s.reset_password("ghost", [0; 16]),
+            Err(UserOpError::NoSuchUser)
+        );
+        assert_eq!(
+            s.set_user_admin("ghost", true),
+            Err(UserOpError::NoSuchUser)
+        );
+        assert_eq!(
+            s.set_user_disabled("ghost", true),
+            Err(UserOpError::NoSuchUser)
+        );
+
+        // 重置：旧记录即刻失效 + 新令牌可落新记录。
+        s.reset_password("admin", [0xC3; 16]).unwrap();
+        assert!(s.user_row("admin").unwrap().opaque_record.is_none());
+        s.set_password_bootstrap("admin", [0xC3; 16], "rec2", 0)
+            .unwrap();
+        assert_eq!(s.password("admin").unwrap().0, "rec2");
+
+        // admin/disabled 往返；禁用不清口令记录。
+        s.set_user_admin("admin", true).unwrap();
+        assert!(s.user_row("admin").unwrap().admin);
+        s.set_user_disabled("admin", true).unwrap();
+        assert!(s.user_row("admin").unwrap().disabled);
+        assert_eq!(
+            s.user_row("admin").unwrap().opaque_record.as_deref(),
+            Some("rec2"),
+            "禁用不清口令"
+        );
+        s.set_user_disabled("admin", false).unwrap();
+        s.set_user_admin("admin", false).unwrap();
+
+        // users_all：含 M8 字段全量往返。
+        s.create_user("bob", [1; 16]).unwrap();
+        let all = s.users_all();
+        assert_eq!(all.len(), 2);
+        assert!(all
+            .iter()
+            .any(|(u, r)| u == "bob" && r.pw_bootstrap == Some([1; 16])));
+    }
+
+    /// pre-M8 旧行（三字段尾截断）宽容解码：admin/disabled 缺省、令牌缺省——
+    /// 既有部署升级不破（写路径一经触碰即升格新布局）。
+    #[test]
+    fn m8_legacy_user_row_decodes_lenient() {
+        // 手工构造 pre-M8 编码（与 encode_user 的旧形状逐字节一致）。
+        let legacy = {
+            let mut v = Vec::new();
+            v.push(1);
+            put_str(&mut v, "old-record");
+            put_u16(&mut v, 0);
+            put_u16(&mut v, 1);
+            v.extend_from_slice(&[7u8; 32]);
+            v
+        };
+        let row = decode_user(&legacy).expect("旧行宽容解码");
+        assert_eq!(row.opaque_record.as_deref(), Some("old-record"));
+        assert_eq!(row.sr_sig_pubs, vec![[7u8; 32]]);
+        assert!(!row.admin && !row.disabled && row.pw_bootstrap.is_none());
+        // 尾部垃圾（不完整 M8 尾）⇒ None（不半解码）。
+        let mut bad = legacy.clone();
+        bad.push(1); // admin=1 后截断
+        assert!(decode_user(&bad).is_none());
+        // 新形状往返。
+        let row = UserRow {
+            opaque_record: None,
+            opaque_profile: 0,
+            sr_sig_pubs: vec![],
+            admin: true,
+            disabled: true,
+            pw_bootstrap: Some([9; 16]),
+        };
+        assert_eq!(decode_user(&encode_user(&row)).unwrap(), row);
     }
 }
