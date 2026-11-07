@@ -6,6 +6,13 @@ license.workspace = true
 repository.workspace = true
 description = "flock 主仓 / showroom 共享协议契约层：混合 KEM、文件信封 v2、SR-SIG1（docs/design.md §1）"
 
+# cdylib：wasm32 目标的 .wasm 产物面（M8b webauth_shim 的 C-ABI 导出需要
+# crate-type 含 cdylib 才落 .wasm 文件；wasm-bindgen 系 crate 同法）。rlib 保持
+# 主位——flock-server/flock-sync 等依赖方链接不受影响；原生构建多出一个无人
+# 消费的 cdylib 单元仅在显式 `-p flock-protocol` 构建时产出。
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 aes-gcm = { workspace = true }
 ed25519-dalek = { workspace = true }
