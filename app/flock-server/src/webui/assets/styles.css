@@ -19,11 +19,13 @@
   --surface: #12161f;
   --surface-2: #171c28;
   --surface-3: #1d2332;
-  --border: #242b3a;
-  --border-strong: #303a4e;
+  /* 卡片边框/行分隔线提一档（🟡 UI 评审项 16：#303747 ≈ 4% 白） */
+  --border: #303747;
+  --border-strong: #3a4356;
   --fg: #e8ecf4;
   --muted: #8a94a8;
-  --faint: #5b6478;
+  /* L4 辅助文字可读性下限（🟡 UI 评审项 16）：#8a93a1 档（配 ≥12px 字号） */
+  --faint: #8a93a1;
   --accent: #4f8cff;
   --accent-hover: #6ba1ff;
   --accent-dim: rgba(79, 140, 255, 0.14);
@@ -45,6 +47,8 @@
   /* 阴影 */
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35), 0 2px 8px rgba(0, 0, 0, 0.22);
   --shadow-2: 0 8px 32px rgba(0, 0, 0, 0.55);
+  /* 遮罩浓度单点 token（🟡 UI 评审项 14：模态/抽屉 scrim 统一） */
+  --overlay: rgba(4, 6, 10, 0.68);
 
   /* 字号阶 */
   --fs-xs: 12px; --fs-sm: 13px; --fs-md: 14px; --fs-lg: 16px;
@@ -179,7 +183,8 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 .table th {
   text-align: left; padding: 10px var(--sp-4);
-  font-size: var(--fs-xs); font-weight: 600; color: var(--muted);
+  /* 表头对比度 ≥#9aa4b2（🟡 UI 评审项 16） */
+  font-size: var(--fs-xs); font-weight: 600; color: #9aa4b2;
   border-bottom: 1px solid var(--border);
   background: var(--surface-2); white-space: nowrap;
 }
@@ -241,7 +246,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 /* —— 模态 —— */
 .modal-overlay {
   position: fixed; inset: 0; z-index: 60;
-  background: rgba(4, 6, 10, 0.68);
+  background: var(--overlay);
   display: flex; align-items: center; justify-content: center;
   padding: var(--sp-4);
   animation: fade-in 0.14s ease;
@@ -255,7 +260,9 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 }
 .modal h3 { font-size: var(--fs-lg); margin-bottom: var(--sp-3); }
 .modal p { color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--sp-5); overflow-wrap: anywhere; }
-.modal-actions { display: flex; gap: var(--sp-3); justify-content: flex-end; flex-wrap: wrap; }
+/* 模态动作行（🟡 UI 评审项 14）：两按钮等高 40px、底边对齐 */
+.modal-actions { display: flex; gap: var(--sp-3); align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+.modal-actions .btn { min-height: 40px; }
 .token-box {
   display: flex; align-items: center; gap: var(--sp-2);
   background: var(--bg); border: 1px dashed var(--border-strong);
@@ -263,6 +270,15 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   font-family: var(--font-mono); font-size: var(--fs-sm);
   overflow-wrap: anywhere; user-select: all;
 }
+/* 一次性令牌安全提示（🟡 UI 评审项 15）：琥珀 ⓘ 单条（安全+交付指引合并） */
+.token-notice {
+  display: flex; align-items: flex-start; gap: var(--sp-2);
+  margin: var(--sp-3) 0 var(--sp-5); padding: 10px var(--sp-3);
+  background: var(--warn-dim); color: var(--warn);
+  border-radius: var(--r-md); font-size: var(--fs-xs); line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.token-notice-ico { flex: none; font-weight: 700; }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes pop-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } }
 
@@ -289,6 +305,11 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--sp-2); padding: var(--sp-10) var(--sp-4); color: var(--muted); }
 .state .icon { font-size: 26px; opacity: 0.6; }
 .state .state-hint { font-size: var(--fs-xs); color: var(--faint); }
+/* 空数据态（🟡 UI 评审项 18）：图标 + 一句中文引导 */
+.state-empty .state-ico { opacity: 0.55; margin-bottom: var(--sp-1); }
+.state-empty span { font-size: var(--fs-sm); }
+/* 弱化文本工具类（未上报主机名等——🟡 UI 评审项 15） */
+.muted { color: var(--faint); }
 .spinner {
   width: 22px; height: 22px; border-radius: 50%;
   border: 2px solid var(--border-strong); border-top-color: var(--accent);
@@ -329,6 +350,8 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .nav-link .ico { width: 18px; text-align: center; opacity: 0.9; }
 .sidebar-foot { margin-top: auto; padding: var(--sp-3); border-top: 1px solid var(--border); font-size: var(--fs-xs); color: var(--faint); display: flex; flex-direction: column; gap: var(--sp-1); }
 .sidebar-foot .who { color: var(--muted); display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+/* 「退出登录」触控目标 ≥44px（🟡 UI 评审项 13） */
+.sidebar-foot .btn { min-height: 44px; margin-top: var(--sp-2); }
 
 .content { flex: 1; padding: var(--sp-6) var(--pad-content); max-width: 1320px; width: 100%; margin: 0 auto; min-width: 0; }
 /* 区块纵向节奏（🟡 UI 评审项 8）：dashboard 区块间距统一 24px（4/8 阶） */
@@ -350,16 +373,19 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   font-size: 18px; cursor: pointer; flex: none;
 }
 .icon-btn:hover { background: var(--surface-2); }
-.drawer-scrim { position: fixed; inset: 0; z-index: 55; background: rgba(4, 6, 10, 0.68); animation: fade-in 0.14s ease; }
+.drawer-scrim { position: fixed; inset: 0; z-index: 55; background: var(--overlay); animation: fade-in 0.14s ease; }
 
 /* 平板窄档（<1024）：表格低优先列收起（最后活跃/口令列——信息密度让位于可读性） */
 @media (max-width: 1023.98px) {
   .hide-narrow { display: none; }
 }
 
-/* 平板（<1200）：侧栏转顶栏+抽屉 */
+/* 平板（<1200）：侧栏转顶栏+抽屉（开态投影 + 右侧圆角——🟡 UI 评审项 13） */
 @media (max-width: 1199.98px) {
-  .sidebar { transform: translateX(-100%); transition: transform 0.2s ease; box-shadow: none; }
+  .sidebar {
+    transform: translateX(-100%); transition: transform 0.2s ease; box-shadow: none;
+    border-radius: 0 var(--r-lg) var(--r-lg) 0;
+  }
   .sidebar.open { transform: none; box-shadow: var(--shadow-2); }
   .topbar { display: flex; }
   .content { --pad-content: var(--sp-4); padding: var(--sp-5) var(--pad-content); }

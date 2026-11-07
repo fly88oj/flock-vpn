@@ -470,11 +470,14 @@
 
       confirmPeer(p, action) {
         const key = 'peers.confirm.' + action;
+        // 确认按钮色阶（🟡 UI 评审项 14）：吊销=红（终态）；禁用=琥珀（警示）；
+        // 其余（启用/强制下线）=主色。
+        const level = { revoke: 'danger', disable: 'warn' }[action] || null;
         this.confirmModal = {
           kind: 'peer', action: action, peer: p,
           title: t(key + '.title'),
-          body: t(key + '.body', { vip: p.vip, host: p.hostname || p.vip }),
-          danger: action === 'revoke',
+          body: t(key + '.body', { vip: p.vip, host: this.hostName(p.hostname) || p.vip }),
+          level: level,
         };
       },
 
@@ -544,7 +547,7 @@
           kind: 'user-disable', user: u,
           title: t('users.confirm.disable.title'),
           body: t('users.confirm.disable.body', { user: u.username }),
-          danger: false,
+          level: 'warn', // 警示级：琥珀（与吊销红同阶梯——🟡 UI 评审项 14）
         };
       },
 
@@ -553,7 +556,7 @@
           kind: 'user-admin', user: u, admin: admin,
           title: t('users.confirm.setadmin.title'),
           body: t('users.confirm.setadmin.body', { user: u.username, role: admin ? t('users.role.admin') : t('users.role.plain') }),
-          danger: !admin,
+          level: admin ? null : 'warn',
         };
       },
 
@@ -683,6 +686,11 @@
         if (remain <= 0) { return t('nav.session.expired'); }
         return t('nav.session.expire', { time: fmtDur(remain) });
       },
+
+      // 主机名占位（🟡 UI 评审项 15）：服务端 (unknown)（目录未收敛的远端服务器）
+      // →「未上报」弱灰展示。
+      hostName(h) { return h && h !== '(unknown)' ? h : t('peers.hostname.unreported'); },
+      hostUnknown(h) { return !h || h === '(unknown)'; },
 
       fmtBps(v) { return fmtBps(v); },
       fmtDur(s) { return fmtDur(s); },
