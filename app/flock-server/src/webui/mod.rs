@@ -31,6 +31,33 @@ use http::Response;
 
 /// VIP 绑定重试周期（§M8.2 定死 5s）。
 const VIP_REBIND_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+/// accept 瞬态错误退避（fd 耗尽/连接竞态——等上收连接腾出句柄后自愈）。
+const ACCEPT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// accept 错误 errno 面：EMFILE/ENFILE（fd 耗尽——瞬态，退避续跑）。
+/// 平台值不同（unix EMFILE=24/ENFILE=23；Windows EMFILE=4，无 ENFILE）——测试
+/// 经同常量构造，跨平台确定性。
+#[cfg(unix)]
+const ACCEPT_TRANSIENT_ERRNOS: [i32; 2] = [24, 23];
+#[cfg(windows)]
+const ACCEPT_TRANSIENT_ERRNOS: [i32; 1] = [4];
+
+/// accept 错误分类（🟡 评审项 2）：瞬态（WouldBlock/Interrupted/ConnAborted/
+/// ConnReset/EMFILE/ENFILE——fd 耗尽或单连接竞态，记日志 + 退避续跑）vs 致命
+/// （其余——监听面失效，退出；VIP 面由重试任务 5s 重绑兜回，与 loopback 面
+/// 「任一错误即永久退出」的旧缺陷对齐消除）。
+fn accept_error_transient(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::WouldBlock
+            | ErrorKind::Interrupted
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+    ) || e
+        .raw_os_error()
+        .is_some_and(|n| ACCEPT_TRANSIENT_ERRNOS.contains(&n))
+}
 
 /// 起服装配（`server::run` / `sync::run_raft` 经 `run` 调用；`[webui] enabled=false`
 /// 时由调用方跳过）。返回 loopback accept 任务句柄 + 实际绑定地址（port=0 时
@@ -81,12 +108,27 @@ pub async fn serve_state(
     Ok((tokio::spawn(accept_loop(listener, state)), local))
 }
 
-/// accept 循环（loopback 与 VIP 面共用语义：独立信号量 + panic 隔离 + 满载 429）。
+/// accept 循环（loopback 与 VIP 面共用语义：独立信号量 + panic 隔离 + 满载 429 +
+/// 瞬态 accept 错误退避续跑——分类见 [`accept_error_transient`]）。
 async fn accept_loop(listener: TcpListener, state: Arc<WebState>) {
     let permits = Arc::new(tokio::sync::Semaphore::new(api::MAX_CONCURRENCY));
     loop {
-        let Ok((mut io, remote)) = listener.accept().await else {
-            return;
+        // 瞬态错误（fd 耗尽/连接竞态）记日志 + 退避续跑；致命错误才退出循环
+        //（VIP 面退出后由重试任务重绑；loopback 面退出 ⇒ serve 返回的任务句柄结束）。
+        let (mut io, remote) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) if accept_error_transient(&e) => {
+                eprintln!(
+                    "flock-server: webui accept 瞬态错误（{e}）——{}ms 退避续跑",
+                    ACCEPT_RETRY_BACKOFF.as_millis()
+                );
+                tokio::time::sleep(ACCEPT_RETRY_BACKOFF).await;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("flock-server: webui accept 致命错误（{e}）——accept 循环退出");
+                return;
+            }
         };
         let permit = match permits.clone().try_acquire_owned() {
             Ok(p) => p,
@@ -188,6 +230,43 @@ mod tests {
     use super::api::WebState;
     use super::http::Request;
     use super::*;
+
+    /// accept 错误分类（🟡 评审项 2）：瞬态面（WouldBlock/Interrupted/
+    /// ConnAborted/ConnReset/EMFILE/ENFILE-unix）退避续跑；其余（PermissionDenied/
+    /// AddrInUse/其它 errno）致命退出——「任一错误即永久退出」缺陷消除。
+    #[test]
+    fn accept_error_classification_transient_vs_fatal() {
+        use std::io::ErrorKind;
+        // 瞬态：ErrorKind 面。
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+        ] {
+            let e = std::io::Error::from(kind);
+            assert!(accept_error_transient(&e), "瞬态（kind）: {e}");
+        }
+        // 瞬态：errno 面（fd 耗尽——同常量构造，跨平台确定性）。
+        for n in ACCEPT_TRANSIENT_ERRNOS {
+            assert!(
+                accept_error_transient(&std::io::Error::from_raw_os_error(n)),
+                "errno {n} 瞬态"
+            );
+        }
+        // 致命：监听面失效类。
+        for e in [
+            std::io::Error::from(ErrorKind::PermissionDenied),
+            std::io::Error::from(ErrorKind::AddrInUse),
+            std::io::Error::from(ErrorKind::Unsupported),
+        ] {
+            assert!(!accept_error_transient(&e), "致命: {e}");
+        }
+        // 致命：未分类 errno（例 13=EACCES——不在瞬态白名单）。
+        assert!(!accept_error_transient(&std::io::Error::from_raw_os_error(
+            13
+        )));
+    }
 
     fn req(method: &str, path: &str) -> Request {
         Request {
