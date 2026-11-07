@@ -27,10 +27,12 @@
 //! 版本收口（§1.2）：本 crate 再导出其锁定的 `ed25519_dalek` / `x25519_dalek` / `ml_kem` /
 //! `rand`（`legacy` 下另含 `rsa`），两项目不得另引版本——下游直接复用，避免类型不兼容。
 
-// wasm32 getrandom 桥（src/wasm_bridge.rs）需裸指针（getrandom custom 后端契约），
-// 其余目标维持 forbid(unsafe_code)（showroom-common lib.rs:4-5 同款豁免）。
+// wasm32 getrandom 桥（src/wasm_bridge.rs）与 M8b wasm C-ABI 垫片
+//（src/webauth_shim.rs）需裸指针（getrandom custom 后端/C-ABI 契约），其余目标
+// 维持 forbid(unsafe_code)（showroom-common lib.rs:4-5 同款豁免；垫片的 native
+// 单测面见该模块头注——`test` cfg 同豁免）。
 #![cfg_attr(
-    not(all(feature = "wasm", target_arch = "wasm32")),
+    not(all(feature = "wasm", any(target_arch = "wasm32", test))),
     forbid(unsafe_code)
 )]
 
@@ -48,6 +50,15 @@ pub mod trust;
 /// wasm32 getrandom 自定义后端桥（`wasm` feature + wasm32 目标；§1.3.1）。
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod wasm_bridge;
+
+/// M8b Web UI 的 wasm C-ABI 垫片（`wasm`+`anchor` feature；wasm32 目标，native
+/// `test` cfg 亦编译——单测直调垫片跑通 OPAQUE 全程，§7-M8.6/§M8.9）。
+#[cfg(all(
+    feature = "wasm",
+    feature = "anchor",
+    any(target_arch = "wasm32", test)
+))]
+pub mod webauth_shim;
 
 // getrandom 0.2（opaque-ke → rand_core 0.6 路径）的 custom 后端注册
 // （showroom-common lib.rs:41-42 同法）。
