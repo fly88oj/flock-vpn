@@ -2,60 +2,501 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
   <title>Flock 管理控制台</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #0f1420; --surface: #171e2e; --border: #2a3550;
-      --fg: #e6ebf5; --muted: #8b96ad; --accent: #4f8cff;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0; min-height: 100vh; display: flex; align-items: center;
-      justify-content: center; background: var(--bg); color: var(--fg);
-      font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
-    }
-    .card {
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 12px; padding: 2rem; width: min(92vw, 380px);
-    }
-    h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
-    p.note { color: var(--muted); font-size: .8rem; margin: 0 0 1.25rem; line-height: 1.5; }
-    label { display: block; font-size: .8rem; color: var(--muted); margin: .75rem 0 .25rem; }
-    input {
-      width: 100%; padding: .55rem .75rem; border-radius: 8px;
-      border: 1px solid var(--border); background: var(--bg); color: var(--fg);
-    }
-    button {
-      margin-top: 1.25rem; width: 100%; padding: .6rem; border: 0; border-radius: 8px;
-      background: var(--accent); color: #fff; font-size: .9rem; cursor: pointer;
-    }
-    #boot { margin-top: 1rem; font-size: .75rem; color: var(--muted); min-height: 1em; }
-  </style>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/vendor/uplot.css">
+  <style>[x-cloak]{display:none !important}</style>
+  <!-- 顺序敏感（defer 按文档序执行）：i18n → uPlot → wasm 胶水 → 应用（注册 alpine:init）→ Alpine -->
+  <script defer src="/static/i18n.js"></script>
+  <script defer src="/static/vendor/uplot.min.js"></script>
+  <script defer src="/static/vendor/flock_pake.js"></script>
+  <script defer src="/static/app.js"></script>
+  <script defer src="/static/vendor/alpine.min.js"></script>
 </head>
-<body>
-  <main class="card">
-    <h1>Flock 管理控制台</h1>
-    <p class="note">M8b 前端未装配——当前为服务端壳页（登录表单占位）。
-      全部管理行为已可经 HTTP API 驱动（examples/webui_login.rs / tests/webui.rs）。</p>
-    <form id="login" autocomplete="off">
-      <label for="user">用户名</label>
-      <input id="user" name="user" autocomplete="username" disabled>
-      <label for="pass">口令</label>
-      <input id="pass" name="pass" type="password" autocomplete="current-password" disabled>
-      <button type="submit" disabled>登录（待 M8b 装配 wasm OPAQUE）</button>
-    </form>
-    <div id="boot">正在连接 /api/bootstrap …</div>
-  </main>
-  <script>
-    // 壳页唯一 JS：调通 /api/bootstrap（W 系断言起跑面）。
-    fetch('/api/bootstrap').then(r => r.ok ? r.json() : Promise.reject(r.status))
-      .then(b => {
-        document.getElementById('boot').textContent =
-          '已连接集群 ' + b.cluster_id.slice(0, 8) + '（server ' + b.server_id.slice(0, 8) + '）';
-      })
-      .catch(() => { document.getElementById('boot').textContent = '/api/bootstrap 不可达'; });
-  </script>
+<body x-data="flockApp()" x-init="boot()" @keydown.escape.window="onEsc()">
+
+  <!-- ================================================================
+       应用壳（登录后）——桌面 ≥1200 固定侧栏；<1200 顶栏+抽屉
+       ================================================================ -->
+  <div class="shell" x-show="authed" x-cloak>
+
+    <!-- 侧栏 / 抽屉 -->
+    <aside class="sidebar" :class="navOpen && 'open'">
+      <div class="brand"><span class="brand-mark">F</span><span x-text="t('app.name')"></span></div>
+      <nav class="nav" @click="navOpen = false">
+        <a class="nav-link" :class="route==='dashboard' && 'active'" href="#/dashboard">
+          <svg class="ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+          <span x-text="t('nav.dashboard')"></span></a>
+        <a class="nav-link" :class="route==='peers' && 'active'" href="#/peers">
+          <svg class="ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          <span x-text="t('nav.peers')"></span></a>
+        <template x-if="isAdmin">
+          <a class="nav-link" :class="route==='users' && 'active'" href="#/users">
+            <svg class="ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8M17.5 14.3c2.4.7 4 2.5 4 5.7"/></svg>
+            <span x-text="t('nav.users')"></span></a>
+        </template>
+        <template x-if="isAdmin">
+          <a class="nav-link" :class="route==='audit' && 'active'" href="#/audit">
+            <svg class="ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16M4 10h16M4 15h10M4 20h7"/></svg>
+            <span x-text="t('nav.audit')"></span></a>
+        </template>
+        <a class="nav-link" :class="route==='settings' && 'active'" href="#/settings">
+          <svg class="ico" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3.2"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.5-2-3.5-2.4 1a7 7 0 0 0-2-1.2L14 3h-4l-.5 2.6a7 7 0 0 0-2 1.2l-2.4-1-2 3.5 2 1.5A7 7 0 0 0 5 12a7 7 0 0 0 .1 1.2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 2 1.2L10 21h4l.5-2.6a7 7 0 0 0 2-1.2l2.4 1 2-3.5-2-1.5A7 7 0 0 0 19 12Z"/></svg>
+          <span x-text="t('nav.settings')"></span></a>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="who">
+          <span class="dot" :class="me && 'dot-on'"></span>
+          <span x-text="me && me.user"></span>
+          <span class="badge badge-accent" x-show="isAdmin" x-text="t('app.admin')"></span>
+          <span class="badge badge-muted" x-show="!isAdmin" x-text="t('app.user')"></span>
+        </div>
+        <div x-text="me && (me.origin === 'vpn' ? t('nav.origin.vpn') : t('nav.origin.loopback'))"></div>
+        <div x-text="sessionRemainText()"></div>
+        <button class="btn btn-ghost btn-sm" style="margin-top:6px" @click="logout()" x-text="t('app.logout')"></button>
+      </div>
+    </aside>
+    <div class="drawer-scrim" x-show="navOpen" x-cloak @click="navOpen=false"></div>
+
+    <div class="main">
+      <!-- 顶栏（<1200） -->
+      <header class="topbar">
+        <button class="icon-btn" @click="navOpen=true" :aria-label="t('nav.menu')">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <strong x-text="t('app.name')"></strong>
+      </header>
+
+      <main class="content">
+
+        <!-- ================= 仪表盘 ================= -->
+        <section x-show="route==='dashboard'">
+          <div class="page-head">
+            <div>
+              <h1 x-text="t('nav.dashboard')"></h1>
+              <div class="page-sub" x-text="t('dash.subtitle', {cluster: shortId(bootstrap && bootstrap.cluster_id)})"></div>
+            </div>
+            <button class="btn btn-ghost btn-sm" @click="loadDashboard()" :disabled="dashBusy">
+              <span class="spin" x-show="dashBusy"></span><span x-text="t('app.refresh')"></span></button>
+          </div>
+
+          <template x-if="dashError">
+            <div class="card"><div class="state">
+              <span class="icon">!</span><span x-text="t('app.error')"></span>
+              <button class="btn btn-sm" @click="loadDashboard()" x-text="t('app.retry')"></button>
+            </div></div>
+          </template>
+
+          <template x-if="summary">
+            <div>
+              <!-- 集群状态 -->
+              <div class="card" style="margin-bottom:16px">
+                <div class="kicker" x-text="t('dash.cluster')"></div>
+                <div class="grid grid-2" style="margin-top:8px">
+                  <div class="kv-row"><span class="k" x-text="t('dash.cluster.epoch')"></span><span class="v num mono" x-text="summary.cluster.epoch"></span></div>
+                  <div class="kv-row"><span class="k" x-text="t('dash.cluster.mode')"></span><span class="v" x-text="summary.cluster.sync_mode === 'raft' ? t('settings.sync.raft') : t('settings.sync.single')"></span></div>
+                </div>
+              </div>
+
+              <!-- 服务器卡片（leader 徽标 / epoch / 在线） -->
+              <div style="margin-bottom:16px">
+                <div class="kicker" style="margin-bottom:8px" x-text="t('dash.servers')"></div>
+                <div class="grid-cards">
+                  <template x-for="s in (summary.servers || [])" :key="s.node_id">
+                    <div class="card">
+                      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
+                        <strong x-text="t('dash.servers.node', {id: s.node_id})"></strong>
+                        <span class="badge" :class="s.leader ? 'badge-accent' : 'badge-muted'" x-text="s.leader ? t('dash.servers.leader') : t('dash.servers.follower')"></span>
+                      </div>
+                      <div class="kv-row"><span class="k">VIP</span><span class="v mono" x-text="s.vip"></span></div>
+                      <div class="kv-row"><span class="k" x-text="t('settings.advertise_endpoint')"></span><span class="v mono ellipsis" x-text="s.endpoint || '—'"></span></div>
+                      <div class="kv-row"><span class="k" x-text="t('dash.cluster.epoch')"></span><span class="v num mono" x-text="s.epoch"></span></div>
+                      <div class="kv-row"><span class="k" x-text="t('peers.col.status')"></span>
+                        <span class="v" style="display:inline-flex;align-items:center;gap:6px">
+                          <span class="dot" :class="s.online && 'dot-on'"></span>
+                          <span x-text="s.online ? t('app.online') : t('app.offline')"></span></span></div>
+                    </div>
+                  </template>
+                </div>
+              </div>
+
+              <!-- 汇总 -->
+              <div style="margin-bottom:16px">
+                <div class="kicker" style="margin-bottom:8px" x-text="t('dash.totals')"></div>
+                <div class="stat-grid">
+                  <div class="stat"><div class="stat-label" x-text="t('dash.totals.devices')"></div><div class="stat-value num" x-text="summary.totals.devices"></div></div>
+                  <div class="stat"><div class="stat-label" x-text="t('dash.totals.devices_active')"></div><div class="stat-value num" x-text="summary.totals.devices_active"></div></div>
+                  <div class="stat"><div class="stat-label" x-text="t('dash.totals.devices_online')"></div><div class="stat-value num" x-text="summary.totals.devices_online"></div></div>
+                  <div class="stat"><div class="stat-label" x-text="t('dash.totals.users')"></div><div class="stat-value num" x-text="summary.totals.users"></div></div>
+                  <div class="stat"><div class="stat-label" x-text="t('dash.totals.tx')"></div><div class="stat-value num" x-text="fmtBps(summary.totals.tx_bps_sum)"></div></div>
+                  <div class="stat"><div class="stat-label" x-text="t('dash.totals.rx')"></div><div class="stat-value num" x-text="fmtBps(summary.totals.rx_bps_sum)"></div></div>
+                </div>
+              </div>
+
+              <!-- 自身信息 -->
+              <div class="card" style="margin-bottom:16px">
+                <div class="kicker" x-text="t('dash.self')"></div>
+                <div class="grid grid-2" style="margin-top:8px">
+                  <div class="kv-row"><span class="k" x-text="t('dash.self.server_id')"></span><span class="v mono" x-text="shortId(summary.self && summary.self.server_id)"></span></div>
+                  <div class="kv-row"><span class="k"></span><span class="v" x-text="t('dash.self.uptime', {dur: fmtDur(summary.self && summary.self.uptime_secs)})"></span></div>
+                </div>
+              </div>
+
+              <!-- 流量曲线 -->
+              <div class="card">
+                <div class="chart-toolbar">
+                  <div class="kicker" x-text="t('dash.chart')"></div>
+                  <label x-text="t('dash.chart.select')"></label>
+                  <select class="input" style="width:auto;min-height:36px" x-model="chartVip" @change="loadSeries()">
+                    <template x-for="p in chartPeers()" :key="p.device_id">
+                      <option :value="p.vip" x-text="p.vip + ' · ' + (p.hostname || '') + (p.online ? '' : '')"></option>
+                    </template>
+                  </select>
+                  <span class="field-hint" x-text="t('dash.chart.hint')"></span>
+                </div>
+                <div class="chart-box">
+                  <div id="traffic-chart" style="width:100%"></div>
+                  <div class="chart-tooltip" id="chart-tooltip"></div>
+                  <template x-if="seriesEmpty()">
+                    <div class="state"><span class="icon">~</span><span x-text="t('dash.chart.empty')"></span></div>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <template x-if="!summary && !dashError">
+            <div class="card"><div class="state"><span class="spinner"></span><span x-text="t('app.loading')"></span></div></div>
+          </template>
+        </section>
+
+        <!-- ================= 设备 ================= -->
+        <section x-show="route==='peers'">
+          <div class="page-head">
+            <div>
+              <h1 x-text="t('nav.peers')"></h1>
+              <div class="page-sub" x-text="t('peers.subtitle')"></div>
+            </div>
+            <button class="btn btn-ghost btn-sm" @click="loadPeers()" :disabled="peersBusy">
+              <span class="spin" x-show="peersBusy"></span><span x-text="t('app.refresh')"></span></button>
+          </div>
+
+          <template x-if="peersError">
+            <div class="card"><div class="state">
+              <span class="icon">!</span><span x-text="errMsg(peersError)"></span>
+              <button class="btn btn-sm" @click="loadPeers()" x-text="t('app.retry')"></button>
+            </div></div>
+          </template>
+          <template x-if="!peersLoaded && !peersError">
+            <div class="card"><div class="state"><span class="spinner"></span><span x-text="t('app.loading')"></span></div></div>
+          </template>
+          <template x-if="peersLoaded && !peersError && peers.length === 0">
+            <div class="card"><div class="state"><span class="icon">□</span><span x-text="t('peers.empty')"></span></div></div>
+          </template>
+
+          <template x-if="peersLoaded && !peersError && peers.length > 0">
+            <div class="table-card"><div class="table-scroll">
+              <table class="table">
+                <thead><tr>
+                  <th x-text="t('peers.col.vip')"></th>
+                  <th x-text="t('peers.col.hostname')"></th>
+                  <th x-text="t('peers.col.owner')"></th>
+                  <th x-text="t('peers.col.kind')"></th>
+                  <th x-text="t('peers.col.status')"></th>
+                  <th class="hide-narrow" x-text="t('peers.col.lastseen')"></th>
+                  <th x-text="t('peers.col.traffic')"></th>
+                  <th x-show="isAdmin" x-text="t('peers.col.actions')"></th>
+                </tr></thead>
+                <tbody>
+                  <template x-for="p in peers" :key="p.device_id">
+                    <tr :title="p.device_id">
+                      <td data-label="VIP"><span class="mono" x-text="p.vip"></span></td>
+                      <td data-label="hostname" class="ellipsis" x-text="p.hostname || '—'"></td>
+                      <td data-label="owner" class="ellipsis" x-text="p.owner"></td>
+                      <td data-label="kind"><span class="badge" :class="p.kind==='server' ? 'badge-info' : 'badge-muted'" x-text="p.kind==='server' ? t('app.server') : t('app.device')"></span></td>
+                      <td data-label="status"><span style="display:inline-flex;align-items:center;gap:6px">
+                        <span class="dot" :class="p.online && 'dot-on'"></span>
+                        <span class="badge" :class="statusBadge(p.status)" x-text="t('peers.status.' + p.status)"></span></span></td>
+                      <td data-label="lastseen" class="num hide-narrow" x-text="fmtAgo(p.last_seen_unix)"></td>
+                      <td data-label="traffic" class="num mono" x-text="'↑ ' + fmtBps(p.tx_bps) + '  ↓ ' + fmtBps(p.rx_bps)"></td>
+                      <td data-label="" x-show="isAdmin">
+                        <div class="row-actions">
+                          <button class="btn btn-danger btn-sm" x-show="p.status==='active'" @click="confirmPeer(p, 'revoke')" x-text="t('peers.act.revoke')"></button>
+                          <button class="btn btn-warn btn-sm" x-show="p.status==='active'" @click="confirmPeer(p, 'disable')" x-text="t('peers.act.disable')"></button>
+                          <button class="btn btn-success btn-sm" x-show="p.status==='disabled'" @click="confirmPeer(p, 'enable')" x-text="t('peers.act.enable')"></button>
+                          <button class="btn btn-ghost btn-sm" x-show="p.kind==='device'" @click="confirmPeer(p, 'kick')" x-text="t('peers.act.kick')"></button>
+                        </div>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div></div>
+          </template>
+        </section>
+
+        <!-- ================= 账号（admin） ================= -->
+        <section x-show="route==='users'">
+          <div class="page-head">
+            <div>
+              <h1 x-text="t('nav.users')"></h1>
+              <div class="page-sub" x-text="t('users.subtitle')"></div>
+            </div>
+            <button class="btn btn-ghost btn-sm" @click="loadUsers()" :disabled="usersBusy">
+              <span class="spin" x-show="usersBusy"></span><span x-text="t('app.refresh')"></span></button>
+          </div>
+
+          <!-- 无权限页（直击 API 403 的前端呈现） -->
+          <template x-if="usersForbidden">
+            <div class="card"><div class="state">
+              <span class="icon">⊘</span><strong x-text="t('app.noperm.title')"></strong>
+              <span x-text="t('app.noperm.body')"></span>
+            </div></div>
+          </template>
+
+          <template x-if="!usersForbidden">
+            <div>
+              <!-- 创建 -->
+              <div class="card" style="margin-bottom:16px">
+                <div class="card-title" x-text="t('users.create.title')"></div>
+                <form @submit.prevent="createUser()" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start">
+                  <div class="field" style="flex:1 1 240px;margin-bottom:0">
+                    <input class="input" x-model="createUserName" :placeholder="t('users.create.name.ph')"
+                           :aria-label="t('users.create.name')" maxlength="32" autocomplete="off">
+                    <div class="field-error" x-text="createUserError"></div>
+                  </div>
+                  <button class="btn btn-primary" type="submit" :disabled="createUserBusy" style="min-width:140px">
+                    <span class="spin" x-show="createUserBusy"></span><span x-text="t('users.create.submit')"></span></button>
+                </form>
+              </div>
+
+              <template x-if="usersError">
+                <div class="card"><div class="state"><span class="icon">!</span><span x-text="errMsg(usersError)"></span>
+                  <button class="btn btn-sm" @click="loadUsers()" x-text="t('app.retry')"></button></div></div>
+              </template>
+              <template x-if="!usersError && users.length === 0">
+                <div class="card"><div class="state"><span class="icon">□</span><span x-text="t('users.empty')"></span></div></div>
+              </template>
+              <template x-if="!usersError && users.length > 0">
+                <div class="table-card"><div class="table-scroll">
+                  <table class="table">
+                    <thead><tr>
+                      <th x-text="t('users.col.username')"></th>
+                      <th x-text="t('users.col.role')"></th>
+                      <th x-text="t('users.col.disabled')"></th>
+                      <th class="hide-narrow" x-text="t('users.col.password')"></th>
+                      <th x-text="t('users.col.devices')"></th>
+                      <th x-text="t('users.col.actions')"></th>
+                    </tr></thead>
+                    <tbody>
+                      <template x-for="u in users" :key="u.username">
+                        <tr>
+                          <td data-label="username"><span x-text="u.username"></span>
+                            <span class="field-hint" x-show="me && u.username === me.user" x-text="t('users.me')"></span></td>
+                          <td data-label="role"><span class="badge" :class="u.admin ? 'badge-accent' : 'badge-muted'" x-text="u.admin ? t('users.role.admin') : t('users.role.plain')"></span></td>
+                          <td data-label="disabled"><span class="badge" :class="u.disabled ? 'badge-danger' : 'badge-success'" x-text="u.disabled ? t('users.disabled.yes') : t('users.disabled.no')"></span></td>
+                          <td data-label="password" class="hide-narrow"><span class="badge badge-muted" x-text="u.has_password ? t('users.password.set') : t('users.password.none')"></span></td>
+                          <td data-label="devices" class="num" x-text="u.devices"></td>
+                          <td data-label="">
+                            <div class="row-actions">
+                              <button class="btn btn-warn btn-sm" x-show="!u.disabled" :disabled="busyKey !== ''" @click="confirmUserDisable(u)" x-text="t('users.act.disable')"></button>
+                              <button class="btn btn-success btn-sm" x-show="u.disabled" :disabled="busyKey !== ''" @click="userEnable(u)" x-text="t('users.act.enable')"></button>
+                              <button class="btn btn-ghost btn-sm" :disabled="busyKey !== ''" @click="userResetPw(u)" x-text="t('users.act.resetpw')"></button>
+                              <button class="btn btn-ghost btn-sm" :disabled="busyKey !== ''" @click="confirmUserAdmin(u, !u.admin)" x-text="u.admin ? t('users.act.unsetadmin') : t('users.act.setadmin')"></button>
+                            </div>
+                          </td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div></div>
+              </template>
+            </div>
+          </template>
+        </section>
+
+        <!-- ================= 审计（admin） ================= -->
+        <section x-show="route==='audit'">
+          <div class="page-head">
+            <div>
+              <h1 x-text="t('nav.audit')"></h1>
+              <div class="page-sub" x-text="t('audit.subtitle')"></div>
+            </div>
+            <button class="btn btn-ghost btn-sm" @click="loadAudit()" :disabled="auditBusy">
+              <span class="spin" x-show="auditBusy"></span><span x-text="t('app.refresh')"></span></button>
+          </div>
+
+          <template x-if="auditForbidden">
+            <div class="card"><div class="state"><span class="icon">⊘</span><strong x-text="t('app.noperm.title')"></strong>
+              <span x-text="t('app.noperm.body')"></span></div></div>
+          </template>
+          <template x-if="auditError">
+            <div class="card"><div class="state"><span class="icon">!</span><span x-text="errMsg(auditError)"></span>
+              <button class="btn btn-sm" @click="loadAudit()" x-text="t('app.retry')"></button></div></div>
+          </template>
+          <template x-if="!auditError && !auditForbidden && audit.length === 0 && auditLoaded">
+            <div class="card"><div class="state"><span class="icon">□</span><span x-text="t('audit.empty')"></span></div></div>
+          </template>
+          <template x-if="!auditError && audit.length > 0">
+            <div class="table-card"><div class="table-scroll">
+              <table class="table">
+                <thead><tr>
+                  <th x-text="t('audit.col.time')"></th>
+                  <th x-text="t('audit.col.user')"></th>
+                  <th x-text="t('audit.col.action')"></th>
+                  <th x-text="t('audit.col.target')"></th>
+                  <th class="hide-narrow" x-text="t('audit.col.origin')"></th>
+                  <th x-text="t('audit.col.result')"></th>
+                </tr></thead>
+                <tbody>
+                  <template x-for="(e, i) in audit" :key="i">
+                    <tr>
+                      <td data-label="time" class="num mono" x-text="fmtTime(e.ts)"></td>
+                      <td data-label="user" class="ellipsis" x-text="e.user"></td>
+                      <td data-label="action" x-text="t('audit.action.' + e.action)"></td>
+                      <td data-label="target" class="mono ellipsis" x-text="shortTarget(e.target)"></td>
+                      <td data-label="origin" class="hide-narrow" x-text="e.origin"></td>
+                      <td data-label="result"><span class="badge" :class="resultBadge(e.result)" x-text="t('audit.result.' + e.result)"></span></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div></div>
+          </template>
+        </section>
+
+        <!-- ================= 设置 ================= -->
+        <section x-show="route==='settings'">
+          <div class="page-head">
+            <div>
+              <h1 x-text="t('nav.settings')"></h1>
+              <div class="page-sub" x-text="t('settings.subtitle')"></div>
+            </div>
+          </div>
+          <template x-if="config">
+            <div class="card">
+              <div class="kv">
+                <div class="kv-row"><span class="k" x-text="t('settings.listen_mode')"></span><span class="v" x-text="config.listen_mode === 'frp' ? t('settings.mode.frp') : t('settings.mode.direct')"></span></div>
+                <div class="kv-row"><span class="k" x-text="t('settings.advertise_endpoint')"></span><span class="v mono" x-text="config.advertise_endpoint"></span></div>
+                <div class="kv-row"><span class="k" x-text="t('settings.sync_mode')"></span><span class="v" x-text="config.sync_mode === 'raft' ? t('settings.sync.raft') : t('settings.sync.single')"></span></div>
+                <div class="kv-row"><span class="k" x-text="t('settings.ticket_ttl_secs')"></span><span class="v num" x-text="config.ticket_ttl_secs"></span></div>
+                <div class="kv-row"><span class="k" x-text="t('settings.peer_retention_days')"></span><span class="v num" x-text="config.peer_retention_days"></span></div>
+                <div class="kv-row"><span class="k" x-text="t('settings.max_sessions')"></span><span class="v num" x-text="config.max_sessions"></span></div>
+                <div class="kv-row"><span class="k" x-text="t('settings.webui.port')"></span><span class="v num" x-text="config.webui && config.webui.port"></span></div>
+                <div class="kv-row"><span class="k" x-text="t('settings.webui.session_ttl_secs')"></span><span class="v num" x-text="config.webui && config.webui.session_ttl_secs"></span></div>
+              </div>
+            </div>
+          </template>
+        </section>
+
+      </main>
+    </div>
+  </div>
+
+  <!-- ================================================================
+       登录页（三档居中形态）
+       ================================================================ -->
+  <div class="auth-wrap" x-show="route==='login'" x-cloak>
+    <div class="card auth-card">
+      <div class="brand-lg"><span class="brand-mark">F</span></div>
+      <h1 class="auth-title" x-text="t('login.title')"></h1>
+      <p class="auth-sub" x-text="t('login.subtitle')"></p>
+      <div class="field-hint" style="text-align:center;margin-bottom:12px"
+           x-text="bootstrap ? t('login.bootstrap', {cluster: shortId(bootstrap.cluster_id), server: shortId(bootstrap.server_id)}) : t('login.bootstrap.unreachable')"></div>
+      <form @submit.prevent="submitLogin()">
+        <div class="field">
+          <label for="login-user" x-text="t('login.username')"></label>
+          <input id="login-user" class="input" x-model="loginUser" :placeholder="t('login.username.ph')"
+                 autocomplete="username" autocapitalize="none" spellcheck="false" :disabled="loginBusy">
+        </div>
+        <div class="field">
+          <label for="login-pass" x-text="t('login.password')"></label>
+          <input id="login-pass" class="input" type="password" x-model="loginPass" :placeholder="t('login.password.ph')"
+                 autocomplete="current-password" :disabled="loginBusy">
+        </div>
+        <div class="field-error" style="margin-bottom:8px" x-text="loginErrorText"></div>
+        <button class="btn btn-primary btn-block" type="submit" :disabled="loginBusy" style="min-height:44px">
+          <span class="spin" x-show="loginBusy"></span>
+          <span x-text="loginBusy ? t('login.busy') : t('login.submit')"></span></button>
+      </form>
+      <div class="auth-alt"><span x-text="t('login.setpw')"></span>
+        <a href="#/set-password" x-text="t('login.setpw.go')"></a></div>
+    </div>
+  </div>
+
+  <!-- ================================================================
+       设置口令页（首次/重置共用；三档居中）
+       ================================================================ -->
+  <div class="auth-wrap" x-show="route==='set-password'" x-cloak>
+    <div class="card auth-card">
+      <h1 class="auth-title" x-text="t('setpw.title')"></h1>
+      <p class="auth-sub" x-text="t('setpw.subtitle')"></p>
+      <form @submit.prevent="submitSetPw()">
+        <div class="field">
+          <label for="pw-user" x-text="t('setpw.username')"></label>
+          <input id="pw-user" class="input" x-model="pwUser" autocomplete="username" autocapitalize="none" spellcheck="false" :disabled="pwBusy">
+        </div>
+        <div class="field">
+          <label for="pw-token" x-text="t('setpw.token')"></label>
+          <input id="pw-token" class="input mono" x-model="pwToken" :placeholder="t('setpw.token.ph')" autocomplete="off" spellcheck="false" :disabled="pwBusy">
+        </div>
+        <div class="field">
+          <label for="pw-pass" x-text="t('setpw.newpass')"></label>
+          <input id="pw-pass" class="input" type="password" x-model="pwPass" autocomplete="new-password" :disabled="pwBusy">
+        </div>
+        <div class="field">
+          <label for="pw-pass2" x-text="t('setpw.newpass2')"></label>
+          <input id="pw-pass2" class="input" type="password" x-model="pwPass2" autocomplete="new-password" :disabled="pwBusy">
+        </div>
+        <div class="field-error" style="margin-bottom:8px" x-text="pwErrorText"></div>
+        <button class="btn btn-primary btn-block" type="submit" :disabled="pwBusy" style="min-height:44px">
+          <span class="spin" x-show="pwBusy"></span>
+          <span x-text="pwBusy ? t('setpw.busy') : t('setpw.submit')"></span></button>
+      </form>
+      <div class="auth-alt"><a href="#/login" x-text="t('setpw.go.login')"></a></div>
+    </div>
+  </div>
+
+  <!-- ================================================================
+       模态：确认操作
+       ================================================================ -->
+  <div class="modal-overlay" x-show="confirmModal" x-cloak @click.self="confirmModal=null">
+    <div class="modal" role="dialog" aria-modal="true">
+      <h3 x-text="confirmModal && confirmModal.title"></h3>
+      <p x-text="confirmModal && confirmModal.body"></p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" @click="confirmModal=null" x-text="t('app.cancel')"></button>
+        <button class="btn" :class="confirmModal && confirmModal.danger ? 'btn-danger' : 'btn-primary'"
+                :disabled="actionBusy" @click="doConfirmed()">
+          <span class="spin" x-show="actionBusy"></span>
+          <span x-text="t('app.confirm')"></span></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态：一次性引导令牌 -->
+  <div class="modal-overlay" x-show="tokenModal" x-cloak @click.self="tokenModal=null">
+    <div class="modal" role="dialog" aria-modal="true">
+      <h3 x-text="tokenModal && t(tokenModal.title)"></h3>
+      <p x-text="t('users.token.body')"></p>
+      <div class="token-box"><span class="mono" style="flex:1" x-text="tokenModal && tokenModal.token"></span>
+        <button class="btn btn-sm" @click="copyToken()" x-text="copied ? t('app.copied') : t('app.copy')"></button></div>
+      <p style="margin-top:12px" x-text="t('users.token.guide', {user: tokenModal && tokenModal.user})"></p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" @click="tokenModal=null" x-text="t('app.close')"></button>
+        <a class="btn btn-primary" href="#/set-password" @click="prefillPwUser(); tokenModal=null" x-text="t('users.token.go')"></a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast-stack">
+    <template x-for="toast in toasts" :key="toast.id">
+      <div class="toast" :class="'toast-' + toast.kind"><span x-text="toast.text"></span></div>
+    </template>
+  </div>
+
 </body>
 </html>

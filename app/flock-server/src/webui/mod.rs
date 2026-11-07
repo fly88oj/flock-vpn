@@ -287,10 +287,11 @@ mod tests {
         assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
     }
 
-    /// 静态资产与 404：/ 与 /static/index.html 200（no-cache）；未知路径 404 页；
-    /// 未知 /api/* 404 JSON；越界来源对静态资产同样 403。
+    /// 静态资产与 SPA fallback：/ 与 /static/* 200（no-cache）；未知非 /api 路径
+    /// 回 index.html（hash 路由接管——M8b）；未知 /api/* 404 JSON（API 客户端
+    /// 不吞 HTML）；越界来源对静态资产同样 403。
     #[tokio::test]
-    async fn dispatch_static_and_404() {
+    async fn dispatch_static_spa_fallback_and_404() {
         let st = state().await;
         let resp = st.dispatch(req("GET", "/"), remote("127.0.0.1")).await;
         assert_eq!(resp.status, 200);
@@ -306,11 +307,17 @@ mod tests {
             .dispatch(req("GET", "/static/index.html"), remote("127.0.0.1"))
             .await;
         assert_eq!(resp.status, 200);
+        // SPA fallback：直击任意未知路径（如 /peers 刷新）⇒ index.html 200。
+        for path in ["/nope", "/peers", "/static/missing.js"] {
+            let resp = st.dispatch(req("GET", path), remote("127.0.0.1")).await;
+            assert_eq!(resp.status, 200, "{path} SPA fallback 200");
+            assert!(
+                String::from_utf8_lossy(&resp.body).contains("flockApp"),
+                "{path} 回 index"
+            );
+        }
         let resp = st.dispatch(req("GET", "/"), remote("8.8.8.8")).await;
         assert_eq!(resp.status, 403);
-        let resp = st.dispatch(req("GET", "/nope"), remote("127.0.0.1")).await;
-        assert_eq!(resp.status, 404);
-        assert!(String::from_utf8_lossy(&resp.body).contains("404"));
         let resp = st
             .dispatch(req("GET", "/api/unknown"), remote("127.0.0.1"))
             .await;

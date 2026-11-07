@@ -185,7 +185,7 @@ impl WebState {
         let Some(origin) = classify_origin(&remote) else {
             return err("forbidden_origin");
         };
-        // ② 静态资产（非 /api/*）。
+        // ② 静态资产与 SPA fallback（非 /api/*）。
         if !req.path.starts_with("/api/") {
             return self.static_route(&req);
         }
@@ -227,13 +227,16 @@ impl WebState {
         if req.method != "GET" {
             return err("method_not_allowed");
         }
+        // SPA fallback（§M8.6 hash 路由的直击/刷新面）：未知非 /api 路径一律回
+        // index.html（200）——浏览器端 hash 路由接管；/api/* 不经本函数（404 JSON
+        // 面不fallback——API 客户端不吞 HTML）。
         let (body, ctype) = match req.path.as_str() {
             "/" | "/index.html" => (assets::index(), "text/html; charset=utf-8"),
             p if p.starts_with("/static/") => match assets::static_file(&p["/static/".len()..]) {
                 Some(b) => (b, assets::content_type(p)),
-                None => return not_found_page(),
+                None => (assets::index(), "text/html; charset=utf-8"),
             },
-            _ => return not_found_page(),
+            _ => (assets::index(), "text/html; charset=utf-8"),
         };
         Response::new(200)
             .with_header("Content-Type", ctype)
@@ -993,14 +996,6 @@ impl WebState {
             .collect();
         ok_json(json!({"entries": entries}))
     }
-}
-
-/// 非 API 路径的 404 页（HTML——「其余 → 404 页」§M8.4）。
-fn not_found_page() -> Response {
-    Response::new(404)
-        .with_header("Content-Type", "text/html; charset=utf-8")
-        .with_header("Cache-Control", "no-cache")
-        .body(b"<html><body><h1>404</h1><p>not found</p></body></html>".to_vec())
 }
 
 /// sync_mode（feature 门控的字段访问收敛）。
