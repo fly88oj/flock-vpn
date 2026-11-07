@@ -779,6 +779,8 @@ impl WebState {
                     "device_id": hex::encode(server_self_device_id_single(&self.core)),
                     "vip": vip_str(&self.core.cfg.vip.octets()),
                     "hostname": self.core.cfg.advertise_endpoint,
+                    // owner = node_id（u64 >2^53）的十进制字符串——String 形态无损，
+                    // 前端按「纯数字串」识别并做分组/截断展示。
                     "owner": flock_sync::node::node_id_of(&self.core.identity.server_id).to_string(),
                     "kind": "server",
                     "online": true,
@@ -829,6 +831,7 @@ impl WebState {
                         "vip": vip_str(&entry.vip),
                         "hostname": dir_hosts.get(&node_id).cloned()
                             .unwrap_or_else(|| flock_sync::HOSTNAME_UNKNOWN.to_string()),
+                        // owner = node_id 十进制字符串（>2^53 无损，前端分组展示）。
                         "owner": node_id.to_string(),
                         "kind": "server",
                         "online": st.is_some_and(|x| x.online),
@@ -940,7 +943,9 @@ impl WebState {
         let sync_mode = sync_mode_of(&self.core);
         let servers = match &self.core.net {
             NetBackend::Single(_) => vec![json!({
-                "node_id": flock_sync::node::node_id_of(&self.core.identity.server_id),
+                // node_id 是 ServerId 前 8B 派生的 u64（>2^53 防 JS 精度丢失——
+                // JSON number 在 JS 端按 double 解析，必须以字符串形态下发）。
+                "node_id": flock_sync::node::node_id_of(&self.core.identity.server_id).to_string(),
                 "vip": format!("{}", self.core.cfg.vip),
                 "endpoint": self.core.cfg.advertise_endpoint,
                 "leader": true,
@@ -974,7 +979,8 @@ impl WebState {
                             .peer_stats(&flock_sync::lease::server_self_device_id(node_id))
                             .is_some_and(|x| x.online);
                         json!({
-                            "node_id": node_id,
+                            // node_id 为 u64（>2^53 防 JS 精度丢失——字符串下发）。
+                            "node_id": node_id.to_string(),
                             "vip": format!("{}.{}.{}.{}", entry.vip[0], entry.vip[1], entry.vip[2], entry.vip[3]),
                             "endpoint": dir_eps.get(&node_id).cloned().unwrap_or_default(),
                             "leader": leader == Some(node_id),
@@ -1333,6 +1339,58 @@ mod tests {
         // enable 恢复。
         st.core.net.set_user_disabled("boss", false).await.unwrap();
         assert_eq!(st.dispatch(get("/api/users"), remote()).await.status, 200);
+    }
+
+    /// u64 标识的字符串序列化往返（🔴 UI 评审项 1：ID 精度丢失）：
+    /// `servers[].node_id`（ServerId 前 8B 派生，必然 >2^53——JSON number 经 JS
+    /// double 解析会丢低位）必须以**字符串**形态下发且值与 `node_id_of` 十进制
+    /// 全值一致；peers 服务器行的 `owner`（同源的纯数字 String）同样无损往返。
+    /// epoch/时间戳等小量级 u64 计数器不在该面（<2^53，保持 number）。
+    #[tokio::test]
+    async fn u64_ids_serialize_as_json_strings() {
+        let st = state().await;
+        st.core.net.create_user("boss", [1; 16]).await.unwrap();
+        st.core.net.set_user_admin("boss", true).await.unwrap();
+        let now = flock_protocol::trust::now_unix();
+        let sid = st
+            .sessions
+            .issue("boss", true, Origin::Loopback, now, 28_800);
+        let cookie = format!("flock_session={sid}");
+        let get = |path: &str| Request {
+            method: "GET".into(),
+            path: path.into(),
+            query: String::new(),
+            headers: vec![("Cookie".into(), cookie.clone())],
+            body: vec![],
+        };
+
+        // dashboard/summary：node_id 是 JSON string，且十进制全值无损。
+        let resp = st.dispatch(get("/api/dashboard/summary"), remote()).await;
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let want = flock_sync::node::node_id_of(&st.core.identity.server_id).to_string();
+        let node_id = &body["servers"][0]["node_id"];
+        assert!(node_id.is_string(), "node_id 须为字符串（实际 {node_id}）");
+        assert_eq!(node_id.as_str().unwrap(), want, "node_id 十进制全值无损");
+        // 小量级计数器（epoch）保持 number——精度面按「标识 vs 计数」划界。
+        assert!(body["cluster"]["epoch"].is_u64());
+
+        // peers：服务器行 owner 为纯数字 String（前端按数字串分组/截断展示）。
+        let resp = st.dispatch(get("/api/peers"), remote()).await;
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let server_row = body["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["kind"] == "server")
+            .expect("单服形态必有服务器自发行");
+        let owner = server_row["owner"].as_str().unwrap();
+        assert!(
+            owner.chars().all(|c| c.is_ascii_digit()),
+            "服务器行 owner 为 node_id 十进制字符串（实际 {owner}）"
+        );
+        assert_eq!(owner, &want, "owner 与 summary.node_id 同源全值一致");
     }
 
     /// 审计 stderr 行注入向量被拒（🟡 评审项 4）：user 含 \n/\r/NUL/超长（>64B）⇒

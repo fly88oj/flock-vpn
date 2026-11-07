@@ -107,7 +107,9 @@
                   <template x-for="s in (summary.servers || [])" :key="s.node_id">
                     <div class="card">
                       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
-                        <strong x-text="t('dash.servers.node', {id: s.node_id})"></strong>
+                        <button type="button" class="id-chip mono" :title="idChipTitle(s.node_id)"
+                                @click="copyText(s.node_id)"
+                                x-text="t('dash.servers.node', {id: shortNum(s.node_id)})"></button>
                         <span class="badge" :class="s.leader ? 'badge-accent' : 'badge-muted'" x-text="s.leader ? t('dash.servers.leader') : t('dash.servers.follower')"></span>
                       </div>
                       <div class="kv-row"><span class="k">VIP</span><span class="v mono" x-text="s.vip"></span></div>
@@ -214,7 +216,15 @@
                     <tr :title="p.device_id">
                       <td data-label="VIP"><span class="mono" x-text="p.vip"></span></td>
                       <td data-label="hostname" class="ellipsis" x-text="p.hostname || '—'"></td>
-                      <td data-label="owner" class="ellipsis" x-text="p.owner"></td>
+                      <td data-label="owner" class="ellipsis">
+                        <template x-if="isNumId(p.owner)">
+                          <button type="button" class="id-chip mono" :title="idChipTitle(p.owner)"
+                                  @click="copyText(p.owner)" x-text="shortNum(p.owner)"></button>
+                        </template>
+                        <template x-if="!isNumId(p.owner)">
+                          <span x-text="p.owner"></span>
+                        </template>
+                      </td>
                       <td data-label="kind"><span class="badge" :class="p.kind==='server' ? 'badge-info' : 'badge-muted'" x-text="p.kind==='server' ? t('app.server') : t('app.device')"></span></td>
                       <td data-label="status"><span style="display:inline-flex;align-items:center;gap:6px">
                         <span class="dot" :class="p.online && 'dot-on'"></span>

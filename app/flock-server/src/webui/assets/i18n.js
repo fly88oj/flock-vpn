@@ -16,6 +16,7 @@
     'app.logout': '退出登录',
     'app.copy': '复制',
     'app.copied': '已复制',
+    'app.copy.full': '点击复制完整编号',
     'app.confirm': '确认',
     'app.cancel': '取消',
     'app.close': '关闭',

@@ -600,6 +600,34 @@
 
       shortTarget(s) { return s && s.length > 16 ? s.slice(0, 8) + '…' : (s || '—'); },
 
+      // —— u64 标识（字符串形态下发，🔴 UI 评审项 1）——
+      // node_id 等 >2^53 的 u64 标识以字符串往返；展示统一「前 4…后 4」截断，
+      // title 悬停给全值（4 位分组），点击复制。
+      isNumId(s) { return typeof s === 'string' && /^\d{5,}$/.test(s); },
+
+      shortNum(s) { return this.isNumId(s) ? s.slice(0, 4) + '…' + s.slice(-4) : (s || '—'); },
+
+      // 4 位分组（从右起断组）：8458693432428654888 → 845 8693 4324 2865 4888，
+      // mono + tabular-nums 下等宽对齐。
+      groupNum(s) {
+        if (!this.isNumId(s)) { return s || ''; }
+        return s.replace(/\B(?=(\d{4})+(?!\d))/g, ' ');
+      },
+
+      // 表格/卡片里的可复制标识芯片：文字为截断形，title 全值分组形。
+      idChipTitle(s) { return this.groupNum(s) + ' · ' + t('app.copy.full'); },
+
+      copyText(text) {
+        const v = String(text || '');
+        const done = () => this.toast('ok', t('app.copied'));
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(v).then(done, () => { this.toast('info', v); });
+        } else {
+          // 剪贴板 API 不可用（非安全上下文 http://）——退化为 toast 展示全值。
+          this.toast('info', v);
+        }
+      },
+
       statusBadge(s) {
         return { active: 'badge-success', disabled: 'badge-warn', revoked: 'badge-danger', expired: 'badge-muted' }[s] || 'badge-muted';
       },
