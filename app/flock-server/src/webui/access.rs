@@ -149,6 +149,9 @@ const LOCK_THRESHOLD: usize = 5;
 const LOCK_BASE_SECS: u64 = 30;
 /// 封顶（900s）。
 const LOCK_MAX_SECS: u64 = 900;
+/// 表容量上限（🟡 评审项 5：未认证面可注入任意 user 名——超限先清惰性过期行，
+/// 仍满逐出最旧；另有 60s 周期清扫兜底）。
+pub const LOGIN_BACKOFF_CAP: usize = 4096;
 
 /// 按用户名失败记账。
 #[derive(Default)]
@@ -172,7 +175,7 @@ impl LoginBackoff {
 
     /// 锁定检查：Some(retry_after_secs) = 当前锁定中（不消费失败）。
     pub fn check(&self, user: &str, now_unix: u64) -> Option<u64> {
-        let g = self.inner.lock().expect("backoff poisoned");
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let st = g.get(user)?;
         // 锁定窗 = 自最近一次失败起 lock_secs。
         let last = *st.fails.last()?;
@@ -182,7 +185,23 @@ impl LoginBackoff {
 
     /// 记一次失败（窗净空后重新起算；第 5 次失败起锁 30s，每再失败翻倍封顶 900）。
     pub fn on_failure(&self, user: &str, now_unix: u64) {
-        let mut g = self.inner.lock().expect("backoff poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // 容量上限：先清惰性过期行（见 sweep_backoff_locked——lock_secs ≤
+        // LOCK_MAX_SECS = FAIL_WINDOW_SECS，窗净空即锁定亦过期、行全惰性），
+        // 仍满则按最近失败时刻逐出最旧。
+        if g.len() >= LOGIN_BACKOFF_CAP {
+            sweep_backoff_locked(&mut g, now_unix);
+        }
+        while g.len() >= LOGIN_BACKOFF_CAP {
+            let Some(oldest) = g
+                .iter()
+                .min_by_key(|(_, st)| st.fails.last().copied().unwrap_or(0))
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            g.remove(&oldest);
+        }
         let st = g.entry(user.to_string()).or_default();
         // 15min 滑窗净空（含锁定过后的残留失败）。
         st.fails
@@ -199,8 +218,39 @@ impl LoginBackoff {
 
     /// 成功清零（窗与锁全清）。
     pub fn on_success(&self, user: &str) {
-        self.inner.lock().expect("backoff poisoned").remove(user);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(user);
     }
+
+    /// 周期清扫（60s 任务——与 mod.rs 会话清扫同档）：清窗净空且锁定过期的惰性
+    /// 行（返回清出条数——测试面）。
+    pub fn sweep(&self, now_unix: u64) -> usize {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        sweep_backoff_locked(&mut g, now_unix)
+    }
+
+    /// 在册行数（测试/诊断面）。
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// 惰性行判定+清扫：最近失败距今 ≥ FAIL_WINDOW_SECS ⇒ 滑窗已净空且锁定必已过期
+///（lock_secs ≤ LOCK_MAX_SECS = FAIL_WINDOW_SECS）——行删除无任何行为差异。
+fn sweep_backoff_locked(g: &mut HashMap<String, FailState>, now_unix: u64) -> usize {
+    let before = g.len();
+    g.retain(|_, st| {
+        st.fails
+            .last()
+            .is_some_and(|t| now_unix.saturating_sub(*t) < FAIL_WINDOW_SECS)
+    });
+    before - g.len()
 }
 
 // ============================================================================
@@ -211,6 +261,11 @@ impl LoginBackoff {
 const BUCKET_BURST: f64 = 10.0;
 /// 回填速率（10/min）。
 const BUCKET_RATE_PER_SEC: f64 = 10.0 / 60.0;
+/// 回满时距（10 突发 / 10 每 min ⇒ 60s 后等效新桶——idle ≥ 此值的行可安全重建）。
+const BUCKET_REFILL_SECS: u64 = 60;
+/// 表容量上限（🟡 评审项 5：VIP 段内多源 IP 可无限增行——超限先清 idle 行，
+/// 仍满逐出最旧；另有 60s 周期清扫兜底）。
+pub const IP_BUCKETS_CAP: usize = 4096;
 
 /// 令牌桶（进程内存；`Mutex<HashMap<IpAddr, (tokens, last)>>`）。
 #[derive(Default)]
@@ -225,7 +280,19 @@ impl IpBuckets {
 
     /// 取一枚令牌：true = 放行；false = 超速（429，retry_after 按 满-token 回填时距）。
     pub fn allow(&self, ip: IpAddr, now_unix: u64) -> Result<(), u64> {
-        let mut g = self.inner.lock().expect("buckets poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // 容量上限：先清 idle ≥ 回满时距的行（重建 = 全新满桶，无行为差异），
+        // 仍满则按 last 逐出最旧（被逐 IP 下次请求按新桶处理——限速面瞬时放宽
+        // 优于无上限内存增长）。
+        if g.len() >= IP_BUCKETS_CAP {
+            sweep_buckets_locked(&mut g, now_unix);
+        }
+        while g.len() >= IP_BUCKETS_CAP {
+            let Some(oldest) = g.iter().min_by_key(|(_, (_, last))| *last).map(|(k, _)| *k) else {
+                break;
+            };
+            g.remove(&oldest);
+        }
         let (tokens, last) = g.get(&ip).copied().unwrap_or((BUCKET_BURST, now_unix));
         let elapsed = now_unix.saturating_sub(last) as f64;
         let filled = (tokens + elapsed * BUCKET_RATE_PER_SEC).min(BUCKET_BURST);
@@ -239,6 +306,28 @@ impl IpBuckets {
             Err(retry.max(1))
         }
     }
+
+    /// 周期清扫（60s 任务）：清 idle ≥ 回满时距的行（返回清出条数——测试面）。
+    pub fn sweep(&self, now_unix: u64) -> usize {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        sweep_buckets_locked(&mut g, now_unix)
+    }
+
+    /// 在册行数（测试/诊断面）。
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// idle 行清扫：last 距今 ≥ BUCKET_REFILL_SECS ⇒ 桶已回满，删除后重建等效。
+fn sweep_buckets_locked(g: &mut HashMap<IpAddr, (f64, u64)>, now_unix: u64) -> usize {
+    let before = g.len();
+    g.retain(|_, (_, last)| now_unix.saturating_sub(*last) < BUCKET_REFILL_SECS);
+    before - g.len()
 }
 
 // ============================================================================
@@ -540,6 +629,90 @@ mod tests {
         // 不同 IP 独立桶。
         let ip2: IpAddr = "127.0.0.2".parse().unwrap();
         assert!(b.allow(ip2, t0).is_ok());
+    }
+
+    /// 容量上限 + 清扫（🟡 评审项 5）：
+    /// - 退避表满载（4096）：先清惰性过期行；仍满逐出最近失败最旧的行——
+    ///   在册数不超上限、新失败者状态保留（可继续累计到锁定）。
+    /// - 退避表 sweep：窗净空（≥15min 无失败）即清；锁定中的行不清。
+    #[test]
+    fn login_backoff_cap_and_sweep() {
+        let b = LoginBackoff::new();
+        let t0 = 1_000u64;
+        // 满：4095 个用户各一次失败（时刻递增——u0 最早；全距 512s < 900s 窗 ⇒
+        // 上限触发时 sweep 无惰性行可清、必走「逐出最旧」路径）。
+        for i in 0..LOGIN_BACKOFF_CAP - 1 {
+            b.on_failure(&format!("u{i:04}"), t0 + i as u64 / 8);
+        }
+        assert_eq!(b.len(), LOGIN_BACKOFF_CAP - 1);
+        // u_last 预置 4 次失败（不锁——阈值 5），逐出若命中它则下面第 5 次
+        // 不再起锁；这里它时刻最新，不应被逐。
+        let t_last = t0 + (LOGIN_BACKOFF_CAP - 1) as u64 / 8;
+        for _ in 0..4 {
+            b.on_failure("u-last", t_last);
+        }
+        // 满 +1：触发上限（时刻相近 ⇒ sweep 无行可清 ⇒ 逐出最近失败最旧 = u0000）。
+        b.on_failure("u-new", t_last + 1);
+        assert_eq!(b.len(), LOGIN_BACKOFF_CAP, "上限维持（不越 4096）");
+        // u-last 保留：第 5 次失败起锁 30s。
+        b.on_failure("u-last", t_last + 2);
+        assert_eq!(b.check("u-last", t_last + 2), Some(30), "最新用户状态保留");
+        // sweep：窗净空（距 u-last 最近失败 ≥ 15min）⇒ 全清；窗内/锁内（<15min）不清。
+        assert_eq!(b.sweep(t_last + 3), 0, "窗内/锁内行不清");
+        let swept = b.sweep(t_last + 2 + FAIL_WINDOW_SECS);
+        assert!(swept >= 2, "窗净空行全清（实际 {swept}）");
+        assert!(b.is_empty());
+        // 边界：恰 FAIL_WINDOW_SECS 距离 = 窗净空（retain 条件 <）。
+        let b2 = LoginBackoff::new();
+        b2.on_failure("solo", 100);
+        assert_eq!(b2.sweep(100 + FAIL_WINDOW_SECS - 1), 0, "差 1s 仍在窗");
+        assert_eq!(b2.sweep(100 + FAIL_WINDOW_SECS), 1, "到点即净空");
+    }
+
+    /// 令牌桶容量上限 + 清扫（🟡 评审项 5）：满载先清 idle ≥60s 行（重建 = 满桶，
+    /// 无行为差异）；全 fresh 时逐出 last 最旧；sweep 清 idle 行、近期行保留。
+    #[test]
+    fn ip_buckets_cap_and_sweep() {
+        let b = IpBuckets::new();
+        let t0 = 100u64;
+        // 满：4096 个 IP 各取一枚（时刻递增——首个最旧）。
+        for i in 0..IP_BUCKETS_CAP {
+            let ip: IpAddr = format!("10.1.{}.{}", i / 250, i % 250 + 1).parse().unwrap();
+            assert!(b.allow(ip, t0 + i as u64 / 64).is_ok());
+        }
+        assert_eq!(b.len(), IP_BUCKETS_CAP);
+        // idle 清扫路径：距全部行 ≥60s ⇒ 新 IP 触发全清后插入（在册 1）。
+        let ip_new: IpAddr = "10.9.9.9".parse().unwrap();
+        assert!(b.allow(ip_new, t0 + 5000).is_ok());
+        assert_eq!(b.len(), 1, "idle 行全清 + 新行插入");
+        // fresh 逐出路径：同刻满载后新 IP ⇒ 逐出 last 最旧而非拒绝；新行可用
+        //（同刻连取突发 10 内放行）。
+        let b2 = IpBuckets::new();
+        let t1 = 9_000u64;
+        for i in 0..IP_BUCKETS_CAP {
+            let ip: IpAddr = format!("10.2.{}.{}", i / 250, i % 250 + 1).parse().unwrap();
+            assert!(b2.allow(ip, t1).is_ok(), "fresh 满：{ip}");
+        }
+        assert!(b2.allow(ip_new, t1).is_ok(), "满载逐出最旧后新 IP 放行");
+        assert_eq!(b2.len(), IP_BUCKETS_CAP);
+        // 新行保留：ip_new 再取 9 枚（首取已用 1）——第 11 枚拒。
+        for _ in 0..9 {
+            assert!(b2.allow(ip_new, t1).is_ok());
+        }
+        assert!(b2.allow(ip_new, t1).is_err(), "新行逐出受害者语义自检");
+        // sweep：idle ≥60s 行清、fresh 行留（ip_new 在 t1+60 再取一枚 ⇒ last 刷新）。
+        assert!(
+            b2.allow(ip_new, t1 + BUCKET_REFILL_SECS).is_ok(),
+            "回满后再取"
+        );
+        let before = b2.len();
+        assert!(before <= IP_BUCKETS_CAP, "上限不变式（≤4096）");
+        assert_eq!(
+            b2.sweep(t1 + BUCKET_REFILL_SECS),
+            before - 1,
+            "其余 idle 行全清"
+        );
+        assert_eq!(b2.len(), 1, "仅 ip_new（fresh）留");
     }
 
     /// 审计环：stderr 同步 + 内存 ≤200 + 新→旧序 + denied 行亦留痕。

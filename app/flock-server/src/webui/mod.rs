@@ -87,7 +87,8 @@ pub async fn serve_state(
     // ② VIP 重试任务（tun 未就绪 ⇒ 5s 重试，永不 crash）。
     tokio::spawn(vip_rebind_loop(core.clone(), state.clone()));
 
-    // ③ 会话清扫（60s 周期）。
+    // ③ 会话清扫 + 退避/令牌桶清扫（60s 周期——SWEEP_PERIOD 同档复用，🟡 评审项 5：
+    //     两表容量上限在写路径惰性执行，周期清扫兜底回收过期/惰性行）。
     {
         let st = state.clone();
         tokio::spawn(async move {
@@ -97,6 +98,8 @@ pub async fn serve_state(
                 tick.tick().await;
                 let now = flock_protocol::trust::now_unix();
                 st.sessions.sweep(now);
+                st.backoff.sweep(now);
+                st.buckets.sweep(now);
             }
         });
     }
