@@ -94,6 +94,8 @@
     // —— 仪表盘 ——
     'dash.cluster': '集群',
     'dash.subtitle': '集群 {cluster} · 实时状态与流量（60s 轮询）',
+    // 集群卡三段之一（round2 评审项 8）：集群标识（hex 前 8 位，title 全值）
+    'dash.cluster.id': '集群标识',
     'dash.cluster.epoch': '纪元（epoch）',
     'dash.cluster.mode': '同步模式',
     'dash.servers': '服务器',

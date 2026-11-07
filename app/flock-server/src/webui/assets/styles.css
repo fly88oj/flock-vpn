@@ -417,6 +417,18 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .grid { display: grid; gap: var(--sp-4); }
 .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid-cards { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+/* dashboard 顶部两列（round2 评审项 8）：桌面（≥1200）集群卡 | 服务器区等高
+   并排——单服务器卡满右列，消除 1/3 宽断裂；<1200 块级默认单列堆叠。 */
+@media (min-width: 1200px) {
+  .dash-top { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: var(--sp-4); align-items: stretch; }
+  .dash-top > * { min-width: 0; }
+}
+/* 集群卡三段等距三列（round2 评审项 8）：标识 / 纪元 / 同步模式 */
+.kv-cols { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-4); margin-top: var(--sp-3); }
+.kv-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.kv-cell .k { color: var(--muted); font-size: var(--fs-xs); }
+.kv-cell .v { font-weight: 600; overflow-wrap: anywhere; }
+@media (max-width: 767.98px) { .kv-cols { gap: var(--sp-3); } }
 /* 服务器卡（🟡 UI 评审项 11）：桌面与集群卡 2 列对称；平板/手机单卡全宽 */
 .servers-grid { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fill, minmax(min(100%, 460px), 1fr)); }
 .kv { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-2) var(--sp-6); }
