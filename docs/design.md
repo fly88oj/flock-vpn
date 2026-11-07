@@ -1403,7 +1403,9 @@ flock-protocol 门禁含 wasm32 check（roster 纯数据无平台面）。
 
 **注册表扩展（Raft 静态面）**：`UserRow`（flock-sync/src/proto.rs；单服 netstate 同源
 再导出）增三字段——**postcard 无字段标签 ⇒ 旧快照/旧日志不可解码，未发布窗口允许**
-（§7-M7.1 同一纪律；升级残留旧库重建）：
+（§7-M7.1 同一纪律；升级残留旧库重建。单服 redb 行编码为 netstate 模块自持布局：
+三字段尾追加，pre-M8 旧行**宽容解码**为缺省值——既有单服部署升级不破库，与 flock-sync
+postcard 快照的「干净失败」是两个不同编码面）：
 
 ```rust
 pub struct UserRow {
@@ -1429,10 +1431,12 @@ SetUserAdmin { user: String, admin: bool }
 SetUserDisabled { user: String, disabled: bool }
 ```
 
-- **禁用语义**：disabled 用户 Web login-finish 401 `user_disabled`（login-begin 仍
-  dummy 同形不泄漏）、控制流 `LoginBegin` 增同一判定（**唯一动到既有控制流分发的
-  点**，测试覆盖）；已建数据面/控制流会话不追溯断开（设备级处置走既有
-  disable/revoke）——文档写明。
+- **禁用语义**：disabled 用户 Web login-finish 401 `user_disabled`（login-begin 对
+  未知用户/未设密码走 dummy 同形防枚举；对 disabled 用户**仍用真记录**——ke2 与
+  正常用户同形、不泄漏禁用态，诚实客户端得以完成 ke3 并在 finish 收到
+  `user_disabled`；禁用判定发生在口令证明成立之后，不泄漏额外信息）、控制流
+  `LoginBegin` 增同一判定（**唯一动到既有控制流分发的点**，测试覆盖）；已建数据面/
+  控制流会话不追溯断开（设备级处置走既有 disable/revoke）——文档写明。
 - **口令设置流（创建/重置共用）**：管理员 `POST /api/users`（或 reset-password）⇒
   响应一次性返回 `pw_bootstrap_token`（32hex，仅此一次，线下交付用户）⇒ 用户浏览器
   `POST /api/pw-begin {user, token, m1_b64}`（令牌预检只读、不消费）⇒
@@ -1844,3 +1848,4 @@ headless 冒烟（资产 content-type + wasm 可下载）进 CI。
 - 2026-11-06 M6 第二阶段（托盘进程）：新增 §7-M6.7（§7-M6.4 tray 行同步）——`flock-client tray` 落地：三项菜单（连接状态/VPN IP 动态只读 + 退出动作），2s 轮询刷新、Denied/IPC 失败⇒「服务未运行」继续重试；退出=对 token Shutdown⇒托盘退出（服务保持已安装）/daemon 不在⇒仅退托盘/Denied⇒不退出+token 失效重载；程序化 32×32 RGBA 图标（零资产文件）；平台库 tray-icon（Windows 最小 Win32 消息泵/macOS 主线程 NSApp 排空循环）+ ksni（Linux DBus SNI，零 GTK 系统依赖），不引 winit/tauri/egui；GUI 探测（Linux DISPLAY/WAYLAND+会话 DBus 前置判定，win/mac 创建失败兜底）无 GUI 一律优雅退出码 0；M6.5 feature 门控兑现（GUI 依赖全部 target 门控 optional、dep: 引用不匹配 target no-op，--no-default-features 三平台零 GUI 依赖——门禁实测）。验证边界如实：核心单测 + Windows 真进程 mock-daemon 实测（存活/刷新日志/状态一致/Shutdown 停服后转显服务未运行）；图标目视/退出点击/真 daemon 联测（需 invite+管理员）列 service-install.md 托盘真机清单；macOS 无设备未验证（apple target 工具链下载过慢未及编译级核验，API 按 crate 源核对）；Linux 桌面真机未验证（容器编译面过）。
 - 2026-11-07 M6/M7 服务端/同步层评审修复（本批 6 项）：① 回收器 last_seen=0 语义缺陷（§7-M7.5 修正）——DeviceRow 增 `registered_at`（注册/兑换时提交方注入落库，无观测时作保留期起算锚）+ 重启/视图未就绪闸门（单服=流量计零观测跳过；多主=租约表空/无远端事件跳过，`LeaseTable::remote_events` 信号 + 反熵循环自过滤）；② server_vip_of 一致性双形态断言（多主 open_sync 断言 cfg.vip==推导值、错误给期望值；单服 VIP 撞设备分配段拒起）；③ NetError::DeviceExists 独立变体（消灭 "already registered" 字符串契约）+ KeyBind re-register owner 校验（跨户改 hostname ⇒ NotAuthorized）；④ systemd 单元路径修正（/etc/systemd → /etc/systemd/system，样例+文档；install.rs 常量由客户端侧同名项同步）+ launchd plist 补 StandardErrorPath 与 newsyslog 轮转建议；⑤ CtrlResponse 变体位纪律固化（Err 之前冻结区、新变体尾部追加；PeerList 迁至 Err 后）+ 租约 EWMA 离线衰减（过期且无累加按窗 ×4/5 至 <8B/s 置 0——名册不呈现离线非零流量）+ §7-M7.2 措辞修正（「同设备身份复活」→「新设备身份（新钥匙）注册新行新 VIP」，同钥匙重注册走 re-register 的 hostname 更新）。
 - 2026-11-07 M8（服务端 Web UI·设计增补）：新增 §7-M8——进程内嵌 HTTP 管理面（**自研最小 HTTP/1.1，非 axum**：Cargo.lock 无 tower 系构件，暴露面仅 loopback+VIP，子集化拒 chunked/重复 Content-Length）；**双绑定 127.0.0.1:9800 + cfg.vip:9800**（配置不暴露 bind 字段——0.0.0.0 误配结构不可能；tun 未就绪 loopback 先行、VIP 5s 重试补绑）；访问矩阵 W-A1–A4（loopback/100.64.0.0/10 放行、其余 403 纵深、反代不承诺）；认证 = **OPAQUE 复用（HTTP 同语义新端点，不复用控制流消息）**+ anchor 保留（bootstrap 自证，不主张 MITM 防护）+ `UserRow.admin/disabled/pw_bootstrap` 三字段（Raft 行扩展，未发布窗口纪律）+ HttpOnly/SameSite=Strict 会话（32B sid、TTL 8h、上限 256、记录 loopback/vpn 来源）；**授权裁决**：Web 会话不映射控制流票据、写操作走 Raft 普通写（handler 层 admin 裁决）、`admin_op` 根签操作与 cluster-* 不进 UI；API 契约 §M8.4 逐字定死（22 端点/统一错误信封/CSRF 双门槛 X-Flock-Web+JSON）；口令创建/重置 = 一次性 `pw_bootstrap` 令牌（Raft 原子消费）；首 admin = `flock-server web-admin-add`（admin 端点尾部两变体，多主须经在跑服务）；流量时间序列 = 内存环形缓冲 120×60s（重启清零如实声明）；前端 = Alpine.js 3.14 + uPlot 1.6.9 + 自写深色设计系统，include_dir 内嵌，中文先行；wasm = C-ABI 垫片 `webauth_shim.rs`（showroom wasm_shim 手法 + 既有 getrandom custom 后端，无 wasm-bindgen）；测试 W1–W7 容器断言 + Rust 原生 OPAQUE 驱动 e2e；R 表增 R27。
+- 2026-11-07 M8a 落地（服务端全量·本批）：flock-sync 五写 + BadBootstrapToken（令牌判定先于记录——错令牌不泄漏是否已有口令；重放同错）+ users_snapshot；webui 模块七文件（http/session/access/api/series/assets/mod——文件落位 §M8.8 逐字）；netstate/backend 用户操作双臂（redb 行尾追加三字段、pre-M8 旧行宽容解码——与 postcard 快照干净失败是不同编码面）；admin 尾部 WebPwBegin/WebPwCommit（web_pw_commit 单一语义源，CLI 直写 fallback 共用）；控制流 LoginBegin 增 disabled 判定；CLI web-admin-add；[webui] 配置节（deny_unknown_fields 白名单键集 + 四面端口冲突拒起）；tests/webui.rs 4 项 + examples/webui_login 载具（cookie 缓存复用——逐子命令登录会耗尽 per-IP 桶）；deploy/webui.yml + webui_assert.sh + Dockerfile.webui（**W1/W2/W3/W5/W7 容器实测全 PASS**，W4/W6 留 M8b）。实现措辞澄清：disabled 用户 login-begin 用真记录（ke2 同形不泄漏禁用态，user_disabled 在口令证明成立后的 finish 返回——否则该错误码对诚实客户端不可达）。顺带清偿存量 clippy 债（新工具链 -D warnings 下的 dataplane 测试锁/unreachable 臂/needless return）。
