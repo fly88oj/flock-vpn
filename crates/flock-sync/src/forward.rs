@@ -186,6 +186,11 @@ impl ForwardPlane {
         self.me
     }
 
+    /// 租约表引用（测试/装配诊断面）。
+    pub fn leases(&self) -> &Arc<LeaseTable> {
+        &self.leases
+    }
+
     /// 本地在册会话设备集（租约续期循环用——长寿命会话的租约重发布，lease.rs）。
     pub fn local_devices(&self) -> Vec<[u8; 32]> {
         self.sessions
@@ -256,10 +261,15 @@ impl ForwardPlane {
         }
         let dst_dev = match self.sm.device_by_vip(&dst_vip.octets()) {
             Some(d) => d,
-            None => {
-                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+            // 服务器段 VIP 回退映射（与 ingest 1b 同源；服务器间 mesh 流量——
+            // §6.2 服务器段在设备表外）。
+            None => match crate::proto::server_vip_node(&dst_vip.octets()) {
+                Some(n) if n != self.me => server_self_device_id(n),
+                _ => {
+                    self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            },
         };
         // 源占位 [0;32]：非任何注册设备 ⇒ 失败路径（drop_with_icmp）找不到源会话，
         // 自然纯丢（内核出向的尽力语义）。
@@ -315,10 +325,17 @@ impl ForwardPlane {
                 }
             }
         }
-        // 1b. 目标 VIP → 设备归属。
-        let Some(dst_dev) = self.sm.device_by_vip(&dst_vip.octets()) else {
-            // 未注册目标：丢 + 尽力 ICMP。
-            return self.drop_with_icmp(device, pkt);
+        // 1b. 目标 VIP → 设备归属（设备注册表）。服务器段 VIP（§6.2 .1–.10）不在
+        //     设备表——按确定性推导映射到对应服务器的 server-self 合成设备
+        //     （§7-M8.2「任意服务器 VIP 可达」的跨服路径：ForwardEnvelope 到收端
+        //     后投其内核，receive 侧）。本机服务器 VIP 已在 1a 兜住（local_peer
+        //     未装配的窗口期按未注册目标处理——尽力 ICMP）。
+        let dst_dev = match self.sm.device_by_vip(&dst_vip.octets()) {
+            Some(dev) => dev,
+            None => match crate::proto::server_vip_node(&dst_vip.octets()) {
+                Some(n) if n != self.me => server_self_device_id(n),
+                _ => return self.drop_with_icmp(device, pkt),
+            },
         };
         self.deliver_or_forward_fwd(device, dst_dev, pkt).await
     }
@@ -470,6 +487,22 @@ impl ForwardPlane {
                 .fetch_add(1, Ordering::Relaxed);
             return ForwardOutcome::Rejected(RejectReason::SrcBinding);
         }
+        // dst = 本服务器自身（server-self 合成设备无会话 sink）⇒ 注本机内核——
+        // §7-M8.2「跨服则 ForwardEnvelope，收端投内核 fwd_delivered_kernel 路径」
+        //（webui 于任意服务器 VIP 可达的跨服面；本机 VIP 未装配内核 ⇒ NOT_HERE）。
+        if env.dst_dev == server_self_device_id(self.me) {
+            let local = self.local_peer.lock().expect("fwd local peer").clone();
+            if let Some((_, kernel)) = local {
+                if kernel.deliver(&env.payload).is_ok() {
+                    self.stats.delivered_kernel.fetch_add(1, Ordering::Relaxed);
+                    // M7 计数点：跨服 dst rx 由收端（= dst 真实持有者）计——服务器
+                    // 自身条目只在自身计（模块文档单点原则）。
+                    self.leases.note_rx(&env.dst_dev, env.payload.len() as u64);
+                    return ForwardOutcome::Delivered;
+                }
+            }
+            return ForwardOutcome::NotHere;
+        }
         // 本机投递或 NOT_HERE（hop 语义内禁止二次转发）。
         let sink = self
             .sessions
@@ -608,6 +641,233 @@ mod tests {
         let mut v6 = p.clone();
         v6[0] = 0x60;
         assert_eq!(ipv4_src(&v6), None, "非 IPv4 ⇒ 拒");
+    }
+
+    // —— M8b 跨服服务器 VIP 转发面测试具（§7-M8.2「任意服务器 VIP 可达」）——
+
+    use crate::hooks::HookRegistry;
+    use crate::lease::{GossipMsg, LeaseTable};
+    use crate::sm::SmCore;
+    use openraft::Entry;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    /// 捕获式 PacketSink（会话收件箱 / 内核注入泵共用）。
+    struct CapSink(StdMutex<Vec<Vec<u8>>>);
+    impl PacketSink for CapSink {
+        fn deliver(&self, pkt: &[u8]) -> io::Result<()> {
+            self.0.lock().unwrap().push(pkt.to_vec());
+            Ok(())
+        }
+    }
+
+    /// 捕获式互连（记录 (peer, envelope)，恒报 Delivered）。
+    struct CapTransport(StdMutex<Vec<(NodeId, ForwardEnvelope)>>);
+    impl ForwardTransport for CapTransport {
+        fn send(
+            &self,
+            peer: NodeId,
+            env: ForwardEnvelope,
+        ) -> BoxFuture<'static, io::Result<ForwardOutcome>> {
+            self.0.lock().unwrap().push((peer, env));
+            Box::pin(async { Ok(ForwardOutcome::Delivered) })
+        }
+    }
+
+    struct NoFanout;
+    impl crate::lease::LocateFanout for NoFanout {
+        fn locate(&self, _device: &[u8; 32]) -> BoxFuture<'static, Option<NodeId>> {
+            Box::pin(async { None })
+        }
+    }
+
+    fn entry_of(idx: u64, req: crate::proto::SyncRequest) -> Entry<crate::raft_types::SyncConfig> {
+        Entry {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), idx),
+            payload: openraft::EntryPayload::Normal(req),
+        }
+    }
+
+    /// node 1 上的转发面（含注册设备 dev=sha(ed25519=[1;32]) @ vip 100.64.0.11，
+    /// 会话 sink 已挂）。
+    async fn plane_with_device() -> (Arc<ForwardPlane>, [u8; 32], Arc<CapSink>, Arc<CapTransport>) {
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = redb::Database::create(dir.path().join("fwd.redb")).expect("db");
+        let sm = SmCore::empty(Arc::new(db), None);
+        let root = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let dev: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest([1u8; 32]).into()
+        };
+        sm.apply_entries(&[
+            entry_of(
+                1,
+                crate::proto::SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32]),
+            ),
+            entry_of(
+                2,
+                crate::proto::SyncRequest::RegisterDevice {
+                    owner: "u".into(),
+                    x25519: [2; 32],
+                    ed25519: [1; 32],
+                    hostname: "t".into(),
+                    registered_at_unix: 1,
+                },
+            ),
+        ])
+        .await;
+        let leases = LeaseTable::new(1, Duration::from_secs(60), HookRegistry::new());
+        let plane = ForwardPlane::new(1, sm, leases);
+        let sess = Arc::new(CapSink(StdMutex::new(Vec::new())));
+        plane.attach_session(dev, sess.clone());
+        let t = Arc::new(CapTransport(StdMutex::new(Vec::new())));
+        plane.set_transport(t.clone(), Arc::new(NoFanout));
+        (plane, dev, sess, t)
+    }
+
+    /// ingest：dst = 远端服务器 VIP（100.64.0.2，非设备表行）⇒ 服务器段回退映射 →
+    /// ForwardEnvelope(dst_dev=server_self(2)) 发往 node 2。
+    #[tokio::test]
+    async fn ingest_to_remote_server_vip_forwards_to_self_device() {
+        let (plane, dev, _sess, t) = plane_with_device().await;
+        // node 2 的 server-self 租约（gossip 视图）。
+        plane.leases().merge_remote(GossipMsg::Publish {
+            device: server_self_device_id(2),
+            holder: 2,
+            term_ms: 1,
+            tx_ewma: 0,
+            rx_ewma: 0,
+            last_seen_unix: 1,
+        });
+        let pkt = ip4(
+            "100.64.0.11".parse().unwrap(),
+            "100.64.0.2".parse().unwrap(),
+            b"req",
+        );
+        let r = plane.ingest(&dev, &pkt).await;
+        assert!(
+            matches!(r, IngestResult::Forwarded(ForwardOutcome::Delivered)),
+            "{r:?}"
+        );
+        let sent = t.0.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let (peer, env) = &sent[0];
+        assert_eq!(*peer, 2, "发往 node 2（lease holder）");
+        assert_eq!(env.dst_dev, server_self_device_id(2));
+        assert_eq!(env.src_dev, dev);
+        assert_eq!(env.origin_server, 1);
+        assert_eq!(env.hop, 1, "hop=1（禁止二次转发）");
+    }
+
+    /// ingest：dst = 未注册的非服务器段 VIP ⇒ 丢 + 尽力 ICMP（回退映射不越界）。
+    #[tokio::test]
+    async fn ingest_to_unknown_device_vip_still_icmp() {
+        let (plane, dev, sess, _t) = plane_with_device().await;
+        let pkt = ip4(
+            "100.64.0.11".parse().unwrap(),
+            "100.64.0.99".parse().unwrap(),
+            b"x",
+        );
+        let r = plane.ingest(&dev, &pkt).await;
+        assert!(matches!(r, IngestResult::DroppedIcmp), "{r:?}");
+        assert_eq!(sess.0.lock().unwrap().len(), 1, "尽力 ICMP 回源会话");
+    }
+
+    /// receive：dst_dev = 本服务器 server-self ⇒ 注本机内核（delivered_kernel）。
+    #[tokio::test]
+    async fn receive_for_server_self_delivers_to_kernel() {
+        let (plane, dev, _sess, _t) = plane_with_device().await;
+        let kern = Arc::new(CapSink(StdMutex::new(Vec::new())));
+        plane.set_local_peer("100.64.0.1".parse().unwrap(), kern.clone());
+        let pkt = ip4(
+            "100.64.0.11".parse().unwrap(),
+            "100.64.0.1".parse().unwrap(),
+            b"req",
+        );
+        let env = ForwardEnvelope {
+            ver: FORWARD_VER,
+            src_dev: dev,
+            dst_dev: server_self_device_id(1),
+            origin_server: 2,
+            hop: 1,
+            payload: pkt,
+        };
+        assert!(matches!(plane.receive(env), ForwardOutcome::Delivered));
+        assert_eq!(kern.0.lock().unwrap().len(), 1, "包入本机内核写泵");
+        assert_eq!(plane.stats().delivered_kernel, 1);
+    }
+
+    /// receive：dst_dev = 本服务器 server-self 但源绑定失配（内层 src ≠ 注册 VIP）
+    /// ⇒ Rejected（server-self 投内核不放松第 0 步校验）。
+    #[tokio::test]
+    async fn receive_for_server_self_bad_src_rejected() {
+        let (plane, dev, _sess, _t) = plane_with_device().await;
+        let kern = Arc::new(CapSink(StdMutex::new(Vec::new())));
+        plane.set_local_peer("100.64.0.1".parse().unwrap(), kern.clone());
+        let pkt = ip4(
+            "100.64.0.12".parse().unwrap(), // ≠ dev 注册 VIP .11
+            "100.64.0.1".parse().unwrap(),
+            b"x",
+        );
+        let env = ForwardEnvelope {
+            ver: FORWARD_VER,
+            src_dev: dev,
+            dst_dev: server_self_device_id(1),
+            origin_server: 2,
+            hop: 1,
+            payload: pkt,
+        };
+        assert!(matches!(
+            plane.receive(env),
+            ForwardOutcome::Rejected(RejectReason::SrcBinding)
+        ));
+        assert!(kern.0.lock().unwrap().is_empty(), "未触内核");
+    }
+
+    /// route_outbound：本机内核 → 远端服务器 VIP（服务器间 mesh 流量面，回退映射）。
+    #[tokio::test]
+    async fn outbound_to_remote_server_vip_forwards() {
+        let (plane, _dev, _sess, t) = plane_with_device().await;
+        plane.leases().merge_remote(GossipMsg::Publish {
+            device: server_self_device_id(2),
+            holder: 2,
+            term_ms: 1,
+            tx_ewma: 0,
+            rx_ewma: 0,
+            last_seen_unix: 1,
+        });
+        let pkt = ip4(
+            "100.64.0.1".parse().unwrap(),
+            "100.64.0.2".parse().unwrap(),
+            b"srv",
+        );
+        plane.route_outbound(&pkt).await;
+        let sent = t.0.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, 2);
+        assert_eq!(sent[0].1.dst_dev, server_self_device_id(2));
+    }
+
+    /// server_vip_of / server_vip_node 往返（段内/段外界点）。
+    #[test]
+    fn server_vip_roundtrip() {
+        for n in 1u64..=10 {
+            let v = crate::proto::server_vip_of(n).unwrap();
+            assert_eq!(crate::proto::server_vip_node(&v), Some(n));
+        }
+        assert_eq!(crate::proto::server_vip_of(0), None);
+        assert_eq!(crate::proto::server_vip_of(11), None);
+        assert_eq!(
+            crate::proto::server_vip_node(&[100, 64, 0, 11]),
+            None,
+            "设备段"
+        );
+        assert_eq!(crate::proto::server_vip_node(&[100, 64, 0, 0]), None);
+        assert_eq!(
+            crate::proto::server_vip_node(&[100, 64, 1, 2]),
+            None,
+            "段外第三字节"
+        );
     }
 
     #[test]

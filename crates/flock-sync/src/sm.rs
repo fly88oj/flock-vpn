@@ -193,7 +193,7 @@ impl SmCore {
     }
 
     /// 执行一批日志的 apply（核心转移 + 钩子触发 + watch 推进）。
-    async fn apply_entries(&self, entries: &[Entry<SyncConfig>]) -> Vec<SyncResponse> {
+    pub(crate) async fn apply_entries(&self, entries: &[Entry<SyncConfig>]) -> Vec<SyncResponse> {
         self.lag.maybe_delay().await;
         let mut out = Vec::with_capacity(entries.len());
         let mut new_epoch: Option<u64> = None;

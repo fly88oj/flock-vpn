@@ -43,6 +43,16 @@ pub fn server_vip_of(node_id: NodeId) -> Option<[u8; 4]> {
         .then_some([100, 64, 0, node_id as u8])
 }
 
+/// [`server_vip_of`] 的逆：服务器段 VIP（`100.64.0.1`–`.10`）→ node id；非服务器
+/// 段地址 ⇒ None。M8b 转发面用（客户端包 dst = 远端服务器 VIP ⇒ 映射到该服务器
+/// 的 server-self 合成设备走 ForwardEnvelope——§7-M8.2「任意服务器 VIP 可达」）。
+pub fn server_vip_node(vip: &[u8; 4]) -> Option<NodeId> {
+    match vip {
+        [100, 64, 0, n @ 1..=10] => Some(u64::from(*n)),
+        _ => None,
+    }
+}
+
 /// 管理操作签名域分离标签（canonical 字节前缀）。
 const L_ADMIN: &[u8] = b"flock-sync/admin/v1";
 /// server_keys 签名域分离标签（目录更名 ch-sync→flock-sync 的漏网点——未发布窗口
