@@ -346,7 +346,9 @@
                             <span class="field-hint" x-show="me && u.username === me.user" x-text="t('users.me')"></span></td>
                           <td :data-label="t('users.col.role')"><span class="badge" :class="u.admin ? 'badge-admin' : 'badge-muted'" x-text="u.admin ? t('users.role.admin') : t('users.role.plain')"></span></td>
                           <td :data-label="t('users.col.disabled')"><span class="badge" :class="u.disabled ? 'badge-danger' : 'badge-success'" x-text="u.disabled ? t('users.disabled.yes') : t('users.disabled.no')"></span></td>
-                          <td :data-label="t('users.col.password')" class="hide-narrow"><span class="badge badge-muted" x-text="u.has_password ? t('users.password.set') : t('users.password.none')"></span></td>
+                          <!-- 口令徽标（round2 评审项 6）：「未设置」琥珀描边胶囊——
+                               需引导关注；「已设置」维持灰底胶囊。 -->
+                          <td :data-label="t('users.col.password')" class="hide-narrow"><span class="badge" :class="u.has_password ? 'badge-muted' : 'badge-outline-warn'" x-text="u.has_password ? t('users.password.set') : t('users.password.none')"></span></td>
                           <td :data-label="t('users.col.devices')" class="num td-num" x-text="u.devices"></td>
                           <td data-label="">
                             <div class="row-actions">
