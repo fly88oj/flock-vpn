@@ -885,6 +885,17 @@ impl SyncNode {
             .with_data(|d| d.devices.iter().map(|(k, v)| (*k, v.clone())).collect())
     }
 
+    /// M8（§7-M8.4 `/api/users`·`/api/dashboard/summary`）：用户表快照——本地已
+    /// apply 视图（展示面档位，与 [`SyncNode::devices_snapshot`] 同一致性级别）。
+    pub fn users_snapshot(&self) -> Vec<(String, crate::proto::UserRow)> {
+        self.inner.sm.with_data(|d| {
+            d.users
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+    }
+
     /// M7（§7-M7.4）：server_keys 快照（本地已 apply 视图——名册 Server 条目的
     /// vip/节点号数据源）。
     pub fn server_keys_snapshot(&self) -> Vec<(NodeId, crate::proto::ServerKeyEntry)> {

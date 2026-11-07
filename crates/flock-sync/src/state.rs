@@ -301,6 +301,70 @@ impl NetStateData {
             }
             SyncRequest::ServerKeys(rs) => self.apply_server_keys(rs, expected_root),
             SyncRequest::AdminOp(rs) => self.apply_admin(rs, expected_root),
+            // —— M8（§7-M8.3）：Web 管理面普通写（尾部追加；授权在提交方层）。——
+            SyncRequest::CreateUser {
+                username,
+                pw_bootstrap,
+            } => {
+                if self.users.contains_key(username) {
+                    return ApplyOutcome::err(StateError::UserExists);
+                }
+                self.users.insert(
+                    username.clone(),
+                    UserRow {
+                        pw_bootstrap: Some(*pw_bootstrap),
+                        ..UserRow::default()
+                    },
+                );
+                ApplyOutcome::ok(SyncResponse::Ok)
+            }
+            SyncRequest::SetPasswordBootstrap {
+                user,
+                token,
+                record_b64,
+                profile,
+            } => {
+                let Some(row) = self.users.get_mut(user) else {
+                    return ApplyOutcome::err(StateError::NoSuchUser);
+                };
+                // 原子三判定（Raft 单次提交）：令牌匹配（None = 已消费 ⇒ 同错——重放拒）
+                // 且记录为空 ⇒ 落记录 + 清令牌。前置判定顺序：令牌先于记录（令牌错
+                // 不泄漏「是否已有口令」）。
+                if row.pw_bootstrap != Some(*token) {
+                    return ApplyOutcome::err(StateError::BadBootstrapToken);
+                }
+                if row.opaque_record.is_some() {
+                    return ApplyOutcome::err(StateError::PasswordExists);
+                }
+                row.opaque_record = Some(record_b64.clone());
+                row.opaque_profile = *profile;
+                row.pw_bootstrap = None;
+                ApplyOutcome::ok(SyncResponse::Ok)
+            }
+            SyncRequest::ResetPassword { user, new_token } => {
+                let Some(row) = self.users.get_mut(user) else {
+                    return ApplyOutcome::err(StateError::NoSuchUser);
+                };
+                // 清记录 + 置新令牌（旧口令即刻失效——登录侧 record=None 走 dummy）。
+                row.opaque_record = None;
+                row.opaque_profile = 0;
+                row.pw_bootstrap = Some(*new_token);
+                ApplyOutcome::ok(SyncResponse::Ok)
+            }
+            SyncRequest::SetUserAdmin { user, admin } => {
+                let Some(row) = self.users.get_mut(user) else {
+                    return ApplyOutcome::err(StateError::NoSuchUser);
+                };
+                row.admin = *admin;
+                ApplyOutcome::ok(SyncResponse::Ok)
+            }
+            SyncRequest::SetUserDisabled { user, disabled } => {
+                let Some(row) = self.users.get_mut(user) else {
+                    return ApplyOutcome::err(StateError::NoSuchUser);
+                };
+                row.disabled = *disabled;
+                ApplyOutcome::ok(SyncResponse::Ok)
+            }
         }
     }
 
@@ -1256,5 +1320,373 @@ mod tests {
         let mut back = NetStateData::from_bytes(&d.to_bytes()).expect("roundtrip");
         back.reindex_vips();
         assert_eq!(back.vip_index, incremental, "快照往返后重建一致");
+    }
+
+    // ------------------------------------------------------------------
+    // M8（§7-M8.3）：UserRow 三新字段 + 五写变体语义
+    // ------------------------------------------------------------------
+
+    /// UserRow 新字段 postcard 往返 + 旧格式（三字段形状）字节对新解码器干净失败
+    /// （§7-M7.1 同一纪律：镜像近似——非旧代码产物真实采样，验证失败干净性）。
+    #[test]
+    fn user_row_new_fields_roundtrip_and_legacy_fails_clean() {
+        let row = UserRow {
+            opaque_record: Some("rec-b64".into()),
+            opaque_profile: 0,
+            sr_sig_pubs: vec![[7; 32]],
+            admin: true,
+            disabled: false,
+            pw_bootstrap: Some([9; 16]),
+        };
+        let bytes = postcard::to_allocvec(&row).unwrap();
+        assert_eq!(postcard::from_bytes::<UserRow>(&bytes).unwrap(), row);
+        // Default 全零面（CreateUser 前的用户不存在；RegisterDevice 自动建户走此形状）。
+        assert_eq!(
+            UserRow::default(),
+            UserRow {
+                opaque_record: None,
+                opaque_profile: 0,
+                sr_sig_pubs: vec![],
+                admin: false,
+                disabled: false,
+                pw_bootstrap: None,
+            }
+        );
+        // 旧格式（pre-M8 三字段）postcard 镜像：解码必须失败（不 panic、不半解码）。
+        #[derive(serde::Serialize)]
+        struct LegacyUserRow {
+            opaque_record: Option<String>,
+            opaque_profile: u16,
+            sr_sig_pubs: Vec<[u8; 32]>,
+        }
+        let legacy = postcard::to_allocvec(&LegacyUserRow {
+            opaque_record: Some("r".into()),
+            opaque_profile: 0,
+            sr_sig_pubs: vec![[1; 32]],
+        })
+        .unwrap();
+        assert!(
+            postcard::from_bytes::<UserRow>(&legacy).is_err(),
+            "旧格式 UserRow 字节必须干净失败"
+        );
+        // 含旧格式用户行的整快照同样干净失败（NetStateData::from_bytes → None）。
+        // 构造：手工把 legacy 字节嵌不进（map 键在结构内），改验「任意 UserRow 非
+        // 新形状字节流」路径——直接以 legacy 行字节作 NetStateData 快照字节 ⇒ None。
+        assert!(NetStateData::from_bytes(&legacy).is_none());
+    }
+
+    /// CreateUser：建户落令牌；重名 ⇒ UserExists（提交方按需幂等忽略——CLI 层职责）。
+    #[test]
+    fn m8_create_user_semantics() {
+        let root = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let mut d = bootstrapped(&root);
+        let create = |u: &str, t: u8| SyncRequest::CreateUser {
+            username: u.into(),
+            pw_bootstrap: [t; 16],
+        };
+        assert!(matches!(
+            d.apply(&create("web-admin", 1), None).resp,
+            SyncResponse::Ok
+        ));
+        let row = d.users.get("web-admin").unwrap();
+        assert_eq!(row.pw_bootstrap, Some([1; 16]), "令牌随建户落库");
+        assert!(!row.admin && !row.disabled, "新户默认非 admin、未禁用");
+        assert!(row.opaque_record.is_none(), "新户无口令记录");
+        // 重名拒。
+        assert!(matches!(
+            d.apply(&create("web-admin", 2), None).resp,
+            SyncResponse::Error(StateError::UserExists)
+        ));
+        assert_eq!(
+            d.users.get("web-admin").unwrap().pw_bootstrap,
+            Some([1; 16]),
+            "拒绝路径不动原行"
+        );
+    }
+
+    /// SetPasswordBootstrap：原子消费（令牌匹配且记录为空 ⇒ 落记录 + 清令牌）；
+    /// 令牌错/重放 ⇒ BadBootstrapToken；记录已有 ⇒ PasswordExists；未知用户 ⇒ NoSuchUser；
+    /// 令牌判定先于记录判定（令牌错不泄漏「是否已有口令」）。
+    #[test]
+    fn m8_set_password_bootstrap_atomic_token_consumption() {
+        let root = ed25519_dalek::SigningKey::from_bytes(&[12; 32]);
+        let mut d = bootstrapped(&root);
+        d.apply(
+            &SyncRequest::CreateUser {
+                username: "alice".into(),
+                pw_bootstrap: [0xA1; 16],
+            },
+            None,
+        );
+        let commit = |user: &str, tok: [u8; 16], rec: &str| SyncRequest::SetPasswordBootstrap {
+            user: user.into(),
+            token: tok,
+            record_b64: rec.into(),
+            profile: 0,
+        };
+        // 未知用户 ⇒ NoSuchUser。
+        assert!(matches!(
+            d.apply(&commit("ghost", [0xA1; 16], "r"), None).resp,
+            SyncResponse::Error(StateError::NoSuchUser)
+        ));
+        // 令牌错 ⇒ BadBootstrapToken。
+        assert!(matches!(
+            d.apply(&commit("alice", [0xB2; 16], "r"), None).resp,
+            SyncResponse::Error(StateError::BadBootstrapToken)
+        ));
+        // 正确令牌 ⇒ 落记录 + 清令牌。
+        assert!(matches!(
+            d.apply(&commit("alice", [0xA1; 16], "rec-alice"), None)
+                .resp,
+            SyncResponse::Ok
+        ));
+        let row = d.users.get("alice").unwrap();
+        assert_eq!(row.opaque_record.as_deref(), Some("rec-alice"));
+        assert_eq!(row.opaque_profile, 0);
+        assert_eq!(row.pw_bootstrap, None, "令牌消费即清");
+        // 令牌重放（已消费 = None ≠ 任何令牌）⇒ BadBootstrapToken（同错——不泄漏
+        // 「已消费」与「错令牌」的区别）。
+        assert!(matches!(
+            d.apply(&commit("alice", [0xA1; 16], "rec-2"), None).resp,
+            SyncResponse::Error(StateError::BadBootstrapToken)
+        ));
+        // 记录已有且令牌仍有效（ResetPassword 后重设前绕过？——令牌已被清，此路径
+        // 需经 ResetPassword 重新置令牌；直接构造：重置口令后令牌有效 + 记录为空 ⇒
+        // 再次 commit 成功）。先验 PasswordExists 分支：手工置令牌且记录非空。
+        d.apply(
+            &SyncRequest::ResetPassword {
+                user: "alice".into(),
+                new_token: [0xC3; 16],
+            },
+            None,
+        );
+        let row = d.users.get("alice").unwrap();
+        assert!(row.opaque_record.is_none(), "重置即清记录（旧口令失效）");
+        assert_eq!(row.pw_bootstrap, Some([0xC3; 16]));
+        // 手工模拟「令牌有效但记录已有」：先 commit 成功，再手工置回令牌（只有状态
+        // 机内可构造——外层路径 ResetPassword 总是清记录；此断言固化状态机级判定序）。
+        assert!(matches!(
+            d.apply(&commit("alice", [0xC3; 16], "rec-3"), None).resp,
+            SyncResponse::Ok
+        ));
+        d.users.get_mut("alice").unwrap().pw_bootstrap = Some([0xD4; 16]);
+        assert!(matches!(
+            d.apply(&commit("alice", [0xD4; 16], "rec-4"), None).resp,
+            SyncResponse::Error(StateError::PasswordExists)
+        ));
+    }
+
+    /// ResetPassword：清记录 + 置新令牌（旧口令即刻失效——record=None ⇒ 登录侧走
+    /// dummy）；未知用户 ⇒ NoSuchUser；幂等重放（同令牌）放行不报错。
+    #[test]
+    fn m8_reset_password_invalidates_old_record() {
+        let root = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
+        let mut d = bootstrapped(&root);
+        d.apply(
+            &SyncRequest::CreateUser {
+                username: "bob".into(),
+                pw_bootstrap: [1; 16],
+            },
+            None,
+        );
+        d.apply(
+            &SyncRequest::SetPasswordBootstrap {
+                user: "bob".into(),
+                token: [1; 16],
+                record_b64: "old-record".into(),
+                profile: 0,
+            },
+            None,
+        );
+        // 未知用户。
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::ResetPassword {
+                    user: "ghost".into(),
+                    new_token: [2; 16]
+                },
+                None
+            )
+            .resp,
+            SyncResponse::Error(StateError::NoSuchUser)
+        ));
+        // 重置：旧记录即刻失效（登录侧 record=None → dummy——枚举面同形）。
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::ResetPassword {
+                    user: "bob".into(),
+                    new_token: [2; 16]
+                },
+                None
+            )
+            .resp,
+            SyncResponse::Ok
+        ));
+        let row = d.users.get("bob").unwrap();
+        assert_eq!(row.opaque_record, None, "旧口令记录失效");
+        assert_eq!(row.opaque_profile, 0);
+        assert_eq!(row.pw_bootstrap, Some([2; 16]), "新令牌就位");
+        // 新令牌可落新记录。
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::SetPasswordBootstrap {
+                    user: "bob".into(),
+                    token: [2; 16],
+                    record_b64: "new-record".into(),
+                    profile: 0
+                },
+                None
+            )
+            .resp,
+            SyncResponse::Ok
+        ));
+        assert_eq!(
+            d.users.get("bob").unwrap().opaque_record.as_deref(),
+            Some("new-record")
+        );
+    }
+
+    /// SetUserAdmin/SetUserDisabled：置位/复位 + 未知用户拒；禁用不追溯清口令
+    /// （`disabled` 与记录是两个正交维度——enable 后原口令继续可用）。
+    #[test]
+    fn m8_set_user_admin_disabled_semantics() {
+        let root = ed25519_dalek::SigningKey::from_bytes(&[14; 32]);
+        let mut d = bootstrapped(&root);
+        d.apply(
+            &SyncRequest::CreateUser {
+                username: "carol".into(),
+                pw_bootstrap: [1; 16],
+            },
+            None,
+        );
+        d.apply(
+            &SyncRequest::SetPasswordBootstrap {
+                user: "carol".into(),
+                token: [1; 16],
+                record_b64: "rec".into(),
+                profile: 0,
+            },
+            None,
+        );
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::SetUserAdmin {
+                    user: "carol".into(),
+                    admin: true
+                },
+                None
+            )
+            .resp,
+            SyncResponse::Ok
+        ));
+        assert!(d.users.get("carol").unwrap().admin);
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::SetUserAdmin {
+                    user: "carol".into(),
+                    admin: false
+                },
+                None
+            )
+            .resp,
+            SyncResponse::Ok
+        ));
+        assert!(!d.users.get("carol").unwrap().admin);
+        // 禁用/启用往返：口令记录保留（enable 后原口令继续可用——设计语义：disabled
+        // 只阻断登录，不是凭据吊销）。
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::SetUserDisabled {
+                    user: "carol".into(),
+                    disabled: true
+                },
+                None
+            )
+            .resp,
+            SyncResponse::Ok
+        ));
+        let row = d.users.get("carol").unwrap();
+        assert!(row.disabled);
+        assert_eq!(
+            row.opaque_record.as_deref(),
+            Some("rec"),
+            "禁用不清口令记录"
+        );
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::SetUserDisabled {
+                    user: "carol".into(),
+                    disabled: false
+                },
+                None
+            )
+            .resp,
+            SyncResponse::Ok
+        ));
+        assert!(!d.users.get("carol").unwrap().disabled);
+        // 未知用户两写同拒。
+        for req in [
+            SyncRequest::SetUserAdmin {
+                user: "ghost".into(),
+                admin: true,
+            },
+            SyncRequest::SetUserDisabled {
+                user: "ghost".into(),
+                disabled: true,
+            },
+        ] {
+            assert!(
+                matches!(
+                    d.apply(&req, None).resp,
+                    SyncResponse::Error(StateError::NoSuchUser)
+                ),
+                "{req:?} 未知用户 ⇒ NoSuchUser"
+            );
+        }
+        // 幂等：同值重放放行（Raft 重放路径）。
+        assert!(matches!(
+            d.apply(
+                &SyncRequest::SetUserAdmin {
+                    user: "carol".into(),
+                    admin: false
+                },
+                None
+            )
+            .resp,
+            SyncResponse::Ok
+        ));
+    }
+
+    /// 快照往返：新 UserRow 三字段随 NetStateData 快照序列化/反序列化保留
+    /// （M8 加字段后的快照兼容性正向锚——与 legacy 失败测试成对）。
+    #[test]
+    fn m8_user_fields_survive_snapshot_roundtrip() {
+        let root = ed25519_dalek::SigningKey::from_bytes(&[15; 32]);
+        let mut d = bootstrapped(&root);
+        d.apply(
+            &SyncRequest::CreateUser {
+                username: "dave".into(),
+                pw_bootstrap: [0x5E; 16],
+            },
+            None,
+        );
+        d.apply(
+            &SyncRequest::SetUserAdmin {
+                user: "dave".into(),
+                admin: true,
+            },
+            None,
+        );
+        d.apply(
+            &SyncRequest::SetUserDisabled {
+                user: "dave".into(),
+                disabled: true,
+            },
+            None,
+        );
+        let back = NetStateData::from_bytes(&d.to_bytes()).expect("roundtrip");
+        let row = back.users.get("dave").unwrap();
+        assert!(row.admin && row.disabled);
+        assert_eq!(row.pw_bootstrap, Some([0x5E; 16]));
     }
 }

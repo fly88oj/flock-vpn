@@ -113,12 +113,22 @@ pub struct DeviceRow {
     pub registered_at: u64,
 }
 
-/// 用户行：OPAQUE 注册记录 + SR-SIG1 用户公钥集（§2.4）。
+/// 用户行：OPAQUE 注册记录 + SR-SIG1 用户公钥集（§2.4）+ M8 Web 管理面三字段
+/// （§7-M8.3 逐字：admin/disabled/pw_bootstrap——postcard 无字段标签 ⇒ 旧快照/旧
+/// 日志不可解码，未发布窗口允许（§7-M7.1 同一纪律；升级残留旧库重建））。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserRow {
     pub opaque_record: Option<String>,
     pub opaque_profile: u16,
     pub sr_sig_pubs: Vec<[u8; 32]>,
+    /// M8：Web 管理角色（决定 webui 管理端点授权）。
+    pub admin: bool,
+    /// M8：禁用 ⇒ 阻断 Web 与控制流登录（不追溯断开已建会话；设备级断离走
+    /// disable/revoke）。
+    pub disabled: bool,
+    /// M8：初始/重置口令一次性引导令牌（消费即置 None；与 invite_id 同信任级——
+    /// Raft 状态内可读、单次消费）。
+    pub pw_bootstrap: Option<[u8; 16]>,
 }
 
 /// 邀请状态（一次性凭据，§1.3.3f）。
@@ -300,6 +310,30 @@ pub enum SyncRequest {
     SetOprf(RootSigned<String>),
     /// admin_op（add_voter/rewrap/revoke_invite；根签管理操作，状态机验签后生效）。
     AdminOp(RootSigned<AdminOp>),
+    // —— M8（§7-M8.3）尾部追加：Web 管理面普通写（无根签要求——授权在提交方
+    //    handler/CLI 层，与 SetPassword/AddUserSigKey 同型）。——
+    /// 创建用户（无口令记录，携一次性引导令牌）；已存在 ⇒ `StateError::UserExists`
+    /// （提交方按需幂等忽略——`web-admin-add` 的多主路径）。
+    CreateUser {
+        username: String,
+        pw_bootstrap: [u8; 16],
+    },
+    /// 引导令牌落口令记录（原子：令牌匹配 且 记录为空 ⇒ 落记录 + 清令牌；
+    /// 令牌错/已消费 ⇒ `StateError::BadBootstrapToken`；记录已有 ⇒
+    /// `StateError::PasswordExists`）。
+    SetPasswordBootstrap {
+        user: String,
+        token: [u8; 16],
+        record_b64: String,
+        profile: u16,
+    },
+    /// 管理员重置口令：清口令记录 + 置新引导令牌（旧口令即刻失效）。
+    ResetPassword { user: String, new_token: [u8; 16] },
+    /// 设/撤 Web 管理角色（`cannot_demote_self` 的会话侧裁决在 webui handler 层——
+    /// 状态机不知会话主体）。
+    SetUserAdmin { user: String, admin: bool },
+    /// 禁用/启用用户（阻断 Web 与控制流登录；不追溯断开已建会话）。
+    SetUserDisabled { user: String, disabled: bool },
 }
 
 impl SyncRequest {
@@ -377,6 +411,9 @@ pub enum StateError {
     NoSuchUser,
     /// bind_token 已消费（一次性凭据重放）。
     BindTokenUsed,
+    /// M8：口令引导令牌不匹配/已被消费（一次性凭据；SetPasswordBootstrap 的状态机
+    /// 级拒绝——幂等重放即同错）。
+    BadBootstrapToken,
 }
 
 impl std::fmt::Display for StateError {
@@ -406,6 +443,7 @@ impl std::fmt::Display for StateError {
             StateError::PasswordExists => write!(f, "password already set"),
             StateError::NoSuchUser => write!(f, "no such user"),
             StateError::BindTokenUsed => write!(f, "bind_token already consumed"),
+            StateError::BadBootstrapToken => write!(f, "bad or consumed password bootstrap token"),
         }
     }
 }
