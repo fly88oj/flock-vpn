@@ -50,7 +50,7 @@
         <div class="who">
           <span class="dot" :class="me && 'dot-on'"></span>
           <span x-text="me && me.user"></span>
-          <span class="badge badge-accent" x-show="isAdmin" x-text="t('app.admin')"></span>
+          <span class="badge badge-admin" x-show="isAdmin" x-text="t('app.admin')"></span>
           <span class="badge badge-muted" x-show="!isAdmin" x-text="t('app.user')"></span>
         </div>
         <div x-text="me && (me.origin === 'vpn' ? t('nav.origin.vpn') : t('nav.origin.loopback'))"></div>
@@ -61,11 +61,13 @@
     <div class="drawer-scrim" x-show="navOpen" x-cloak @click="navOpen=false"></div>
 
     <div class="main">
-      <!-- 顶栏（<1200） -->
+      <!-- 顶栏（<1200）：中小视口补 24px 品牌方块（🟡 UI 评审项 9） -->
       <header class="topbar">
-        <button class="icon-btn" @click="navOpen=true" :aria-label="t('nav.menu')">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        <button class="icon-btn" @click="navOpen = !navOpen" :aria-label="t('nav.menu')" :aria-expanded="navOpen">
+          <svg x-show="!navOpen" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+          <svg x-show="navOpen" x-cloak viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>
         </button>
+        <span class="brand-mark brand-mark-sm" aria-hidden="true">F</span>
         <strong x-text="t('app.name')"></strong>
       </header>
 
@@ -90,9 +92,9 @@
           </template>
 
           <template x-if="summary">
-            <div>
+            <div class="stack">
               <!-- 集群状态 -->
-              <div class="card" style="margin-bottom:16px">
+              <div class="card">
                 <div class="kicker" x-text="t('dash.cluster')"></div>
                 <div class="grid grid-2" style="margin-top:8px">
                   <div class="kv-row"><span class="k" x-text="t('dash.cluster.epoch')"></span><span class="v num mono" x-text="summary.cluster.epoch"></span></div>
@@ -101,9 +103,9 @@
               </div>
 
               <!-- 服务器卡片（leader 徽标 / epoch / 在线） -->
-              <div style="margin-bottom:16px">
+              <div>
                 <div class="kicker" style="margin-bottom:8px" x-text="t('dash.servers')"></div>
-                <div class="grid-cards">
+                <div class="servers-grid">
                   <template x-for="s in (summary.servers || [])" :key="s.node_id">
                     <div class="card">
                       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
@@ -125,20 +127,20 @@
               </div>
 
               <!-- 汇总 -->
-              <div style="margin-bottom:16px">
+              <div>
                 <div class="kicker" style="margin-bottom:8px" x-text="t('dash.totals')"></div>
                 <div class="stat-grid">
                   <div class="stat"><div class="stat-label" x-text="t('dash.totals.devices')"></div><div class="stat-value num" x-text="summary.totals.devices"></div></div>
                   <div class="stat"><div class="stat-label" x-text="t('dash.totals.devices_active')"></div><div class="stat-value num" x-text="summary.totals.devices_active"></div></div>
                   <div class="stat"><div class="stat-label" x-text="t('dash.totals.devices_online')"></div><div class="stat-value num" x-text="summary.totals.devices_online"></div></div>
                   <div class="stat"><div class="stat-label" x-text="t('dash.totals.users')"></div><div class="stat-value num" x-text="summary.totals.users"></div></div>
-                  <div class="stat"><div class="stat-label" x-text="t('dash.totals.tx')"></div><div class="stat-value num" x-text="fmtBps(summary.totals.tx_bps_sum)"></div></div>
-                  <div class="stat"><div class="stat-label" x-text="t('dash.totals.rx')"></div><div class="stat-value num" x-text="fmtBps(summary.totals.rx_bps_sum)"></div></div>
+                  <div class="stat"><div class="stat-label" x-text="t('dash.totals.tx')"></div><div class="stat-value num" x-html="fmtBpsStat(summary.totals.tx_bps_sum)"></div></div>
+                  <div class="stat"><div class="stat-label" x-text="t('dash.totals.rx')"></div><div class="stat-value num" x-html="fmtBpsStat(summary.totals.rx_bps_sum)"></div></div>
                 </div>
               </div>
 
               <!-- 自身信息 -->
-              <div class="card" style="margin-bottom:16px">
+              <div class="card">
                 <div class="kicker" x-text="t('dash.self')"></div>
                 <div class="grid grid-2" style="margin-top:8px">
                   <div class="kv-row"><span class="k" x-text="t('dash.self.server_id')"></span><span class="v mono" x-text="shortId(summary.self && summary.self.server_id)"></span></div>
@@ -207,8 +209,8 @@
                   <th x-text="t('peers.col.owner')"></th>
                   <th x-text="t('peers.col.kind')"></th>
                   <th x-text="t('peers.col.status')"></th>
-                  <th class="hide-narrow" x-text="t('peers.col.lastseen')"></th>
-                  <th x-text="t('peers.col.traffic')"></th>
+                  <th class="hide-narrow th-num" x-text="t('peers.col.lastseen')"></th>
+                  <th class="th-num" x-text="t('peers.col.traffic')"></th>
                   <th x-show="isAdmin" x-text="t('peers.col.actions')"></th>
                 </tr></thead>
                 <tbody>
@@ -229,8 +231,14 @@
                       <td :data-label="t('peers.col.status')"><span style="display:inline-flex;align-items:center;gap:6px">
                         <span class="dot" :class="p.online && 'dot-on'"></span>
                         <span class="badge" :class="statusBadge(p.status)" x-text="t('peers.status.' + p.status)"></span></span></td>
-                      <td :data-label="t('peers.col.lastseen')" class="num hide-narrow" x-text="fmtAgo(p.last_seen_unix)"></td>
-                      <td :data-label="t('peers.col.traffic')" class="num mono" x-text="'↑ ' + fmtBps(p.tx_bps) + '  ↓ ' + fmtBps(p.rx_bps)"></td>
+                      <td :data-label="t('peers.col.lastseen')" class="num td-num hide-narrow" x-text="fmtAgo(p.last_seen_unix)"></td>
+                      <td :data-label="t('peers.col.traffic')" class="td-num">
+                        <!-- 流量拆 ↑/↓ 两行右对齐等宽（🟡 UI 评审项 6） -->
+                        <span class="traffic-pair mono">
+                          <span class="tp-row"><span class="tp-arrow">↑</span><span class="tp-v" x-text="fmtBps(p.tx_bps)"></span></span>
+                          <span class="tp-row"><span class="tp-arrow">↓</span><span class="tp-v" x-text="fmtBps(p.rx_bps)"></span></span>
+                        </span>
+                      </td>
                       <td data-label="" x-show="isAdmin">
                         <!-- 稳定控件集（🔴 评审项 5）：server 行无 吊销/禁用/启用；
                              终态行「吊销」置灰占位——操作列不锯齿；高危动作
@@ -304,7 +312,7 @@
                       <th x-text="t('users.col.role')"></th>
                       <th x-text="t('users.col.disabled')"></th>
                       <th class="hide-narrow" x-text="t('users.col.password')"></th>
-                      <th x-text="t('users.col.devices')"></th>
+                      <th class="th-num" x-text="t('users.col.devices')"></th>
                       <th x-text="t('users.col.actions')"></th>
                     </tr></thead>
                     <tbody>
@@ -427,15 +435,15 @@
       <form @submit.prevent="submitLogin()">
         <div class="field">
           <label for="login-user" x-text="t('login.username')"></label>
-          <input id="login-user" class="input" x-model="loginUser" :placeholder="t('login.username.ph')"
+          <input id="login-user" class="input" :class="loginError && 'input-error'" x-model="loginUser" :placeholder="t('login.username.ph')"
                  autocomplete="username" autocapitalize="none" spellcheck="false" :disabled="loginBusy">
         </div>
         <div class="field">
           <label for="login-pass" x-text="t('login.password')"></label>
-          <input id="login-pass" class="input" type="password" x-model="loginPass" :placeholder="t('login.password.ph')"
+          <input id="login-pass" class="input" :class="loginError && 'input-error'" type="password" x-model="loginPass" :placeholder="t('login.password.ph')"
                  autocomplete="current-password" :disabled="loginBusy">
         </div>
-        <div class="field-error" style="margin-bottom:8px" x-text="loginErrorText"></div>
+        <div class="field-error field-error-fixed" x-text="loginErrorText"></div>
         <button class="btn btn-primary btn-block" type="submit" :disabled="loginBusy" style="min-height:44px">
           <span class="spin" x-show="loginBusy"></span>
           <span x-text="loginBusy ? t('login.busy') : t('login.submit')"></span></button>
@@ -455,21 +463,21 @@
       <form @submit.prevent="submitSetPw()">
         <div class="field">
           <label for="pw-user" x-text="t('setpw.username')"></label>
-          <input id="pw-user" class="input" x-model="pwUser" autocomplete="username" autocapitalize="none" spellcheck="false" :disabled="pwBusy">
+          <input id="pw-user" class="input" :class="pwError && 'input-error'" x-model="pwUser" autocomplete="username" autocapitalize="none" spellcheck="false" :disabled="pwBusy">
         </div>
         <div class="field">
           <label for="pw-token" x-text="t('setpw.token')"></label>
-          <input id="pw-token" class="input mono" x-model="pwToken" :placeholder="t('setpw.token.ph')" autocomplete="off" spellcheck="false" :disabled="pwBusy">
+          <input id="pw-token" class="input mono" :class="pwError && 'input-error'" x-model="pwToken" :placeholder="t('setpw.token.ph')" autocomplete="off" spellcheck="false" :disabled="pwBusy">
         </div>
         <div class="field">
           <label for="pw-pass" x-text="t('setpw.newpass')"></label>
-          <input id="pw-pass" class="input" type="password" x-model="pwPass" autocomplete="new-password" :disabled="pwBusy">
+          <input id="pw-pass" class="input" :class="pwError && 'input-error'" type="password" x-model="pwPass" autocomplete="new-password" :disabled="pwBusy">
         </div>
         <div class="field">
           <label for="pw-pass2" x-text="t('setpw.newpass2')"></label>
-          <input id="pw-pass2" class="input" type="password" x-model="pwPass2" autocomplete="new-password" :disabled="pwBusy">
+          <input id="pw-pass2" class="input" :class="pwError && 'input-error'" type="password" x-model="pwPass2" autocomplete="new-password" :disabled="pwBusy">
         </div>
-        <div class="field-error" style="margin-bottom:8px" x-text="pwErrorText"></div>
+        <div class="field-error field-error-fixed" x-text="pwErrorText"></div>
         <button class="btn btn-primary btn-block" type="submit" :disabled="pwBusy" style="min-height:44px">
           <span class="spin" x-show="pwBusy"></span>
           <span x-text="pwBusy ? t('setpw.busy') : t('setpw.submit')"></span></button>

@@ -665,7 +665,16 @@
       },
 
       resultBadge(r) {
-        return { ok: 'badge-success', denied: 'badge-warn', error: 'badge-danger' }[r] || 'badge-muted';
+        // 语义分离（🟡 UI 评审项 10）：琥珀仅用于警示操作——审计「拒绝/错误」一律红。
+        return { ok: 'badge-success', denied: 'badge-danger', error: 'badge-danger' }[r] || 'badge-muted';
+      },
+
+      // 统计卡速率值：数值 + 小一号弱化单位（🟡 UI 评审项 6：<small>Mbps</small>）。
+      // 自产 HTML（无用户输入面）——x-html 安全。
+      fmtBpsStat(v) {
+        const s = fmtBps(v);
+        const i = s.lastIndexOf(' ');
+        return i < 0 ? s : s.slice(0, i) + '<small>' + s.slice(i + 1) + '</small>';
       },
 
       sessionRemainText() {
