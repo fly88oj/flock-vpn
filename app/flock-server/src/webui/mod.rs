@@ -3,4 +3,6 @@
 //! 装配（loopback 先行 + VIP 绑定重试任务）在各模块就位后落于本文件
 //! （见 [`serve`]）；当前批次先落 HTTP 子集层。
 
+pub mod access;
 pub mod http;
+pub mod session;
