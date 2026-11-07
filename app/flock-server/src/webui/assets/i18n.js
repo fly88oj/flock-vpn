@@ -125,7 +125,10 @@
     'peers.col.hostname': '主机名',
     'peers.col.owner': '账户',
     'peers.col.kind': '类型',
-    'peers.col.status': '状态',
+    // 状态列三形态（round2 评审项 5）：列名「状态/在线」；legend 悬停图例说明
+    // 圆点=在线状态、文字=生命周期状态的解耦语义
+    'peers.col.status': '状态/在线',
+    'peers.col.status.legend': '圆点=在线状态；文字=生命周期状态',
     'peers.col.lastseen': '最后活跃',
     'peers.col.traffic': '流量（↑发送 / ↓接收）',
     'peers.col.actions': '操作',

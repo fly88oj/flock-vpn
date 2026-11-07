@@ -225,7 +225,10 @@
                   <th x-text="t('peers.col.hostname')"></th>
                   <th x-text="t('peers.col.owner')"></th>
                   <th x-text="t('peers.col.kind')"></th>
-                  <th x-text="t('peers.col.status')"></th>
+                  <!-- 状态列三形态（round2 评审项 5）：列名「状态/在线」+ 悬停图例——
+                       圆点=在线状态（在线绿/离线灰）、文字=生命周期（正常/已禁用/已吊销），
+                       二者解耦：已吊销红徽标保留、圆点色只随 online 变。 -->
+                  <th :title="t('peers.col.status.legend')" x-text="t('peers.col.status')"></th>
                   <th class="hide-narrow th-num" x-text="t('peers.col.lastseen')"></th>
                   <th class="th-num" x-text="t('peers.col.traffic')"></th>
                   <th x-show="isAdmin" x-text="t('peers.col.actions')"></th>
@@ -246,7 +249,7 @@
                         </template>
                       </td>
                       <td :data-label="t('peers.col.kind')"><span class="badge" :class="p.kind==='server' ? 'badge-info' : 'badge-muted'" x-text="p.kind==='server' ? t('app.server') : t('app.device')"></span></td>
-                      <td :data-label="t('peers.col.status')"><span style="display:inline-flex;align-items:center;gap:6px">
+                      <td :data-label="t('peers.col.status')"><span :title="t('peers.col.status.legend')" style="display:inline-flex;align-items:center;gap:6px">
                         <span class="dot" :class="p.online && 'dot-on'"></span>
                         <span class="badge" :class="statusBadge(p.status)" x-text="t('peers.status.' + p.status)"></span></span></td>
                       <td :data-label="t('peers.col.lastseen')" class="num td-num hide-narrow" x-text="fmtAgo(p.last_seen_unix)"></td>
