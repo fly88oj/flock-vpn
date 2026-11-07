@@ -170,6 +170,17 @@
                     </div>
                   </template>
                 </div>
+                <!-- 双系列图例（🔴 round2 评审项 1）：DOM 自绘（uPlot 内建图例已关），
+                     桌面/手机一致呈现；色片与曲线同色（app.js CHART_*_COLOR 单点定义），
+                     hover 实时读数与 tooltip 同源同单位。 -->
+                <div class="chart-legend" x-show="!seriesEmpty()" x-cloak>
+                  <span class="lg-item"><i class="lg-sw" :style="'background:' + chartTxColor()"></i>
+                    <span x-text="t('dash.chart.tx')"></span>
+                    <b class="mono" x-text="legendTx">--</b></span>
+                  <span class="lg-item"><i class="lg-sw" :style="'background:' + chartRxColor()"></i>
+                    <span x-text="t('dash.chart.rx')"></span>
+                    <b class="mono" x-text="legendRx">--</b></span>
+                </div>
               </div>
             </div>
           </template>

@@ -12,6 +12,11 @@
 (function () {
   'use strict';
 
+  // —— 图表双系列色（🔴 round2 评审项 1）：曲线描边与自绘图例色片单点定义，
+  // 图例颜色恒与线一致（防两处 hex 漂移）。 ——
+  const CHART_TX_COLOR = '#4f8cff';
+  const CHART_RX_COLOR = '#3fb972';
+
   // —— API 封装（错误信封解析）——
   async function api(method, path, body) {
     const headers = {};
@@ -38,6 +43,9 @@
       const err = new Error((data && data.error && data.error.code) || 'http_' + resp.status);
       err.code = (data && data.error && data.error.code) || 'http_' + resp.status;
       err.status = resp.status;
+      // 服务端信封的 message（英文诊断短语）透传——错误 Toast 括注原因
+      //（round2 评审项 9：中文主文案仍走 i18n err.*）。
+      err.serverMessage = (data && data.error && data.error.message) || '';
       err.retryAfter = data && data.error && data.error.retry_after_secs;
       throw err;
     }
@@ -87,6 +95,10 @@
       uplot: null,
       pollTimer: null,
       resizeBound: null,
+      // 自绘图例实时读数（🔴 round2 评审项 1）：hover 时与 tooltip 同源取值，
+      // 离开画布/换序列回落 '--'。
+      legendTx: '--',
+      legendRx: '--',
 
       // 设备
       peers: [],
@@ -390,28 +402,52 @@
           return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
         };
 
+        // X 轴显式刻度（🔴 round2 评审项 1）：不依赖 uPlot 自动时间分度（标签
+        // 密度随宽度/字体浮动，round2 桌面全页截图曾表现为零可见时间刻度）——
+        // 自产等间隔「整分」刻度，任何视口恒 4–6 个。
+        const timeTickSplits = (u, axisIdx, min, max) => {
+          const span = max - min;
+          // 目标刻度数：约 150px/刻度的标签预算取整，再夹到 4–6。
+          const target = Math.min(6, Math.max(4, Math.floor(u.width / 150)));
+          // 步长梯：60s 采样数据 1 分钟起的最小可读步长；窗口 ≤2h 封顶 2h 档。
+          const steps = [60, 120, 300, 600, 900, 1800, 3600, 7200];
+          const step = steps.find((s) => span / s <= target) || steps[steps.length - 1];
+          const out = [];
+          for (let v = Math.ceil(min / step) * step; v <= max; v += step) { out.push(v); }
+          // 退化保护（span < step 的极窄序列）：首尾兜底两刻度。
+          return out.length >= 2 ? out : [min, max];
+        };
+
         const opts = {
           width: el.clientWidth || 600,
           height: height,
           padding: [8, 8, 0, 8],
           cursor: { drag: { x: false, y: false } },
-          legend: { show: true, live: true },
+          // uPlot 内建图例关闭（🔴 round2 评审项 1）：双系列图例改 DOM 自绘
+          //（index.html .chart-legend）——桌面/手机一致呈现，不被画布层吞掉。
+          legend: { show: false },
           plugins: [uplotTooltip(tooltip, this)],
           scales: {
             x: { time: true },
-            // 平坦/全 0 序列给 1 单位抬头——0 值基线不贴画布底边
-            //（🟡 UI 评审项 12：0 值系列保持 ≥1.5px 可见）。
-            y: { range: (u, lo, hi) => (hi - lo < 1 ? [lo, hi + 1] : [lo, hi]) },
+            // Y 恒从 0 起（🔴 round2 评审项 1：0 刻度线常驻轴面）；平坦/全 0 序列
+            // 保持 round1 的 1 单位抬头（0 值系列 ≥1.5px 可见），抬头值域形
+            // [0, hi+1]——+1 不再把 0 挤出轴。
+            y: { range: (u, lo, hi) => [0, hi - lo < 1 ? hi + 1 : hi] },
           },
           axes: [
             {
+              // —— X 轴（时间）——
+              // time:true 只声明语义（刻度面由 splits/values 自管）。
               time: true,
+              // 轴线弱灰；网格 5% 白——不与曲线抢对比度。
               stroke: '#8a93a1',
               grid: { show: true, stroke: 'rgba(255,255,255,0.05)' },
               ticks: { stroke: '#303a4e' },
+              // 显式 splits：4–6 个等间隔整分刻度（见上 timeTickSplits 注释）。
+              splits: timeTickSplits,
               // 本地时区：unix 秒 → Date 本地格式化（uPlot 数值轴默认 UTC 面——显式覆写）。
-              // 刻度标签按「唯一分钟」去重（🟡 UI 评审项 12：60s 采样下相邻刻度
-              // 可能落同一分钟，重复标签只留首个）。
+              // 标签按「唯一分钟」去重（60s 采样下相邻刻度可能落同一分钟——
+              // 显式 splits 下不会发生，保留为防御性去重）。
               values: (u, vals) => {
                 const seen = {};
                 return vals.map((v) => {
@@ -424,19 +460,23 @@
               },
             },
             {
+              // —— Y 轴（速率）——
               stroke: '#8a93a1',
-              size: 60,
+              // 轴宽预算 68px：「20.0 Mbps」「500 Kbps」完整单位标签的最长形
+              //（🔴 round2 评审项 1：弃用「60.0 M」紧凑形，单位写法全 UI 统一）。
+              size: 68,
               grid: { show: true, stroke: 'rgba(255,255,255,0.05)' },
               ticks: { stroke: '#303a4e' },
-              // Y 轴刻度带紧凑单位（🟡 UI 评审项 12：补 bps / K/M/G）。
-              values: (u, vals) => vals.map((v) => fmtBpsAxis(v)),
+              // 刻度与统计卡/tooltip 同源 fmtBps（完整 bps/Kbps/Mbps/Gbps）。
+              values: (u, vals) => vals.map((v) => fmtBps(v)),
             },
           ],
           series: [
-            // x 系列标签：uPlot 默认 "Time" →「时间」（🟡 UI 评审项 12）。
+            // x 系列标签：uPlot 默认 "Time" →「时间」（🟡 UI 评审项 12；图例已
+            // 自绘，此 label 仅存语义面）。
             { label: t('dash.chart.time'), values: (u, v) => (v == null ? '--' : hhmmss(v)) },
-            { label: t('dash.chart.tx'), stroke: '#4f8cff', width: 1.6, fill: 'rgba(79,140,255,0.10)', points: { show: false }, values: (u, v) => (v == null ? '--' : fmtBps(v)) },
-            { label: t('dash.chart.rx'), stroke: '#3fb972', width: 1.6, fill: 'rgba(63,185,114,0.08)', points: { show: false }, values: (u, v) => (v == null ? '--' : fmtBps(v)) },
+            { label: t('dash.chart.tx'), stroke: CHART_TX_COLOR, width: 1.6, fill: 'rgba(79,140,255,0.10)', points: { show: false }, values: (u, v) => (v == null ? '--' : fmtBps(v)) },
+            { label: t('dash.chart.rx'), stroke: CHART_RX_COLOR, width: 1.6, fill: 'rgba(63,185,114,0.08)', points: { show: false }, values: (u, v) => (v == null ? '--' : fmtBps(v)) },
           ],
         };
 
@@ -631,6 +671,18 @@
 
       errMsg(code) { return t('err.' + (code || 'network')); },
 
+      // 错误文案带原因（round2 评审项 9）：API 错误信封的 message（英文诊断
+      // 短语，如 "cannot demote self"）透传为括注；中文主文案仍走 i18n err.*。
+      errText(e) {
+        const base = t('err.' + ((e && e.code) || 'network'));
+        const why = e && e.serverMessage;
+        return why && why !== base ? base + '（' + why + '）' : base;
+      },
+
+      // 图例色片取线色常量（🔴 round2 评审项 1：模板 :style 绑定用）。
+      chartTxColor() { return CHART_TX_COLOR; },
+      chartRxColor() { return CHART_RX_COLOR; },
+
       shortId(id) { return id ? id.slice(0, 8) : '—'; },
 
       shortTarget(s) { return s && s.length > 16 ? s.slice(0, 8) + '…' : (s || '—'); },
@@ -718,6 +770,8 @@
           const idx = u.cursor.idx;
           if (idx == null || u.cursor.left == null || !u.data[0] || u.data[0].length === 0) {
             el.style.display = 'none';
+            ctx.legendTx = '--';
+            ctx.legendRx = '--';
             return;
           }
           const ts = u.data[0][idx];
@@ -729,6 +783,9 @@
             '<b>' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '</b><br>' +
             t('dash.chart.tx') + ' ' + fmtBps(tx) + '<br>' +
             t('dash.chart.rx') + ' ' + fmtBps(rx);
+          // 自绘图例实时读数（🔴 round2 评审项 1）：与 tooltip 同源同单位。
+          ctx.legendTx = fmtBps(tx);
+          ctx.legendRx = fmtBps(rx);
           el.style.display = 'block';
           const host = el.parentElement; // .chart-box（tooltip 与图同容器）
           const hostRect = host.getBoundingClientRect();
@@ -740,27 +797,22 @@
           el.style.left = left + 'px';
           el.style.top = Math.max(top, 4) + 'px';
         },
-        setScale: () => { if (el) { el.style.display = 'none'; } },
+        setScale: () => {
+          if (el) { el.style.display = 'none'; }
+          ctx.legendTx = '--';
+          ctx.legendRx = '--';
+        },
       },
     };
   }
 
   // —— 格式化工具 ——
-  function fmtBps(v, axis) {
-    v = Number(v) || 0;
-    if (v < 1000) { return axis ? String(Math.round(v)) : Math.round(v) + ' bps'; }
-    const units = ['Kbps', 'Mbps', 'Gbps', 'Tbps'];
-    let u = -1;
-    let x = v;
-    do { x /= 1000; u++; } while (x >= 1000 && u < units.length - 1);
-    return (x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2)) + (axis ? '' : ' ' + units[u]);
-  }
-
-  // Y 轴刻度紧凑单位形：「500 bps」「82.3 M」「1.2 G」（🟡 UI 评审项 12）。
-  function fmtBpsAxis(v) {
+  // 速率完整单位形（🔴 round2 评审项 1：图表 Y 轴 / tooltip / 统计卡三处同源，
+  // 单位写法统一 bps/Kbps/Mbps/Gbps——不再有「60.0 M」紧凑形）。
+  function fmtBps(v) {
     v = Number(v) || 0;
     if (v < 1000) { return Math.round(v) + ' bps'; }
-    const units = ['K', 'M', 'G', 'T'];
+    const units = ['Kbps', 'Mbps', 'Gbps', 'Tbps'];
     let u = -1;
     let x = v;
     do { x /= 1000; u++; } while (x >= 1000 && u < units.length - 1);
