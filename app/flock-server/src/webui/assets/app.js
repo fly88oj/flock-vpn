@@ -637,8 +637,9 @@
 
       // —— u64 标识（字符串形态下发，🔴 UI 评审项 1）——
       // node_id 等 >2^53 的 u64 标识以字符串往返；展示统一「前 4…后 4」截断，
-      // title 悬停给全值（4 位分组），点击复制。
-      isNumId(s) { return typeof s === 'string' && /^\d{5,}$/.test(s); },
+      // title 悬停给全值（4 位分组），点击复制。≥10 位阈值：node_id 实际
+      // 19~20 位（u64 均匀分布），纯数字用户名（≤32 位合法字符集）不误判。
+      isNumId(s) { return typeof s === 'string' && /^\d{10,}$/.test(s); },
 
       shortNum(s) { return this.isNumId(s) ? s.slice(0, 4) + '…' + s.slice(-4) : (s || '—'); },
 
