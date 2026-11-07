@@ -40,6 +40,9 @@ flock-server [--config <server.toml>] [<subcommand>]
   device-add --user U --device-x B32 --device-ed B32
                                  直接注册设备（TOFU 预置）
   revoke --device HEX64          吊销设备（推进 revocation_epoch + 杀会话）
+  web-admin-add <用户名>          M8 Web UI 首 admin 引导（stdin 两遍口令；原生 OPAQUE
+                                 注册；优先经 admin 端点；服务未跑 ⇒ 单服直写/
+                                 多主明确报错指引）
 ";
 
 fn main() {
@@ -91,6 +94,10 @@ enum Cmd {
     },
     Revoke {
         device: [u8; 32],
+    },
+    /// M8：Web UI 首 admin 引导（§7-M8.3——stdin 两遍口令 + 原生 OPAQUE 注册）。
+    WebAdminAdd {
+        user: String,
     },
 }
 
@@ -269,6 +276,11 @@ fn parse_args() -> Result<Cli, String> {
                 device: device.ok_or("revoke 需要 --device")?,
             }
         }
+        Some("web-admin-add") => {
+            it.next();
+            let user = it.next().ok_or("web-admin-add 需要 <用户名>")?;
+            Cmd::WebAdminAdd { user }
+        }
         Some(other) => return Err(format!("未知子命令 {other:?}\n\n{USAGE}")),
     };
     Ok(Cli { config, cmd })
@@ -300,6 +312,130 @@ fn load_root_seed(path: &str) -> Result<flock_protocol::ed25519_dalek::SigningKe
         .try_into()
         .map_err(|v: Vec<u8>| format!("root.seed 期望 64 hex（32B），得 {}B", v.len()))?;
     Ok(flock_protocol::ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
+/// `web-admin-add <用户名>`：M8 Web UI 首 admin 引导（§7-M8.3）。
+///
+/// 流程：stdin 两遍口令（tty 有回显——本地信任域取舍，与 `flock-client login`
+/// 同语义）→ 原生 OPAQUE 注册（reg_start → admin 端点 m1→m2 → reg_finish →
+/// WebPwCommit（token 由本进程生成随消息携带））。服务在跑 ⇒ 经 admin 端点
+/// （多主亦经它——写走 Raft）；服务未跑 ⇒ 单服可直写状态库（Cmd::Invite 的
+/// fallback 先例）；**多主必须经在跑服务提交（Raft），否则明确报错指引**。
+async fn cmd_web_admin_add(cfg: ServerConfig, user: String) -> Result<(), String> {
+    use std::io::BufRead as _;
+    // 用户名约束与 Web API 一致（§M8.4）。
+    let valid = |u: &str| {
+        !u.is_empty()
+            && u.len() <= 32
+            && u.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+    };
+    if !valid(&user) {
+        return Err(format!(
+            "用户名 {user:?} 不合法（1..=32B、[A-Za-z0-9_.-]，与 Web API 一致）"
+        ));
+    }
+    // stdin 两遍口令。
+    let mut lines = std::io::stdin().lock().lines();
+    let mut read_pw = |prompt: &str| -> Result<String, String> {
+        eprint!("{prompt}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        lines
+            .next()
+            .transpose()
+            .map_err(|e| format!("stdin: {e}"))?
+            .ok_or_else(|| "stdin EOF（需要两行口令）".to_string())
+    };
+    let pw = read_pw("口令（本地 tty 有回显，与 flock-client login 同取舍）: ")?;
+    let pw2 = read_pw("再输一遍: ")?;
+    if pw.is_empty() {
+        return Err("口令为空".into());
+    }
+    if pw != pw2 {
+        return Err("两遍口令不一致".into());
+    }
+    // 原生 OPAQUE 注册第一步（进程内）。
+    let mut rng = flock_protocol::rand::rngs::OsRng;
+    let (cstate, m1_b64) = flock_protocol::pake::reg_start(&mut rng, &pw, &user)
+        .map_err(|e| format!("OPAQUE reg_start: {e}"))?;
+
+    // 服务在跑 ⇒ admin 端点（多主写经 Raft）；未跑 ⇒ 单服直写。
+    let admin_up = tokio::net::TcpStream::connect(cfg.admin_bind).await.is_ok();
+    let token: [u8; 16] = flock_protocol::rand::random();
+    if admin_up {
+        // ① m1 → m2（目标已有口令的拒答在此返回）。
+        let m2_b64 = match client(
+            cfg.admin_bind,
+            AdminRequest::WebPwBegin {
+                user: user.clone(),
+                m1_b64,
+            },
+        )
+        .await
+        .map_err(|e| format!("admin 端点（{}）: {e}", cfg.admin_bind))?
+        {
+            AdminResponse::WebPwM2 { m2_b64 } => m2_b64,
+            AdminResponse::Err { msg } => return Err(msg),
+            other => return Err(format!("admin 响应形态不符: {other:?}")),
+        };
+        // ② reg_finish → record。
+        let record_b64 = flock_protocol::pake::reg_finish(&mut rng, cstate, &pw, &user, &m2_b64)
+            .map_err(|e| format!("OPAQUE reg_finish: {e}"))?;
+        // ③ 提交（token 随消息携带；admin=true——首 admin 引导）。
+        match client(
+            cfg.admin_bind,
+            AdminRequest::WebPwCommit {
+                user: user.clone(),
+                token,
+                record_b64,
+                profile: 0,
+                admin: true,
+            },
+        )
+        .await?
+        {
+            AdminResponse::WebPwDone { username } => {
+                println!("web admin 就绪: {username}（admin=true；Web UI 登录口令即上述输入）");
+                Ok(())
+            }
+            AdminResponse::Err { msg } => Err(msg),
+            other => Err(format!("admin 响应形态不符: {other:?}")),
+        }
+    } else {
+        // 服务未跑：多主必须经在跑服务（Raft）——明确报错指引。
+        let raft = cfg.sync.as_ref().is_some_and(|s| s.mode == "raft");
+        if raft {
+            return Err(
+                "多主（[sync] mode=raft）形态的 web-admin-add 必须经在跑服务提交（写走 Raft）——请先启动 flock-server 再运行本命令"
+                    .into(),
+            );
+        }
+        // 单服直写（Cmd::Invite 的 fallback 先例：探测先于 redb 打开——服务若在跑，
+        // 库锁会被占用）。
+        let (core, created) = flock_server::server::ServerCore::open_or_init(cfg)?;
+        if created {
+            eprintln!("note: 已引导新状态库（生产请先 init-cluster）");
+        }
+        // 目标已有口令 ⇒ 拒（与 admin 端点同语义）。
+        if core
+            .net
+            .user_row(&user)
+            .await
+            .is_some_and(|r| r.opaque_record.is_some())
+        {
+            return Err(format!(
+                "用户 {user} 已设置口令——web-admin-add 仅用于首次设置；已有口令的账户请经 Web UI 重置（管理员 /api/users/{user}/reset-password）"
+            ));
+        }
+        // OPAQUE m2 由本进程 OPRF（同库同 key）生成——直写路径与服务端同一注册语义。
+        let m2_b64 = flock_protocol::pake::server_reg_start(&core.oprf, &m1_b64, &user)
+            .map_err(|e| format!("OPAQUE server_reg_start: {e}"))?;
+        let record_b64 = flock_protocol::pake::reg_finish(&mut rng, cstate, &pw, &user, &m2_b64)
+            .map_err(|e| format!("OPAQUE reg_finish: {e}"))?;
+        flock_server::admin::web_pw_commit(&core, &user, token, &record_b64, 0, true).await?;
+        println!("web admin 就绪: {user}（admin=true；单服直写；Web UI 登录口令即上述输入）");
+        Ok(())
+    }
 }
 
 fn run_cli() -> Result<(), String> {
@@ -648,6 +784,7 @@ fn run_cli() -> Result<(), String> {
                     _ => Err("admin 响应形态不符".into()),
                 }
             }
+            Cmd::WebAdminAdd { user } => cmd_web_admin_add(cfg, user).await,
             Cmd::Run => {
                 let mode = cfg.listener_mode()?;
                 // 多主形态（§6.2 M5 批次）：TCP 织物 + SyncNode + 服务器自身 peer 面；
