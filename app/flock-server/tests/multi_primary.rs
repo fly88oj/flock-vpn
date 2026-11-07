@@ -264,7 +264,10 @@ fn sync_server_cfg(
         vip,
         frp: None,
         sync: None,
-        webui: Default::default(),
+        webui: flock_server::config::WebUiSection {
+            enabled: false,
+            ..Default::default()
+        },
     }
 }
 

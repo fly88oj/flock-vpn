@@ -32,9 +32,18 @@ use http::Response;
 const VIP_REBIND_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 起服装配（`server::run` / `sync::run_raft` 经 `run` 调用；`[webui] enabled=false`
-/// 时由调用方跳过）。返回 loopback accept 任务句柄（VIP/清扫/采样任务 detached）。
-pub async fn serve(core: Arc<ServerCore>) -> Result<JoinHandle<()>, String> {
+/// 时由调用方跳过）。返回 loopback accept 任务句柄 + 实际绑定地址（port=0 时
+/// 调用方取随机端口；VIP/清扫/采样任务 detached）。
+pub async fn serve(core: Arc<ServerCore>) -> Result<(JoinHandle<()>, SocketAddr), String> {
     let state = Arc::new(WebState::new(core.clone()));
+    serve_state(core, state).await
+}
+
+/// [`serve`] 的注入态变体（tests/webui.rs 持有 WebState 驱动采样/断言）。
+pub async fn serve_state(
+    core: Arc<ServerCore>,
+    state: Arc<WebState>,
+) -> Result<(JoinHandle<()>, SocketAddr), String> {
     let port = core.cfg.webui.port;
 
     // ① loopback：启动即绑定（失败 ⇒ 装配失败——refuse to start）。
@@ -42,7 +51,10 @@ pub async fn serve(core: Arc<ServerCore>) -> Result<JoinHandle<()>, String> {
     let listener = TcpListener::bind(lo_addr)
         .await
         .map_err(|e| format!("webui loopback bind {lo_addr}: {e}"))?;
-    eprintln!("flock-server: webui listening on http://{lo_addr}");
+    let local = listener
+        .local_addr()
+        .map_err(|e| format!("webui local_addr: {e}"))?;
+    eprintln!("flock-server: webui listening on http://{local}");
 
     // ② VIP 重试任务（tun 未就绪 ⇒ 5s 重试，永不 crash）。
     tokio::spawn(vip_rebind_loop(core.clone(), state.clone()));
@@ -65,7 +77,7 @@ pub async fn serve(core: Arc<ServerCore>) -> Result<JoinHandle<()>, String> {
     tokio::spawn(state.series.clone().sampler_loop(core.clone()));
 
     // ⑤ accept 循环（独立信号量 64；handler panic 隔离为 500）。
-    Ok(tokio::spawn(accept_loop(listener, state)))
+    Ok((tokio::spawn(accept_loop(listener, state)), local))
 }
 
 /// accept 循环（loopback 与 VIP 面共用语义：独立信号量 + panic 隔离 + 满载 429）。

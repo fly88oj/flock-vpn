@@ -323,14 +323,15 @@ impl WebState {
         if let Some(retry) = self.backoff.check(user, self.now()) {
             return err_with("rate_limited", Some(retry));
         }
-        // 记录侧：存在且未禁用才有真记录；其余（未知用户/未设密码/禁用）一律 dummy
-        //（ke2 同形——禁用不在此泄漏，§M8.3）。
+        // 记录侧：未知用户/未设密码 ⇒ dummy（ke2 同形防枚举）；**disabled 用户仍用
+        // 真记录**——ke2 同形不泄漏禁用态，且诚实客户端得以完成 ke3、在 login-finish
+        // 收到 401 user_disabled（§M8.3「login-begin 仍 dummy 同形不泄漏」指未知
+        // 用户面；禁用判定发生在口令证明成立之后——不泄漏任何额外信息）。
         let record = self
             .core
             .net
             .user_row(user)
             .await
-            .filter(|row| !row.disabled)
             .and_then(|row| row.opaque_record)
             .and_then(|r| flock_protocol::pake::server_record_from_b64(&r).ok());
         let (ke2_b64, state) = match server_login_start(

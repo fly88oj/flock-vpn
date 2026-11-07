@@ -25,7 +25,10 @@ fn cfg_for(mode: &str, state_dir: &std::path::Path) -> ServerConfig {
         admin_bind: "127.0.0.1:0".parse().unwrap(),
         max_sessions: 1024,
         sync: None,
-        webui: Default::default(),
+        webui: flock_server::config::WebUiSection {
+            enabled: false,
+            ..Default::default()
+        },
         tun_name: "tun0".into(),
         vip: "100.64.0.1".parse().unwrap(),
         frp: Some(flock_server::config::FrpSection {

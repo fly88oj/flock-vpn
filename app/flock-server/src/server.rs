@@ -66,8 +66,9 @@ pub struct LiveSessions {
 }
 
 impl LiveSessions {
-    /// 登记（会话任务）；`pub(crate)`——M7 名册单测驱动「在线」态。
-    pub(crate) fn register(&self, device: [u8; 32]) -> tokio::sync::watch::Receiver<bool> {
+    /// 登记（会话任务）；`pub`——M7 名册单测与 M8 webui 集成测试驱动「在线」态
+    ///（serve_conn 之外的登记面只服务测试）。
+    pub fn register(&self, device: [u8; 32]) -> tokio::sync::watch::Receiver<bool> {
         let (tx, rx) = tokio::sync::watch::channel(false);
         self.inner
             .lock()

@@ -334,7 +334,10 @@ impl TestServer {
             vip: "100.64.0.1".parse().unwrap(),
             frp: None,
             sync: None,
-            webui: Default::default(),
+            webui: flock_server::config::WebUiSection {
+                enabled: false,
+                ..Default::default()
+            },
         };
         let (core, created) = ServerCore::open_or_init(cfg).expect("core");
         assert!(created, "全新状态库");
