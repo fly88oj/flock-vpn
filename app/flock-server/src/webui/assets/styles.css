@@ -384,10 +384,23 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 @media (max-width: 1199.98px) {
   .sidebar {
     transform: translateX(-100%); transition: transform 0.2s ease; box-shadow: none;
-    border-radius: 0 var(--r-lg) var(--r-lg) 0;
+    /* 右缘 12px 圆角（🔴 round2 评审项 2：核验确认缺失——显式 12px，不用 token） */
+    border-radius: 0 12px 12px 0;
+    /* 抽屉层级（🔴 round2 评审项 2 的真缺陷修复）：面板 56 必须高于遮罩 55——
+       旧值 50 < 55 时 0.68 黑遮罩盖在抽屉之上，整个面板内容被压暗成
+       「全黑不可见」（仅最亮的品牌行可辨）。模态 60 / Toast 80 仍在其上。 */
+    z-index: 56;
   }
-  .sidebar.open { transform: none; box-shadow: var(--shadow-2); }
-  .topbar { display: flex; }
+  /* 静止开态：内容完全可见——显式 opacity:1 加固 transition 结束态（无
+     opacity 过渡面，防任何隐式继承/覆写把内容层置于半透明）。 */
+  .sidebar.open {
+    transform: none; opacity: 1;
+    /* 更明显的开态投影（🔴 round2 评审项 2）：右向 12px 扩散 40px——
+       抽屉与遮罩面的层次可辨（原 shadow-2 四向弥散在深色主题下不可读）。 */
+    box-shadow: 12px 0 40px rgba(0, 0, 0, 0.55);
+  }
+  /* 顶栏 58 > 抽屉 56：开态顶栏（汉堡→X）仍可点——关闭路径不因抽屉铺满而断 */
+  .topbar { display: flex; z-index: 58; }
   .content { --pad-content: var(--sp-4); padding: var(--sp-5) var(--pad-content); }
 }
 @media (min-width: 1200px) {
