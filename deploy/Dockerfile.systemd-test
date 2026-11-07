@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # flock-client —— M6 systemd 真机语义实测容器（deploy/systemd-test.yml 的 client 服务）。
 #
 # 与 Dockerfile.client 的差异 = 「Linux 服务形态」的物化：

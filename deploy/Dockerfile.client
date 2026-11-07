@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # flock-client —— M3 客户端镜像（docs/design.md §3.12/§7-M3：m3.yml 的 client 服务）。
 #
 # 构建模式与 Dockerfile.server 相同（manifest+stub 依赖层缓存；glibc 两侧同钉

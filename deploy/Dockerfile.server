@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # flock-server —— Frp 模式镜像（docs/design.md §7-M2：m2.yml 的 server 服务）。
 #
 # 依赖层缓存：先只拷 manifest + stub 源构建依赖层，再拷真实源重编——源码改动不重拉依赖。

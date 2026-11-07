@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # flock-server —— Direct 模式镜像（docs/design.md §7-M2：m2-direct.yml 的唯一服务）。
 #
 # 与 Dockerfile.server 的差异即「Direct 形态」的物化：**镜像内没有任何 frp 二进制**
