@@ -246,7 +246,7 @@ w4() {
   $WV --user w2admin --pass W2Boss-Pw login | grep -q "login=ok" \
     && echo "  VIP 登录链 login=ok OK" || { bad "W4 VIP 登录"; return; }
   # ④ origin=vpn（VPN 段会话定档）+ 只读面 + peers 含服务器行。
-  $WV --user w2admin --pass W2Boss-Pw me 2>/dev/null | grep -q "origin=vpn" \
+  $WV --user w2admin --pass W2Boss-Pw me 2>/dev/null | grep -q 'origin="vpn"' \
     && echo "  me origin=vpn OK" || bad "W4 origin=vpn"
   $WV --user w2admin --pass W2Boss-Pw probe-readonly >/dev/null \
     && echo "  只读面（VIP base）全 200 OK" || bad "W4 只读面"
@@ -474,7 +474,7 @@ w6() {
   sb=$($WB --user w6admin --pass W6Boss-Pw summary 2>/dev/null)
   echo "  summary（.1）: $sa"
   echo "  summary（.2）: $sb"
-  if [ "$sa" = "$sb" ] && printf '%s' "$sa" | grep -q 'sync_mode=raft' \
+  if [ "$sa" = "$sb" ] && printf '%s' "$sa" | grep -q 'sync_mode="raft"' \
      && printf '%s' "$sa" | grep -q 'servers=2'; then
     echo "  summary 一致（raft/双服/totals 对齐）OK"
   else
