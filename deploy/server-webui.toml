@@ -1,0 +1,26 @@
+# server-webui.toml —— M8 Web UI 断言拓扑的 server 配置（deploy/webui.yml 内嵌）。
+#
+# Direct 模式（与 server-direct.toml 同构）+ [webui] 显式节（§7-M8.2：双绑定
+# 127.0.0.1:9800 + tun VIP 100.64.0.1:9800——不绑 LAN/公网 ⇒ W5 的连接层不可达）。
+
+state_dir = "/var/lib/flock"
+bind = "0.0.0.0:9443"
+admin_bind = "127.0.0.1:9444"
+
+advertise_endpoint = "127.0.0.1:9443"
+extra_endpoints = []
+dir_version = 1
+
+ticket_ttl_secs = 60
+peer_retention_days = 30
+max_sessions = 1024
+
+tun_name = "tun0"
+vip = "100.64.0.1"
+
+[webui]
+enabled = true
+port = 9800
+session_ttl_secs = 28800
+series_points = 120
+series_interval_secs = 60

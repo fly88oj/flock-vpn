@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+# flock-webui —— M8 Web UI 断言镜像（docs/design.md §7-M8.9 deploy/webui.yml 的 server 面）。
+#
+# 与 Dockerfile.server-direct 的差异：① 运行段带 curl/jq（W1 断言）；② 额外构建并
+# 安装 examples/webui_login（W2/W3 的 HTTP-OPAQUE 驱动器）。构建模式沿用
+# manifest+stub 依赖层缓存；glibc 两侧同钉 bookworm。
+
+FROM rust:1.98-slim-bookworm AS builder
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/flock-protocol/Cargo.toml crates/flock-protocol/
+COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
+COPY crates/flock-sync/Cargo.toml crates/flock-sync/
+COPY app/flock-server/Cargo.toml app/flock-server/
+COPY app/flock-client/Cargo.toml app/flock-client/
+RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
+             crates/flock-frpc/src crates/flock-sync/src \
+             app/flock-server/src app/flock-server/examples app/flock-client/src \
+ && echo 'pub fn _stub() {}' > crates/flock-protocol/src/lib.rs \
+ && echo 'fn main() {}' > crates/flock-protocol/benches/aead.rs \
+ && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/flock-sync/src/lib.rs \
+ && echo 'pub fn _stub() {}' > app/flock-server/src/lib.rs \
+ && echo 'fn main() {}' > app/flock-server/src/main.rs \
+ && echo 'fn main() {}' > app/flock-server/examples/webui_login.rs \
+ && echo 'pub fn _stub() {}' > app/flock-client/src/lib.rs \
+ && echo 'fn main() {}' > app/flock-client/src/main.rs \
+ && cargo build --release --locked -p flock-server --example webui_login \
+ && rm -rf target/release/deps/flock_server* target/release/deps/flock_server_lib* \
+          target/release/deps/flock_client* target/release/deps/flock_protocol* \
+          target/release/deps/flock_frpc* target/release/deps/flock_sync* \
+          target/release/deps/webui_login* \
+ && rm -f target/release/flock-server target/release/examples/webui_login
+COPY crates/flock-protocol/src crates/flock-protocol/src
+COPY crates/flock-frpc/src crates/flock-frpc/src
+COPY crates/flock-sync/src crates/flock-sync/src
+COPY app/flock-client/src app/flock-client/src
+COPY app/flock-server/src app/flock-server/src
+COPY app/flock-server/examples app/flock-server/examples
+RUN touch crates/flock-protocol/src/lib.rs crates/flock-frpc/src/lib.rs \
+      crates/flock-sync/src/lib.rs \
+      app/flock-client/src/lib.rs app/flock-client/src/main.rs \
+      app/flock-server/src/lib.rs app/flock-server/src/main.rs \
+      app/flock-server/examples/webui_login.rs \
+ && cargo build --release --locked -p flock-server --bins --example webui_login
+
+FROM debian:bookworm-slim
+# curl/jq：W1 未登录 401 断言与响应解析（本机容器内 127.0.0.1:9800）。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends procps curl jq \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/flock-server /usr/local/bin/flock-server
+COPY --from=builder /src/target/release/examples/webui_login /usr/local/bin/webui_login
+RUN mkdir -p /var/lib/flock
+COPY deploy/server-webui.toml /etc/flock/server.toml
+ENTRYPOINT ["/usr/local/bin/flock-server"]
+CMD ["--config", "/etc/flock/server.toml"]

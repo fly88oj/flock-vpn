@@ -14,6 +14,7 @@
 //!   user-set-admin <u> <0|1>       （cannot_demote_self ⇒ 退出码 42）
 //!   pw-set --user U --token T --pass P   公共引导链（pw-begin/commit，原生 OPAQUE）
 //!   peers / summary / series --vip V     只读面
+//!   peer-op <revoke|disable|enable|kick> <dev_hex>   设备操作（admin；invalid_state ⇒ 42）
 //!   audit-grep <action> [target]   /api/audit 行匹配（无匹配 ⇒ 退出码 3）
 //!   probe-readonly                 me/peers/summary/series/config 全 200 断言
 //!   probe-admin-denied             users/audit/user-create/peer-op 全 403 断言
@@ -407,6 +408,38 @@ fn run() -> Result<u32, String> {
             println!("pw-set={target} ok");
             Ok(0)
         }
+        "peer-op" => {
+            // peer-op <revoke|disable|enable|kick> <device_hex64>（admin；W2 载具）。
+            let (ck, _) = logged(&base, &user, &pass)?;
+            let action = arg(0);
+            let dev = arg(1);
+            if !matches!(action, "revoke" | "disable" | "enable" | "kick") {
+                return Err("peer-op <revoke|disable|enable|kick> <device_hex64>".into());
+            }
+            let r = post(
+                &format!("/api/peers/{dev}/{action}"),
+                Some(&ck),
+                &json!({}),
+                &base,
+            )?;
+            if r.status != 200 {
+                println!(
+                    "peer-op {action} {dev} status={} code={}",
+                    r.status,
+                    r.code()
+                );
+                return Ok(match r.code().as_str() {
+                    "invalid_state" => 42,
+                    _ => 1,
+                });
+            }
+            let v = r.json();
+            println!(
+                "peer-op {action} {dev} ok epoch={}",
+                v["epoch"].as_u64().unwrap_or(0)
+            );
+            Ok(0)
+        }
         "peers" => {
             let (ck, _) = logged(&base, &user, &pass)?;
             let r = get("/api/peers", Some(&ck), &base)?;
@@ -638,11 +671,12 @@ fn print_list(r: Resp, key: &str) -> Result<u32, String> {
             .as_str()
             .unwrap_or_else(|| item["vip"].as_str().unwrap_or(""));
         println!(
-            "{key} {name} admin={} disabled={} online={} status={}",
+            "{key} {name} admin={} disabled={} online={} status={} device_id={}",
             item["admin"].as_bool().unwrap_or(false),
             item["disabled"].as_bool().unwrap_or(false),
             item["online"].as_bool().unwrap_or(false),
             item["status"].as_str().unwrap_or(""),
+            item["device_id"].as_str().unwrap_or(""),
         );
     }
     Ok(0)
