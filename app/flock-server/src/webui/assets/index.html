@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flock 管理控制台</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1420; --surface: #171e2e; --border: #2a3550;
+      --fg: #e6ebf5; --muted: #8b96ad; --accent: #4f8cff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center;
+      justify-content: center; background: var(--bg); color: var(--fg);
+      font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 2rem; width: min(92vw, 380px);
+    }
+    h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
+    p.note { color: var(--muted); font-size: .8rem; margin: 0 0 1.25rem; line-height: 1.5; }
+    label { display: block; font-size: .8rem; color: var(--muted); margin: .75rem 0 .25rem; }
+    input {
+      width: 100%; padding: .55rem .75rem; border-radius: 8px;
+      border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+    }
+    button {
+      margin-top: 1.25rem; width: 100%; padding: .6rem; border: 0; border-radius: 8px;
+      background: var(--accent); color: #fff; font-size: .9rem; cursor: pointer;
+    }
+    #boot { margin-top: 1rem; font-size: .75rem; color: var(--muted); min-height: 1em; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Flock 管理控制台</h1>
+    <p class="note">M8b 前端未装配——当前为服务端壳页（登录表单占位）。
+      全部管理行为已可经 HTTP API 驱动（examples/webui_login.rs / tests/webui.rs）。</p>
+    <form id="login" autocomplete="off">
+      <label for="user">用户名</label>
+      <input id="user" name="user" autocomplete="username" disabled>
+      <label for="pass">口令</label>
+      <input id="pass" name="pass" type="password" autocomplete="current-password" disabled>
+      <button type="submit" disabled>登录（待 M8b 装配 wasm OPAQUE）</button>
+    </form>
+    <div id="boot">正在连接 /api/bootstrap …</div>
+  </main>
+  <script>
+    // 壳页唯一 JS：调通 /api/bootstrap（W 系断言起跑面）。
+    fetch('/api/bootstrap').then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(b => {
+        document.getElementById('boot').textContent =
+          '已连接集群 ' + b.cluster_id.slice(0, 8) + '（server ' + b.server_id.slice(0, 8) + '）';
+      })
+      .catch(() => { document.getElementById('boot').textContent = '/api/bootstrap 不可达'; });
+  </script>
+</body>
+</html>

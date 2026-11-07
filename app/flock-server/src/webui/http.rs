@@ -300,7 +300,9 @@ pub async fn serve_conn(io: &mut TcpStream, remote: SocketAddr, handler: Handler
                         ParseError::PayloadTooLarge => 413,
                         _ => 400,
                     };
-                    write_response(io, &Response::json(status, &err_envelope(status)), false).await;
+                    let _ =
+                        write_response(io, &Response::json(status, &err_envelope(status)), false)
+                            .await;
                     return;
                 }
             }

@@ -36,12 +36,13 @@ fn in_vpn_segment(ip: IpAddr) -> bool {
 }
 
 /// 来源分类（`X-Forwarded-For` 不参与——一律以连接 RemoteAddr 判定，W-A4）。
-pub fn classify_origin(remote: &SocketAddr) -> Result<Origin, ()> {
+/// None = 越界来源（403 `forbidden_origin` 面）。
+pub fn classify_origin(remote: &SocketAddr) -> Option<Origin> {
     match remote.ip() {
-        IpAddr::V4(v4) if v4.is_loopback() => Ok(Origin::Loopback), // 127.0.0.0/8
-        IpAddr::V6(v6) if v6.is_loopback() => Ok(Origin::Loopback), // ::1
-        ip if in_vpn_segment(ip) => Ok(Origin::Vpn),
-        _ => Err(()),
+        IpAddr::V4(v4) if v4.is_loopback() => Some(Origin::Loopback), // 127.0.0.0/8
+        IpAddr::V6(v6) if v6.is_loopback() => Some(Origin::Loopback), // ::1
+        ip if in_vpn_segment(ip) => Some(Origin::Vpn),
+        _ => None,
     }
 
     // 注：127.0.0.0/8 与 100.64.0.0/10 不相交（is_loopback 先判），两档各自记录。
@@ -351,7 +352,7 @@ mod tests {
         for ok_lb in ["127.0.0.1:1", "127.3.2.1:2", "127.255.255.254:3", "[::1]:4"] {
             assert_eq!(
                 classify_origin(&addr(ok_lb)),
-                Ok(Origin::Loopback),
+                Some(Origin::Loopback),
                 "{ok_lb} ⇒ loopback"
             );
         }
@@ -363,7 +364,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_origin(&addr(ok_vpn)),
-                Ok(Origin::Vpn),
+                Some(Origin::Vpn),
                 "{ok_vpn} ⇒ vpn"
             );
         }
@@ -378,7 +379,7 @@ mod tests {
             "[2001:db8::1]:1",
             "169.254.1.1:1",
         ] {
-            assert_eq!(classify_origin(&addr(bad)), Err(()), "{bad} ⇒ 拒（403 面）");
+            assert_eq!(classify_origin(&addr(bad)), None, "{bad} ⇒ 拒（403 面）");
         }
     }
 

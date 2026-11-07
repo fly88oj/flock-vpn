@@ -988,6 +988,7 @@ mod tests {
     fn store_of(core: &crate::server::ServerCore) -> std::sync::Arc<StateStore> {
         match &core.net {
             NetBackend::Single(s) => s.clone(),
+            #[cfg(feature = "multi-primary")]
             _ => panic!("single"),
         }
     }

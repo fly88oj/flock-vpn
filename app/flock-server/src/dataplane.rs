@@ -536,8 +536,11 @@ mod tests {
     use super::*;
 
     /// SRC_MISMATCH/SRC_MISMATCH_KILLS 是进程级静态——触达它们的服务端 e2e 测试
-    /// 间以此锁串行（否则并行测试互踩彼此的精确计数断言）。
-    static MISMATCH_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// 间以此锁串行（否则并行测试互踩彼此的精确计数断言）。tokio Mutex（LazyLock
+    /// 物化——new 非 const）：异步测试持锁跨 await 点（测试全程互斥；std Mutex
+    /// 跨 await 持有属 clippy 禁形），同步单元测试经 try_lock/阻塞获取同锁串行。
+    static MISMATCH_COUNTER_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     #[test]
     fn ipv4_src_dst_parses_and_rejects() {
@@ -564,9 +567,7 @@ mod tests {
     /// [`SRC_MISMATCH_SESSION_LIMIT`] 次返回拆链信号并累计 kills。
     #[test]
     fn src_mismatch_counter_kills_at_limit() {
-        let _g = MISMATCH_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = futures::executor::block_on(MISMATCH_COUNTER_LOCK.lock());
         let mism_before = src_vip_mismatches();
         let kills_before = src_vip_mismatch_kills();
         let mut c = SrcMismatchCounter::default();
@@ -630,9 +631,7 @@ mod tests {
     ///    不得删除新登记——新流下行必须照常（旧代码下该设备下行黑洞）。
     #[tokio::test]
     async fn serve_stream_inbound_check_outbound_and_reregistration_race() {
-        let _g = MISMATCH_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = MISMATCH_COUNTER_LOCK.lock().await;
         use flock_protocol::session::{
             respond, ClusterId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, ServerId,
             ServerIdentity, TunnelConfig,
@@ -759,9 +758,7 @@ mod tests {
     /// EOF）+ kills 计数递增——持续伪造源的会话不再永久存活于「丢包+计数」兜底。
     #[tokio::test]
     async fn serve_stream_killed_after_100_src_vip_mismatches() {
-        let _g = MISMATCH_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = MISMATCH_COUNTER_LOCK.lock().await;
         use flock_protocol::session::{
             respond, ClusterId, DeviceRecord, DeviceStaticKeys, InMemoryDirectory, ServerId,
             ServerIdentity, TunnelConfig,

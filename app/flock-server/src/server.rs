@@ -1098,6 +1098,7 @@ mod reaper_tests {
             ServerCore::open_or_init(m7_cfg(dir.path().to_path_buf(), 30)).expect("core");
         let store = match &core.net {
             crate::backend::NetBackend::Single(s) => s.clone(),
+            #[cfg(feature = "multi-primary")]
             _ => panic!("single"),
         };
         // 设备 A（活跃——流量计近期 last_seen）、B（从未在线——registered_at 锚）、
@@ -1169,6 +1170,7 @@ mod reaper_tests {
                 .expect("core0");
         let store0 = match &core0.net {
             crate::backend::NetBackend::Single(s) => s.clone(),
+            #[cfg(feature = "multi-primary")]
             _ => panic!("single"),
         };
         store0.register_device("u", [1; 32], ed_of(1), "a").unwrap();
@@ -1192,6 +1194,7 @@ mod reaper_tests {
             let (core, _) = ServerCore::open_or_init(m7_cfg(state_dir.clone(), 30)).expect("core");
             let store = match &core.net {
                 crate::backend::NetBackend::Single(s) => s.clone(),
+                #[cfg(feature = "multi-primary")]
                 _ => panic!("single"),
             };
             let row_a = store.register_device("u", [1; 32], ed_of(1), "a").unwrap();
@@ -1203,6 +1206,7 @@ mod reaper_tests {
         let (core2, _) = ServerCore::open_or_init(m7_cfg(state_dir, 30)).expect("reopen");
         let store2 = match &core2.net {
             crate::backend::NetBackend::Single(s) => s.clone(),
+            #[cfg(feature = "multi-primary")]
             _ => panic!("single"),
         };
         assert_eq!(store2.devices_all().len(), 2, "注册表跨重启保留");

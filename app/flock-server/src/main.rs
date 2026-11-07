@@ -378,7 +378,7 @@ fn run_cli() -> Result<(), String> {
                 #[cfg(not(feature = "multi-primary"))]
                 {
                     let _ = root_seed;
-                    return Err("cluster-bootstrap 需要 multi-primary 构建档".into());
+                    Err("cluster-bootstrap 需要 multi-primary 构建档".into())
                 }
                 #[cfg(feature = "multi-primary")]
                 {
@@ -502,7 +502,7 @@ fn run_cli() -> Result<(), String> {
                 #[cfg(not(feature = "multi-primary"))]
                 {
                     let _ = (root_seed, bundle, ttl_secs);
-                    return Err("cluster-invite 需要 multi-primary 构建档".into());
+                    Err("cluster-invite 需要 multi-primary 构建档".into())
                 }
                 #[cfg(feature = "multi-primary")]
                 {

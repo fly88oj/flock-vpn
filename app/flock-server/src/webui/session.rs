@@ -119,12 +119,13 @@ impl Sessions {
     }
 }
 
-/// 上限淘汰：超 [`SESSION_CAP`] 按 iat 淘汰最旧（iat 同刻按 sid 序——确定性）。
+/// 上限淘汰：超 [`SESSION_CAP`] 按 iat 淘汰最旧（iat 同刻任取一席——毫秒级同刻
+/// 属边界态，逐出哪一席语义等价：均为同刻签发的死会话）。
 fn evict_to_cap(g: &mut HashMap<String, Session>) {
     while g.len() >= SESSION_CAP {
         let Some(oldest) = g
             .iter()
-            .min_by_key(|(sid, s)| (s.iat_unix, sid.clone()))
+            .min_by_key(|(_, s)| s.iat_unix)
             .map(|(sid, _)| sid.clone())
         else {
             break;

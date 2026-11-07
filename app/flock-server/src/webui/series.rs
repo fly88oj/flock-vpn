@@ -174,6 +174,7 @@ mod tests {
     fn store_of(core: &ServerCore) -> Arc<crate::netstate::StateStore> {
         match &core.net {
             NetBackend::Single(s) => s.clone(),
+            #[cfg(feature = "multi-primary")]
             _ => panic!("single"),
         }
     }
