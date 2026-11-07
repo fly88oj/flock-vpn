@@ -56,6 +56,8 @@ RUN if [ -n "$server_features" ]; then FEAT="--features $server_features"; else 
  && cargo build --release --locked -p flock-server --bins --example webui_login $FEAT
 
 FROM debian:bookworm-slim
+# ARG 按构建段作用域——final 段需重声明才能在 COPY 展开（否则空串 ⇒ 整目录拷入）。
+ARG server_conf="server-webui.toml"
 # curl/jq：W1 未登录 401 断言与响应解析（本机容器内 127.0.0.1:9800）。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends procps curl jq \

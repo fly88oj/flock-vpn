@@ -62,6 +62,8 @@ services:
     restart: unless-stopped
 
   # —— dual 档（W6）：双 voter Raft ——
+  # 注意：a/b 构建档不同（server-webui-{a,b}.toml）⇒ **镜像 tag 必须分立**——
+  # 同 tag 双 build 会后者覆盖前者（b 的配置进 a 的容器）。
   dual-a:
     build:
       context: ..
@@ -69,7 +71,7 @@ services:
       args:
         server_features: multi-primary
         server_conf: server-webui-a.toml
-    image: flock/server:webui-mp
+    image: flock/server:webui-mp-a
     profiles: [dual]
     hostname: dual-a
     cap_add: [NET_ADMIN]
@@ -91,7 +93,7 @@ services:
       args:
         server_features: multi-primary
         server_conf: server-webui-b.toml
-    image: flock/server:webui-mp
+    image: flock/server:webui-mp-b
     profiles: [dual]
     hostname: dual-b
     cap_add: [NET_ADMIN]
@@ -134,7 +136,7 @@ services:
       args:
         server_features: multi-primary
         server_conf: server-webui-a.toml
-    image: flock/server:webui-mp
+    image: flock/server:webui-mp-a
     profiles: [dual]
     entrypoint:
       - /bin/sh
