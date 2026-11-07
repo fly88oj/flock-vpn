@@ -11,7 +11,8 @@
 //! 登录链（§M8.3）：`login-begin/finish` 调同一组 `pake::server_*`（dummy 同形防
 //! 枚举）；anchor = 服务端身份签名（`anchor_sign`）——/api/bootstrap 提供
 //! `identity_pub` 验签材料。pending 登录态按 user 单槽（末次 begin 覆盖）+ 5min
-//! 过期 + 256 上限。
+//! 过期 + 256 上限（满载按 exp/插入序逐出最旧、put/take 惰性清过期行——🟡 评审
+//! 项 3：字典序最小 ≠ 最旧）。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -116,6 +117,15 @@ fn ok_json(value: serde_json::Value) -> Response {
 struct PendingLogin {
     state: Vec<u8>,
     exp_unix: u64,
+    /// 插入序（同秒 exp 并列时「逐出最旧」的确定性破平——自增计数）。
+    seq: u64,
+}
+
+/// pending 表内态（seq 与 map 同锁——插入序无需原子面）。
+#[derive(Default)]
+struct PendingTable {
+    seq: u64,
+    map: std::collections::HashMap<String, PendingLogin>,
 }
 
 /// webui 装配态（serve/mod.rs 构建；测试直接构造以注入源地址）。
@@ -128,7 +138,7 @@ pub struct WebState {
     pub series: Arc<Series>,
     pub ttl_secs: u64,
     pub started: std::time::Instant,
-    pending: std::sync::Mutex<std::collections::HashMap<String, PendingLogin>>,
+    pending: std::sync::Mutex<PendingTable>,
 }
 
 impl WebState {
@@ -146,7 +156,7 @@ impl WebState {
             series: Arc::new(Series::new(points, interval)),
             ttl_secs: ttl,
             started: std::time::Instant::now(),
-            pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending: std::sync::Mutex::new(PendingTable::default()),
         }
     }
 
@@ -154,26 +164,53 @@ impl WebState {
         flock_protocol::trust::now_unix()
     }
 
+    /// 满载逐出最旧（按 `(exp_unix, seq)`——exp=begin 时刻+TTL，即最早 begin 的
+    /// 在途槽位；字典序 keys().min() 会误逐「名字靠前的新 begin」，🟡 评审项 3）。
+    /// 入口先惰性清过期行（过期槽位优先回收）。
     fn put_pending(&self, user: &str, state: Vec<u8>) {
-        let mut g = self.pending.lock().expect("pending poisoned");
-        if g.len() >= PENDING_LOGIN_CAP {
-            if let Some(k) = g.keys().min().cloned() {
-                g.remove(&k);
-            }
+        let now = self.now();
+        let mut g = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let tab = &mut *g;
+        tab.map.retain(|_, p| p.exp_unix > now);
+        while tab.map.len() >= PENDING_LOGIN_CAP {
+            let Some(oldest) = tab
+                .map
+                .iter()
+                .min_by_key(|(_, p)| (p.exp_unix, p.seq))
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            tab.map.remove(&oldest);
         }
-        g.insert(
+        tab.seq += 1;
+        let seq = tab.seq;
+        tab.map.insert(
             user.to_string(),
             PendingLogin {
                 state,
-                exp_unix: self.now() + PENDING_LOGIN_TTL,
+                exp_unix: now + PENDING_LOGIN_TTL,
+                seq,
             },
         );
     }
 
+    /// 取走在途态（末次 begin 的）；顺带惰性清全部过期行（🟡 评审项 3）。
     fn take_pending(&self, user: &str) -> Option<Vec<u8>> {
-        let mut g = self.pending.lock().expect("pending poisoned");
         let now = self.now();
-        g.remove(user).filter(|p| p.exp_unix > now).map(|p| p.state)
+        let mut g = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let tab = &mut *g;
+        tab.map.retain(|_, p| p.exp_unix > now);
+        tab.map.remove(user).map(|p| p.state)
+    }
+
+    /// 在册行数（测试/诊断面）。
+    fn pending_len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .len()
     }
 
     // ========================================================================
@@ -1021,4 +1058,84 @@ fn server_self_device_id_single(core: &ServerCore) -> [u8; 32] {
     let node_id = flock_sync::node::node_id_of(&core.identity.server_id);
     // server_self_device_id 是 node_id 的确定性推导（flock-sync lease）；复用之。
     flock_sync::lease::server_self_device_id(node_id)
+}
+
+// ============================================================================
+// 单元测试（评审项 3 的 pending 表面——满载逐出最旧/惰性清过期）
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn state() -> Arc<WebState> {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        let cfg = crate::config::ServerConfig {
+            state_dir,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mode: "direct".into(),
+            advertise_endpoint: "127.0.0.1:9443".parse().unwrap(),
+            extra_endpoints: vec![],
+            dir_version: 1,
+            ticket_ttl_secs: 60,
+            peer_retention_days: 30,
+            admin_bind: "127.0.0.1:0".parse().unwrap(),
+            max_sessions: 1024,
+            tun_name: "tun0".into(),
+            vip: "100.64.0.1".parse().unwrap(),
+            frp: None,
+            sync: None,
+            webui: Default::default(),
+        };
+        let (core, _) = crate::server::ServerCore::open_or_init(cfg).unwrap();
+        Arc::new(WebState::new(core))
+    }
+
+    /// 满载逐出按「最旧」而非字典序最小（🟡 评审项 3）：预填大字典序名至满载后，
+    /// admin（字典序最小）登录不被驱逐——旧实现 keys().min() 会逐掉 admin 的
+    /// 在途态（其 login-finish 无故 login_failed）。
+    #[tokio::test]
+    async fn pending_evicts_oldest_not_lexicographic_min() {
+        let st = state().await;
+        // 预填 PENDING_LOGIN_CAP-1 个大字典序名（z-user-NNNN）。
+        for i in 0..PENDING_LOGIN_CAP - 1 {
+            st.put_pending(&format!("z-user-{i:04}"), vec![i as u8]);
+        }
+        assert_eq!(st.pending_len(), PENDING_LOGIN_CAP - 1);
+        // admin 末位 begin（字典序最小——旧实现下一轮逐出的就是它）。
+        st.put_pending("admin", vec![0xAA]);
+        assert_eq!(st.pending_len(), PENDING_LOGIN_CAP);
+        // 再触发一次满载逐出：应逐最旧（z-user-0000），非 admin。
+        st.put_pending("z-zzz", vec![0xBB]);
+        assert_eq!(st.pending_len(), PENDING_LOGIN_CAP, "逐一插一维持上限");
+        assert_eq!(
+            st.take_pending("admin"),
+            Some(vec![0xAA]),
+            "admin 不因字典序被逐（逐出的是最旧 z-user-0000）"
+        );
+    }
+
+    /// take_pending 惰性清过期行：过期行（含请求者自身）不返回且被顺带清出。
+    #[tokio::test]
+    async fn pending_take_lazy_expires_stale_rows() {
+        let st = state().await;
+        st.put_pending("fresh", vec![1]);
+        st.put_pending("stale", vec![2]);
+        // 直接置过期（同模块测试面——不引入时钟注入缝）。
+        st.pending
+            .lock()
+            .unwrap()
+            .map
+            .get_mut("stale")
+            .unwrap()
+            .exp_unix = 1;
+        assert_eq!(st.take_pending("stale"), None, "过期行不返回");
+        // 任意 take 顺带清全部过期行（fresh 保留）。
+        assert_eq!(st.take_pending("nobody"), None);
+        assert_eq!(st.pending_len(), 1);
+        assert_eq!(st.take_pending("fresh"), Some(vec![1]));
+        assert_eq!(st.pending_len(), 0);
+    }
 }
