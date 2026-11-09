@@ -138,7 +138,11 @@ impl SessionIndex {
         gen
     }
 
-    /// 当前登记的出站通道（内核回程路由用）。
+    /// 当前登记的出站通道（内核回程路由用）。调用面 = Linux 编译面的
+    /// `with_kernel_router_task` + 测试档（`outbound_sender`/SessionIndex 单测）——
+    /// 非 Linux 的非测试编译面无调用方，cfg 到位即免 allow（dead_code 按平台面
+    /// 独立分析，Windows 开发机看不到 Linux 调用点）。
+    #[cfg(any(test, target_os = "linux"))]
     fn get(&self, vip: &[u8; 4]) -> Option<mpsc::Sender<Vec<u8>>> {
         self.map
             .lock()
@@ -158,8 +162,12 @@ impl SessionIndex {
 
 /// 单服数据面路由器（VIP → 会话包通道）。
 pub struct PeerRouter {
-    /// TUN 设备句柄（**存活持有**：接口与路由随句柄存续；非 Linux 装配路径不写入）。
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// TUN 设备句柄（**存活持有**：接口与路由随句柄存续——不被读取即其全部用途，
+    /// 纯 RAII 语义；Linux 真实装配路径写入 Some，非 Linux 降级路径恒 None，任何
+    /// 平台的编译面都不存在读取点）。allow(dead_code) 须无条件覆盖全部平台：
+    /// dead_code 恰在 Linux 编译面触发（有写入无读取），该 unix 编译面 Windows
+    /// 开发机不可见。
+    #[allow(dead_code)]
     tun: Option<Arc<TunIo>>,
     /// 目标 VIP → 该会话出站通道（内核回程 → 对端；代际守卫见 [`SessionIndex`]）。
     sessions: SessionIndex,
@@ -194,7 +202,7 @@ impl PeerRouter {
         {
             match open_tun_with_route(tun_name, vip).await {
                 Ok(tun) => {
-                    let mut sess = tun.session();
+                    let sess = tun.session();
                     let kernel_tx = sess.tx.clone();
                     PeerRouter {
                         tun: Some(Arc::new(tun)),
@@ -306,9 +314,11 @@ impl PeerRouter {
         })
     }
 
-    /// 当前登记的出站通道（内核回程路由/测试直驱用）。
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn outbound_sender(&self, vip: &[u8; 4]) -> Option<mpsc::Sender<Vec<u8>>> {
+    /// 当前登记的出站通道（测试直驱用——非测试面内核回程走
+    /// [`SessionIndex::get`]（with_kernel_router_task 内联），本方法无生产调用方，
+    /// Linux 编译面曾以 cfg_attr allow 掩盖其 unused，实为纯测试档）。
+    #[cfg(test)]
+    fn outbound_sender(&self, vip: &[u8; 4]) -> Option<mpsc::Sender<Vec<u8>>> {
         self.sessions.get(vip)
     }
 
