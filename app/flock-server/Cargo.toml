@@ -7,7 +7,9 @@ repository.workspace = true
 description = "Flock VPN 服务端装配（单服形态）：TCP :9443 E2E 会话 + 控制流（OPAQUE 登录锚/票据/设备注册表）+ ListenerMode 直连|frp（docs/design.md §2.2/§3.11/§7-M2）"
 
 [dependencies]
-flock-protocol = { path = "../../crates/flock-protocol", features = ["anchor"] }
+# 独立协议仓（原 crates/flock-protocol，v0.1.0 起独立发布）：anchor feature
+# （OPAQUE 登录锚）照搬抽取前声明。
+flock-protocol = { git = "https://github.com/fly88oj/flock-protocol.git", tag = "v0.1.0", features = ["anchor"] }
 flock-frpc = { path = "../../crates/flock-frpc" }
 # M4 多主同步（§3.10/§4）：Raft 状态机 + 两级读目录 + 租约/转发承载 + Raft 内票据根。
 # 行类型（DeviceRow/DeviceStatus/UserRow，评审项 12 去重）为唯一权威定义——非 optional

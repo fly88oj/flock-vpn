@@ -7,7 +7,9 @@ repository.workspace = true
 description = "Flock VPN 客户端装配（docs/design.md §2.3/§3.12/§7-M3）：tun 适配（TunDevice 接缝）+ 接入器退避/端点轮询 + IP 包 ↔ PacketChannel 数据面 + 路由配置"
 
 [dependencies]
-flock-protocol = { path = "../../crates/flock-protocol", features = ["anchor"] }
+# 独立协议仓（原 crates/flock-protocol，v0.1.0 起独立发布）：anchor feature
+# （OPAQUE 登录锚）照搬抽取前声明。
+flock-protocol = { git = "https://github.com/fly88oj/flock-protocol.git", tag = "v0.1.0", features = ["anchor"] }
 futures = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
