@@ -1475,7 +1475,11 @@ mod tests {
             0o600,
             "netstate.redb 权限 0600"
         );
-        // 重开（已存在文件）亦保持 0600。
+        // 重开（已存在文件）亦保持 0600。先拆首句柄再开——redb 对同文件持排它锁
+        // （flock 语义对进程内第二句柄同样生效，「Database already open」），「重开」
+        // 的真义是进程退出后的再开。unix 测试面：Windows 开发机不编译本用例，该
+        // 排它性只在 Linux 容器/CI 现形（首次容器跑测即暴露）。
+        drop(_s);
         let _s2 = StateStore::open(&path).expect("reopen");
         assert_eq!(
             std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
