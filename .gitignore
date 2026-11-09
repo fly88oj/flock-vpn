@@ -1,5 +1,6 @@
 target/
 .tmp/
 
-# 多机实测构建产物（deploy/multinode/Dockerfile.buildbin 的 --output 目录）
+# Multi-machine test build artifacts (the --output directory of
+# deploy/multinode/Dockerfile.buildbin).
 deploy/multinode/out/

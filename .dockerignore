@@ -1,6 +1,8 @@
-# Docker build context 裁剪（server 镜像主 context = 仓库根；保持小，§7-M2）。
-# .tmp 不进主 context——frp 二进制经命名构建上下文（build.additional_contexts）
-# 直取，命名 context 的传输不受本文件约束。
+# Docker build-context trimming (the server image's main context is the
+# repository root; keep it small, §7-M2).
+# .tmp stays out of the main context — the frp binaries are pulled via the
+# named build contexts (build.additional_contexts) directly, and named
+# context transfer is not governed by this file.
 target/
 .tmp/
 .git/
