@@ -1,419 +1,536 @@
-# Showroom 协议层裁定（Verdict）：截至 2026-10-31 是否行业最佳
+# Showroom protocol-layer verdict: is it industry-best as of 2026-10-31
 
-- 评估人：架构评审官（动态工作流子代理）
-- 裁定日期：2026-10-31
-- 输入材料（本次全部通读）：
-  `docs/research/showroom-analysis.md`、`docs/research/crypto-2026.md`、
-  `docs/research/compression-2026.md`、`docs/research/vpn-mesh-2026.md`、`docs/research/frp-compat.md`
-- 评估对象：`E:\Works\showroom` 的 `showroom-common`（SR-SIG1 + 加密信封 v1 + OPAQUE）
-  及其调用方约定，作为 ChmlVPN 协议库候选底子。
-- 场景区分（裁定前提）：showroom = 文件/请求传输（短生命周期信封、一次性密钥、
-  HTTP 请求响应语义）；ChmlVPN = 长寿命隧道（大量小包 + 高吞吐混合、单条 FRP TCP、
-  多主多活）。VPN 侧新增面（tun、多主多活）不参与 adopt/upgrade/hedge 判定，
-  但必须进升级清单（协议库要为它们提供接口）。
+- Evaluator: architecture review officer (a dynamic workflow subagent)
+- Verdict date: 2026-10-31
+- Input materials (all read in full this time):
+  `docs/research/showroom-analysis.md`, `docs/research/crypto-2026.md`,
+  `docs/research/compression-2026.md`, `docs/research/vpn-mesh-2026.md`,
+  `docs/research/frp-compat.md`
+- Subject of evaluation: `E:\Works\showroom`'s `showroom-common` (SR-SIG1 + encrypted envelope
+  v1 + OPAQUE) and its caller conventions, as the candidate foundation for the ChmlVPN protocol
+  library.
+- Scenario distinction (verdict premise): showroom = file/request transfer (short-lived
+  envelopes, one-time keys, HTTP request-response semantics); ChmlVPN = a long-lived tunnel
+  (many small packets mixed with high-throughput bulk, a single FRP TCP, multi-primary
+  active-active). The VPN-side new surfaces (tun, multi-primary active-active) do not take part
+  in the adopt/upgrade/hedge verdicts, but must enter the upgrade list (the protocol library
+  must provide interfaces for them).
 
 ---
 
-## 0. 本次亲自执行的源码抽查（裁定证据基线）
+## 0. Source spot-checks performed first-hand this time (the verdict's evidence baseline)
 
-以下各项在本次评估中直接读取 `E:\Works\showroom` 源码核实，与 showroom-analysis.md
-的描述**全部一致**：
+Each item below was verified by directly reading the `E:\Works\showroom` sources during this
+evaluation, **all consistent** with showroom-analysis.md's description:
 
-| 论断 | 核实位置（本次读取） |
+| Claim | Verification location (read this time) |
 |---|---|
-| `SIG_WINDOW_SECS=300`；`KEY_LEN=32`/`NONCE_LEN=12`/`TAG_LEN=16`/`SEG=4MiB`/`WRAP_LEN=384` | showroom-common/src/lib.rs:48-55 |
-| `nonce_hex()` = 16 随机字节 → 32 hex 字符（实现强于文档的"8 随机字节"） | lib.rs:75-79 |
-| SR-SIG1 canonical 串七字段 + Ed25519 签名 + base64url 无 pad | lib.rs:221-261 |
-| 验签：格式 → ±300s 窗口 → user 名下公钥逐一试签 | lib.rs:289-340 |
-| 信封：一次性随机 32B k → RSA-3072-OAEP-SHA256 封装、强制 384B 头 | lib.rs:383-394 |
-| 每段：新随机 12B nonce + AES-256-GCM，**无 AAD、无段序号** | lib.rs:396-411（encrypt 调用仅 nonce+明文） |
-| 解封流式、错误不 panic、段边界干净 EOF | lib.rs:416-461 |
+| `SIG_WINDOW_SECS=300`; `KEY_LEN=32`/`NONCE_LEN=12`/`TAG_LEN=16`/`SEG=4MiB`/`WRAP_LEN=384` | showroom-common/src/lib.rs:48-55 |
+| `nonce_hex()` = 16 random bytes → 32 hex characters (the implementation stronger than the doc's "8 random bytes") | lib.rs:75-79 |
+| SR-SIG1 canonical string of seven fields + Ed25519 signature + base64url unpadded | lib.rs:221-261 |
+| Verification: format → ±300s window → try each public key under the user | lib.rs:289-340 |
+| Envelope: one-time random 32B k → RSA-3072-OAEP-SHA256 encapsulation, enforced 384B header | lib.rs:383-394 |
+| Per segment: a fresh random 12B nonce + AES-256-GCM, **no AAD, no segment sequence number** | lib.rs:396-411 (the encrypt call takes only nonce+plaintext) |
+| Opening is streaming, errors do not panic, clean EOF on segment boundaries | lib.rs:416-461 |
 | OPAQUE Suite = Ristretto255(OPRF+KE) + TripleDH + Identity KSF | showroom-common/src/opaque.rs:32-39 |
-| argon2id m=19456KiB/t=2/p=1，盐 = `b"showroom-opaque-v1"+user` | opaque.rs:53-70 |
-| **opaque.rs:1 注释误写「RFC 9380」**（OPAQUE 实为 RFC 9807；9380 是 H2C）——crypto-2026.md §1 的发现属实 | opaque.rs:1（本次目视确认） |
-| nonce 查重：`HashMap<"user:nonce", 过期时刻>` + 惰性 retain 清理 + 重启清零；bind_token 60s 单次 | showroomctl/src/serve.rs:34-44（AppState）、serve.rs:913-922（nonce_fresh）、serve.rs:924-951（auth） |
-| zstd 固定 level 19（上行 docker save / 下行 pg_dump） | showroom/src/main.rs:318、showroomctl/src/dbmaint.rs:158 |
-| 魔数自适应解包（zstd `28 B5 2F FD`） | showroomctl/src/unpack.rs:15 |
-| ndjson 30s 心跳 `{"hb":true}` | showroomctl/src/streams.rs:28、68-69 |
-| dump 分片 ≤4MiB（`DUMP_CHUNK_MAX = 4<<20`） | dbmaint.rs:155 |
-| import 8MB 分片（wasm 控制台契约） | showroom-web/smoke-wizard.mjs:808-811（CHUNK8=8*1024*1024 测试佐证） |
-| 依赖锁定：opaque-ke 3.0.0 / aes-gcm 0.10.3 / rsa 0.9.10 / ed25519-dalek 2.2.0 / argon2 0.5.3 / sha2 0.10.9 / rand 0.8.8 / zstd 0.13.3 / curve25519-dalek 4.1.3 | Cargo.lock（本次 grep 逐项核对） |
-| **首登无信任锚边界**（复核轮新增核实）：『明文 HTTP 首登无信任锚——PAKE 只保证密码不泄露，主动 MITM 可中继 login-finish 并在 key-bind 登记自己的公钥接管账号（缓解：公网站点 B 经 Caddy TLS；LAN 不可信时用 CLI 钥匙路径）』 | E:\Works\showroom\SPEC.md:285-287（§16.2 风险边界，本次 sed 读取原文） |
-| ML-KEM-768 尺寸口径（复核轮实跑）：`ML-KEM-768 sizes: ek=1184B ct=1088B dk=64B \| hybrid X25519+ML-KEM-768: key-share=32+1184=1216B, ciphertext=32+1088=1120B`。**口径注记（三轮复核补）**：`dk=64B` 是 ml-kem 0.3.x `KeyExport::to_bytes()` 返回的**种子序列化形态**（Seed=d‖z，恒 64B），非 FIPS 203 完整解封装密钥长度（ML-KEM-768 dkLen=**2400B**）；本报告无任何结论引用 dk 尺寸，ek/ct 两值即 FIPS 203 参数组 | 本次执行 `cd .tmp/cryptobench && cargo run --release`（ml-kem 0.3.3，新增 size-check 代码）；种子语义经本地 registry 源码核实：ml-kem-0.3.3/src/decapsulation_key.rs:231-233（`fn to_bytes(&self) -> Seed`）与 :243-245（种子恒 64B、展开形态 ML-KEM-768=2400B）；同轮复跑的性能输出见 §3.3/§3.7 |
+| argon2id m=19456KiB/t=2/p=1, salt = `b"showroom-opaque-v1"+user` | opaque.rs:53-70 |
+| **opaque.rs:1's comment mistakenly writes "RFC 9380"** (OPAQUE is actually RFC 9807; 9380 is H2C) — crypto-2026.md §1's finding is real | opaque.rs:1 (visually confirmed this time) |
+| Nonce duplicate-check: `HashMap<"user:nonce", expiry instant>` + lazy retain cleanup + cleared on restart; bind_token 60s one-time | showroomctl/src/serve.rs:34-44 (AppState), serve.rs:913-922 (nonce_fresh), serve.rs:924-951 (auth) |
+| zstd fixed at level 19 (upstream docker save / downstream pg_dump) | showroom/src/main.rs:318, showroomctl/src/dbmaint.rs:158 |
+| Magic-byte adaptive unpacking (zstd `28 B5 2F FD`) | showroomctl/src/unpack.rs:15 |
+| ndjson 30s heartbeat `{"hb":true}` | showroomctl/src/streams.rs:28, 68-69 |
+| dump chunking ≤4MiB (`DUMP_CHUNK_MAX = 4<<20`) | dbmaint.rs:155 |
+| import 8MB chunks (the wasm console contract) | showroom-web/smoke-wizard.mjs:808-811 (CHUNK8=8*1024*1024 as test corroboration) |
+| Locked dependencies: opaque-ke 3.0.0 / aes-gcm 0.10.3 / rsa 0.9.10 / ed25519-dalek 2.2.0 / argon2 0.5.3 / sha2 0.10.9 / rand 0.8.8 / zstd 0.13.3 / curve25519-dalek 4.1.3 | Cargo.lock (checked item by item by grep this time) |
+| **The no-trust-anchor-on-first-login boundary** (newly verified in the re-check round): "first login over plaintext HTTP has no trust anchor — PAKE only guarantees the password is not leaked; an active MITM can relay login-finish and register its own public key at key-bind to take over the account (mitigation: site B on the public network behind Caddy TLS; when the LAN is untrusted, use the CLI key path)" | E:\Works\showroom\SPEC.md:285-287 (§16.2 risk boundary; the original text read via sed this time) |
+| ML-KEM-768 size figures (run in the re-check round): `ML-KEM-768 sizes: ek=1184B ct=1088B dk=64B \| hybrid X25519+ML-KEM-768: key-share=32+1184=1216B, ciphertext=32+1088=1120B`. **Calibration note (added in the third re-check)**: `dk=64B` is the **seed serialization form** returned by ml-kem 0.3.x's `KeyExport::to_bytes()` (Seed=d‖z, always 64B), not the FIPS 203 full decapsulation-key length (ML-KEM-768 dkLen=**2400B**); no conclusion in this report cites the dk size — the ek/ct values are the FIPS 203 parameter set | executed this time: `cd .tmp/cryptobench && cargo run --release` (ml-kem 0.3.3, with new size-check code); the seed semantics verified against the local registry sources: ml-kem-0.3.3/src/decapsulation_key.rs:231-233 (`fn to_bytes(&self) -> Seed`) and :243-245 (the seed is always 64B; the expanded form ML-KEM-768=2400B); the performance output re-run in the same round is in §3.3/§3.7 |
 
-本次**未复跑**的检查（如实声明）：compression-2026.md §2 的压缩实测为前期调研在同一台
-机器上执行，本次仅引用其数据未复现。crypto-2026.md 附录 A 的密码学基准在**复核轮已复跑**
-（cryptobench，输出与原报告一致：旧内核 AES-GCM 2.21–2.29 GB/s、GCM-SIV 5.09–5.27 GB/s、
-Ed25519 13.3/22.7μs、ML-KEM-768 keypair 0.022ms / encap+decap 0.044ms）。
-streams.rs 的逐行实现、serve.rs 的 kid 派生细节未逐行复核，按报告采信（关键常量已抽查）。
-
----
-
-## 1. 总判断
-
-**整体不可视为截至 2026-10-31 的行业最佳（overallKeep = false）。**
-
-showroom 协议层是 2024 年前后水准的**优秀经典密码学工程**：认证（OPAQUE）与请求签名
-（Ed25519）两维的算法选型即使放到今天也是行业第一梯队，可直接沿用；工程纪律
-（流式恒定内存、EtM、防枚举、0600 落盘、wasm 同栈向量测试）扎实。但整体落后在五点：
-
-1. **密钥封装是上个时代的答案**：RSA-3072-OAEP 无前向保密、无后量子路径、运算贵；
-   2026 年新协议的默认答案是 X25519+ML-KEM-768 混合（RFC 10024）。
-2. **后量子就绪为零**：全栈无任何 PQ 元素。对 showroom 自己的「存起来等私钥」型备份
-   信封，harvest-now-decrypt-later 威胁尤其成立。
-3. **控制面信任引导缺失（复核轮补入）**：明文链路首登无信任锚，主动 MITM 可中继
-   login-finish 并经 bind_token 登记自己的公钥接管账号（SPEC.md:285-287 本次核实）；
-   现有缓解仅为部署层（前置 TLS / 换 CI 钥匙路径），无协议层机制。对 VPN——账号
-   接管 ≈ 网络接入接管——这是必须协议层解决的维度。
-4. **依赖代际落后且性能白丢**：aes-gcm 0.10.3 走 aes 0.8.4 旧内核（新代 0.11/VAES
-   实测 ~2.3×，复核轮复跑确认）；opaque-ke 3.0.0 落后一个大版本（4.0.1）；
-   ed25519-dalek 2.2.0（3.0.0 已发布）；rand 0.8.8（生态已并行 0.9/0.10）。
-5. **缺传输帧/多路复用层与压缩策略档位**：showroom 依托 HTTP 语义，没有自己的帧与流；
-   压缩只有单一 zstd-19 批量档——这两项对 VPN 长寿命隧道是必须新建的面，且压缩直接
-   搬用会有 VORACLE 一族侧信道风险。
+Checks **not re-run** this time (stated as-is): compression-2026.md §2's compression
+measurements were executed by the earlier research on this same machine; this evaluation cites
+the data without reproducing it. crypto-2026.md Appendix A's cryptographic benchmarks **were
+re-run in the re-check round** (cryptobench, output matching the original report: old-kernel
+AES-GCM 2.21–2.29 GB/s, GCM-SIV 5.09–5.27 GB/s, Ed25519 13.3/22.7μs, ML-KEM-768 keypair
+0.022ms / encap+decap 0.044ms). streams.rs's line-by-line implementation and serve.rs's kid
+derivation details were not re-checked line by line; taken on the reports' word (key constants
+spot-checked).
 
 ---
 
-## 2. 逐维度裁定表
+## 1. Overall judgment
 
-| # | 维度 | showroom 现状 | 截至 2026-10-31 行业最佳 | 判定 |
+**The whole cannot be considered industry-best as of 2026-10-31 (overallKeep = false).**
+
+The showroom protocol layer is circa-2024-grade **excellent classical cryptography
+engineering**: its algorithm choices in both authentication (OPAQUE) and request signing
+(Ed25519) are still top-tier industry picks today and can be carried over directly; the
+engineering discipline (streaming constant memory, EtM, anti-enumeration, 0600 persistence,
+same-stack wasm vector tests) is solid. But the whole lags on five points:
+
+1. **Key encapsulation is a previous-era answer**: RSA-3072-OAEP has no forward secrecy, no
+   post-quantum path, and is computationally expensive; the 2026 default answer for new
+   protocols is the X25519+ML-KEM-768 hybrid (RFC 10024).
+2. **Post-quantum readiness is zero**: the whole stack has not a single PQ element. For
+   showroom's own "store now, open when the key leaks" style backup envelopes, the
+   harvest-now-decrypt-later threat applies in particular.
+3. **Control-plane trust bootstrap is missing (added in the re-check round)**: the first login
+   over a plaintext link has no trust anchor; an active MITM can relay login-finish and, via
+   bind_token, register its own public key to take over the account (SPEC.md:285-287 verified
+   this time); the existing mitigations are deployment-level only (fronting TLS / switching to
+   the CI key path), with no protocol-layer mechanism. For a VPN — account takeover ≈ network
+   access takeover — this is a dimension the protocol layer must solve.
+4. **Dependency generations lag and performance is left on the table**: aes-gcm 0.10.3 rides
+   the old aes 0.8.4 kernel (the new 0.11/VAES generation measured ~2.3×, confirmed by the
+   re-check-round re-run); opaque-ke 3.0.0 is a major version behind (4.0.1); ed25519-dalek
+   2.2.0 (3.0.0 released); rand 0.8.8 (the ecosystem already runs 0.9/0.10 in parallel).
+5. **Missing a transport-framing/multiplexing layer and compression policy tiers**: showroom
+   leans on HTTP semantics and has no frames or streams of its own; compression is a single
+   zstd-19 bulk tier — both are surfaces a long-lived VPN tunnel must newly build, and direct
+   reuse of the compression would carry the VORACLE-family side-channel risk.
+
+---
+
+## 2. Per-dimension verdict table
+
+| # | Dimension | showroom today | Industry best as of 2026-10-31 | Verdict |
 |---|---|---|---|---|
-| 1 | 用户认证（OPAQUE） | OPAQUE ristretto255-SHA512 + TripleDH + Identity KSF + 外部 argon2id(19MiB/t2/p1)；opaque-ke 3.0.0 | 同协议同套件；实现升 opaque-ke 4.0.1；PQ-PAKE 尚无标准 | **adopt** |
-| 2 | 请求签名（SR-SIG1/Ed25519） | Ed25519 canonical 签名 + 预哈希流式；ed25519-dalek 2.2.0 | Ed25519（FIPS 186-5 批准）仍为主流；dalek 3.0.0；ML-DSA 仅可选加档 | **adopt** |
-| 3 | 信封密钥封装（RSA-3072-OAEP） | RSA-3072-OAEP-SHA256 封一次性 32B k，384B 定长头 | X25519+ML-KEM-768 混合（RFC 10024；Chrome/OpenSSH/Cloudflare 已主流化） | **upgrade** |
-| 4 | 对称加密与流式分段（AES-256-GCM/4MiB 段） | AES-256-GCM，每段随机 96-bit nonce、无 AAD、一次性 k；aes-gcm 0.10.3（aes 0.8 旧内核） | 算法不变；计数器 nonce 纪律（长会话）+ 段序号 AAD + aes-gcm 0.11 新内核 + XChaCha/GCM-SIV 后备档 | **hedge** |
-| 5 | 压缩（zstd） | zstd 固定 level 19，先压后密，魔数路由解包 | zstd 分档（直通/字典/分块流）+ 非膨胀回退 + 默认关按策略开（VORACLE） | **hedge** |
-| 6 | 抗重放与会话管理 | ±300s 窗 + per-user nonce 内存查重 + bind_token 60s + EtM；无会话/rekey/keepalive | 控制面沿用；数据面 64-bit 计数器 + 滑动窗口 + 双阈值 rekey + keepalive（WireGuard 常量） | **hedge** |
-| 7 | 后量子就绪 | 零（RSA/Ed25519/OPAQUE 全经典） | 传输层 X25519+ML-KEM-768 混合为默认；签名 ML-DSA-65 可选加档 | **upgrade** |
-| 8 | 传输帧与多路复用 | 无自有帧/复用层（HTTP + ndjson + 分片端点；30s JSON 心跳） | 单条 TCP 上：长度前缀帧 + yamux（rust-yamux 0.14.1）承载于 E2E 会话之上；显式 EOF 帧 | **upgrade** |
-| 9 | 首登信任锚/控制面 MITM（复核轮补入） | 明文 HTTP 首登无信任锚：MITM 可中继 login-finish 抢用 bind_token 登记自己公钥接管账号（SPEC.md:285-287） | 协议层信任引导：TOFU+公钥指纹钉扎、带外预置凭证/邀请制、或服务端长期身份密钥进 OPAQUE/握手并由客户端钉扎（RFC 9807 的 aPAKE 模型要求客户端持有已认证服务端身份） | **upgrade** |
+| 1 | User authentication (OPAQUE) | OPAQUE ristretto255-SHA512 + TripleDH + Identity KSF + external argon2id(19MiB/t2/p1); opaque-ke 3.0.0 | same protocol and suite; implementation upgraded to opaque-ke 4.0.1; PQ-PAKE not yet standardized | **adopt** |
+| 2 | Request signing (SR-SIG1/Ed25519) | Ed25519 canonical signing + prehashed streaming; ed25519-dalek 2.2.0 | Ed25519 (FIPS 186-5 approved) still mainstream; dalek 3.0.0; ML-DSA only an optional add-on | **adopt** |
+| 3 | Envelope key encapsulation (RSA-3072-OAEP) | RSA-3072-OAEP-SHA256 wrapping a one-time 32B k, 384B fixed header | X25519+ML-KEM-768 hybrid (RFC 10024; already mainstream in Chrome/OpenSSH/Cloudflare) | **upgrade** |
+| 4 | Symmetric encryption and streaming segmentation (AES-256-GCM/4MiB segments) | AES-256-GCM, random 96-bit nonce per segment, no AAD, one-time k; aes-gcm 0.10.3 (the old aes 0.8 kernel) | algorithm unchanged; counter-nonce discipline (long sessions) + segment-sequence AAD + the aes-gcm 0.11 new kernel + XChaCha/GCM-SIV fallback tiers | **hedge** |
+| 5 | Compression (zstd) | zstd fixed at level 19, compress-then-encrypt, magic-routed unpacking | tiered zstd (pass-through/dictionary/chunked streaming) + non-expansion fallback + off by default, on by policy (VORACLE) | **hedge** |
+| 6 | Anti-replay and session management | ±300s window + in-memory per-user nonce duplicate check + bind_token 60s + EtM; no session/rekey/keepalive | control plane carried over; data plane 64-bit counters + sliding window + dual-threshold rekey + keepalive (WireGuard constants) | **hedge** |
+| 7 | Post-quantum readiness | zero (RSA/Ed25519/OPAQUE all classical) | X25519+ML-KEM-768 hybrid as the transport-layer default; ML-DSA-65 signature add-on optional | **upgrade** |
+| 8 | Transport framing and multiplexing | no framing/multiplexing layer of its own (HTTP + ndjson + chunked endpoints; 30s JSON heartbeat) | over a single TCP: length-prefixed frames + yamux (rust-yamux 0.14.1) riding on top of the E2E session; explicit EOF frames | **upgrade** |
+| 9 | First-login trust anchor / control-plane MITM (added in the re-check round) | first login over plaintext HTTP has no trust anchor: a MITM can relay login-finish, front-run bind_token, register its own public key, and take over the account (SPEC.md:285-287) | protocol-layer trust bootstrap: TOFU + public-key fingerprint pinning, out-of-band preset credentials/invites, or the server's long-term identity key entering OPAQUE/the handshake and pinned by the client (RFC 9807's aPAKE model requires the client to hold an authenticated server identity) | **upgrade** |
 
 ---
 
-## 3. 逐维度详述（证据 + 理由 + 动作）
+## 3. Per-dimension detail (evidence + reasoning + actions)
 
-### 3.1 用户认证（OPAQUE）——adopt
+### 3.1 User authentication (OPAQUE) — adopt
 
-**现状**（本次核实：opaque.rs:32-39、42、53-70）：OPAQUE，Suite =
-Ristretto255（OPRF 群 + KE 群）+ TripleDH + Identity KSF；口令硬化外置 argon2id
-m=19456KiB/t=2/p=1（OWASP 档），盐 = 常数前缀 + 用户名；未知用户走 dummy 假记录防枚举。
-依赖 opaque-ke 3.0.0（Cargo.lock 本次核对）。注释误引 RFC 9380（opaque.rs:1，本次目视确认）。
+**Current state** (verified this time: opaque.rs:32-39, 42, 53-70): OPAQUE, Suite =
+Ristretto255 (OPRF group + KE group) + TripleDH + Identity KSF; password hardening externalized
+argon2id m=19456KiB/t=2/p=1 (the OWASP tier), salt = constant prefix + username; unknown users
+go down the dummy fake-record path against enumeration. Depends on opaque-ke 3.0.0 (Cargo.lock
+checked this time). The comment mis-cites RFC 9380 (opaque.rs:1, visually confirmed this time).
 
-**行业最佳**（crypto-2026.md §4.1，来源 [4][5][28]）：OPAQUE 正式编号 **RFC 9807**
-（2025-07）；其 §7 推荐配置**第一位仍是 ristretto255-SHA512**——showroom 的套件选择与
-RFC 推荐一致，ristretto255 未废弃（RFC 9496 仍被新草案引用）。PQ-PAKE 尚无标准化实现
-（draft-vos-cfrg-pqpake 仍在讨论），因此「认证层经典 OPAQUE + 隧道层混合 KEM」就是
-2026 年的正确分工——不存在比 OPAQUE 更先进的可落地替代。实现侧最新稳定为
-opaque-ke **4.0.1**（2025-11-03），showroom 落后一个大版本。
+**Industry best** (crypto-2026.md §4.1, sources [4][5][28]): OPAQUE's official number is
+**RFC 9807** (2025-07); its §7's recommended configurations put **ristretto255-SHA512 first** —
+showroom's suite choice matches the RFC's recommendation, and ristretto255 is not deprecated
+(RFC 9496 still cited by new drafts). PQ-PAKE has no standardized implementation yet
+(draft-vos-cfrg-pqpake still under discussion), so "classical OPAQUE at the authentication
+layer + hybrid KEM at the tunnel layer" is the correct 2026 division of labor — there is no
+more advanced, deployable alternative than OPAQUE. On the implementation side, the latest
+stable is opaque-ke **4.0.1** (2025-11-03); showroom is a major version behind.
 
-**理由**：算法/套件/防枚举设计=行业最佳，无更优选项可换；差距只在 crate 版本、
-RFC 引用笔误与 argon2 参数档位，均属升级清单项而非改选算法。
-**动作**：升 opaque-ke 4.0.1（注意 API 代际回归测试，固定向量测试是守门员）；
-修正 RFC 引用；argon2 参数做成可升级的版本化 profile（RFC 9807 档 m=2GiB/t=1/p=4
-作为高配档，WebAssembly/低端设备保留 OWASP 档）。
+**Reasoning**: the algorithm/suite/anti-enumeration design = industry best, with nothing better
+to switch to; the gaps are only the crate version, the RFC citation typo, and the argon2
+parameter tier — all upgrade-list items, not reasons to change algorithms.
+**Actions**: upgrade to opaque-ke 4.0.1 (mind API-generation regression testing; the
+fixed-vector tests are the gatekeeper); fix the RFC citation; make the argon2 parameters an
+upgradable versioned profile (the RFC 9807 tier m=2GiB/t=1/p=4 as the high tier, the OWASP tier
+kept for WebAssembly/low-end devices).
 
-### 3.2 请求签名（SR-SIG1/Ed25519）——adopt
+### 3.2 Request signing (SR-SIG1/Ed25519) — adopt
 
-**现状**（本次核实：lib.rs:221-261、289-340）：canonical 七字段
-`SR-SIG1\nuser\nts\nnonce\nMETHOD\npath_with_query\nsha256(body)`，Ed25519 签名，
-base64url 无 pad；大文件流式预哈希签名（sign_prehashed）；多公钥任一命中 + kid 定位。
-ed25519-dalek 2.2.0（Cargo.lock 本次核对）。
+**Current state** (verified this time: lib.rs:221-261, 289-340): the seven-field canonical
+`SR-SIG1\nuser\nts\nnonce\nMETHOD\npath_with_query\nsha256(body)`, Ed25519 signature,
+base64url unpadded; streaming prehashed signing for large files (sign_prehashed);
+any-key-hits among multiple public keys + kid locating. ed25519-dalek 2.2.0 (Cargo.lock checked
+this time).
 
-**行业最佳**（crypto-2026.md §4.2，来源 [13][14][28]）：Ed25519 是 **FIPS 186-5 批准
-算法**（2023-02），合规性不再构成换 ML-DSA 的理由；请求级非对称签名（对比 AWS SigV4
-的 HMAC 对称方案）配多设备公钥档案 + kid 吊销，就是设备/用户请求认证的主流最佳形态。
-新代码用 ed25519-dalek 3.0.0（2026-07-06）。ML-DSA-65（FIPS 204）只是「未来不可抵赖 +
-抗收割」的可选并行档，不是必选——签名密钥档案的 PQ 化在业界尚不紧迫（Cloudflare
-origin 侧 ML-DSA 也才 2026 年中路线图）。
+**Industry best** (crypto-2026.md §4.2, sources [13][14][28]): Ed25519 is a **FIPS 186-5
+approved algorithm** (2023-02); compliance is no longer a reason to switch to ML-DSA;
+per-request asymmetric signing (versus AWS SigV4's symmetric HMAC) paired with a multi-device
+public-key profile + kid revocation is the mainstream best form of device/user request
+authentication. New code uses ed25519-dalek 3.0.0 (2026-07-06). ML-DSA-65 (FIPS 204) is only an
+optional parallel tier for "future non-repudiation + harvest resistance", not a must — PQ-ifying
+signing key profiles is not yet industry-urgent (Cloudflare's origin-side ML-DSA is itself only
+a mid-2026 roadmap item).
 
-**理由**：算法与协议设计达行业水准且无短板；升级项（dalek 3.0.0、可选 ML-DSA 并行
-公钥）不改变「已是最佳」的定性。
-**动作**：升 ed25519-dalek 3.0.0；密钥档案预留 kid→算法类型分派，为 ML-DSA-65 并行
-公钥留位（PQ 维度统一处理）。
+**Reasoning**: the algorithm and protocol design meet industry grade with no shortcomings; the
+upgrade items (dalek 3.0.0, optional parallel ML-DSA public keys) do not change the "already
+best" characterization.
+**Actions**: upgrade to ed25519-dalek 3.0.0; reserve kid→algorithm-type dispatch in the key
+profile, leaving room for parallel ML-DSA-65 public keys (PQ dimension handled uniformly).
 
-### 3.3 信封密钥封装（RSA-3072-OAEP）——upgrade
+### 3.3 Envelope key encapsulation (RSA-3072-OAEP) — upgrade
 
-**现状**（本次核实：lib.rs:383-394、347-349）：每信封一次性随机 32B AES 密钥，用平台
-RSA-3072 公钥以 OAEP-SHA256 封装，强制 384B 定长头；平台 RSA 常驻不轮换（泄露才换）。
+**Current state** (verified this time: lib.rs:383-394, 347-349): a one-time random 32B AES key
+per envelope, encapsulated with OAEP-SHA256 to the platform RSA-3072 public key, an enforced
+384B fixed header; the platform RSA is persistent and unrotated (rotated only on leak).
 
-**行业最佳**（crypto-2026.md §3.2/§3.3，来源 [12][20][22]-[26][37]）：
-**X25519 + ML-KEM-768 混合 KEM** 已是 2026 年新协议的默认答案——RFC 10024
-（2026-08，Proposed Standard）定型 TLS 混合组 X25519MLKEM768；Chrome 131 起默认；
-OpenSSH 10.0 起默认 `mlkem768x25519-sha256`；Cloudflare 人类流量 PQ 占比 >65%
-（2026-04）。成本可忽略——**复核轮实跑**（`.tmp/cryptobench`，ml-kem 0.3.3，release）：
-keypair 0.022ms、encap+decaps 0.044ms。尺寸口径（同轮实跑输出，FIPS 203 参数组）：
-ML-KEM-768 **ek=1184B、ct=1088B** ⇒ 混合封装**密文 = 32(X25519 临时公钥)+1088 =
-1120B**，接收方混合**公钥（key share）= 32+1184 = 1216B**。勘误：crypto-2026.md
-§3.3 原文「混合密文约 32+1184B」把 ek（封装公钥）混进了密文口径，本报告按实跑修正。
+**Industry best** (crypto-2026.md §3.2/§3.3, sources [12][20][22]-[26][37]): the
+**X25519 + ML-KEM-768 hybrid KEM** is already the 2026 default answer for new protocols —
+RFC 10024 (2026-08, Proposed Standard) fixed the TLS hybrid group X25519MLKEM768; default since
+Chrome 131; default `mlkem768x25519-sha256` since OpenSSH 10.0; Cloudflare's PQ share of human
+traffic >65% (2026-04). The cost is negligible — **re-check-round run**
+(`.tmp/cryptobench`, ml-kem 0.3.3, release): keypair 0.022ms, encap+decaps 0.044ms. Size
+figures (the same round's output; the FIPS 203 parameter set): ML-KEM-768 **ek=1184B,
+ct=1088B** ⇒ the hybrid encapsulation's **ciphertext = 32(X25519 ephemeral public key)+1088 =
+1120B**, and the receiver's hybrid **public key (key share) = 32+1184 = 1216B**. Erratum:
+crypto-2026.md §3.3's original "hybrid ciphertext ~32+1184B" mixed the ek (the encapsulation
+public key) into the ciphertext figure; this report corrects it per the actual run.
 
-**理由**：RSA-3072-OAEP 三重落后——①无前向保密（持平台私钥者未来任意时刻可解历史
-信封，对 dump 备份这类「存起来等私钥」形态是实质弱点，EtM 与一次性 k 均不缓解此点）；
-②无 PQ 路径（RSA 落在 SHC 攻击面内）；③运算贵：OAEP 加解密百微秒~毫秒级、RSA-3072
-keygen 昂贵（多主多活逐服务器密钥场景更痛）。尺寸上 RSA 的 384B 头反而**小于**混合
-密文 1120B——这是 RSA 唯一的尺寸优势，不构成保留理由。NIST SP 800-57 也只把
-RSA-3072 排到 2035 档。这不是漏洞（一次性 k 纪律下无已知实际攻击），但作为 2026 年
-的长期方案必须替换。
-**动作**：封装头改为 X25519+ML-KEM-768 混合（可保留 RSA-OAEP 兼容档做过渡双封装）；
-信封语义从「平台公钥收件」自然升级为「临时份额收件」，顺带获得一次性信封的前向保密。
+**Reasoning**: RSA-3072-OAEP is triply behind — ① no forward secrecy (the platform private-key
+holder can open historical envelopes at any future time; for the dump-backup "store now, open
+when the key leaks" form this is a substantive weakness, which neither EtM nor the one-time k
+mitigates); ② no PQ path (RSA falls inside the SHC attack surface); ③ computationally
+expensive: OAEP encrypt/decrypt in the hundred-microsecond-to-millisecond range, RSA-3072
+keygen costly (more painful in the per-server-key multi-primary active-active scenario). On
+size, RSA's 384B header is actually **smaller** than the 1120B hybrid ciphertext — RSA's only
+size advantage, and not a reason to keep it. NIST SP 800-57 also only puts RSA-3072 in the 2035
+tier. This is not a vulnerability (no known practical attack under the one-time-k discipline),
+but as a 2026 long-term plan it must be replaced.
+**Actions**: change the encapsulation header to the X25519+ML-KEM-768 hybrid (an RSA-OAEP
+compatibility tier can be kept for transitional dual encapsulation); the envelope semantics
+naturally upgrade from "recipient = platform public key" to "recipient = ephemeral share",
+gaining one-time-envelope forward secrecy along the way.
 
-### 3.4 对称加密与流式分段（AES-256-GCM / 4MiB 段）——hedge
+### 3.4 Symmetric encryption and streaming segmentation (AES-256-GCM / 4MiB segments) — hedge
 
-**现状**（本次核实：lib.rs:396-411、51-55）：AES-256-GCM，96-bit nonce，每段独立
-**随机** nonce，**无 AAD、无段序号**；密钥为每信封一次性随机 32B；段 = 4MiB 明文，
-流式恒定内存（seal 一块 / open 两块 4MiB 级缓冲）。aes-gcm 0.10.3（→ aes 0.8.4 旧内核，
-Cargo.lock 本次核对）。
+**Current state** (verified this time: lib.rs:396-411, 51-55): AES-256-GCM, 96-bit nonce, a
+fresh **random** nonce per segment, **no AAD, no segment sequence number**; the key is a
+one-time random 32B per envelope; segment = 4MiB plaintext, streaming with constant memory
+(one ~4MiB buffer in seal / two in open). aes-gcm 0.10.3 (→ the old aes 0.8.4 kernel, Cargo.lock
+checked this time).
 
-**行业最佳**（crypto-2026.md §2，来源 [2][15]-[17][27][30] 及附录 A 实测）：
-- 算法：AES-256-GCM 仍是桌面/服务器 CPU 上的首选（AES 硬件普及）——算法选择本身最佳；
-  无 AES 硬件端后备 ChaCha20/XChaCha20-Poly1305，抗误用场景 AES-256-GCM-SIV（RFC 8452）。
-- **nonce 纪律是分水岭**：随机 96-bit nonce 仅在「每密钥消息数 ≪ 2^32 且密钥一次性」
-  时可用（SP 800-38D 随机 IV 上限，经 C2SP/ePrint 2024/1111 转引；38D Rev.1 修订中）。
-  showroom 的「一次性 k + 每信封段数 = n/4MiB」恰好落在安全区内——**文件信封场景合法**；
-  但长寿命 VPN 会话必须改为每方向 64-bit 严格单调计数器 nonce（WireGuard 模型）。
-- **段 AAD**：标准做法是把段序号（及总长/信封 ID）绑进 AAD——showroom 缺失，意味着
-  信封层本身不防段重排/段拼接（同一信封内各段独立可解）；现靠外层 SR-SIG1 全信封哈希
-  （EtM，先验签后解密，security.md:84）兜底。作为通用协议库，AAD 应补。
-- **实现代际**：RustCrypto 新代 aes-gcm 0.11.1（aes 0.9 内核，运行时探测 VAES）比
-  showroom 所用旧代实测快 **~2.3×**（2.23 → 5.20-5.22 GB/s @4MiB 段，crypto-2026.md
-  附录 A；复核轮复跑复现：2.21-2.29 → 5.09-5.27 GB/s）——零密码学风险、纯性能收益的
-  第一优先升级。
-- 4MiB 段本身合法（GCM 单消息上限 ~64GiB；恒定内存设计是对的）；VPN 数据面则应按
-  MTU 级小包分段，文件信封才用大段。
+**Industry best** (crypto-2026.md §2, sources [2][15]-[17][27][30] and the Appendix A
+measurements):
+- Algorithm: AES-256-GCM remains first choice on desktop/server CPUs (AES hardware
+  ubiquitous) — the algorithm choice itself is best; ChaCha20/XChaCha20-Poly1305 as the
+  fallback on hosts without AES hardware; AES-256-GCM-SIV (RFC 8452) for misuse-resistant
+  scenarios.
+- **Nonce discipline is the watershed**: random 96-bit nonces are usable only when "messages
+  per key ≪ 2^32 and the key is one-time" (the SP 800-38D random-IV cap, relayed via C2SP/
+  ePrint 2024/1111; 38D Rev.1 under revision). showroom's "one-time k + segments per envelope =
+  n/4MiB" happens to sit inside the safe zone — **legal for the file-envelope scenario**; but a
+  long-lived VPN session must switch to a 64-bit strictly monotonic counter nonce per direction
+  (the WireGuard model).
+- **Segment AAD**: the standard practice binds the segment sequence number (and total
+  length/envelope ID) into the AAD — showroom lacks this, meaning the envelope layer itself
+  does not defend against segment reordering/splicing (each segment within one envelope is
+  independently decryptable); it is currently backstopped by the outer SR-SIG1 whole-envelope
+  hash (EtM, verify-then-decrypt, security.md:84). As a general protocol library, the AAD
+  should be added.
+- **Implementation generation**: the new RustCrypto aes-gcm 0.11.1 (aes 0.9 kernel, runtime
+  VAES detection) measured **~2.3× faster** than the old generation showroom uses (2.23 →
+  5.20-5.22 GB/s @4MiB segments, crypto-2026.md Appendix A; reproduced by the re-check-round
+  re-run: 2.21-2.29 → 5.09-5.27 GB/s) — the number-one-priority upgrade with zero cryptographic
+  risk and pure performance gain.
+- The 4MiB segments themselves are legal (GCM's per-message cap ~64GiB; the constant-memory
+  design is right); the VPN data plane, however, should segment at MTU-scale small packets;
+  large segments belong to file envelopes.
 
-**理由**：算法与流式架构正确且经测试（长度不变量断言），但三项改造（段 AAD、0.11 代
-内核、为 VPN 另立计数器 nonce + rekey 档位）必须做——保留主体、加新档位，故 hedge。
-**动作**：升 aes-gcm 0.11.1；信封 v2 加段序号 AAD（v1 兼容读）；协议库提供
-「一次性 k + 随机 nonce（信封档）」与「会话密钥 + 计数器 nonce（隧道档）」两个明确
-档位并文档化各自安全前提；协商后备 XChaCha20-Poly1305 与 AES-256-GCM-SIV。
+**Reasoning**: the algorithm and streaming architecture are correct and tested (length-invariant
+assertions), but three retrofits (segment AAD, the 0.11-generation kernel, and a separate
+counter-nonce + rekey tier for the VPN) are mandatory — keep the body, add new tiers; hence
+hedge.
+**Actions**: upgrade to aes-gcm 0.11.1; add segment-sequence AAD to envelope v2 (v1
+compat-read); the protocol library offers two explicit, separately documented tiers — "one-time
+k + random nonce (envelope tier)" and "session key + counter nonce (tunnel tier)" — each with
+its security preconditions written down; negotiate the fallbacks XChaCha20-Poly1305 and
+AES-256-GCM-SIV.
 
-### 3.5 压缩（zstd）——hedge
+### 3.5 Compression (zstd) — hedge
 
-**现状**（本次核实：main.rs:318、dbmaint.rs:158、unpack.rs:15）：zstd 固定 level 19，
-先压后密（顺序正确）；解包按魔数自适应（zstd/gzip/裸流）；common 刻意不含 zstd
-（压缩管道在调用方）。仅此一档，无字典、无分块流、无非膨胀回退开关。
+**Current state** (verified this time: main.rs:318, dbmaint.rs:158, unpack.rs:15): zstd fixed
+at level 19, compress-then-encrypt (the order is right); unpacking adapts by magic bytes
+(zstd/gzip/bare stream); common deliberately contains no zstd (the compression pipeline is in
+the callers). This single tier only — no dictionary, no chunked streaming, no non-expansion
+fallback switch.
 
-**行业最佳**（compression-2026.md §0/§2/§3/§6，来源 S1-S13）：
-- **算法族选对了**：zstd 是大流与小包（配字典）的双料最优；brotli/snappy 出局。
-  这部分 adopt。
-- **但档位必须重做**（依据本机实测 + 一级来源）：①<128B 直通（实测 40B 膨胀至
-  122.5%、120B 零收益；zstd #3722 固定成本主导）；②128B–1.5KB 结构化小包
-  zstd level 1 + 训练字典 4–16KB（实测 120B→28–30%、1400B→9.4% 且比无字典更快）；
-  ③大流 zstd -1 分块 16–64KB + 5–10ms 定时 flush（实测 64KB 块仅损 0.2pp）；
-  ④非膨胀回退（RFC 3173 §2.2 MUST）+ 自适应跳过；⑤上下文复用（实测 3×）。
-- **安全前提变了**：showroom 压的是自家批量载荷（docker 层、DB dump），注入面小；
-  ChmlVPN 隧道承载成员全部上网流量 + FRP 中转即密文长度观察点——CRIME/BREACH/VORACLE
-  三前提全部成立（compression-2026.md §3.2）。行业结论：WireGuard 完全不压缩（宁可
-  16B 填充）、OpenVPN 2.5→2.6 默认禁用并计划移除。因此 VPN 数据面压缩必须
-  **默认关、按策略开 + 输出填充**。
+**Industry best** (compression-2026.md §0/§2/§3/§6, sources S1-S13):
+- **The algorithm family is right**: zstd is the dual best for bulk streams and (with a
+  dictionary) small packets; brotli/snappy are out. That part is adopt.
+- **But the tiers must be redone** (per local measurements + primary sources): ① <128B pass
+  through (measured: 40B expands to 122.5%, 120B zero gain; zstd #3722 fixed costs dominate);
+  ② 128B–1.5KB structured small packets at zstd level 1 + a trained 4–16KB dictionary
+  (measured: 120B→28–30%, 1400B→9.4%, and faster than without); ③ bulk streams zstd -1 chunked
+  at 16–64KB + a 5–10ms timed flush (measured: 64KB chunks lose only 0.2pp); ④ non-expansion
+  fallback (RFC 3173 §2.2 MUST) + adaptive skipping; ⑤ context reuse (measured 3×).
+- **The security premise changed**: showroom compresses its own bulk payloads (docker layers,
+  DB dumps) with a small injection surface; the ChmlVPN tunnel carries all members' web traffic
+  + the FRP relay is precisely a ciphertext-length observation point — all three
+  CRIME/BREACH/VORACLE preconditions hold (compression-2026.md §3.2). Industry conclusions:
+  WireGuard does no compression at all (preferring 16B padding); OpenVPN 2.5→2.6 disabled it by
+  default and plans removal. Hence VPN data-plane compression must be **off by default, on by
+  policy + output padding**.
 
-**理由**：zstd-19 单一档对 showroom 的批量场景够用且比率优先合理，但作为协议库的
-压缩层既缺性能档（小包/延迟敏感）又缺安全档（策略门控/回退/填充），照搬进 VPN 会
-同时输掉性能与安全。
-**动作**：压缩层按上述四档重构；level 19 保留为「批量/归档」档；帧格式加压缩标志位
-+ 原始长度字段（解压端预分配）；默认安全态=关闭；字典用合成模板训练并版本化分发。
+**Reasoning**: the single zstd-19 tier is sufficient for showroom's bulk scenarios and
+ratio-first is reasonable there, but as a protocol library's compression layer it lacks both
+performance tiers (small packets/latency-sensitive) and safety tiers (policy gating/fallback/
+padding); copied into a VPN it would lose both performance and safety.
+**Actions**: rebuild the compression layer into the four tiers above; keep level 19 as the
+"bulk/archive" tier; add a compression flag + original-length field to the frame format (so
+the decompressing side can preallocate); the safe default = off; train dictionaries on
+synthetic templates and distribute them versioned.
 
-### 3.6 抗重放与会话管理——hedge
+### 3.6 Anti-replay and session management — hedge
 
-**现状**（本次核实：lib.rs:48、326-328；serve.rs:34-44、913-951）：时间窗
-|now−ts|≤300s + per-user nonce 查重（`HashMap<"user:nonce", 过期时刻>`，插入时惰性
-清理，条目寿命=窗口期，**重启清零**——SPEC 明示可接受）；bind_token 60s 单次消费；
-EtM 先验签后解密；分片导入 seq/total 服务端强制。**没有会话概念**：无 rekey、
-无 keepalive（ndjson 流有 30s JSON 心跳，属 HTTP 层）、无数据面计数器。
+**Current state** (verified this time: lib.rs:48, 326-328; serve.rs:34-44, 913-951): time
+window |now−ts|≤300s + per-user nonce duplicate-checking (`HashMap<"user:nonce", expiry
+instant>`, lazily cleaned on insert, entry lifetime = the window, **cleared on restart** — SPEC
+declares this acceptable); bind_token 60s one-time; EtM verify-then-decrypt; server-enforced
+seq/total on chunked imports. **No session concept**: no rekey, no keepalive (the ndjson stream
+has a 30s JSON heartbeat, but that is HTTP-layer), no data-plane counters.
 
-**行业最佳**（crypto-2026.md §2.2/§6，来源 [6][8][9][10]；vpn-mesh-2026.md §5）：
-- 控制面/API 面：时间窗 + nonce 查重是标准做法（与 AWS SigV4 同型且 nonce 存储更强），
-  showroom 现设计可保留。
-- 数据面/长寿命会话（WireGuard 常量，wireguard-go `device/constants.go`）：nonce =
-  32-bit 零 + 64-bit LE 计数器；接收侧 64-bit 计数 + 滑动窗口（实现 2048）；
-  rekey 双阈值 2^60 包或 120s；180s / 2^64−2^13−1 硬拒绝；10s keepalive；
-  重连 = 全新握手（不做 PSK 恢复）；伪造尝试限额触发断链。
-- 多主多活新增约束：nonce/会话/吊销状态跨服务端的语义需要设计（内存态重启清零在
-  多活集群里等于「重启窗口全网重放面」，需共享状态或会话级机制接管）。
+**Industry best** (crypto-2026.md §2.2/§6, sources [6][8][9][10]; vpn-mesh-2026.md §5):
+- Control plane/API surface: time window + nonce duplicate-checking is standard practice (the
+  same shape as AWS SigV4, with stronger nonce storage); showroom's design can stay.
+- Data plane/long-lived sessions (WireGuard constants, wireguard-go `device/constants.go`):
+  nonce = 32-bit zero + 64-bit LE counter; receiver-side 64-bit counter + sliding window
+  (implementation 2048); rekey dual threshold 2^60 packets or 120s; 180s / 2^64−2^13−1 hard
+  reject; 10s keepalive; reconnect = a brand-new handshake (no PSK resumption); forgery-attempt
+  limits triggering disconnect.
+- New multi-primary active-active constraints: the cross-server semantics of nonce/session/
+  revocation state need design (in-memory state cleared on restart amounts, in an
+  active-active cluster, to a "restart-window network-wide replay surface"; shared state or a
+  session-level mechanism must take over).
 
-**理由**：showroom 单服务器场景内该设计成立且边界已被 SPEC 知悉接受；但协议库面向
-长寿命隧道完全没有会话级抗重放/rekey/保活档位，VPN 场景必须新增——保留并加档，hedge。
-**动作**：API 面机制原样保留；新增会话档（计数器+滑动窗口+双阈值 rekey+keepalive，
-常量参照 wireguard-go）；明确多主多活下的重放状态归属（Raft 状态机或会话票据）。
+**Reasoning**: within showroom's single-server scenario the design holds and its boundaries are
+known and accepted by SPEC; but the protocol library, aimed at long-lived tunnels, has no
+session-level anti-replay/rekey/keepalive tier at all — the VPN scenario must add one; keep and
+add tiers, hedge.
+**Actions**: keep the API-surface mechanism as-is; add a session tier (counters + sliding
+window + dual-threshold rekey + keepalive, constants per wireguard-go); make the ownership of
+replay state under multi-primary active-active explicit (the Raft state machine or session
+tickets).
 
-### 3.7 后量子就绪——upgrade
+### 3.7 Post-quantum readiness — upgrade
 
-**现状**（本次核实：Cargo.lock 无 ml-kem/ml-dsa/liboqs 等条目；封装=RSA、签名=Ed25519、
-认证=OPAQUE，全经典）：**零 PQ 元素**。
+**Current state** (verified this time: Cargo.lock has no ml-kem/ml-dsa/liboqs entries;
+encapsulation = RSA, signing = Ed25519, authentication = OPAQUE, all classical): **zero PQ
+elements**.
 
-**行业最佳**（crypto-2026.md §3.2/§7，来源 [12][13][20]-[26]）：X25519+ML-KEM-768
-混合是 2026 年新协议默认（RFC 10024 / FIPS 203；Chrome 131 默认、OpenSSH 10.0 默认、
-Cloudflare >65% 并目标 2029 全 PQ）；纯 Rust ml-kem 0.3.3（FIPS 203）可用（复核轮
-实跑其延迟与 crypto-2026.md 附录 A 一致：keypair 0.022ms / encap+decaps 0.044ms）；
-签名侧 ML-DSA-65（FIPS 204）为可选加档（crate 自述未审计，或用形式化验证的 libcrux
-备选）；**不要用 liboqs**（官方明示不建议生产）。认证层 PQ-PAKE 尚无标准 → PQ 放
-传输层即可。
+**Industry best** (crypto-2026.md §3.2/§7, sources [12][13][20]-[26]): the X25519+ML-KEM-768
+hybrid is the 2026 default for new protocols (RFC 10024 / FIPS 203; Chrome 131 default,
+OpenSSH 10.0 default, Cloudflare >65% and targeting full PQ by 2029); the pure-Rust ml-kem
+0.3.3 (FIPS 203) is usable (the re-check round ran its latency, consistent with crypto-2026.md
+Appendix A: keypair 0.022ms / encap+decaps 0.044ms); on signatures, ML-DSA-65 (FIPS 204) is an
+optional add-on (the crate self-describes as unaudited; or use the formally verified libcrux as
+an alternative); **do not use liboqs** (officially not recommended for production). PQ-PAKE at
+the authentication layer is not yet standardized → putting PQ in the transport layer suffices.
 
-**理由**：这是唯一「完全空白」的维度。RSA 信封对 harvest-now-decrypt-later 尤其脆弱
-（备份 dump 天生长存）；2026 年评估「行业最佳」，无 PQ 路径即不合格。
-**动作**：与 3.3 合并执行——封装/握手换混合 KEM；密钥档案可选并行 ML-DSA-65；
-版本协商字段预留算法档位以便未来升级。
+**Reasoning**: this is the only "completely blank" dimension. The RSA envelopes are especially
+vulnerable to harvest-now-decrypt-later (backup dumps are long-lived by nature); evaluated
+against "industry best 2026", lacking a PQ path is disqualifying.
+**Actions**: execute together with 3.3 — switch encapsulation/handshake to the hybrid KEM;
+optionally parallel ML-DSA-65 public keys in the key profile; reserve algorithm-tier fields in
+version negotiation for future upgrades.
 
-### 3.8 传输帧与多路复用——upgrade
+### 3.8 Transport framing and multiplexing — upgrade
 
-**现状**（本次核实：streams.rs:28/68-69 心跳、dbmaint.rs:155 dump 分片、
-smoke-wizard.mjs:808-811 import 8MB 分片佐证；showroom-analysis.md §4.2）：showroom
-**没有自己的传输帧/复用层**——控制面是 HTTP/1.1 请求响应（axum），下行是 ndjson 流
-（30s `{"hb":true}` 心跳防代理断连），大载荷靠端点级分片（import 8MB/片、dump ≤4MB/片）。
-对 FRP 明文中转的适配靠 HTTP 自身的可代理性。
+**Current state** (verified this time: streams.rs:28/68-69 heartbeat, dbmaint.rs:155 dump
+chunking, smoke-wizard.mjs:808-811 import 8MB-chunk corroboration; showroom-analysis.md §4.2):
+showroom **has no transport-framing/multiplexing layer of its own** — the control plane is
+HTTP/1.1 request-response (axum), the downstream is ndjson streams (a 30s `{"hb":true}`
+heartbeat against proxy disconnects), and large payloads rely on endpoint-level chunking
+(import 8MB/chunk, dump ≤4MB/chunk). Adaptation to the FRP plaintext relay leans on HTTP's own
+proxyability.
 
-**行业最佳**（vpn-mesh-2026.md §4；frp-compat.md §1.5）：单条 FRP TCP 中转上的
-VPN 隧道应采用：**长度前缀帧 + 流 ID 的多路复用，承载于 E2E 加密会话之上**——具体
-推荐 yamux（hashicorp 规范；Rust 实现 rust-yamux 0.14.1，2026-09-21 仍活跃，被
-libp2p 大规模使用）：依赖可靠有序字节流的前提与单条 TCP 严丝合缝、原生 keepalive、
-流控/背压内建。明确不选：HTTP/2（语义错配且同样有 TCP 队头阻塞）、QUIC-over-TCP
-（双层可靠传输，收益为零复杂度翻倍）。**硬约束**（frp 实证）：禁依赖 TCP 半关闭表达
-单向结束（T3 实验：SHUT_WR 后回程 0/65536 字节，整链即拆）——必须用显式 EOF 帧或
-长度前缀；首字节任意值安全（用户口无探测，T2 已证）；数据面空闲不超时但节点重启/
-NAT 会硬断，需应用层心跳 + 重连。
+**Industry best** (vpn-mesh-2026.md §4; frp-compat.md §1.5): a VPN tunnel over a single FRP
+TCP relay should use: **length-prefixed frames + stream-ID multiplexing, riding on top of the
+E2E encrypted session** — specifically recommended: yamux (the hashicorp spec; the Rust
+implementation rust-yamux 0.14.1, still active 2026-09-21, used at scale by libp2p): its
+premise of relying on a reliable ordered byte stream fits a single TCP exactly, keepalive is
+native, flow control/backpressure built in. Explicitly not chosen: HTTP/2 (semantic mismatch
+and the same TCP head-of-line blocking), QUIC-over-TCP (double-layer reliable transport; zero
+benefit, doubled complexity). **Hard constraints** (proven on frp): do not rely on TCP
+half-close to express one-directional end (the T3 experiment: after SHUT_WR the return path is
+0/65536 bytes and the whole chain tears) — an explicit EOF frame or length prefixes are
+mandatory; any first-byte value is safe (no probing at the user port, proven by T2); the data
+plane has no idle timeout, but node restarts/NAT will hard-drop — an application-layer
+heartbeat + reconnect are needed.
 
-**理由**：这不是「showroom 做得不够好」，而是该层在 showroom 中根本不存在（HTTP
-代行了帧与多路复用）。VPN 隧道必须新建此层，故 upgrade。
-**动作**：协议库新增帧层（长度前缀 + 流 ID + 帧类型含显式 EOF/keepalive）与
-复用层（yamux 或等价语义：流控、背压、keepalive、多流优先级——控制流高优先级）；
-会话/重连语义按 3.6 的 WireGuard 模型配套。
+**Reasoning**: this is not "showroom did it insufficiently well" — the layer simply does not
+exist in showroom (HTTP did the framing and multiplexing on its behalf). A VPN tunnel must
+build this layer; hence upgrade.
+**Actions**: the protocol library gains a framing layer (length prefix + stream ID + frame
+types including explicit EOF/keepalive) and a multiplexing layer (yamux or equivalent
+semantics: flow control, backpressure, keepalive, multi-stream priorities — the control flow at
+high priority); the session/reconnect semantics pair with 3.6's WireGuard model.
 
-### 3.9 首登信任锚/控制面 MITM（复核轮补入维度）——upgrade
+### 3.9 First-login trust anchor / control-plane MITM (dimension added in the re-check round) —
+upgrade
 
-**现状**（本次核实：SPEC.md:285-287 原文读取；showroom-analysis.md §6 第 5 条同载）：
-明文 HTTP 首登无信任锚——SPEC §16.2 风险边界如实声明：「PAKE 只保证密码不泄露，
-主动 MITM 可中继 login-finish 并在 key-bind 登记自己的公钥接管账号」，现行缓解
-仅为**部署层**（公网站点前置 Caddy TLS；LAN 不可信时改走 CI 钥匙路径），协议层
-无任何信任引导机制。攻击路径（由已核实的机制推演）：OPAQUE 全程可被中继（PAKE
-不向首登客户端认证服务端身份——showroom 的 `SERVER_ID=b"showroom-server"` 是
-字面量常量，opaque.rs:42 本次核实，不是已认证的密钥材料）；login-finish 后服务端
-下发 60s 单次 bind_token（serve.rs:43-44 本次核实）是 bearer 凭据，中继者可抢在
-客户端之前用它 key-bind 登记自己持有的公钥（key-bind 的签名由候选新钥匙本体作出，
-只证明持有新钥匙、不证明持有账号口令），账号即被接管。次要同类边界：UnknownUser
-假记录存在响应长度/时序统计残差（SPEC.md:287-288）。
+**Current state** (verified this time: SPEC.md:285-287 read in the original;
+showroom-analysis.md §6 item 5 carries the same): the first login over plaintext HTTP has no
+trust anchor — SPEC §16.2's risk boundary states it plainly: "PAKE only guarantees the password
+is not leaked; an active MITM can relay login-finish and register its own public key at
+key-bind to take over the account"; the current mitigations are **deployment-level only** (a
+public-network site fronted by Caddy TLS; the CI key path when the LAN is untrusted); the
+protocol layer has no trust-bootstrap mechanism at all. Attack path (extrapolated from the
+verified mechanisms): OPAQUE can be relayed end to end (PAKE does not authenticate the server
+identity to a first-login client — showroom's `SERVER_ID=b"showroom-server"` is a literal
+constant, opaque.rs:42 verified this time, not authenticated key material); after
+login-finish, the server issues the 60s one-time bind_token (serve.rs:43-44 verified this
+time), a bearer credential that a relaying attacker can front-run the client to use for
+key-binding a public key it holds (the key-bind signature is made by the candidate new key
+itself, proving only possession of the new key, not of the account password) — the account is
+taken over. A secondary boundary of the same class: the UnknownUser fake record has
+statistical residue in response length/timing (SPEC.md:287-288).
 
-**行业最佳**：身份引导（trust bootstrap）是authenticated key exchange 的标准议题——
-RFC 9807 的 aPAQUE 安全模型**要求客户端持有已认证的服务端身份**，否则 PAKE 不提供
-服务端认证；工程上的成熟做法：①TOFU + 公钥指纹钉扎（SSH known_hosts 模型，指纹
-变更告警）；②带外预置凭证/邀请制（innernet 一次性邀请文件、Tailscale IdP 外包、
-ZeroTier 控制器证书）；③服务端长期签名身份密钥进 OPAQUE 信封/握手 transcript，
-客户端首登钉扎、后续登录强制校验（与混合 KEM 的服务端静态份额天然可合并）。
+**Industry best**: identity bootstrap is a standard topic of authenticated key exchange —
+RFC 9807's aPAKE security model **requires the client to hold an authenticated server
+identity**, otherwise PAKE provides no server authentication; the mature engineering
+approaches: ① TOFU + public-key fingerprint pinning (the SSH known_hosts model, with
+fingerprint-change warnings); ② out-of-band preset credentials/invites (innernet's one-time
+invite files, Tailscale's IdP outsourcing, ZeroTier's controller certificates); ③ the server's
+long-term signing identity key entering the OPAQUE envelope/handshake transcript, pinned by
+the client at first login and enforced on subsequent logins (naturally combinable with the
+hybrid KEM's server static share).
 
-**理由**：showroom 自己已如实声明该边界且以部署层缓解——在其「管理员可控部署」
-场景属已知取舍；但 ChmlVPN 的账号即网络接入权，接管账号=接管网格 membership，
-且 FRP 明文中转是该攻击的结构性放大器（中转方天然位于中继位置）。作为 VPN 协议库
-的必备维度，此为结构性缺口。
-**动作**：升级清单 P0-5：协议层信任引导（TOFU 钉扎 + 带外预置凭证双路径，服务端
-长期身份密钥进握手/OPAQUE 并覆盖 bind_token 等引导凭据的完整性）；首登指纹展示
-与钉扎变更告警进管理面。
-
----
-
-## 4. 升级清单（协议库设计硬输入）
-
-按优先级排列；标 ★ 的为 VPN 新增面（不参与上文判定，但协议库必须提供接口）。
-
-**P0（安全结构项，不做则不配称 2026 最佳）**
-1. 密钥封装替换为 **X25519 + ML-KEM-768 混合 KEM**（RFC 10024 / FIPS 203；ml-kem
-   0.3.3 纯 Rust；不用 liboqs）；一次性信封获得前向保密 + PQ；可保留 RSA-OAEP 兼容
-   档做过渡双封装。（尺寸参考，复核轮实跑：混合密文 32+1088=1120B、混合公钥
-   32+1184=1216B、延迟 <0.1ms）
-2. **会话/隧道档 AEAD 纪律**：每方向 64-bit 严格单调计数器 nonce；2^60 包或 120s
-   双阈值 rekey；180s / 2^64−2^13−1 硬拒绝；伪造尝试限额断链；禁用长会话随机
-   96-bit nonce（信封档保留「一次性 k + 随机 nonce」并文档化前提）。
-3. **信封 v2 段 AAD**：段序号（+ 信封 ID/总段数）进 AAD，防段重排与拼接；v1 只读兼容。
-4. **压缩层安全化**：压缩默认关闭、按策略/按流开启（VORACLE/CRIME 前提在 ChmlVPN
-   成立——FRP 中转即长度观察点）；开启会话配输出填充；非膨胀回退（RFC 3173 §2.2 MUST）
-   + 自适应跳过。
-5. **首登信任锚/控制面 MITM（复核轮补入）**：协议层信任引导——①服务端长期签名
-   身份密钥进 OPAQUE 信封/握手 transcript，客户端首登 TOFU 钉扎（指纹展示 + 变更
-   告警），后续登录强制校验；②带外预置凭证/邀请制作为强路径（对标 innernet 邀请
-   文件 / SSH known_hosts）；bind_token 等引导凭据的完整性须被服务端身份密钥覆盖。
-   依据：SPEC.md:285-287 已声明的接管攻击；RFC 9807 aPAKE 模型要求客户端持有已
-   认证服务端身份。
-
-**P1（性能与档位项）**
-6. **crate 代际升级**：aes-gcm 0.10.3 → 0.11.1（aes 0.9/VAES 内核，实测 ~2.3×）；
-   opaque-ke 3.0.0 → 4.0.1；ed25519-dalek 2.2.0 → 3.0.0；评估 rand 0.8.8 → 0.9/0.10
-   （API 代差；0.8.x 仍被维护，可延后但要有计划）。
-7. **压缩档位重构**：<128B 直通；128B–1.5KB zstd-1 + 字典 4–16KB（合成模板训练、
-   dictID 协商、版本强制一致）；>1.5KB zstd -1 分块 16–64KB + 5–10ms flush；上下文
-   复用；level 19 仅留批量/归档档；帧头加压缩标志 + 原始长度；lz4_flex 作 CPU 受限
-   备选档。
-8. **AEAD 协商后备档**：XChaCha20-Poly1305（无 AES 硬件端）、AES-256-GCM-SIV
-   （抗误用/多主复制场景，本机实测最快）。
-9. **传输帧与多路复用层**：长度前缀帧 + 流 ID + 显式 EOF 帧（禁依赖 TCP 半关闭，
-   frp T3 实证）+ keepalive；复用采用 yamux（rust-yamux 0.14.1）或等价语义（流控/
-   背压/keepalive/控制流高优先级）；首字节任意值合规（frp 用户口无探测）。
-10. **握手**：WireGuard 式 1-RTT（Noise IK 结构）+ 混合 KEM 槽位；按对端静态公钥
-    索引会话支持漫游；重连 = 全新握手（不做 PSK 恢复）；10s keepalive 兼作中转探活。
-
-**P2（认证/签名维护项）**
-11. OPAQUE：升 opaque-ke 4.0.1（固定向量测试守门）；argon2id 参数版本化 profile
-    （RFC 9807 高配档 vs OWASP 档）；修正 RFC 引用 9380 → **9807**（opaque.rs:1，
-    本次已核实笔误存在）。
-12. 签名：ed25519-dalek 3.0.0；密钥档案预留 ML-DSA-65 并行公钥/kid 类型分派（可选
-    PQ 加档）。
-13. 文档回改：nonce 长度规范-实现偏差以实现为准（16 随机字节/32 hex，lib.rs:75-79）。
-
-**★ VPN 新增面（必须提供接口，不参与判定）**
-14. **tun 数据面接口**：帧化 TUN IP 包进逻辑流；适配 tun-rs 2.8.16（Win/macOS/Linux/
-    Android/iOS 平台矩阵最全）；Linux 路由配 rtnetlink；MTU 1280（Tailscale 同款、
-    IPv6 下限）；Android `protect()` / iOS fd 传入的接入缝。
-15. **多主多活同步接口**：设备注册表/凭证/配置版本走强一致状态机（openraft）；
-    在线状态走 gossip 租约；会话票据本地签发下放；吊销全网生效语义 + nonce/重放状态
-    的跨服务端归属；协议库需暴露「按服务器独立密钥/逐次重封装」的权限点。
-16. **frp 中转适配接口**：应用层心跳 + 断链重连（全新握手）；不依赖半关闭；单隧道
-    多会话复用（不依赖多隧道）；frpc 子进程托管（ChmlFrp v0.51.2 定版 + 原版定版
-    双栈，ChmlFrp 三次重连退出需进程守护）。
-
----
-
-## 5. 方法与限度声明
-
-- 本报告的「行业最佳」结论转引自五份调研报告的一级来源链（RFC/NIST/官方博客/
-  上游源码/crates.io API + 报告内本机实测），评估人对报告结论做了源码侧交叉抽查
-  （§0 表）；网络检索未复跑。密码学基准在复核轮已实跑复现（cryptobench，§0 表），
-  压缩实测未复跑。
-- 本次未做的：ChmlVPN 侧任何实现验证（仓库尚无代码）；移动端（iOS/Android）纯 Rust
-  crate 交叉实测（crypto-2026.md gaps #6）；ChmlFrp 真实节点端到端实测
-  （frp-compat.md gaps #1）。
-- 9 个维度中 adopt 2 项、hedge 3 项、upgrade 4 项；总判断 overallKeep = false，
-  主要由 #3（封装）、#7（PQ）、#8（帧/复用）、#9（信任锚）四项 upgrade 与
-  #4/#5/#6 的档位缺口驱动。
+**Reasoning**: showroom itself declares this boundary honestly and mitigates it at the
+deployment layer — a known trade-off within its "administrator-controlled deployment"
+scenario; but for ChmlVPN the account is network access itself: taking over the account =
+taking over mesh membership, and the FRP plaintext relay is a structural amplifier of this
+attack (the relay sits in the relay position by definition). As a mandatory dimension of a VPN
+protocol library, this is a structural gap.
+**Actions**: upgrade-list P0-5: protocol-layer trust bootstrap (a dual path of TOFU pinning +
+out-of-band preset credentials, with the server's long-term identity key entering the
+handshake/OPAQUE and covering the integrity of bootstrap credentials such as bind_token);
+first-login fingerprint display and pin-change warnings go into the admin plane.
 
 ---
 
-## 6. 复核修订记录（2026-10-31 第二轮）
+## 4. Upgrade list (the hard input for protocol-library design)
 
-复核员提出两条异议，逐条核实结果如下：
+Ordered by priority; ★ items are VPN-new surfaces (not part of the verdicts above, but the
+protocol library must provide interfaces).
 
-1. **遗漏「首登信任锚/控制面 MITM」维度——成立，已修订。** 核实：SPEC.md:285-287
-   原文本次读取，确载「明文 HTTP 首登无信任锚——PAKE 只保证密码不泄露，主动 MITM
-   可中继 login-finish 并在 key-bind 登记自己的公钥接管账号」；showroom-analysis.md
-   §6 第 5 条（229-231 行）同载。原 verdict 的 8 维度与 15 项升级清单均未覆盖，属
-   完备性缺口。修订：新增维度 9（§2 表、§3.9 详述，判定 upgrade）、升级清单新增
-   P0-5（TOFU 钉扎 / 带外预置凭证 / 服务端身份密钥进 OPAQUE 与握手）；总判断
-   overallKeep=false 不变且论据增强。
-2. **§3.3 混合密文数字口径错误——成立，已修订。** 核实：本次实跑 cryptobench
-   （ml-kem 0.3.3）输出 `ek=1184B ct=1088B`，即混合密文 = 32+1088 = **1120B**、
-   混合公钥 key share = 32+1184 = **1216B**。crypto-2026.md §3.3 原文「混合密文约
-   32+1184B」把 ek 混入密文口径（1184 是封装公钥长度，密文是 1088）；原 verdict
-   「混合密文 ~1120B + 32B」为重复加总。修订：§3.3 数字按实跑改正并注明勘误；
-   同时纠正理由段——RSA 384B 头其实**小于**混合密文 1120B（RSA 唯一的尺寸优势，
-   不构成保留理由），替换论据是前向保密 + PQ + 速度。维度 upgrade 结论不变。
+**P0 (security-structure items; without them it cannot claim to be 2026-best)**
+1. Replace key encapsulation with the **X25519 + ML-KEM-768 hybrid KEM** (RFC 10024 / FIPS
+   203; ml-kem 0.3.3 pure Rust; no liboqs); one-time envelopes gain forward secrecy + PQ; an
+   RSA-OAEP compatibility tier can be kept for transitional dual encapsulation. (Size
+   reference, re-check-round run: hybrid ciphertext 32+1088=1120B, hybrid public key
+   32+1184=1216B, latency <0.1ms)
+2. **Session/tunnel-tier AEAD discipline**: a 64-bit strictly monotonic counter nonce per
+   direction; 2^60-packet or 120s dual-threshold rekey; 180s / 2^64−2^13−1 hard reject;
+   forgery-attempt limit disconnects; random 96-bit nonces banned for long sessions (the
+   envelope tier keeps "one-time k + random nonce" with its preconditions documented).
+3. **Envelope v2 segment AAD**: the segment sequence number (+ envelope ID/segment count)
+   enters the AAD, preventing segment reordering and splicing; v1 read-only compatible.
+4. **Compression-layer hardening**: compression off by default, enabled per policy/per stream
+   (the VORACLE/CRIME preconditions hold in ChmlVPN — the FRP relay is a length observation
+   point); sessions with it on get output padding; non-expansion fallback (RFC 3173 §2.2 MUST)
+   + adaptive skipping.
+5. **First-login trust anchor / control-plane MITM (added in the re-check round)**:
+   protocol-layer trust bootstrap — ① the server's long-term signing identity key enters the
+   OPAQUE envelope/handshake transcript; the client TOFU-pins at first login (fingerprint
+   display + change warnings) and enforces the check on subsequent logins; ② out-of-band
+   preset credentials/invites as the strong path (modeled on innernet's invite files / SSH
+   known_hosts); the integrity of bootstrap credentials such as bind_token must be covered by
+   the server identity key. Basis: the takeover attack already declared at SPEC.md:285-287;
+   RFC 9807's aPAKE model requires the client to hold an authenticated server identity.
 
-## 7. 复核修订记录（2026-10-31 第三轮）
+**P1 (performance and tiering items)**
+6. **crate generation upgrades**: aes-gcm 0.10.3 → 0.11.1 (the aes 0.9/VAES kernel, measured
+   ~2.3×); opaque-ke 3.0.0 → 4.0.1; ed25519-dalek 2.2.0 → 3.0.0; evaluate rand 0.8.8 →
+   0.9/0.10 (an API generation gap; 0.8.x is still maintained — can be deferred but needs a
+   plan).
+7. **Compression tier rebuild**: <128B pass-through; 128B–1.5KB zstd-1 + 4–16KB dictionary
+   (synthetic-template training, dictID negotiation, versions strictly matched); >1.5KB zstd -1
+   chunked at 16–64KB + 5–10ms flush; context reuse; level 19 kept only as the bulk/archive
+   tier; the frame header gains a compression flag + original length; lz4_flex as the
+   CPU-constrained fallback tier.
+8. **AEAD negotiation fallback tiers**: XChaCha20-Poly1305 (hosts without AES hardware),
+   AES-256-GCM-SIV (misuse-resistant/multi-primary-replication scenarios; fastest locally).
+9. **Transport framing and multiplexing layer**: length-prefixed frames + stream IDs +
+   explicit EOF frames (no reliance on TCP half-close, proven by frp T3) + keepalive;
+   multiplexing via yamux (rust-yamux 0.14.1) or equivalent semantics (flow control/
+   backpressure/keepalive/control flow at high priority); any first-byte value compliant (no
+   probing at the frp user port).
+10. **Handshake**: WireGuard-style 1-RTT (Noise IK structure) + the hybrid-KEM slot; sessions
+    indexed by the peer's static public key to support roaming; reconnect = a brand-new
+    handshake (no PSK resumption); the 10s keepalive doubles as relay liveness probing.
 
-复核员提出两条（均文书级，不影响任何判定），逐条核实结果如下：
+**P2 (authentication/signature maintenance items)**
+11. OPAQUE: upgrade to opaque-ke 4.0.1 (fixed-vector tests as the gate); versioned argon2id
+    parameter profiles (the RFC 9807 high tier vs the OWASP tier); fix the RFC citation
+    9380 → **9807** (opaque.rs:1; the typo's existence verified this time).
+12. Signatures: ed25519-dalek 3.0.0; reserve ML-DSA-65 parallel public keys / kid-type dispatch
+    in the key profile (an optional PQ add-on).
+13. Doc correction: the nonce-length spec-implementation deviation follows the implementation
+    (16 random bytes/32 hex, lib.rs:75-79).
 
-1. **§4 升级清单编号冲突——成立，已重编。** 核实：grep 本文件确认第二轮在 P0 块
-   末尾插入第 5 项（首登信任锚）后，P1 块仍从「5. crate 代际升级」起号，出现两个
-   5 号；P2 仍为 10–12、★ 仍为 13–15，未顺延。无条目丢失，§3.9 的「P0-5」指称
-   在 P0 块内无歧义。修订：P1 重编为 6–10、P2 重编为 11–13、★ 重编为 14–16，
-   共 16 项连续编号；条目内容零变化。
-2. **§0 表『dk=64B』口径无限定语——成立，已加注。** 核实：本地 cargo registry
-   源码 ml-kem-0.3.3/src/decapsulation_key.rs:231-233 证实 `KeyExport::to_bytes()`
-   返回 `Seed`（d‖z，恒 64B），:243-245 证实展开形态（FIPS 203 dkLen）ML-KEM-768
-   为 2400B。§0 表原样照录了程序输出 `dk=64B` 而未注明是种子序列化形态，易被误读
-   为 FIPS dk 尺寸。修订：§0 表该行加「口径注记」；报告无任何结论引用 dk 尺寸，
-   各判定不受影响。
+**★ VPN-new surfaces (interfaces must be provided; not part of the verdicts)**
+14. **tun data-plane interface**: frame TUN IP packets into logical streams; adapt tun-rs
+    2.8.16 (the fullest Win/macOS/Linux/Android/iOS platform matrix); Linux routing via
+    rtnetlink; MTU 1280 (same as Tailscale, the IPv6 floor); access seams for Android
+    `protect()` / iOS fd injection.
+15. **Multi-primary active-active sync interface**: device registry/credentials/config
+    versions through a strongly consistent state machine (openraft); online state via gossip
+    leases; session tickets delegated to local issuance; network-wide-effective revocation
+    semantics + the cross-server ownership of nonce/replay state; the protocol library must
+    expose the "per-server independent keys / per-rotation re-wrapping" permission point.
+16. **frp relay adaptation interface**: application-layer heartbeat + disconnect-reconnect (a
+    brand-new handshake); no half-close reliance; multi-session multiplexing over a single
+    tunnel (no multi-tunnel reliance); frpc subprocess supervision (the dual stack of pinned
+    ChmlFrp v0.51.2 + pinned original; ChmlFrp's exit-after-three-reconnects needs process
+    supervision).
+
+---
+
+## 5. Method and limitation statement
+
+- This report's "industry best" conclusions are relayed from the five research reports'
+  primary-source chains (RFC/NIST/official blogs/upstream sources/the crates.io API + the
+  reports' local measurements); the evaluator cross-checked the reports' conclusions against
+  the source side (the §0 table); web searches were not re-run. The cryptographic benchmarks
+  were re-run and reproduced in the re-check round (cryptobench, §0 table); the compression
+  measurements were not re-run.
+- Not done this time: any ChmlVPN-side implementation verification (the repository has no code
+  yet); cross-compilation tests of pure-Rust crates on mobile (iOS/Android) (crypto-2026.md
+  gaps #6); live end-to-end testing on a real ChmlFrp node (frp-compat.md gaps #1).
+- Of the 9 dimensions: 2 adopt, 3 hedge, 4 upgrade; the overall judgment overallKeep = false,
+  driven mainly by the four upgrades — #3 (encapsulation), #7 (PQ), #8 (framing/multiplexing),
+  #9 (trust anchor) — plus the tier gaps of #4/#5/#6.
+
+---
+
+## 6. Re-check revision record (2026-10-31, round two)
+
+The reviewer raised two objections; the item-by-item verification results:
+
+1. **The "first-login trust anchor / control-plane MITM" dimension was missing — upheld;
+   revised.** Verification: SPEC.md:285-287 was read in the original this time and indeed
+   carries "first login over plaintext HTTP has no trust anchor — PAKE only guarantees the
+   password is not leaked; an active MITM can relay login-finish and register its own public
+   key at key-bind to take over the account"; showroom-analysis.md §6 item 5 (lines 229-231)
+   carries the same. Neither the original verdict's 8 dimensions nor its 15-item upgrade list
+   covered it — a completeness gap. Revision: dimension 9 added (the §2 table, detailed in
+   §3.9, verdict upgrade) and upgrade-list item P0-5 added (TOFU pinning / out-of-band preset
+   credentials / the server identity key entering OPAQUE and the handshake); the overall
+   judgment overallKeep=false stands, with strengthened argumentation.
+2. **§3.3's hybrid-ciphertext figures were wrong — upheld; revised.** Verification: this
+   round's cryptobench run (ml-kem 0.3.3) output `ek=1184B ct=1088B`, i.e. the hybrid
+   ciphertext = 32+1088 = **1120B** and the hybrid public-key key share = 32+1184 = **1216B**.
+   crypto-2026.md §3.3's original "hybrid ciphertext ~32+1184B" mixed the ek into the
+   ciphertext figure (1184 is the encapsulation public key's length; the ciphertext is 1088);
+   the original verdict's "hybrid ciphertext ~1120B + 32B" was a double summation. Revision:
+   §3.3's figures corrected per the actual run with the erratum noted; the reasoning paragraph
+   also corrected — RSA's 384B header is actually **smaller** than the 1120B hybrid ciphertext
+   (RSA's only size advantage, not a reason to keep it); the replacement arguments are forward
+   secrecy + PQ + speed. The dimension's upgrade verdict is unchanged.
+
+## 7. Re-check revision record (2026-10-31, round three)
+
+The reviewer raised two items (both clerical; no verdicts affected); the item-by-item
+verification results:
+
+1. **§4 upgrade-list numbering conflict — upheld; renumbered.** Verification: grepping this
+   file confirms that after round two inserted item 5 (first-login trust anchor) at the end of
+   the P0 block, the P1 block still started numbering at "5. crate generation upgrades",
+   producing two 5s; P2 remained 10–12 and ★ remained 13–15, without shifting. No entries were
+   lost, and §3.9's "P0-5" reference is unambiguous within the P0 block. Revision: P1
+   renumbered 6–10, P2 renumbered 11–13, ★ renumbered 14–16 — 16 items with consecutive
+   numbering; entry contents unchanged.
+2. **The §0 table's "dk=64B" figure lacked a qualifier — upheld; annotated.** Verification: the
+   local cargo registry sources, ml-kem-0.3.3/src/decapsulation_key.rs:231-233, confirm
+   `KeyExport::to_bytes()` returns `Seed` (d‖z, always 64B), and :243-245 confirm the expanded
+   form (FIPS 203 dkLen) for ML-KEM-768 is 2400B. The §0 table reproduced the program output
+   `dk=64B` verbatim without noting it is the seed serialization form, easily misread as the
+   FIPS dk size. Revision: a "calibration note" added to that row of the §0 table; no
+   conclusion in the report cites the dk size; the verdicts are unaffected.
