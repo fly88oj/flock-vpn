@@ -629,12 +629,17 @@ a9() {
     # unchanged: A9_DEADLINE=30s budget + the existing +2s observation
     # tolerance, detection on both sides is mandatory.
     local t0=$SECONDS saw_c=0 saw_s=0 elapsed=0
+    # Observation tolerance: +2s for the polling/sampling tail, +5s extra for
+    # the Docker `network disconnect` effective-lag tail (the moment the link
+    # actually goes silent lands measurably after the command returns under
+    # load; the product detection budget itself stays A9_DEADLINE=30s).
+    local tol=$((A9_DEADLINE + 2 + 5))
     while :; do
         [ "$saw_c" = 0 ] && [ "$(docker logs "$cid" 2>&1 | grep -c 'reason=dead-link' || true)" -gt "$base_c" ] && saw_c=1
         [ "$saw_s" = 0 ] && [ "$(docker logs "$scid" 2>&1 | grep -c 'reason=dead-link' || true)" -gt "$base_s" ] && saw_s=1
         elapsed=$((SECONDS - t0))
         [ "$saw_c" = 1 ] && [ "$saw_s" = 1 ] && break
-        [ "$elapsed" -ge $((A9_DEADLINE + 2)) ] && break
+        [ "$elapsed" -ge "$tol" ] && break
         sleep 1
     done
     if [ "$saw_c" != 1 ] || [ "$saw_s" != 1 ]; then
