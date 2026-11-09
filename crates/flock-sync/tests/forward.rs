@@ -605,8 +605,16 @@ async fn traffic_counting_single_point_local_and_cross_server() {
         "跨服转发通路在位（前置：C 的租约已扩散到 n0）"
     );
     // 等投递 + ewma 折叠循环（1s 窗）转过折叠轮（首 tick 定基准、次 tick 折出）。
-    tokio::time::sleep(Duration::from_millis(2300)).await;
-    let a_n0 = n0.lease().peer_stats(&id_a).expect("A 行在 n0");
+    // 修法与 157f141（前置显式化）同款：折叠由背景 1s 循环驱动，并行负载下 tick
+    // 迟滞不定（MissedTickBehavior::Delay 只顺延不追帧）——固定睡 2.3s 仅 ~300ms
+    // 裕量，容器/CI 多用例并行即抖破。显式等条件，预算 4s：仍 < 反熵 5s 窗，保住
+    // 下方「origin 不计 dst rx」==0 断言的观察窗（n1 折出值经反熵到达 n0 之前）。
+    let mut a_n0 = n0.lease().peer_stats(&id_a).expect("A 行在 n0");
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while a_n0.tx_ewma == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        a_n0 = n0.lease().peer_stats(&id_a).expect("A 行在 n0");
+    }
     assert!(a_n0.tx_ewma > 0, "src tx 由接入服务器计：{}", a_n0.tx_ewma);
     let c_n0 = n0.lease().peer_stats(&id_c).expect("C 行在 n0（远端视图）");
     assert_eq!(
@@ -625,8 +633,13 @@ async fn traffic_counting_single_point_local_and_cross_server() {
         n0.ingest_packet(&id_a, &pkt2).await,
         IngestResult::DeliveredLocal
     ));
-    tokio::time::sleep(Duration::from_millis(2300)).await;
-    let c_n0_after = n0.lease().peer_stats(&id_c).expect("C 行");
+    // 同上：显式等折出（固定 2.3s 睡的抖动面在并行负载下不可靠）。
+    let mut c_n0_after = n0.lease().peer_stats(&id_c).expect("C 行");
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while c_n0_after.rx_ewma == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        c_n0_after = n0.lease().peer_stats(&id_c).expect("C 行");
+    }
     // 同服投递 ⇒ dst rx 由本机（= 持有者）计。注：A 的行现在由 n0 持有（publish 后）。
     assert!(c_n0_after.rx_ewma > 0, "dst rx 由投递成功的服务器计");
 }
