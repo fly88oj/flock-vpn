@@ -83,6 +83,13 @@ set -u
 _src="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 HERE="$(cd "$_src" && pwd -W 2>/dev/null || echo "$_src")"
 REPO="$(cd "$HERE/.." && pwd)"
+
+# The protocol crate lives in its own repository since the extraction;
+# its unit-test re-run entries (A8/A11/A12) run against that checkout.
+# Resolution order: $FLOCK_PROTOCOL_REPO, then the sibling checkout next to
+# this repository (../flock-protocol).
+PROTO_REPO="${FLOCK_PROTOCOL_REPO:-$REPO/../flock-protocol}"
+[ -d "$PROTO_REPO/src" ] || { echo "FATAL: flock-protocol checkout not found at $PROTO_REPO (set FLOCK_PROTOCOL_REPO)"; exit 64; }
 COMPOSE_FILE="$HERE/e2e.yml"
 RESULTS="$HERE/e2e-results.md"
 NET_PUB="flock-e2e-flockpub"
@@ -585,7 +592,7 @@ a7() {
 a8() {
     log "A8 multi-session single tunnel: 100 concurrent yamux streams for 60s without error (unit-test entry: session_mux ignored tier)"
     local out
-    out="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux hundred_streams -- --ignored --nocapture 2>&1)"
+    out="$(cd "$PROTO_REPO" && cargo test --test session_mux hundred_streams -- --ignored --nocapture 2>&1)"
     printf '%s\n' "$out" | grep -E 'A8:|test hundred|test result' | sed 's/^/    /'
     # The criterion must be a **real execution**: the named test ok + "N passed"
     # with N≥1 —— an empty run (0 passed, e.g. --ignored combined with the
@@ -734,7 +741,7 @@ a11() {
     printf '    zeros=%sB random=%sB (inner payload 4MiB=4194304B each)\n' "$bytes0" "$bytesR"
 
     local unit
-    unit="$(cd "$REPO" && cargo test -p flock-protocol --lib compress 2>&1 | grep 'test result')"
+    unit="$(cd "$PROTO_REPO" && cargo test --lib compress 2>&1 | grep 'test result')"
     printf '    %s\n' "$unit"
 
     local ok_wire=0 ok_unit=0
@@ -758,8 +765,8 @@ a11() {
 a12() {
     log "A12 anti-replay: replayed_record_rejected_and_counted + forge quota (unit-test entry re-run)"
     local out1 out2
-    out1="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux replayed_record 2>&1)"
-    out2="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux forge 2>&1)"
+    out1="$(cd "$PROTO_REPO" && cargo test --test session_mux replayed_record 2>&1)"
+    out2="$(cd "$PROTO_REPO" && cargo test --test session_mux forge 2>&1)"
     printf '%s\n' "$out1$out2" | grep -E 'test .*(replay|forge)' | sed 's/^/    /'
     # The criterion must be a **real execution** (A8 discipline, same as
     # a8()): counting only `test result: ok` lines would book an empty run
