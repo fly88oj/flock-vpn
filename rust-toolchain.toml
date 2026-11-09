@@ -1,0 +1,5 @@
+# 工具链钉扎（CI 与本地一致；升级 = 全仓同一 commit 内改此文件并过全部门禁）。
+# 1.98 系：本仓依赖代际（docs/design.md §1.3.2）在该线验证；protocol 仓同钉 1.98。
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"

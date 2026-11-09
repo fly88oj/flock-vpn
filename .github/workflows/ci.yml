@@ -1,0 +1,60 @@
+# CI —— 三平台矩阵门禁（与 CONTRIBUTING.md「常用门禁命令清单」一一对应）。
+#
+# 不跑容器 e2e（deploy/ 的 smoke/断言档 #[ignore] 测试不进 CI），理由：
+#   1. 拓扑语义宿主绑定：smoke 对「宿主映射口」实连（127.0.0.1:9443/27500 等），
+#      GitHub runner 无 Docker Desktop 的端口发布/多容器网络语义等价物；
+#   2. relay 档需 prepare 资产（frp v0.71.1 二进制进命名构建上下文），属真机/
+#      发布前手动清单（docs/manual/multinode-test.md），runner 内拉第三方二进制
+#      不可复现；
+#   3. 镜像内构建走 flock-protocol git 依赖（与宿主同一 GitHub 网络，无额外面）。
+# 容器面由本地门禁 + 发布前手动 e2e 把关（CONTRIBUTING「容器 e2e 指引」）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu = lint 档（clippy/fmt 只跑一份，见 lint job）；windows/macos 只测。
+        os: [ubuntu-24.04, windows-2025, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml 钉 1.98.1；此处显式同版本（双保险，防止 runner 预装漂移）。
+      - uses: dtolnay/rust-toolchain@1.98.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: test (workspace, all features)
+        run: cargo test --workspace --all-features
+
+      - name: check headless client (no default features)
+        run: cargo check -p flock-client --no-default-features
+
+  lint:
+    name: clippy + fmt (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-features -- -D warnings
+      - name: fmt (check)
+        run: cargo fmt --all -- --check
