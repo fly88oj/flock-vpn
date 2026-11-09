@@ -41,7 +41,9 @@ fi
 
 # 幂等性复核：clean 重建一次，sha256 应不变（工具链确定性）。
 echo "== build-wasm: 幂等复核（重跑构建比对 sha256）"
-touch crates/flock-protocol/src/lib.rs   # 强制重编该 crate（依赖层缓存保留）
+# flock-protocol 已是 git 依赖（独立仓 v0.1.0，源码在 cargo git checkout）——
+# 强制重编该 crate（依赖层缓存保留）改用 cargo clean -p，不再 touch 仓库内路径。
+cargo clean -p flock-protocol --release --target $TARGET   # 强制重编该 crate（依赖层缓存保留）
 cargo build -p flock-protocol --release --target $TARGET --no-default-features --features $FEATURES
 again_hash=$(sha256sum "$SRC_CRATE" | cut -d' ' -f1)
 if [ "$again_hash" != "$new_hash" ]; then

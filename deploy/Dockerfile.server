@@ -15,20 +15,16 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates/flock-protocol/Cargo.toml crates/flock-protocol/
 COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
 COPY crates/flock-sync/Cargo.toml crates/flock-sync/
 COPY app/flock-server/Cargo.toml app/flock-server/
 # flock-server 依赖 flock-client（M3 数据面：TunDevice/route 接缝复用，§2.2/§3.12）。
 COPY app/flock-client/Cargo.toml app/flock-client/
 # —— 依赖层（stub 源）——
-# stub benches/aead.rs：flock-protocol manifest 声明 [[bench]]，cargo 解析 manifest
-# 需该文件存在（依赖层不编译 bench 本体）。
-RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
-             crates/flock-frpc/src crates/flock-sync/src \
+# flock-protocol 已是 git 依赖（独立仓 v0.1.0）：镜像内构建经 GitHub 拉取，
+# 不再进 stub 层（随真实 lockfile 一次构建、两阶段复用缓存）。
+RUN mkdir -p crates/flock-frpc/src crates/flock-sync/src \
              app/flock-server/src app/flock-client/src \
- && echo 'pub fn _stub() {}' > crates/flock-protocol/src/lib.rs \
- && echo 'fn main() {}' > crates/flock-protocol/benches/aead.rs \
  && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/flock-sync/src/lib.rs \
  && echo 'pub fn _stub() {}' > app/flock-server/src/lib.rs \
@@ -37,20 +33,18 @@ RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
  && echo 'fn main() {}' > app/flock-client/src/main.rs \
  && cargo build --release --locked -p flock-server \
  && rm -rf target/release/deps/flock_server* target/release/deps/flock_server_lib* \
-          target/release/deps/flock_client* target/release/deps/flock_protocol* \
+          target/release/deps/flock_client* \
           target/release/deps/flock_frpc* target/release/deps/flock_sync* \
  && rm -f target/release/flock-server target/release/flock-client
 
 # —— 源码层 ——
 # server_features：构建档（e2e 多主拓扑传 "multi-primary"——§6.2 M5；缺省空 = 单服）。
 ARG server_features=""
-COPY crates/flock-protocol/src crates/flock-protocol/src
 COPY crates/flock-frpc/src crates/flock-frpc/src
 COPY crates/flock-sync/src crates/flock-sync/src
 COPY app/flock-client/src app/flock-client/src
 COPY app/flock-server/src app/flock-server/src
-RUN touch crates/flock-protocol/src/lib.rs crates/flock-frpc/src/lib.rs \
-      crates/flock-sync/src/lib.rs \
+RUN touch crates/flock-frpc/src/lib.rs crates/flock-sync/src/lib.rs \
       app/flock-client/src/lib.rs app/flock-client/src/main.rs \
       app/flock-server/src/lib.rs app/flock-server/src/main.rs \
  && cargo build --release --locked -p flock-server --features "${server_features}"

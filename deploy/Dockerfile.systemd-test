@@ -17,16 +17,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates/flock-protocol/Cargo.toml crates/flock-protocol/
 COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
 COPY crates/flock-sync/Cargo.toml crates/flock-sync/
 COPY app/flock-server/Cargo.toml app/flock-server/
 COPY app/flock-client/Cargo.toml app/flock-client/
-RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
-             crates/flock-frpc/src crates/flock-sync/src \
+# flock-protocol 为 git 依赖（独立仓 v0.1.0）：镜像内构建经 GitHub 拉取。
+RUN mkdir -p crates/flock-frpc/src crates/flock-sync/src \
              app/flock-server/src app/flock-client/src \
- && echo 'pub fn _stub() {}' > crates/flock-protocol/src/lib.rs \
- && echo 'fn main() {}' > crates/flock-protocol/benches/aead.rs \
  && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/flock-sync/src/lib.rs \
  && echo 'pub fn _stub() {}' > app/flock-server/src/lib.rs \
@@ -34,12 +31,11 @@ RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
  && echo 'pub fn _stub() {}' > app/flock-client/src/lib.rs \
  && echo 'fn main() {}' > app/flock-client/src/main.rs \
  && cargo build --release --locked -p flock-client \
- && rm -rf target/release/deps/flock_client* target/release/deps/flock_protocol* \
+ && rm -rf target/release/deps/flock_client* \
  && rm -f target/release/flock-client
 
-COPY crates/flock-protocol/src crates/flock-protocol/src
 COPY app/flock-client/src app/flock-client/src
-RUN touch crates/flock-protocol/src/lib.rs app/flock-client/src/lib.rs \
+RUN touch app/flock-client/src/lib.rs \
       app/flock-client/src/main.rs \
  && cargo build --release --locked -p flock-client
 

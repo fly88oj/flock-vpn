@@ -3,6 +3,9 @@
 # 与 Dockerfile.server 的差异即「Direct 形态」的物化：**镜像内没有任何 frp 二进制**
 # （§2.1 硬约束：Direct 代码路径不触碰 flock-frpc；容器内 pgrep -f frp 恒无命中）。
 # 免 prepare 步骤：build context 不需要 deploy/build/。
+# flock-protocol 已是 git 依赖（github.com/fly88oj/flock-protocol，tag v0.1.0）——
+# 镜像内构建时 cargo 从 GitHub 拉取（与 apt-get 同样依赖出网；stub 依赖层只覆盖
+# workspace 成员，协议 crate 随真实 lockfile 一次构建、两阶段复用缓存）。
 
 # 构建段与运行段必须同一 Debian suite（glibc 符号版本兼容）：binary 链接的
 # GLIBC_2.x 取决于构建段基底；rust:1.98-slim 当前=trixie(glibc 2.41)，而运行段若用
@@ -13,17 +16,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates/flock-protocol/Cargo.toml crates/flock-protocol/
 COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
 COPY crates/flock-sync/Cargo.toml crates/flock-sync/
 COPY app/flock-server/Cargo.toml app/flock-server/
 # flock-server 依赖 flock-client（M3 数据面接缝复用，§2.2/§3.12）。
 COPY app/flock-client/Cargo.toml app/flock-client/
-RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
-             crates/flock-frpc/src crates/flock-sync/src \
+RUN mkdir -p crates/flock-frpc/src crates/flock-sync/src \
              app/flock-server/src app/flock-client/src \
- && echo 'pub fn _stub() {}' > crates/flock-protocol/src/lib.rs \
- && echo 'fn main() {}' > crates/flock-protocol/benches/aead.rs \
  && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/flock-sync/src/lib.rs \
  && echo 'pub fn _stub() {}' > app/flock-server/src/lib.rs \
@@ -32,16 +31,14 @@ RUN mkdir -p crates/flock-protocol/src crates/flock-protocol/benches \
  && echo 'fn main() {}' > app/flock-client/src/main.rs \
  && cargo build --release --locked -p flock-server \
  && rm -rf target/release/deps/flock_server* target/release/deps/flock_server_lib* \
-          target/release/deps/flock_client* target/release/deps/flock_protocol* \
+          target/release/deps/flock_client* \
           target/release/deps/flock_frpc* target/release/deps/flock_sync* \
  && rm -f target/release/flock-server
-COPY crates/flock-protocol/src crates/flock-protocol/src
 COPY crates/flock-frpc/src crates/flock-frpc/src
 COPY crates/flock-sync/src crates/flock-sync/src
 COPY app/flock-client/src app/flock-client/src
 COPY app/flock-server/src app/flock-server/src
-RUN touch crates/flock-protocol/src/lib.rs crates/flock-frpc/src/lib.rs \
-      crates/flock-sync/src/lib.rs \
+RUN touch crates/flock-frpc/src/lib.rs crates/flock-sync/src/lib.rs \
       app/flock-client/src/lib.rs app/flock-client/src/main.rs \
       app/flock-server/src/lib.rs app/flock-server/src/main.rs \
  && cargo build --release --locked -p flock-server
