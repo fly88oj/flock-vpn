@@ -472,7 +472,7 @@ async fn user_token_auto_argv_shape() {
     let relay = sup
         .start(RelaySpec::ChmlFrp {
             mode: ChmlFrpMode::UserTokenAuto {
-                usertoken: "ut-测试-token".into(),
+                usertoken: "ut-Ünicode-token".into(),
                 tunnel_id: 77,
             },
         })
@@ -483,7 +483,7 @@ async fn user_token_auto_argv_shape() {
     let run_dir = relay.health().run_dir;
     let argv = argv_lines(&run_dir.join("stub-marker.log"));
     assert!(
-        argv.iter().any(|a| a.contains("-u ut-测试-token -p 77")),
+        argv.iter().any(|a| a.contains("-u ut-Ünicode-token -p 77")),
         "-u/-p should be dispatched per the modded CLI contract: {argv:?}"
     );
     relay.stop().await.expect("stop winds down");
