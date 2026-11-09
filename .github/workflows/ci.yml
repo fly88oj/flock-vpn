@@ -30,7 +30,9 @@ jobs:
       fail-fast: false
       matrix:
         # ubuntu = lint 档（clippy/fmt 只跑一份，见 lint job）；windows/macos 只测。
-        os: [ubuntu-24.04, windows-2025, macos-14]
+        # macos-14 已被 GitHub 退役（job 挂起被取消并拖垮整轮，协议仓实测 macos-15
+        # 全绿）——macos-15 同为 arm64，cfg 面与 14 无差异。
+        os: [ubuntu-24.04, windows-2025, macos-15]
     steps:
       - uses: actions/checkout@v4
 
@@ -53,8 +55,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy, rustfmt
+      # rust-toolchain.toml 钉 profile = "minimal"：任何经它触发的 rustup 自动安装
+      # 都不含 clippy/rustfmt（「cargo-clippy is not installed」）——上面 action 的
+      # components 参数与自动安装存在竞态面（协议仓 flock-protocol@d2e1b89 同坑），
+      # 此步在工具链解析后显式补装组件，确定性兜底。
+      - name: ensure clippy/rustfmt components
+        run: rustup component add clippy rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: clippy (deny warnings)
-        run: cargo clippy --workspace --all-features -- -D warnings
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
       - name: fmt (check)
         run: cargo fmt --all -- --check
