@@ -1,19 +1,26 @@
-//! M8 webui 访问控制（docs/design.md §7-M8.2/M8.3/M8.4/M8.7）：
+//! M8 webui access control (docs/design.md §7-M8.2/M8.3/M8.4/M8.7):
 //!
-//! - **来源矩阵**（W-A1–W-A4）：`127.0.0.0/8`（含 ::1）与 `100.64.0.0/10` 放行；
-//!   其余 403 `forbidden_origin`（纵深防御——根本机制是未绑定 LAN/公网）。
-//!   `X-Forwarded-For` **一律忽略**（客户端可伪造；不支持反代部署）；
-//! - **CSRF 双门槛**（变更类 = 全部 POST）：`X-Flock-Web: 1` **且** `Content-Type:
-//!   application/json`——缺头 ⇒ 400（不泄漏是 CSRF 拦截）；
-//! - **角色矩阵**（路由静态面：公共/登录/管理三档；「先会话后角色」的先后由
-//!   api.rs 分发序承担）；
-//! - **登录退避**（按用户名 15min 滑窗：第 5 次失败起锁 30s、每再失败翻倍、封顶
-//!   900s；成功或窗净空即清零——注入时钟可测）；
-//! - **per-IP 令牌桶**（login-begin/pw-begin：10 次/min，突发 10）；
-//! - **审计环**（内存最近 200 条 + stderr 同步留痕；11 个 action 词表 + result
-//!   三态；不记口令/令牌/票据字节）。
+//! - **Origin matrix** (W-A1–W-A4): `127.0.0.0/8` (including ::1) and
+//!   `100.64.0.0/10` allowed; everything else 403 `forbidden_origin` (defense
+//!   in depth —— the fundamental mechanism is not binding to LAN/public
+//!   interfaces). `X-Forwarded-For` is **always ignored** (client-forgeable;
+//!   reverse-proxy deployments unsupported);
+//! - **CSRF double gate** (mutating class = all POSTs): `X-Flock-Web: 1`
+//!   **and** `Content-Type: application/json` —— a missing header ⇒ 400 (does
+//!   not leak that it was a CSRF block);
+//! - **Role matrix** (routing static surface: public/logged-in/admin tiers;
+//!   the "session before role" ordering is carried by the api.rs dispatch
+//!   order);
+//! - **Login backoff** (per username, 15min sliding window: from the 5th
+//!   failure lock 30s, doubling per further failure, capped at 900s; zeroed
+//!   on success or when the window drains —— injectable clock, testable);
+//! - **Per-IP token bucket** (login-begin/pw-begin: 10/min, burst 10);
+//! - **Audit ring** (most recent 200 entries in memory + synchronous stderr
+//!   trail; an 11-entry action vocabulary + three result states; no
+//!   passwords/tokens/ticket bytes recorded).
 //!
-//! 全部组件进程内存、独立时钟入参——无 Raft/无持久化（设计定死）。
+//! All components are in-process memory with injected clock parameters —— no
+//! Raft / no persistence (fixed by design).
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -21,10 +28,10 @@ use std::net::{IpAddr, SocketAddr};
 use super::session::Origin;
 
 // ============================================================================
-// 来源矩阵（W-A1–W-A4）
+// Origin matrix (W-A1–W-A4)
 // ============================================================================
 
-/// `100.64.0.0/10`（RFC 6598 CGNAT 段 = 本 VPN 的 VIP 池，§2.1）。
+/// `100.64.0.0/10` (the RFC 6598 CGNAT segment = this VPN's VIP pool, §2.1).
 fn in_vpn_segment(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -35,8 +42,9 @@ fn in_vpn_segment(ip: IpAddr) -> bool {
     }
 }
 
-/// 来源分类（`X-Forwarded-For` 不参与——一律以连接 RemoteAddr 判定，W-A4）。
-/// None = 越界来源（403 `forbidden_origin` 面）。
+/// Origin classification (`X-Forwarded-For` does not participate —— decided
+/// solely by the connection's RemoteAddr, W-A4). None = out-of-bounds origin
+/// (the 403 `forbidden_origin` face).
 pub fn classify_origin(remote: &SocketAddr) -> Option<Origin> {
     match remote.ip() {
         IpAddr::V4(v4) if v4.is_loopback() => Some(Origin::Loopback), // 127.0.0.0/8
@@ -45,15 +53,17 @@ pub fn classify_origin(remote: &SocketAddr) -> Option<Origin> {
         _ => None,
     }
 
-    // 注：127.0.0.0/8 与 100.64.0.0/10 不相交（is_loopback 先判），两档各自记录。
+    // Note: 127.0.0.0/8 and 100.64.0.0/10 do not intersect (is_loopback is
+    // checked first); the two tiers are recorded separately.
 }
 
 // ============================================================================
-// CSRF 双门槛（§M8.4——变更类 = 全部 POST）
+// CSRF double gate (§M8.4 —— mutating class = all POSTs)
 // ============================================================================
 
-/// POST 的 CSRF 双门槛：`X-Flock-Web: 1` 且 `Content-Type: application/json`
-///（前缀匹配 `application/json`——charset 参数合法）。true = 放行。
+/// POST CSRF double gate: `X-Flock-Web: 1` and `Content-Type:
+/// application/json` (prefix match on `application/json` —— a charset
+/// parameter is legal). true = allowed through.
 pub fn csrf_gate_ok(method: &str, x_flock_web: Option<&str>, content_type: Option<&str>) -> bool {
     if method != "POST" {
         return true;
@@ -72,25 +82,29 @@ pub fn csrf_gate_ok(method: &str, x_flock_web: Option<&str>, content_type: Optio
 }
 
 // ============================================================================
-// 角色矩阵（路由静态面——三态枚举的判定源）
+// Role matrix (routing static surface —— the decision source of the
+// three-state enum)
 // ============================================================================
 
-/// 端点角色档（§M8.4 逐端点；「先会话后角色」在 api.rs 分发序）。
+/// Endpoint role slot (§M8.4 per endpoint; "session before role" lives in the
+/// api.rs dispatch order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// 公共（login-begin/finish、pw-begin/commit、bootstrap、静态资产——静态资产
-    /// 不经本枚举，由 api.rs 直接路由）。
+    /// Public (login-begin/finish, pw-begin/commit, bootstrap, static assets
+    /// —— static assets do not pass through this enum, routed directly by
+    /// api.rs).
     Public,
-    /// 登录即可（只读面 + logout + me）。
+    /// Logged-in suffices (read-only surface + logout + me).
     LoggedIn,
-    /// admin。
+    /// admin.
     Admin,
-    /// 未知 `/api/*` 路径（404）。
+    /// Unknown `/api/*` path (404).
     Unknown,
 }
 
-/// 按 method+path 定角色档（管理写路径按前缀分派：`/api/users/{u}/*` 与
-/// `/api/peers/{id}/*` 的四个动作端点全为 Admin）。
+/// Role slot by method+path (admin write paths dispatched by prefix: the four
+/// action endpoints of `/api/users/{u}/*` and `/api/peers/{id}/*` are all
+/// Admin).
 pub fn required_role(method: &str, path: &str) -> Role {
     let m_get = method == "GET";
     let m_post = method == "POST";
@@ -108,8 +122,8 @@ pub fn required_role(method: &str, path: &str) -> Role {
         "/api/users" if m_post => Role::Admin,
         "/api/audit" if m_get => Role::Admin,
         _ => {
-            // /api/users/{u}/disable|enable|reset-password|admin（POST，Admin）
-            // /api/peers/{device_id}/revoke|disable|enable|kick（POST，Admin）
+            // /api/users/{u}/disable|enable|reset-password|admin (POST, Admin)
+            // /api/peers/{device_id}/revoke|disable|enable|kick (POST, Admin)
             if m_post {
                 if let Some(rest) = path.strip_prefix("/api/users/") {
                     if user_action_known(rest) {
@@ -127,7 +141,8 @@ pub fn required_role(method: &str, path: &str) -> Role {
     }
 }
 
-/// `/api/users/{u}/<action>` 的动作档（与 method 无关的路径形状判定）。
+/// Action slot of `/api/users/{u}/<action>` (path-shape determination
+/// independent of method).
 fn user_action_known(rest: &str) -> bool {
     rest.contains('/')
         && matches!(
@@ -136,7 +151,8 @@ fn user_action_known(rest: &str) -> bool {
         )
 }
 
-/// `/api/peers/{id}/<action>` 的动作档（与 method 无关的路径形状判定）。
+/// Action slot of `/api/peers/{id}/<action>` (path-shape determination
+/// independent of method).
 fn peer_action_known(rest: &str) -> bool {
     rest.contains('/')
         && matches!(
@@ -145,9 +161,11 @@ fn peer_action_known(rest: &str) -> bool {
         )
 }
 
-/// 路径已知（与 method 无关的路径形状）：已知路径 + 方法错档 ⇒ 分发层 405
-/// `method_not_allowed`（§M8.4 错误码表），未知路径才 404（🟢 评审项 7——
-/// 旧实现方法错档并入 Unknown ⇒ 404，与错误码表的 405 档不一致）。
+/// Path known (path shape independent of method): known path + wrong method
+/// slot ⇒ dispatch layer 405 `method_not_allowed` (the §M8.4 error-code
+/// table); only unknown paths 404 (green review item 7 —— the old
+/// implementation folded wrong-method into Unknown ⇒ 404, inconsistent with
+/// the error-code table's 405 tier).
 pub fn path_known(path: &str) -> bool {
     match path {
         "/api/bootstrap"
@@ -174,31 +192,32 @@ pub fn path_known(path: &str) -> bool {
 }
 
 // ============================================================================
-// 登录退避（按用户名；注入时钟）
+// Login backoff (per username; injected clock)
 // ============================================================================
 
-/// 滑窗（15min）。
+/// Sliding window (15min).
 const FAIL_WINDOW_SECS: u64 = 15 * 60;
-/// 起锁阈值（第 5 次失败起锁定）。
+/// Lockout threshold (locked from the 5th failure).
 const LOCK_THRESHOLD: usize = 5;
-/// 起锁时长（30s；每再失败翻倍）。
+/// Initial lockout duration (30s; doubles per further failure).
 const LOCK_BASE_SECS: u64 = 30;
-/// 封顶（900s）。
+/// Cap (900s).
 const LOCK_MAX_SECS: u64 = 900;
-/// 表容量上限（🟡 评审项 5：未认证面可注入任意 user 名——超限先清惰性过期行，
-/// 仍满逐出最旧；另有 60s 周期清扫兜底）。
+/// Table capacity cap (review item 5: the unauthenticated surface can inject
+/// arbitrary user names —— over the cap, first clear lazily-expired rows,
+/// evict the oldest if still full; a 60s periodic sweep backstops).
 pub const LOGIN_BACKOFF_CAP: usize = 4096;
 
-/// 按用户名失败记账。
+/// Per-username failure accounting.
 #[derive(Default)]
 struct FailState {
-    /// 窗内失败时刻（unix 秒；升序推入）。
+    /// Failure timestamps inside the window (unix seconds; pushed ascending).
     fails: Vec<u64>,
-    /// 当前锁定时长（翻倍基；0 = 未锁）。
+    /// Current lockout duration (doubling base; 0 = not locked).
     lock_secs: u64,
 }
 
-/// 登录退避器（进程内存；`Mutex<HashMap<user, FailState>>`）。
+/// Login backoff (in-process memory; `Mutex<HashMap<user, FailState>>`).
 #[derive(Default)]
 pub struct LoginBackoff {
     inner: std::sync::Mutex<HashMap<String, FailState>>,
@@ -209,22 +228,26 @@ impl LoginBackoff {
         Self::default()
     }
 
-    /// 锁定检查：Some(retry_after_secs) = 当前锁定中（不消费失败）。
+    /// Lockout check: Some(retry_after_secs) = currently locked (does not
+    /// consume a failure).
     pub fn check(&self, user: &str, now_unix: u64) -> Option<u64> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let st = g.get(user)?;
-        // 锁定窗 = 自最近一次失败起 lock_secs。
+        // Lockout window = lock_secs from the most recent failure.
         let last = *st.fails.last()?;
         let until = last.saturating_add(st.lock_secs);
         (now_unix < until).then(|| until - now_unix)
     }
 
-    /// 记一次失败（窗净空后重新起算；第 5 次失败起锁 30s，每再失败翻倍封顶 900）。
+    /// Record one failure (restarts counting once the window drains; from the
+    /// 5th failure lock 30s, doubling per further failure, capped at 900).
     pub fn on_failure(&self, user: &str, now_unix: u64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // 容量上限：先清惰性过期行（见 sweep_backoff_locked——lock_secs ≤
-        // LOCK_MAX_SECS = FAIL_WINDOW_SECS，窗净空即锁定亦过期、行全惰性），
-        // 仍满则按最近失败时刻逐出最旧。
+        // Capacity cap: first clear lazily-expired rows (see
+        // sweep_backoff_locked —— lock_secs ≤ LOCK_MAX_SECS =
+        // FAIL_WINDOW_SECS, so once the window drains the lockout has also
+        // expired and the row is fully lazy); evict the oldest by most-recent
+        // failure time if still full.
         if g.len() >= LOGIN_BACKOFF_CAP {
             sweep_backoff_locked(&mut g, now_unix);
         }
@@ -239,12 +262,14 @@ impl LoginBackoff {
             g.remove(&oldest);
         }
         let st = g.entry(user.to_string()).or_default();
-        // 15min 滑窗净空（含锁定过后的残留失败）。
+        // 15min sliding-window drain (including leftover failures after a
+        // lockout).
         st.fails
             .retain(|t| now_unix.saturating_sub(*t) < FAIL_WINDOW_SECS);
         st.fails.push(now_unix);
         if st.fails.len() >= LOCK_THRESHOLD {
-            // 第 5 次失败：30s；其后每再失败翻倍（len=5→30, 6→60, 7→120 …封顶 900）。
+            // 5th failure: 30s; each further failure doubles (len=5→30,
+            // 6→60, 7→120 … capped at 900).
             let excess = st.fails.len() - LOCK_THRESHOLD;
             st.lock_secs = LOCK_BASE_SECS
                 .saturating_mul(1u64 << excess.min(6))
@@ -252,7 +277,7 @@ impl LoginBackoff {
         }
     }
 
-    /// 成功清零（窗与锁全清）。
+    /// Success zeroes everything (window and lockout fully cleared).
     pub fn on_success(&self, user: &str) {
         self.inner
             .lock()
@@ -260,14 +285,15 @@ impl LoginBackoff {
             .remove(user);
     }
 
-    /// 周期清扫（60s 任务——与 mod.rs 会话清扫同档）：清窗净空且锁定过期的惰性
-    /// 行（返回清出条数——测试面）。
+    /// Periodic sweep (60s task —— same tier as the session sweep in mod.rs):
+    /// clears lazy rows whose window has drained and whose lockout has
+    /// expired (returns the number cleared —— test surface).
     pub fn sweep(&self, now_unix: u64) -> usize {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         sweep_backoff_locked(&mut g, now_unix)
     }
 
-    /// 在册行数（测试/诊断面）。
+    /// Rows on record (test/diagnostics surface).
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -277,8 +303,10 @@ impl LoginBackoff {
     }
 }
 
-/// 惰性行判定+清扫：最近失败距今 ≥ FAIL_WINDOW_SECS ⇒ 滑窗已净空且锁定必已过期
-///（lock_secs ≤ LOCK_MAX_SECS = FAIL_WINDOW_SECS）——行删除无任何行为差异。
+/// Lazy-row predicate + sweep: most recent failure ≥ FAIL_WINDOW_SECS ago ⇒
+/// the sliding window has drained and the lockout has necessarily expired
+/// (lock_secs ≤ LOCK_MAX_SECS = FAIL_WINDOW_SECS) —— deleting the row makes no
+/// behavioral difference.
 fn sweep_backoff_locked(g: &mut HashMap<String, FailState>, now_unix: u64) -> usize {
     let before = g.len();
     g.retain(|_, st| {
@@ -290,20 +318,22 @@ fn sweep_backoff_locked(g: &mut HashMap<String, FailState>, now_unix: u64) -> us
 }
 
 // ============================================================================
-// per-IP 令牌桶（login-begin/pw-begin；10/min 突发 10）
+// Per-IP token bucket (login-begin/pw-begin; 10/min burst 10)
 // ============================================================================
 
-/// 桶容量（突发 10）。
+/// Bucket capacity (burst 10).
 const BUCKET_BURST: f64 = 10.0;
-/// 回填速率（10/min）。
+/// Refill rate (10/min).
 const BUCKET_RATE_PER_SEC: f64 = 10.0 / 60.0;
-/// 回满时距（10 突发 / 10 每 min ⇒ 60s 后等效新桶——idle ≥ 此值的行可安全重建）。
+/// Time to refill full (burst 10 / 10 per min ⇒ an equivalent fresh bucket
+/// after 60s —— rows idle ≥ this value can be safely rebuilt).
 const BUCKET_REFILL_SECS: u64 = 60;
-/// 表容量上限（🟡 评审项 5：VIP 段内多源 IP 可无限增行——超限先清 idle 行，
-/// 仍满逐出最旧；另有 60s 周期清扫兜底）。
+/// Table capacity cap (review item 5: many source IPs inside the VPN segment
+/// can grow rows without bound —— over the cap, first clear idle rows, evict
+/// the oldest if still full; a 60s periodic sweep backstops).
 pub const IP_BUCKETS_CAP: usize = 4096;
 
-/// 令牌桶（进程内存；`Mutex<HashMap<IpAddr, (tokens, last)>>`）。
+/// Token bucket (in-process memory; `Mutex<HashMap<IpAddr, (tokens, last)>>`).
 #[derive(Default)]
 pub struct IpBuckets {
     inner: std::sync::Mutex<HashMap<IpAddr, (f64, u64)>>,
@@ -314,12 +344,15 @@ impl IpBuckets {
         Self::default()
     }
 
-    /// 取一枚令牌：true = 放行；false = 超速（429，retry_after 按 满-token 回填时距）。
+    /// Take one token: true = allowed; false = over rate (429; retry_after per
+    /// the full-token refill time).
     pub fn allow(&self, ip: IpAddr, now_unix: u64) -> Result<(), u64> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // 容量上限：先清 idle ≥ 回满时距的行（重建 = 全新满桶，无行为差异），
-        // 仍满则按 last 逐出最旧（被逐 IP 下次请求按新桶处理——限速面瞬时放宽
-        // 优于无上限内存增长）。
+        // Capacity cap: first clear rows idle ≥ the full-refill time
+        // (rebuilding = a brand-new full bucket, no behavioral difference);
+        // evict the oldest by last if still full (an evicted IP is treated as
+        // a fresh bucket on its next request —— a momentary loosening of the
+        // rate-limit surface beats unbounded memory growth).
         if g.len() >= IP_BUCKETS_CAP {
             sweep_buckets_locked(&mut g, now_unix);
         }
@@ -343,13 +376,14 @@ impl IpBuckets {
         }
     }
 
-    /// 周期清扫（60s 任务）：清 idle ≥ 回满时距的行（返回清出条数——测试面）。
+    /// Periodic sweep (60s task): clears rows idle ≥ the full-refill time
+    /// (returns the number cleared —— test surface).
     pub fn sweep(&self, now_unix: u64) -> usize {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         sweep_buckets_locked(&mut g, now_unix)
     }
 
-    /// 在册行数（测试/诊断面）。
+    /// Rows on record (test/diagnostics surface).
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -359,7 +393,8 @@ impl IpBuckets {
     }
 }
 
-/// idle 行清扫：last 距今 ≥ BUCKET_REFILL_SECS ⇒ 桶已回满，删除后重建等效。
+/// Idle-row sweep: last ≥ BUCKET_REFILL_SECS ago ⇒ the bucket has refilled
+/// full; deleting and rebuilding is equivalent.
 fn sweep_buckets_locked(g: &mut HashMap<IpAddr, (f64, u64)>, now_unix: u64) -> usize {
     let before = g.len();
     g.retain(|_, (_, last)| now_unix.saturating_sub(*last) < BUCKET_REFILL_SECS);
@@ -367,13 +402,14 @@ fn sweep_buckets_locked(g: &mut HashMap<IpAddr, (f64, u64)>, now_unix: u64) -> u
 }
 
 // ============================================================================
-// 审计环（§M8.7-4：内存 200 条 + stderr；action 词表定死）
+// Audit ring (§M8.7-4: 200 entries in memory + stderr; action vocabulary
+// fixed)
 // ============================================================================
 
-/// 审计环容量。
+/// Audit ring capacity.
 pub const AUDIT_CAP: usize = 200;
 
-/// action 词表（§M8.4 定死 11 个）。
+/// Action vocabulary (11 entries, fixed by §M8.4).
 pub const AUDIT_ACTIONS: [&str; 11] = [
     "session.login",
     "session.logout",
@@ -388,7 +424,8 @@ pub const AUDIT_ACTIONS: [&str; 11] = [
     "peer.kick",
 ];
 
-/// 审计行（不记口令/令牌/票据字节——§M8.7-4 红线）。
+/// Audit entry (no passwords/tokens/ticket bytes recorded —— the §M8.7-4 red
+/// line).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEntry {
     pub ts: u64,
@@ -399,16 +436,19 @@ pub struct AuditEntry {
     pub result: &'static str, // "ok" | "denied" | "error"
 }
 
-/// 审计环（`Mutex<VecDeque>` + stderr 同步行——journald 接管，与既有 flock-server:
-/// 日志同通道）。
+/// Audit ring (`Mutex<VecDeque>` + synchronous stderr lines —— journald takes
+/// them over, same channel as the existing flock-server: logs).
 #[derive(Default)]
 pub struct AuditLog {
     inner: std::sync::Mutex<VecDeque<AuditEntry>>,
 }
 
-/// 审计字段清洗（🟡 评审项 4）：user/target 含换行/回车（或其它控制字符）时，
-/// stderr 单行格式可被伪造出「新的审计行」（行注入）。输出前把控制字符替换为
-/// 可视化占位（stderr 与内存环同清洗——API 面回显与留痕一致）。
+/// Audit field sanitization (review item 4): when user/target contain
+/// line feeds/carriage returns (or other control characters), the
+/// single-line stderr format could be forged into "new audit lines" (line
+/// injection). Before output, control characters are replaced with a visible
+/// placeholder (stderr and the in-memory ring sanitized identically —— the
+/// API-surface echo and the trail stay consistent).
 fn audit_sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '␀' } else { c })
@@ -420,8 +460,9 @@ impl AuditLog {
         Self::default()
     }
 
-    /// 记一行（stderr 同步留痕 + 内存环；环满挤最旧；user/target 输出前清洗
-    /// 控制字符——防 stderr 行注入伪造审计行）。
+    /// Record one line (synchronous stderr trail + memory ring; the ring
+    /// evicts the oldest when full; user/target sanitized before output ——
+    /// prevents stderr line injection forging audit lines).
     pub fn record(
         &self,
         ts: u64,
@@ -431,7 +472,10 @@ impl AuditLog {
         origin: Origin,
         result: &'static str,
     ) {
-        debug_assert!(AUDIT_ACTIONS.contains(&action), "action 词表外: {action}");
+        debug_assert!(
+            AUDIT_ACTIONS.contains(&action),
+            "action outside vocabulary: {action}"
+        );
         let user = audit_sanitize(user);
         let target = audit_sanitize(target);
         let entry = AuditEntry {
@@ -442,7 +486,8 @@ impl AuditLog {
             origin,
             result,
         };
-        // stderr（journald）：固定单行格式，诊断可 grep；不打印凭据字节。
+        // stderr (journald): fixed single-line format, greppable for
+        // diagnostics; no credential bytes printed.
         eprintln!(
             "flock-server: webui audit ts={} user={} action={} target={} origin={} result={}",
             entry.ts,
@@ -459,7 +504,7 @@ impl AuditLog {
         g.push_back(entry);
     }
 
-    /// 快照（新→旧，§M8.4 `/api/audit`）。
+    /// Snapshot (new→old, §M8.4 `/api/audit`).
     pub fn entries_newest_first(&self) -> Vec<AuditEntry> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.iter().rev().cloned().collect()
@@ -475,7 +520,8 @@ impl AuditLog {
 }
 
 // ============================================================================
-// 单元测试（§M8.9：来源矩阵/CSRF/角色三态/退避曲线/令牌桶/审计环）
+// Unit tests (§M8.9: origin matrix / CSRF / role three-states / backoff
+// curve / token bucket / audit ring)
 // ============================================================================
 
 #[cfg(test)]
@@ -486,9 +532,10 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// W-A1–W-A3 来源矩阵：127.0.0.0/8（含 127.3.2.1）与 ::1 放 Loopback；
-    /// 100.64.0.0/10（含段首/段尾/中段）放 Vpn；其余（RFC1918/公网/其它回环外
-    /// IPv6/链路本地）拒。
+    /// W-A1–W-A3 origin matrix: 127.0.0.0/8 (including 127.3.2.1) and ::1 go
+    /// Loopback; 100.64.0.0/10 (including segment head/tail/middle) goes Vpn;
+    /// the rest (RFC1918/public internet/other non-loopback IPv6/link-local)
+    /// rejected.
     #[test]
     fn origin_matrix() {
         for ok_lb in ["127.0.0.1:1", "127.3.2.1:2", "127.255.255.254:3", "[::1]:4"] {
@@ -510,7 +557,8 @@ mod tests {
                 "{ok_vpn} ⇒ vpn"
             );
         }
-        // /10 段外邻位（100.63.x / 100.128.x）拒。
+        // Neighbors just outside the /10 segment (100.63.x / 100.128.x)
+        // rejected.
         for bad in [
             "192.168.1.5:1",
             "10.0.0.1:1",
@@ -521,34 +569,43 @@ mod tests {
             "[2001:db8::1]:1",
             "169.254.1.1:1",
         ] {
-            assert_eq!(classify_origin(&addr(bad)), None, "{bad} ⇒ 拒（403 面）");
+            assert_eq!(
+                classify_origin(&addr(bad)),
+                None,
+                "{bad} ⇒ rejected (403 face)"
+            );
         }
     }
 
-    /// CSRF 双门槛：POST 缺自定义头 400；有头缺 JSON content-type 400；双齐放行；
-    /// GET 不设槛；`application/json; charset=utf-8` 前缀合法。
+    /// CSRF double gate: POST missing the custom header 400; header present
+    /// but missing the JSON content-type 400; both present passes; GET sets
+    /// no gate; `application/json; charset=utf-8` prefix is legal.
     #[test]
     fn csrf_double_gate() {
         let ct_json = Some("application/json");
         let gate = Some("1");
-        assert!(csrf_gate_ok("POST", gate, ct_json), "双齐放行");
+        assert!(csrf_gate_ok("POST", gate, ct_json), "both present passes");
         assert!(csrf_gate_ok(
             "POST",
             gate,
             Some("application/json; charset=utf-8")
         ));
-        assert!(!csrf_gate_ok("POST", None, ct_json), "缺 X-Flock-Web");
-        assert!(!csrf_gate_ok("POST", Some("0"), ct_json), "值非 1");
-        assert!(!csrf_gate_ok("POST", gate, Some("text/plain")), "缺 JSON");
-        assert!(!csrf_gate_ok("POST", gate, None), "缺 content-type");
+        assert!(!csrf_gate_ok("POST", None, ct_json), "missing X-Flock-Web");
+        assert!(!csrf_gate_ok("POST", Some("0"), ct_json), "value not 1");
+        assert!(
+            !csrf_gate_ok("POST", gate, Some("text/plain")),
+            "missing JSON"
+        );
+        assert!(!csrf_gate_ok("POST", gate, None), "missing content-type");
         assert!(!csrf_gate_ok("POST", gate, Some("application/json+xml")),);
-        assert!(csrf_gate_ok("GET", None, None), "GET 不设槛");
+        assert!(csrf_gate_ok("GET", None, None), "GET sets no gate");
     }
 
-    /// 角色矩阵逐端点枚举（§M8.4 全 22 端点 + 方法错档 + 未知路径）。
+    /// Role matrix enumerated per endpoint (§M8.4, all 22 endpoints + wrong
+    /// methods + unknown paths).
     #[test]
     fn role_matrix_all_endpoints() {
-        // 公共 5。
+        // 5 public.
         for (m, p) in [
             ("GET", "/api/bootstrap"),
             ("POST", "/api/login-begin"),
@@ -558,7 +615,7 @@ mod tests {
         ] {
             assert_eq!(required_role(m, p), Role::Public, "{m} {p}");
         }
-        // 登录 6。
+        // 6 logged-in.
         for (m, p) in [
             ("GET", "/api/me"),
             ("POST", "/api/logout"),
@@ -569,7 +626,7 @@ mod tests {
         ] {
             assert_eq!(required_role(m, p), Role::LoggedIn, "{m} {p}");
         }
-        // 管理 11（含路径参数形）。
+        // 11 admin (including path-parameter shapes).
         for (m, p) in [
             ("GET", "/api/users"),
             ("POST", "/api/users"),
@@ -585,7 +642,8 @@ mod tests {
         ] {
             assert_eq!(required_role(m, p), Role::Admin, "{m} {p}");
         }
-        // 方法错档（同路径异方法 = 未知——分发层 405）与未知路径。
+        // Wrong-method slots (same path, foreign method = unknown —— the
+        // dispatch layer 405s) and unknown paths.
         for (m, p) in [
             ("GET", "/api/login-begin"),
             ("POST", "/api/bootstrap"),
@@ -598,39 +656,46 @@ mod tests {
         }
     }
 
-    /// 退避曲线（注入时钟）：4 次失败不锁；第 5 次锁 30s；再失败翻倍 60/120/240/
-    /// 480/960→封顶 900；成功清零；窗净空（15min 无失败）重置。
+    /// Backoff curve (injected clock): 4 failures do not lock; the 5th locks
+    /// 30s; further failures double 60/120/240/480/960 → capped at 900;
+    /// success zeroes; window drain (15min without failure) resets.
     #[test]
     fn login_backoff_curve() {
         let b = LoginBackoff::new();
         let mut t = 1_000u64;
-        // ① 1–4 次失败：不锁。
+        // ① Failures 1–4: no lockout.
         for i in 1..5 {
             b.on_failure("alice", t);
             assert!(
                 b.check("alice", t + 1).is_none(),
-                "第 {i} 次失败不锁（阈值 5）"
+                "failure {i} does not lock (threshold 5)"
             );
             t += 10;
         }
-        // ② 第 5 次：锁 30s。
+        // ② 5th failure: 30s lockout.
         b.on_failure("alice", t);
         assert_eq!(b.check("alice", t), Some(30));
         assert_eq!(b.check("alice", t + 29), Some(1));
-        assert!(b.check("alice", t + 30).is_none(), "锁到期即放");
-        // ③ 再失败翻倍：60/120/240/480；第 10 次（excess=5）960 → 封顶 900。
+        assert!(
+            b.check("alice", t + 30).is_none(),
+            "lockout expires and releases"
+        );
+        // ③ Further failures double: 60/120/240/480; the 10th (excess=5) is
+        // 960 → capped at 900.
         for expect in [60u64, 120, 240, 480] {
             t += 60;
             b.on_failure("alice", t);
-            assert_eq!(b.check("alice", t), Some(expect), "翻倍至 {expect}");
+            assert_eq!(b.check("alice", t), Some(expect), "doubled to {expect}");
         }
         t += 60;
         b.on_failure("alice", t);
-        assert_eq!(b.check("alice", t), Some(900), "封顶 900");
-        // ④ 成功清零（即使锁定期内——成功即证明合法用户拿回了账号）。
+        assert_eq!(b.check("alice", t), Some(900), "capped at 900");
+        // ④ Success zeroes (even mid-lockout —— success proves the legitimate
+        // user recovered the account).
         b.on_success("alice");
         assert!(b.check("alice", t).is_none());
-        // ⑤ 窗净空重置：4 失败 + 跨窗（>15min）后再失败 = 新窗第 1 次（不锁）。
+        // ⑤ Window drain resets: 4 failures + across the window (>15min) then
+        // another failure = the new window's 1st (no lockout).
         let b2 = LoginBackoff::new();
         let t0 = 10_000u64;
         for i in 0..4 {
@@ -639,119 +704,169 @@ mod tests {
         b2.on_failure("bob", t0 + FAIL_WINDOW_SECS + 1);
         assert!(
             b2.check("bob", t0 + FAIL_WINDOW_SECS + 2).is_none(),
-            "窗净空后重新起算"
+            "restarts counting after the window drains"
         );
-        // ⑥ 不同用户互不影响。
+        // ⑥ Different users do not affect each other.
         assert!(b2.check("carol", t0).is_none());
     }
 
-    /// 令牌桶（注入时钟）：突发 10 枚即时放行；第 11 枚拒（429 面）；按 10/min
-    /// 回填（6s 回 1 枚）；不同 IP 独立桶。
+    /// Token bucket (injected clock): 10 burst tokens allowed immediately;
+    /// the 11th rejected (429 face); refills at 10/min (1 token per 6s);
+    /// independent buckets per IP.
     #[test]
     fn ip_token_bucket() {
         let b = IpBuckets::new();
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         let t0 = 100u64;
-        // 突发 10 枚：同刻取（离散时钟下无回填掺入——曲线本身在回填用例验证）。
+        // 10-token burst: taken at the same instant (under a discrete clock no
+        // refill mixes in —— the refill curve is verified in its own case).
         for i in 0..10 {
-            assert!(b.allow(ip, t0).is_ok(), "突发 10 内第 {} 枚放行", i + 1);
+            assert!(
+                b.allow(ip, t0).is_ok(),
+                "token {} allowed within burst 10",
+                i + 1
+            );
         }
-        assert!(b.allow(ip, t0).is_err(), "第 11 枚拒");
-        // 同刻重试仍拒（无回填）。
+        assert!(b.allow(ip, t0).is_err(), "the 11th rejected");
+        // Same-instant retry still rejected (no refill).
         assert!(b.allow(ip, t0).is_err());
-        // 6s 回填 ≈1 枚（10/min ⇒ 6s/枚；浮点取整保守——7s 后必满 1 枚）。
-        assert!(b.allow(ip, t0 + 7).is_ok(), "回填一枚");
-        assert!(b.allow(ip, t0 + 7).is_err(), "再取仍需等");
-        // 不同 IP 独立桶。
+        // 6s refills ≈1 token (10/min ⇒ 6s/token; float rounding is
+        // conservative —— after 7s a full token is guaranteed).
+        assert!(b.allow(ip, t0 + 7).is_ok(), "one token refilled");
+        assert!(b.allow(ip, t0 + 7).is_err(), "the next take still waits");
+        // Independent buckets per IP.
         let ip2: IpAddr = "127.0.0.2".parse().unwrap();
         assert!(b.allow(ip2, t0).is_ok());
     }
 
-    /// 容量上限 + 清扫（🟡 评审项 5）：
-    /// - 退避表满载（4096）：先清惰性过期行；仍满逐出最近失败最旧的行——
-    ///   在册数不超上限、新失败者状态保留（可继续累计到锁定）。
-    /// - 退避表 sweep：窗净空（≥15min 无失败）即清；锁定中的行不清。
+    /// Capacity caps + sweep (review item 5):
+    /// - Backoff table saturated (4096): lazily-expired rows cleared first;
+    ///   if still full, the row with the oldest most-recent failure is
+    ///   evicted —— the on-record count never exceeds the cap, and a new
+    ///   failure's state is retained (can keep accumulating toward lockout).
+    /// - Backoff table sweep: window drained (≥15min without failure) rows
+    ///   cleared; locked rows are not.
     #[test]
     fn login_backoff_cap_and_sweep() {
         let b = LoginBackoff::new();
         let t0 = 1_000u64;
-        // 满：4095 个用户各一次失败（时刻递增——u0 最早；全距 512s < 900s 窗 ⇒
-        // 上限触发时 sweep 无惰性行可清、必走「逐出最旧」路径）。
+        // Fill: 4095 users, one failure each (timestamps increasing —— u0
+        // earliest; total span 512s < 900s window ⇒ when the cap triggers the
+        // sweep finds no lazy rows to clear and must take the "evict oldest"
+        // path).
         for i in 0..LOGIN_BACKOFF_CAP - 1 {
             b.on_failure(&format!("u{i:04}"), t0 + i as u64 / 8);
         }
         assert_eq!(b.len(), LOGIN_BACKOFF_CAP - 1);
-        // u_last 预置 4 次失败（不锁——阈值 5），逐出若命中它则下面第 5 次
-        // 不再起锁；这里它时刻最新，不应被逐。
+        // u-last pre-seeded with 4 failures (no lockout —— threshold 5); if
+        // eviction hit it, the 5th failure below would not start a lockout;
+        // here it has the newest timestamp and must not be evicted.
         let t_last = t0 + (LOGIN_BACKOFF_CAP - 1) as u64 / 8;
         for _ in 0..4 {
             b.on_failure("u-last", t_last);
         }
-        // 满 +1：触发上限（时刻相近 ⇒ sweep 无行可清 ⇒ 逐出最近失败最旧 = u0000）。
+        // Full +1: cap triggers (timestamps close ⇒ sweep clears nothing ⇒
+        // evict the oldest by most-recent failure = u0000).
         b.on_failure("u-new", t_last + 1);
-        assert_eq!(b.len(), LOGIN_BACKOFF_CAP, "上限维持（不越 4096）");
-        // u-last 保留：第 5 次失败起锁 30s。
+        assert_eq!(
+            b.len(),
+            LOGIN_BACKOFF_CAP,
+            "cap maintained (never exceeds 4096)"
+        );
+        // u-last retained: the 5th failure starts a 30s lockout.
         b.on_failure("u-last", t_last + 2);
-        assert_eq!(b.check("u-last", t_last + 2), Some(30), "最新用户状态保留");
-        // sweep：窗净空（距 u-last 最近失败 ≥ 15min）⇒ 全清；窗内/锁内（<15min）不清。
-        assert_eq!(b.sweep(t_last + 3), 0, "窗内/锁内行不清");
+        assert_eq!(
+            b.check("u-last", t_last + 2),
+            Some(30),
+            "newest user state retained"
+        );
+        // sweep: window drained (u-last's most recent failure ≥ 15min ago) ⇒
+        // all cleared; inside the window / mid-lockout (<15min) not cleared.
+        assert_eq!(
+            b.sweep(t_last + 3),
+            0,
+            "rows inside window/lockout not cleared"
+        );
         let swept = b.sweep(t_last + 2 + FAIL_WINDOW_SECS);
-        assert!(swept >= 2, "窗净空行全清（实际 {swept}）");
+        assert!(swept >= 2, "drained rows all cleared (actually {swept})");
         assert!(b.is_empty());
-        // 边界：恰 FAIL_WINDOW_SECS 距离 = 窗净空（retain 条件 <）。
+        // Boundary: exactly FAIL_WINDOW_SECS distance = window drained (the
+        // retain condition is <).
         let b2 = LoginBackoff::new();
         b2.on_failure("solo", 100);
-        assert_eq!(b2.sweep(100 + FAIL_WINDOW_SECS - 1), 0, "差 1s 仍在窗");
-        assert_eq!(b2.sweep(100 + FAIL_WINDOW_SECS), 1, "到点即净空");
+        assert_eq!(
+            b2.sweep(100 + FAIL_WINDOW_SECS - 1),
+            0,
+            "1s short is still in-window"
+        );
+        assert_eq!(
+            b2.sweep(100 + FAIL_WINDOW_SECS),
+            1,
+            "drained right at the mark"
+        );
     }
 
-    /// 令牌桶容量上限 + 清扫（🟡 评审项 5）：满载先清 idle ≥60s 行（重建 = 满桶，
-    /// 无行为差异）；全 fresh 时逐出 last 最旧；sweep 清 idle 行、近期行保留。
+    /// Token bucket capacity cap + sweep (review item 5): when saturated,
+    /// first clear rows idle ≥60s (rebuild = full bucket, no behavioral
+    /// difference); when all fresh, evict the oldest by last; sweep clears
+    /// idle rows and keeps recent ones.
     #[test]
     fn ip_buckets_cap_and_sweep() {
         let b = IpBuckets::new();
         let t0 = 100u64;
-        // 满：4096 个 IP 各取一枚（时刻递增——首个最旧）。
+        // Fill: 4096 IPs, one token each (timestamps increasing —— the first
+        // is the oldest).
         for i in 0..IP_BUCKETS_CAP {
             let ip: IpAddr = format!("10.1.{}.{}", i / 250, i % 250 + 1).parse().unwrap();
             assert!(b.allow(ip, t0 + i as u64 / 64).is_ok());
         }
         assert_eq!(b.len(), IP_BUCKETS_CAP);
-        // idle 清扫路径：距全部行 ≥60s ⇒ 新 IP 触发全清后插入（在册 1）。
+        // Idle-sweep path: ≥60s from all rows ⇒ a new IP triggers a full
+        // clear then inserts (1 on record).
         let ip_new: IpAddr = "10.9.9.9".parse().unwrap();
         assert!(b.allow(ip_new, t0 + 5000).is_ok());
-        assert_eq!(b.len(), 1, "idle 行全清 + 新行插入");
-        // fresh 逐出路径：同刻满载后新 IP ⇒ 逐出 last 最旧而非拒绝；新行可用
-        //（同刻连取突发 10 内放行）。
+        assert_eq!(b.len(), 1, "idle rows fully cleared + new row inserted");
+        // Fresh-eviction path: saturated at the same instant, a new IP ⇒ evict
+        // the oldest by last rather than reject; the new row is usable
+        // (same-instant takes allowed within burst 10).
         let b2 = IpBuckets::new();
         let t1 = 9_000u64;
         for i in 0..IP_BUCKETS_CAP {
             let ip: IpAddr = format!("10.2.{}.{}", i / 250, i % 250 + 1).parse().unwrap();
-            assert!(b2.allow(ip, t1).is_ok(), "fresh 满：{ip}");
+            assert!(b2.allow(ip, t1).is_ok(), "fresh fill: {ip}");
         }
-        assert!(b2.allow(ip_new, t1).is_ok(), "满载逐出最旧后新 IP 放行");
+        assert!(
+            b2.allow(ip_new, t1).is_ok(),
+            "new IP allowed after oldest evicted at saturation"
+        );
         assert_eq!(b2.len(), IP_BUCKETS_CAP);
-        // 新行保留：ip_new 再取 9 枚（首取已用 1）——第 11 枚拒。
+        // New row retained: ip_new takes 9 more (the first take used 1) ——
+        // the 11th rejected.
         for _ in 0..9 {
             assert!(b2.allow(ip_new, t1).is_ok());
         }
-        assert!(b2.allow(ip_new, t1).is_err(), "新行逐出受害者语义自检");
-        // sweep：idle ≥60s 行清、fresh 行留（ip_new 在 t1+60 再取一枚 ⇒ last 刷新）。
+        assert!(
+            b2.allow(ip_new, t1).is_err(),
+            "eviction-victim semantics self-check"
+        );
+        // sweep: idle ≥60s rows cleared, fresh rows kept (ip_new takes one
+        // more token at t1+60 ⇒ last refreshed).
         assert!(
             b2.allow(ip_new, t1 + BUCKET_REFILL_SECS).is_ok(),
-            "回满后再取"
+            "take again after full refill"
         );
         let before = b2.len();
-        assert!(before <= IP_BUCKETS_CAP, "上限不变式（≤4096）");
+        assert!(before <= IP_BUCKETS_CAP, "cap invariant (≤4096)");
         assert_eq!(
             b2.sweep(t1 + BUCKET_REFILL_SECS),
             before - 1,
-            "其余 idle 行全清"
+            "all other idle rows cleared"
         );
-        assert_eq!(b2.len(), 1, "仅 ip_new（fresh）留");
+        assert_eq!(b2.len(), 1, "only ip_new (fresh) kept");
     }
 
-    /// 审计环：stderr 同步 + 内存 ≤200 + 新→旧序 + denied 行亦留痕。
+    /// Audit ring: synchronous stderr + memory ≤200 + new→old order + denied
+    /// lines also recorded.
     #[test]
     fn audit_ring_cap_and_order() {
         let a = AuditLog::new();
@@ -767,10 +882,10 @@ mod tests {
         );
         let es = a.entries_newest_first();
         assert_eq!(es.len(), 2);
-        assert_eq!(es[0].action, "user.create", "新→旧");
-        assert_eq!(es[0].result, "denied", "denied 也记录");
+        assert_eq!(es[0].action, "user.create", "new→old");
+        assert_eq!(es[0].result, "denied", "denied also recorded");
         assert_eq!(es[1].origin, Origin::Vpn);
-        // 环 200 上限（挤最旧）。
+        // Ring cap 200 (evicts the oldest).
         for i in 0..AUDIT_CAP + 37 {
             a.record(
                 t0 + i as u64 + 2,
@@ -781,12 +896,14 @@ mod tests {
                 "ok",
             );
         }
-        assert_eq!(a.len(), AUDIT_CAP, "环上限 200");
+        assert_eq!(a.len(), AUDIT_CAP, "ring cap 200");
         assert_eq!(a.entries_newest_first()[0].ts, t0 + AUDIT_CAP as u64 + 38);
     }
 
-    /// 审计输出清洗（🟡 评审项 4）：user/target 含 \n/\r/其它控制字符 ⇒ 输出前
-    /// 替换为可视化占位——stderr 单行格式不可被伪造出新的审计行（行注入）。
+    /// Audit output sanitization (review item 4): user/target containing
+    /// \n/\r/other control characters ⇒ replaced with a visible placeholder
+    /// before output —— the single-line stderr format cannot be forged into
+    /// new audit lines (line injection).
     #[test]
     fn audit_sanitizes_control_chars_in_user_and_target() {
         let a = AuditLog::new();
@@ -801,15 +918,18 @@ mod tests {
         let e = &a.entries_newest_first()[0];
         assert!(
             !e.user.contains('\n') && !e.user.contains('\r'),
-            "user 无裸换行"
+            "user has no bare line feeds"
         );
         assert!(
             !e.target.contains('\n') && !e.target.contains('\r'),
-            "target 无裸换行"
+            "target has no bare line feeds"
         );
-        assert!(e.user.contains("evil"), "内容保留（可追溯）");
-        assert!(e.user.contains('␀'), "控制字符可视化占位");
-        // NUL/Tab 同清洗。
+        assert!(e.user.contains("evil"), "content retained (traceable)");
+        assert!(
+            e.user.contains('␀'),
+            "control characters visualized as placeholders"
+        );
+        // NUL/Tab sanitized the same way.
         a.record(8, "u\u{0}x\t", "session.login", "t\u{1}", Origin::Vpn, "ok");
         let e2 = &a.entries_newest_first()[0];
         assert!(!e2.user.bytes().any(|b| b.is_ascii_control()));

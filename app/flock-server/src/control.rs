@@ -1,27 +1,37 @@
-//! 控制流（docs/design.md §2.2 / §3.11：yamux 控制流、postcard 消息、版本化）。
+//! Control flow (docs/design.md §2.2 / §3.11: yamux control flow, postcard
+//! messages, versioning).
 //!
-//! 承载：OPAQUE 登录（`anchor`：服务端身份签名覆盖 SERVER_ID‖user‖ke2‖bind_token）→
-//! 会话票据签发（TTL、revocation_epoch；票据根 = 本地种子（单服）或 Raft 状态内根
-//! （多主，任何服务器都验得了——SR-SIG1 跨服重放面的闭合前提，§2.2））→ key-bind
-//! （设备公钥登记）→ 设备注册表操作 → SR-SIG1 请求验签 → dir_pull（根签
-//! ClusterDirectory 下发）。
+//! Carries: OPAQUE login (`anchor`: the server identity signature covering
+//! SERVER_ID‖user‖ke2‖bind_token) → session ticket issuance (TTL,
+//! revocation_epoch; the ticket root = a local seed (single server) or the
+//! root inside Raft state (multi-primary, verifiable by any server —— the
+//! closure precondition of the SR-SIG1 cross-server replay surface, §2.2)) →
+//! key-bind (device public key registration) → device registry operations →
+//! SR-SIG1 request verification → dir_pull (the root-signed
+//! ClusterDirectory pushed down).
 //!
-//! # 票据强制契约（§2.2，接口契约级）
+//! # Ticket enforcement contract (§2.2, interface-contract level)
 //!
-//! 所有受 SR-SIG1 保护的**状态变更**请求必须携带有效票据；[`CtrlGuard::admit_state_change`]
-//! 的校验顺序 = **票据（签名+TTL+epoch+吊销）→ SR-SIG1 验签 → nonce 记账**——票据/签名
-//! 失败时 nonce **不入账**（`ticket.rs::tests` + `tests/control_flow.rs::full_chain_*`
-//! 断言该顺序：错误票据 + 全新 nonce ⇒ 拒且不记账）。
+//! All SR-SIG1-protected **state change** requests must carry a valid
+//! ticket; the check order of [`CtrlGuard::admit_state_change`] =
+//! **ticket (signature+TTL+epoch+revocation) → SR-SIG1 verification → nonce
+//! accounting** —— on ticket/signature failure the nonce is **not
+//! recorded** (`ticket.rs::tests` + `tests/control_flow.rs::full_chain_*`
+//! assert this order: bad ticket + fresh nonce ⇒ rejected and not
+//! recorded).
 //!
-//! # 异步派发（M4 多主批次）
+//! # Async dispatch (M4 multi-primary batch)
 //!
-//! 写读经 [`NetBackend`]（single = 本地 redb 立即完成；multi-primary = Raft 提交/线性
-//! 一致读——网络往返，故派发为 async；§1.3.3c lookup 接缝的同一理由）。
+//! Reads/writes go through [`NetBackend`] (single = local redb completes
+//! immediately; multi-primary = Raft commit/linearizable read —— a network
+//! round trip, hence dispatched as async; the same reason as the §1.3.3c
+//! lookup seam).
 //!
-//! # 帧格式
+//! # Frame format
 //!
-//! 控制流 = 隧道内首条 yamux 流（客户端 `open_stream(Prio::Control)`；服务端按流 id=1
-//! 分派）。每条消息 = `[u32 LE len][postcard CtrlRequest/CtrlResponse]`。
+//! The control flow = the first yamux stream inside the tunnel (client
+//! `open_stream(Prio::Control)`; the server dispatches by stream id=1).
+//! Each message = `[u32 LE len][postcard CtrlRequest/CtrlResponse]`.
 
 use ed25519_dalek::{Signature, Verifier};
 use flock_protocol::opaque_ke;
@@ -40,8 +50,9 @@ use crate::server::ServerCore;
 use crate::ticket::{NonceLedger, TicketAuthority};
 
 // ============================================================================
-// 共享契约再导出（M7 类型上收——定义在 flock_protocol::roster，两端同类型无第二
-// 真相源；既有引用路径 `flock_server::control::*` 不变）
+// Shared contract re-exports (M7 type uplift —— defined in
+// flock_protocol::roster, the same type on both ends with no second source
+// of truth; existing reference paths `flock_server::control::*` unchanged)
 // ============================================================================
 
 pub use flock_protocol::roster::{
@@ -50,9 +61,11 @@ pub use flock_protocol::roster::{
     CTRL_PROTO_VERSION, KEYBIND_LABEL, MAX_CTRL_MSG,
 };
 
-/// SR-SIG1 canonical 的 method 槽（控制面统一方法名；path 区分操作）。
+/// The method slot of the SR-SIG1 canonical (the unified control-plane
+/// method name; the path distinguishes operations).
 pub const CTRL_METHOD: &str = "CTRL";
-/// 各 SR-SIG1 保护操作的 path（进 canonical 七字段，§1.3.2 线上格式不变）。
+/// The path of each SR-SIG1-protected operation (goes into the canonical
+/// seven fields, §1.3.2 wire format unchanged).
 pub const PATH_TICKET_RENEW: &str = "/ticket-renew";
 pub const PATH_REDEEM_INVITE: &str = "/redeem-invite";
 pub const PATH_DEVICE_OP: &str = "/device-op";
@@ -91,19 +104,28 @@ fn redeem_err_code(e: &RedeemError) -> CtrlError {
 }
 
 // ============================================================================
-// CtrlGuard：票据强制契约 + SR-SIG1 + nonce 记账（§2.2，接口契约级）
+// CtrlGuard: the ticket enforcement contract + SR-SIG1 + nonce accounting
+// (§2.2, interface-contract level)
 // ============================================================================
 
-/// 状态变更的统一准入：**票据（签名+TTL+epoch+吊销）→ SR-SIG1 验签 → nonce 记账**。
+/// Unified admission for state changes: **ticket
+/// (signature+TTL+epoch+revocation) → SR-SIG1 verification → nonce
+/// accounting**.
 ///
-/// 契约（写死、顺序有测试断言）：
-/// 1. 票据缺失/无效 ⇒ 立即拒——**nonce 不入账**（错误票据 + 全新 nonce 被拒后，同一 nonce
-///    仍可持有效票据走到后续校验）；等效重放窗 = min(±300s, 票据 TTL)。
-/// 2. SR-SIG1：用户登记公钥（key-bind 落库）任一命中；±300s 窗；header user == 票据 user
-///    且票据绑定设备 == 当前会话设备（票据绑 device，§2.2）。
-/// 3. nonce 查重 + 入账（最后一步；只有前两步都过才执行）。
+/// Contract (set in stone, the ordering has test assertions):
+/// 1. Missing/invalid ticket ⇒ immediate rejection —— the **nonce is not
+///    recorded** (after a bad ticket + fresh nonce is rejected, the same
+///    nonce can still reach the later checks with a valid ticket); the
+///    equivalent replay window = min(±300s, ticket TTL).
+/// 2. SR-SIG1: any hit among the user's registered public keys (key-bind
+///    persisted); ±300s window; header user == ticket user and the ticket's
+///    bound device == the current session device (tickets bind the device,
+///    §2.2).
+/// 3. Nonce dedup + recording (the last step; executed only after both
+///    previous steps pass).
 pub struct CtrlGuard {
-    /// 票据权威（Local 种子 / Sync = Raft 内根——校验语义一致，见 [`TicketAuthority`]）。
+    /// Ticket authority (Local seed / Sync = the root inside Raft —— the
+    /// verification semantics match, see [`TicketAuthority`]).
     pub authority: TicketAuthority,
     pub nonces: NonceLedger,
 }
@@ -116,7 +138,8 @@ impl CtrlGuard {
         }
     }
 
-    /// 票据校验 + user 解析（KeyBind 与 admit 共用；epoch/设备态来自 NetBackend）。
+    /// Ticket verification + user resolution (shared by KeyBind and admit;
+    /// epoch/device state come from the NetBackend).
     async fn ticket_principal(
         &self,
         net: &NetBackend,
@@ -130,7 +153,8 @@ impl CtrlGuard {
             .authority
             .verify(ticket, session_device, now_unix, epoch, |_| verdict)?;
         match principal.user {
-            // Local 票据内嵌 user；Sync 票据绑 device——user 由注册表 owner 解析。
+            // Local tickets embed the user; Sync tickets bind the device ——
+            // the user is resolved from the registry owner.
             None => net
                 .device_row(session_device)
                 .await
@@ -152,7 +176,8 @@ impl CtrlGuard {
         body: &[u8],
         now_unix: i64,
     ) -> Result<String, CtrlError> {
-        // ① 票据（先于一切 nonce 记账——§2.2 契约序）。
+        // ① Ticket (ahead of any nonce accounting —— the §2.2 contract
+        //    order).
         let user = self
             .ticket_principal(net, session_device, ticket, now_unix as u64)
             .await
@@ -160,7 +185,8 @@ impl CtrlGuard {
                 eprintln!("flock-server: ticket rejected: {r}");
                 CtrlError::TicketBad
             })?;
-        // ② SR-SIG1 验签（user 公钥集来自注册表——线性一致）。
+        // ② SR-SIG1 verification (the user's public key set comes from the
+        //    registry —— linearizable).
         let keys = net.user_sig_pubs(&user).await;
         let verified = sig::verify(&auth.header, &keys, CTRL_METHOD, path, body, now_unix)
             .map_err(|e| match e {
@@ -171,7 +197,8 @@ impl CtrlGuard {
         if verified.user != user {
             return Err(CtrlError::SigBad);
         }
-        // ③ nonce 记账（查重 + 入账；仅在前两步通过后到达此处）。
+        // ③ Nonce accounting (dedup + record; reached only after the first
+        //    two steps pass).
         if !self
             .nonces
             .check_and_record(&verified.user, &verified.nonce, verified.ts, now_unix)
@@ -183,27 +210,33 @@ impl CtrlGuard {
 }
 
 // ============================================================================
-// 服务端分发
+// Server dispatch
 // ============================================================================
 
-/// 单条控制连接的会话上下文。
+/// Session context of one control connection.
 struct ConnCtx {
-    /// 隧道对端设备（respond 已认证）。
+    /// The tunnel's peer device (authenticated by respond).
     device: DeviceId,
-    /// LoginBegin 的在途 OPAQUE 状态。
+    /// The in-flight OPAQUE state of LoginBegin.
     pending_login: Option<Vec<u8>>,
 }
 
-/// 控制流空闲超时（评审项 8）：3×keepalive（30s）无任何帧即关闭该流。
+/// Control-flow idle timeout (review item 8): no frame at all for
+/// 3×keepalive (30s) closes the stream.
 ///
-/// 与会话层 PING/PONG 的关系：PING/PONG 走**记录层**（整条连接），不产生 yamux 流
-/// 帧本层可见——它维持的是隧道存活，**不维持**单条流的空闲豁免。控制流关闭后隧道
-/// 与数据通道不受影响；客户端需要控制业务时重开控制流即可（当前 M3 客户端的控制
-/// 流为静默占位、不发业务，被空闲关闭无功能影响）。
+/// Relationship with the session-layer PING/PONG: PING/PONG travels on the
+/// **record layer** (the whole connection), producing no yamux stream frames
+/// visible to this layer —— it keeps the tunnel alive, **not** the idle
+/// exemption of a single stream. After the control stream closes, the tunnel
+/// and data channels are unaffected; the client just reopens a control
+/// stream when it needs control business (the current M3 client's control
+/// stream is a silent placeholder sending no business, so an idle close has
+/// no functional impact).
 const CTRL_IDLE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(3 * flock_protocol::session::KEEPALIVE.as_secs());
 
-/// 处理一条控制流直到 EOF/错误。返回 Err 仅表示 IO 层失败（业务错误走 CtrlResponse::Err）。
+/// Serve one control stream until EOF/error. Err means only an IO-layer
+/// failure (business errors go through CtrlResponse::Err).
 pub async fn serve_control<S: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin>(
     core: &ServerCore,
     device: DeviceId,
@@ -214,13 +247,14 @@ pub async fn serve_control<S: futures::io::AsyncRead + futures::io::AsyncWrite +
         pending_login: None,
     };
     loop {
-        // 空闲超时（评审项 8）：3×keepalive 无任何入站帧 ⇒ 优雅结束控制流。
+        // Idle timeout (review item 8): no inbound frame for 3×keepalive ⇒
+        // gracefully end the control stream.
         let req: CtrlRequest = match tokio::time::timeout(CTRL_IDLE_TIMEOUT, recv_ctrl_msg(io))
             .await
         {
             Ok(r) => match r {
                 Ok(r) => r,
-                Err(_) => return Ok(()), // EOF/坏帧：控制流结束
+                Err(_) => return Ok(()), // EOF/bad frame: the control stream ends
             },
             Err(_) => {
                 eprintln!("flock-server: control stream idle > {CTRL_IDLE_TIMEOUT:?} — closing");
@@ -247,7 +281,8 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             }
         }
 
-        // —— OPAQUE 注册（设置口令；授权 = 本会话设备 owner）——
+        // —— OPAQUE registration (set password; authorization = this session
+        //    device's owner) ——
         CtrlRequest::PwBegin { user, m1_b64 } => {
             if owner_of_device(net, &ctx.device).await.as_deref() != Some(user.as_str()) {
                 return err(CtrlError::NotAuthorized);
@@ -267,7 +302,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             let Some(owner) = owner_of_device(net, &ctx.device).await else {
                 return err(CtrlError::NotAuthorized);
             };
-            // 记录侧规范化（解码验证）。
+            // Record-side canonicalization (decode validation).
             let canonical = match flock_protocol::pake::server_reg_canonical(&record_b64) {
                 Ok(c) => c,
                 Err(_) => return err(CtrlError::Internal),
@@ -278,7 +313,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             }
         }
 
-        // —— OPAQUE 登录（anchor）→ 票据签发 ——
+        // —— OPAQUE login (anchor) → ticket issuance ——
         CtrlRequest::LoginBegin { user, ke1_b64 } => {
             let Some(owner) = owner_of_device(net, &ctx.device).await else {
                 return err(CtrlError::NotAuthorized);
@@ -286,8 +321,11 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             if owner != user {
                 return err(CtrlError::NotAuthorized);
             }
-            // M8（§7-M8.3）：禁用判定——disabled 用户阻断控制流登录（会话设备 owner
-            // 已认证，此处的 NotAuthorized 不构成匿名枚举面；已建会话不追溯断开）。
+            // M8 (§7-M8.3): the disabled check —— disabled users are blocked
+            // from control-flow login (the session device's owner is already
+            // authenticated, so this NotAuthorized forms no anonymous
+            // enumeration surface; established sessions are not
+            // retroactively dropped).
             if net.user_row(&user).await.is_some_and(|r| r.disabled) {
                 eprintln!("flock-server: login rejected (user disabled): {user}");
                 return err(CtrlError::NotAuthorized);
@@ -304,7 +342,8 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                 &user,
             ) {
                 Ok((ke2_b64, state)) => {
-                    // anchor：服务端身份签名覆盖 SERVER_ID‖user‖ke2‖bind_token（§1.3.3f）。
+                    // anchor: the server identity signature covers
+                    // SERVER_ID‖user‖ke2‖bind_token (§1.3.3f).
                     let bind_token: [u8; 16] = rand::random();
                     let anchor_sig = anchor_sign(
                         &core.identity.identity,
@@ -350,7 +389,8 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             CtrlResponse::LoginOk { ticket, epoch }
         }
 
-        // —— key-bind：设备公钥登记（§1.3.3f「公钥经登录态登记」）——
+        // —— key-bind: device public key registration (§1.3.3f "public keys
+        //    registered through the logged-in state") ——
         CtrlRequest::KeyBind {
             ticket,
             bind_token,
@@ -358,7 +398,8 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             sr_sig_pub,
             device_sig,
         } => {
-            // 票据（状态变更必带；含会话设备绑定检查）。
+            // Ticket (mandatory on state changes; includes the session-device
+            // binding check).
             let user = match core
                 .guard
                 .ticket_principal(net, &ctx.device, &ticket, now_unix)
@@ -370,11 +411,12 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                     return err(CtrlError::TicketBad);
                 }
             };
-            // bind_token 一次性（§2.4 线性一致查重）。
+            // bind_token one-time (§2.4 linearizable dedup).
             if !net.consume_bind_token(&bind_token).await {
                 return err(CtrlError::BindTokenUsed);
             }
-            // 设备签名（占有证明）：覆盖 cluster‖user‖bind_token‖设备公钥‖SR-SIG1 公钥。
+            // Device signature (proof of possession): covers
+            // cluster‖user‖bind_token‖device public key‖SR-SIG1 public key.
             let sig_bytes = keybind_canonical(
                 &core.identity.cluster_id.0,
                 &user,
@@ -396,14 +438,17 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                 .await
             {
                 Ok(row) => {
-                    // SR-SIG1 公钥登记失败必须可见（评审项 6：禁止无痕成功）——设备行
-                    // 已建但用户验签公钥缺失 ⇒ 后续全部 SR-SIG1 状态变更将 SigBad。
-                    // 返回明确错误 + 日志留痕（响应面无告警字段，不改线格式——客户端
-                    // 可凭 bind_token 未消费的语义重试其他账号路径）。
+                    // A failed SR-SIG1 public key registration must be visible
+                    // (review item 6: no silent success allowed) —— the device
+                    // row exists but the user's verification key is missing ⇒
+                    // every later SR-SIG1 state change would SigBad. Return an
+                    // explicit error + a log trail (the response surface has
+                    // no alert field; the wire format stays unchanged —— the
+                    // client can retry another account path by the semantics
+                    // of the unconsumed bind_token).
                     if let Err(e) = net.add_user_sig_key(&user, sr_sig_pub).await {
                         eprintln!(
-                            "flock-server: key-bind: 设备已注册但 SR-SIG1 公钥登记失败\
-                             （user={user}）: {e}"
+                            "flock-server: key-bind: device registered but SR-SIG1 public key registration failed (user={user}): {e}"
                         );
                         return err(CtrlError::Internal);
                     }
@@ -412,19 +457,23 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                         vip: row.vip,
                     }
                 }
-                // M7 re-register：同设备（同公钥集）再次 key-bind ⇒ 更新 hostname，
-                // VIP 不变（窗口内重连同设备保持同 IP，§7-M7）。bind_token 已消费、
-                // 设备签名已验——与首注册同授权强度。按 **DeviceExists 变体**分流
-                // （消灭 `contains("already registered")` 字符串契约）+ owner 校验：
-                // 目标行 owner != 票据 user ⇒ NotAuthorized（跨户改他人设备 hostname
-                // 被拒——设备签名只证明设备侧占有，不证明账户归属）。
+                // M7 re-register: key-binding again with the same device
+                // (same key set) ⇒ update the hostname, VIP unchanged (a
+                // same-device reconnect within the window keeps the same IP,
+                // §7-M7). The bind_token is consumed and the device signature
+                // verified —— the same authorization strength as a first
+                // registration. Dispatched as the **DeviceExists variant**
+                // (eliminating the `contains("already registered")` string
+                // contract) + owner check: target row owner != ticket user ⇒
+                // NotAuthorized (changing another user's device hostname
+                // cross-account is rejected —— the device signature only
+                // proves device-side possession, not account ownership).
                 Err(NetError::DeviceExists) => {
                     let dev_id = DeviceId::from_ed25519(&vk);
                     match net.device_row(&dev_id).await {
                         Some(row) if row.owner != user => {
                             eprintln!(
-                                "flock-server: key-bind(re): 跨户重绑定被拒\
-                                 （device owner={} != ticket user={user}）",
+                                "flock-server: key-bind(re): cross-owner rebind rejected (device owner={} != ticket user={user})",
                                 row.owner
                             );
                             return err(CtrlError::NotAuthorized);
@@ -436,8 +485,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                         Ok(row) => {
                             if let Err(e) = net.add_user_sig_key(&user, sr_sig_pub).await {
                                 eprintln!(
-                                    "flock-server: key-bind(re): SR-SIG1 公钥登记失败\
-                                     （user={user}）: {e}"
+                                    "flock-server: key-bind(re): SR-SIG1 public key registration failed (user={user}): {e}"
                                 );
                                 return err(CtrlError::Internal);
                             }
@@ -453,7 +501,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             }
         }
 
-        // —— SR-SIG1 + 票据 + nonce 的状态变更 ——
+        // —— State changes with SR-SIG1 + ticket + nonce ——
         CtrlRequest::TicketRenew { ticket, auth } => {
             let Some(ticket) = ticket else {
                 return err(CtrlError::TicketMissing);
@@ -519,7 +567,10 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                     let Ok(invite_bytes) = b64_decode(&invite_b64) else {
                         return err(CtrlError::InviteBadSig);
                     };
-                    // 集群身份钉扎：Sync 形态由状态机 bootstrap 身份自证；单服以库内根比对。
+                    // Cluster identity pinning: the Sync form is
+                    // self-attested by the state machine's bootstrap
+                    // identity; single-server compares against the in-store
+                    // root.
                     match net
                         .redeem_invite(RedeemRequest {
                             invite_bytes: &invite_bytes,
@@ -571,8 +622,12 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
                     }
                     match net.revoke(&DeviceId(device)).await {
                         Ok(_) => {
-                            // 杀本地该设备会话（§2.2 吊销传播界：apply 回调内本地执行——
-                            // 多主形态经 SyncHooks 于各节点 apply 现场触发；单机即时执行）。
+                            // Kill this device's local sessions (§2.2
+                            // revocation propagation bound: executed locally
+                            // inside the apply callback —— in multi-primary
+                            // form triggered per node at the apply site via
+                            // SyncHooks; executed immediately on a single
+                            // node).
                             core.sessions.kill(&DeviceId(device).0);
                             CtrlResponse::Ok
                         }
@@ -622,7 +677,7 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             }
         }
 
-        // —— 目录拉取（只读；根签目录，§1.3.3f）——
+        // —— Directory pull (read-only; the root-signed directory, §1.3.3f) ——
         CtrlRequest::DirPull { since_version } => {
             let dir = core.build_directory();
             if dir.dir_version == since_version {
@@ -637,13 +692,16 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
             }
         }
 
-        // —— M7：成员名册（票据保护；票据校验先于数据装配，§7-M7.4）——
+        // —— M7: the member roster (ticket-protected; ticket verification
+        //    precedes data assembly, §7-M7.4) ——
         CtrlRequest::PeerListPull { ticket } => {
             let Some(ticket) = ticket else {
                 return err(CtrlError::TicketMissing);
             };
-            // 契约序：票据（签名+TTL+epoch+设备态）通过之前**不触碰**名册装配——
-            // 坏票据 ⇒ TicketBad 且装配计数不动（tests 断言该顺序）。
+            // Contract order: roster assembly is **never touched** before the
+            // ticket (signature+TTL+epoch+device state) passes —— a bad
+            // ticket ⇒ TicketBad with the assembly counter unmoved (tests
+            // assert this order).
             if let Err(r) = core
                 .guard
                 .ticket_principal(net, &ctx.device, &ticket, now_unix)
@@ -660,25 +718,33 @@ async fn dispatch(core: &ServerCore, ctx: &mut ConnCtx, req: CtrlRequest) -> Ctr
 }
 
 // ============================================================================
-// M7：名册装配（§7-M7.4——注册表快照 ⋈ 本地租约视图；VIP 升序）
+// M7: roster assembly (§7-M7.4 —— registry snapshot ⋈ local lease view; VIP
+// ascending)
 // ============================================================================
 
-/// 名册装配累计（诊断/测试面——「票据先行」顺序断言的探针：坏票据 ⇒ 计数不动）。
+/// Cumulative roster assemblies (diagnostics/test surface —— the probe for
+/// the "ticket first" order assertion: a bad ticket ⇒ the counter stays
+/// put).
 pub fn roster_assemblies() -> u64 {
     ROSTER_ASSEMBLIES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static ROSTER_ASSEMBLIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 装配名册：注册表快照（**本地已 apply 视图**——两级读缓存档即可，允许 follower
-/// 视图秒级陈旧）⋈ 本地租约视图（在线判定 + last_seen + EWMA）+ Server 条目。
+/// Assemble the roster: registry snapshot (**locally applied view** —— the
+/// two-level-read cache tier suffices, allowing a follower view seconds
+/// stale) ⋈ local lease view (online verdict + last_seen + EWMA) + Server
+/// entries.
 ///
-/// - 设备条目：仅 `status == Active` 行（Disabled/Revoked/Expired 排除——名册 =
-///   现任成员；审计走 DeviceList）；
-/// - Server 条目：多主 = Raft server_keys 本地视图（vip）+ 根签目录 endpoint
-///   （hostname）+ 各服务器自发布租约（在线/流量）；单服 = 本机一条
-///   （vip = cfg.vip，hostname = advertise_endpoint，流量 = 本机 TrafficMeter）；
-/// - 输出按 VIP 升序。
+/// - Device entries: only `status == Active` rows (Disabled/Revoked/Expired
+///   excluded —— the roster = current members; auditing goes through
+///   DeviceList);
+/// - Server entries: multi-primary = the Raft server_keys local view (vip) +
+///   the root-signed directory endpoint (hostname) + each server's
+///   self-published lease (online/traffic); single-server = one local entry
+///   (vip = cfg.vip, hostname = advertise_endpoint, traffic = the local
+///   TrafficMeter);
+/// - Output ascending by VIP.
 pub async fn assemble_roster(core: &ServerCore) -> Vec<PeerInfo> {
     ROSTER_ASSEMBLIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut out: Vec<PeerInfo> = Vec::new();
@@ -700,7 +766,8 @@ pub async fn assemble_roster(core: &ServerCore) -> Vec<PeerInfo> {
                     rx_bps: rx,
                 });
             }
-            // 服务器自身（单服形态唯一 Server 条目）。
+            // The server itself (the single Server entry in single-server
+            // form).
             let (stx, srx, sls) = core
                 .traffic
                 .stats(crate::dataplane::SERVER_TRAFFIC_KEY)
@@ -736,8 +803,9 @@ pub async fn assemble_roster(core: &ServerCore) -> Vec<PeerInfo> {
                     rx_bps: st.map_or(0, |x| x.rx_ewma),
                 });
             }
-            // Server 条目：server_keys（根签登记的 mesh VIP）+ 目录 endpoint（hostname）
-            // + 自发布租约（在线/流量经既有 gossip 同步）。
+            // Server entries: server_keys (the root-signed registered mesh
+            // VIP) + directory endpoint (hostname) + self-published leases
+            // (online/traffic synced via the existing gossip).
             let dir_hosts: std::collections::BTreeMap<u64, String> = node
                 .directory()
                 .current()
@@ -779,7 +847,7 @@ async fn owner_of_device(net: &NetBackend, device: &DeviceId) -> Option<String> 
     net.device_row(device).await.map(|r| r.owner)
 }
 
-/// owner 检查（用户只能操作自己名下设备）。
+/// Owner check (users may only operate their own devices).
 async fn authorize_owner(net: &NetBackend, user: &str, device: &DeviceId) -> bool {
     net.device_row(device)
         .await
@@ -787,7 +855,8 @@ async fn authorize_owner(net: &NetBackend, user: &str, device: &DeviceId) -> boo
         .unwrap_or(false)
 }
 
-/// RedeemInvite 的 SR-SIG1 签名覆盖 body（与客户端构造逐字节一致）。
+/// The SR-SIG1-signed body of RedeemInvite (byte-identical to the client's
+/// construction).
 fn redeem_body(username: &str, device: &DevicePubs) -> Vec<u8> {
     #[derive(serde::Serialize)]
     struct RedeemBody<'a> {
@@ -806,7 +875,8 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, ()> {
         .map_err(|_| ())
 }
 
-/// [`client_login_finish_anchored`] 的期望身份入参（期望身份来自钉扎 ServerPin）。
+/// The expected-identity input of [`client_login_finish_anchored`] (the
+/// expected identity comes from the pinned ServerPin).
 #[derive(Debug, Clone)]
 pub struct AnchorLoginExpectation {
     pub server_id: [u8; 16],
@@ -815,7 +885,7 @@ pub struct AnchorLoginExpectation {
     pub anchor_sig: Vec<u8>,
 }
 
-/// 客户端 anchor 版 login-finish 封装（tests/smoke 共用）。
+/// Client-side anchored login-finish wrapper (shared by tests/smoke).
 pub fn client_login_finish_anchored(
     state: opaque_ke::ClientLogin<flock_protocol::pake::Suite>,
     pw: &str,
@@ -836,11 +906,12 @@ pub fn client_login_finish_anchored(
     login_finish_anchored(state, pw, user, ke2_b64, PakeProfile::default(), &exp, &sig)
 }
 
-// 避免 unused-import 警告（x25519_dalek 仅在设备公钥转换处经由类型推断使用）。
+// Avoids an unused-import warning (x25519_dalek is used only at the
+// device-public-key conversion via type inference).
 const _: fn([u8; 32]) -> x25519_dalek::PublicKey = x25519_dalek::PublicKey::from;
 
 // ============================================================================
-// 单元测试：契约顺序（票据先于 nonce 记账）
+// Unit tests: contract order (ticket before nonce accounting)
 // ============================================================================
 
 #[cfg(test)]
@@ -869,7 +940,8 @@ mod tests {
         }
     }
 
-    /// 错误票据 + 全新 nonce ⇒ 拒且 nonce 不入账；同 nonce 持有效票据走到下一层（顺序证明）。
+    /// Bad ticket + fresh nonce ⇒ rejected and the nonce not recorded; the
+    /// same nonce with a valid ticket reaches the next layer (order proof).
     #[tokio::test]
     async fn ticket_checked_before_nonce_accounting() {
         let dir = tempfile::tempdir().unwrap();
@@ -892,9 +964,10 @@ mod tests {
                 .unwrap(),
         );
         let mut bad = good.clone();
-        bad.exp += 100; // 篡改覆盖字段 ⇒ BadSignature
+        bad.exp += 100; // tamper a covered field ⇒ BadSignature
 
-        // ① 错误票据 + 全新 nonce ⇒ TicketBad，且 nonce 不入账。
+        // ① Bad ticket + fresh nonce ⇒ TicketBad, and the nonce is not
+        //    recorded.
         let e = guard
             .admit_state_change(
                 &net,
@@ -907,12 +980,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(e, CtrlError::TicketBad, "错误票据被拒");
+        assert_eq!(e, CtrlError::TicketBad, "bad ticket rejected");
         assert!(
             !guard.nonces.contains("alice", "n1"),
-            "全新 nonce 未入账（契约：票据先于 nonce 记账）"
+            "fresh nonce not recorded (contract: ticket before nonce accounting)"
         );
-        // ② 同 nonce 持有效票据 ⇒ 走到 SR-SIG1 层（SigBad：无登记公钥）而非 TicketBad。
+        // ② The same nonce with a valid ticket ⇒ reaches the SR-SIG1 layer
+        //    (SigBad: no registered key) rather than TicketBad.
         let e2 = guard
             .admit_state_change(
                 &net,
@@ -925,9 +999,16 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(e2, CtrlError::SigBad, "有效票据 ⇒ 校验推进到签名层");
-        assert!(!guard.nonces.contains("alice", "n1"), "签名失败亦不入账");
-        // ③ 票据绑定设备 ≠ 会话设备 ⇒ 拒。
+        assert_eq!(
+            e2,
+            CtrlError::SigBad,
+            "valid ticket ⇒ checking advances to the signature layer"
+        );
+        assert!(
+            !guard.nonces.contains("alice", "n1"),
+            "signature failure also not recorded"
+        );
+        // ③ Ticket-bound device ≠ session device ⇒ rejected.
         let other = DeviceId([9; 32]);
         let e3 = guard
             .admit_state_change(
@@ -942,7 +1023,8 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e3, CtrlError::TicketBad);
-        // ④ 会话设备已吊销 ⇒ 票据层拒（DeviceNotActive → TicketBad）。
+        // ④ Session device already revoked ⇒ rejected at the ticket layer
+        //    (DeviceNotActive → TicketBad).
         store.revoke(&device).unwrap();
         let e4 = guard
             .admit_state_change(
@@ -956,7 +1038,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(e4, CtrlError::TicketBad, "吊销后票据被拒（epoch/设备态）");
+        assert_eq!(
+            e4,
+            CtrlError::TicketBad,
+            "ticket rejected after revocation (epoch/device state)"
+        );
         assert_eq!(
             store.device_row(&device).unwrap().status,
             DeviceStatus::Revoked
@@ -968,7 +1054,8 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // M7（§7-M7.4）：名册装配三态 + Server 条目 + 票据先行顺序
+    // M7 (§7-M7.4): roster assembly three-states + Server entries + the
+    // ticket-first order
     // ------------------------------------------------------------------
 
     fn m7_cfg(state_dir: std::path::PathBuf) -> crate::config::ServerConfig {
@@ -999,7 +1086,8 @@ mod tests {
         }
     }
 
-    /// 三态（在线/离线/过期）+ Server 条目 + VIP 升序 + hostname 默认值链路。
+    /// Three states (online/offline/expired) + Server entry + VIP ascending +
+    /// the hostname default chain.
     #[tokio::test]
     async fn roster_three_states_and_server_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -1030,7 +1118,8 @@ mod tests {
             )
             .unwrap();
 
-        // 在线设备：会话登记 + 喂流量（EWMA 两折收敛出非零）。
+        // Online device: session registered + traffic fed (two EWMA folds
+        // converge to non-zero).
         let id_on = DeviceId::from_ed25519(&vk_on.verifying_key());
         let _kill = core.sessions.register(id_on.0);
         let mut ms = 1_000_000u64;
@@ -1040,60 +1129,68 @@ mod tests {
             ms += 1000;
             core.traffic.tick(ms);
         }
-        // 过期设备。
+        // Expired device.
         let id_exp = DeviceId::from_ed25519(&vk_exp.verifying_key());
         store.expire(&id_exp, 1_700_000_000).unwrap();
 
         let peers = assemble_roster(&core).await;
-        // 三条：两台 Active 设备 + 本服务器；Expired 排除。
+        // Three entries: two Active devices + this server; Expired excluded.
         assert_eq!(peers.len(), 3, "{peers:?}");
-        // VIP 升序（服务器 .1 < 设备 .2/.3）。
+        // VIP ascending (server .1 < devices .2/.3).
         let vips: Vec<[u8; 4]> = peers.iter().map(|p| p.vip).collect();
         let mut sorted = vips.clone();
         sorted.sort();
-        assert_eq!(vips, sorted, "VIP 升序");
+        assert_eq!(vips, sorted, "VIP ascending");
 
         let srv = peers
             .iter()
             .find(|p| p.kind == PeerKind::Server)
-            .expect("Server 条目");
+            .expect("Server entry");
         assert_eq!(srv.vip, [100, 64, 0, 1]);
         assert_eq!(
             srv.hostname, "127.0.0.1:9443",
-            "单服 Server hostname = advertise"
+            "single-server Server hostname = advertise"
         );
-        assert!(!srv.owner.is_empty(), "owner = server_id 承载（node 号）");
-        assert!(srv.online, "服务器自身恒在线（本机视角）");
+        assert!(
+            !srv.owner.is_empty(),
+            "owner = carried by server_id (node number)"
+        );
+        assert!(
+            srv.online,
+            "the server itself is always online (local view)"
+        );
 
         let p_on = peers.iter().find(|p| p.vip == row_on.vip).unwrap();
         assert_eq!(p_on.hostname, "online-pad");
         assert_eq!(p_on.owner, "alice");
-        assert!(p_on.online, "会话在册 ⇒ 在线");
+        assert!(p_on.online, "session on record ⇒ online");
         assert!(
             p_on.tx_bps > 0 && p_on.rx_bps > 0,
-            "EWMA 非零（tx={} rx={}）",
+            "EWMA non-zero (tx={} rx={})",
             p_on.tx_bps,
             p_on.rx_bps
         );
         assert!(p_on.last_seen_unix > 0);
 
         let p_off = peers.iter().find(|p| p.vip == row_off.vip).unwrap();
-        assert!(!p_off.online, "无会话 ⇒ 离线");
-        assert_eq!(p_off.tx_bps, 0, "从未计到流量");
+        assert!(!p_off.online, "no session ⇒ offline");
+        assert_eq!(p_off.tx_bps, 0, "never counted traffic");
         assert_eq!(
             p_off.hostname,
             flock_sync::HOSTNAME_UNKNOWN,
-            "空 hostname 默认值"
+            "empty-hostname default"
         );
 
         assert!(
             peers.iter().all(|p| p.vip != row_exp.vip),
-            "Expired 设备不进名册"
+            "Expired devices do not enter the roster"
         );
     }
 
-    /// 票据先行顺序：无票据 ⇒ TicketMissing；坏票据 ⇒ TicketBad 且**装配计数不动**
-    ///（坏票据 + 有效名册数据 ⇒ 拒——数据装配未发生）；好票据 ⇒ PeerList + 计数 +1。
+    /// Ticket-first order: no ticket ⇒ TicketMissing; a bad ticket ⇒
+    /// TicketBad with the **assembly counter unmoved** (bad ticket + valid
+    /// roster data ⇒ rejected —— the data assembly never happened); a good
+    /// ticket ⇒ PeerList + counter +1.
     #[tokio::test]
     async fn peer_list_pull_ticket_checked_before_assembly() {
         let dir = tempfile::tempdir().unwrap();
@@ -1116,7 +1213,7 @@ mod tests {
             pending_login: None,
         };
 
-        // ① 无票据 ⇒ TicketMissing。
+        // ① No ticket ⇒ TicketMissing.
         let r = dispatch(&core, &mut ctx, CtrlRequest::PeerListPull { ticket: None }).await;
         assert!(
             matches!(
@@ -1129,7 +1226,8 @@ mod tests {
             "{r:?}"
         );
 
-        // ② 坏票据（篡改 exp ⇒ BadSignature）⇒ TicketBad 且装配计数不动（顺序证明）。
+        // ② Bad ticket (tampered exp ⇒ BadSignature) ⇒ TicketBad with the
+        //    assembly counter unmoved (order proof).
         let mut bad = match &good {
             TicketWire::Local(s) => {
                 let mut c = s.clone();
@@ -1160,10 +1258,10 @@ mod tests {
         assert_eq!(
             roster_assemblies(),
             before,
-            "坏票据 ⇒ 名册装配未发生（票据先行）"
+            "bad ticket ⇒ roster assembly never happened (ticket first)"
         );
 
-        // ③ 好票据 ⇒ PeerList（含 Server 条目）+ 计数 +1。
+        // ③ Good ticket ⇒ PeerList (with the Server entry) + counter +1.
         bad = good.clone();
         let r = dispatch(
             &core,
@@ -1178,24 +1276,30 @@ mod tests {
             }
             other => panic!("peer list: {other:?}"),
         }
-        assert_eq!(roster_assemblies(), before + 1, "好票据才装配");
+        assert_eq!(
+            roster_assemblies(),
+            before + 1,
+            "only a good ticket assembles"
+        );
     }
 
-    /// M8（§7-M8.3）：控制流 LoginBegin 的 disabled 判定——禁用 ⇒ NotAuthorized
-    ///（登录链在 begin 即断，不进 OPAQUE）；enable 后恢复。
+    /// M8 (§7-M8.3): the disabled check of control-flow LoginBegin ——
+    /// disabled ⇒ NotAuthorized (the login chain breaks at begin, never
+    /// entering OPAQUE); restored after enable.
     #[tokio::test]
     async fn login_begin_rejects_disabled_user() {
         let dir = tempfile::tempdir().unwrap();
         let (core, _) = crate::server::ServerCore::open_or_init(m7_cfg(dir.path().to_path_buf()))
             .expect("core");
         let store = store_of(&core);
-        // dave 的会话设备（owner 面）。
+        // dave's session device (owner surface).
         let vk = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
         store
             .register_device("dave", [11; 32], *vk.verifying_key().as_bytes(), "")
             .unwrap();
         let device = DeviceId::from_ed25519(&vk.verifying_key());
-        // 建户（RegisterDevice 自动建空户）+ 设口令 + 禁用。
+        // Create the account (RegisterDevice auto-creates an empty one) + set
+        // a password + disable.
         store.set_password("dave", "rec-dave", 0).unwrap();
         store.set_user_disabled("dave", true).unwrap();
 
@@ -1204,7 +1308,7 @@ mod tests {
             pending_login: None,
         };
         let mut ke1 = String::new();
-        // 非法 ke1 无所谓——判定在 OPAQUE 之前。
+        // An invalid ke1 does not matter —— the check precedes OPAQUE.
         ke1.push_str("AAAA");
         let resp = dispatch(
             &core,
@@ -1223,11 +1327,15 @@ mod tests {
                     ..
                 }
             ),
-            "禁用用户登录 begin 即拒: {resp:?}"
+            "disabled user's login begin rejected: {resp:?}"
         );
-        assert!(ctx.pending_login.is_none(), "未进 OPAQUE 在途态");
+        assert!(
+            ctx.pending_login.is_none(),
+            "never entered the OPAQUE in-flight state"
+        );
 
-        // enable 后恢复（坏 ke1 走 LoginFailed——判定推进到 OPAQUE 层）。
+        // Restored after enable (a bad ke1 takes LoginFailed —— the check
+        // advanced to the OPAQUE layer).
         store.set_user_disabled("dave", false).unwrap();
         let resp = dispatch(
             &core,
@@ -1246,13 +1354,14 @@ mod tests {
                     ..
                 }
             ),
-            "恢复后推进到 OPAQUE（坏 ke1 ⇒ LoginFailed）: {resp:?}"
+            "after restore it advances to OPAQUE (bad ke1 ⇒ LoginFailed): {resp:?}"
         );
     }
 
-    /// KeyBind re-register 的 owner 校验（DeviceExists 变体分流）：跨户对他人设备
-    /// 重绑定（改 hostname）⇒ NotAuthorized 且原行不动；本人 re-register ⇒ hostname
-    /// 更新 + VIP 不变。
+    /// The owner check of KeyBind re-register (DeviceExists variant
+    /// dispatch): re-binding another user's device cross-account (changing
+    /// the hostname) ⇒ NotAuthorized with the original row untouched;
+    /// re-registering oneself ⇒ hostname updated + VIP unchanged.
     #[tokio::test]
     async fn keybind_reregister_rejects_cross_owner_hostname_change() {
         use ed25519_dalek::Signer as _;
@@ -1262,7 +1371,8 @@ mod tests {
             .expect("core");
         let store = store_of(&core);
 
-        // alice 的设备（已注册）；bob 的会话设备（票据主体）。
+        // alice's device (registered); bob's session device (the ticket
+        // principal).
         let vk_alice_dev = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
         let row_a = store
             .register_device(
@@ -1276,7 +1386,8 @@ mod tests {
         store
             .register_device("bob", [6; 32], *vk_bob.verifying_key().as_bytes(), "")
             .unwrap();
-        // 变体契约：同钥匙重注册 ⇒ NetError::DeviceExists（非 InvalidState 串）。
+        // Variant contract: re-registering the same keys ⇒
+        // NetError::DeviceExists (not an InvalidState string).
         assert!(matches!(
             store
                 .register_device(
@@ -1303,9 +1414,11 @@ mod tests {
             other => panic!("local authority: {other:?}"),
         };
 
-        // bob 携 alice 设备公钥重绑定：设备签名**可过**（由 alice 设备密钥签 bob 的
-        // canonical——占有证明是设备侧的），但目标行 owner=alice != 票据 user=bob ⇒
-        // NotAuthorized，hostname 不被篡改。
+        // bob re-binding with alice's device public keys: the device
+        // signature **can pass** (signed by alice's device key over bob's
+        // canonical —— proof of possession is device-side), but the target
+        // row owner=alice != ticket user=bob ⇒ NotAuthorized, the hostname
+        // untampered.
         let bind_token = [0xA7u8; 16];
         let pubs = DevicePubs {
             x25519: [5; 32],
@@ -1343,16 +1456,17 @@ mod tests {
                     ..
                 }
             ),
-            "跨户改 hostname 被拒: {resp:?}"
+            "cross-owner hostname change rejected: {resp:?}"
         );
         assert_eq!(
             store.device_row(&alice_dev).unwrap().hostname,
             "alice-pad",
-            "原行不被篡改"
+            "the original row is untampered"
         );
 
-        // 对照：本人 re-register（alice 的票据 + alice 的设备）⇒ hostname 更新 +
-        // VIP 不变（DeviceExists 分流的正路径）。
+        // Control: re-registering oneself (alice's ticket + alice's device)
+        // ⇒ hostname updated + VIP unchanged (the positive path of the
+        // DeviceExists dispatch).
         let ticket_alice = match core
             .guard
             .authority
@@ -1394,9 +1508,9 @@ mod tests {
         match resp {
             CtrlResponse::KeyBound { device_id, vip } => {
                 assert_eq!(device_id, alice_dev.0);
-                assert_eq!(vip, row_a.vip, "re-register 保持 VIP（§7-M7）");
+                assert_eq!(vip, row_a.vip, "re-register keeps the VIP (§7-M7)");
             }
-            other => panic!("本人 re-register: {other:?}"),
+            other => panic!("self re-register: {other:?}"),
         }
         assert_eq!(store.device_row(&alice_dev).unwrap().hostname, "renamed");
     }

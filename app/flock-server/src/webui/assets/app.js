@@ -1,23 +1,33 @@
-// app.js —— M8 Web UI 应用核心（Alpine.js 根组件 + API 封装 + uPlot 集成，§M8.6）。
+// app.js —— M8 Web UI application core (Alpine.js root component + API wrapper +
+// uPlot integration, §M8.6).
 //
-// 职责：
-//  - hash 路由（手写，无路由库）：#/login | #/set-password | #/dashboard | #/peers |
-//    #/users | #/audit | #/settings；未知路由回落 dashboard（未登录回落 login）。
-//  - 会话状态：boot 时 GET /api/me 验活恢复；任何 API 401 ⇒ 回登录页。
-//  - API 封装：统一错误信封 {error:{code,message[,retry_after_secs]}} 解析；
-//    POST 恒带 X-Flock-Web: 1 + Content-Type: application/json（CSRF 双门槛）。
-//  - wasm OPAQUE：登录/设置口令全程经 window.FlockPake（C-ABI 垫片胶水），
-//    anchor 用 /api/bootstrap 的 identity_pub 在 wasm 内验签。
-//  - uPlot 流量曲线：本地时区刻度 + 触控/鼠标 tooltip；容器宽自适应 + resize。
+// Responsibilities:
+//  - hash routing (hand-rolled, no router lib): #/login | #/set-password |
+//    #/dashboard | #/peers | #/users | #/audit | #/settings; unknown routes fall
+//    back to dashboard (login when unauthenticated).
+//  - session state: boot probes GET /api/me to restore; any API 401 ⇒ back to
+//    the login page.
+//  - API wrapper: unified error envelope {error:{code,message[,retry_after_secs]}}
+//    parsing; POST always carries X-Flock-Web: 1 + Content-Type: application/json
+//    (CSRF double gate).
+//  - wasm OPAQUE: login / set-password run entirely through window.FlockPake
+//    (C-ABI shim glue); the anchor is verified inside wasm against
+//    /api/bootstrap's identity_pub.
+//  - uPlot traffic chart: local-timezone ticks + touch/mouse tooltip;
+//    container-width adaptive + resize.
+//  - language: i18n.js packs (en default + zh); the Lang switcher (login page /
+//    settings) persists the choice to localStorage; the bootstrap `lang` field
+//    acts as the initial hint on first visit (see i18n.js header).
 (function () {
   'use strict';
 
-  // —— 图表双系列色（🔴 round2 评审项 1）：曲线描边与自绘图例色片单点定义，
-  // 图例颜色恒与线一致（防两处 hex 漂移）。 ——
+  // —— Chart two-series colors (round2 review item 1): line strokes and the
+  // hand-drawn legend swatches are defined in one place, so legend colors
+  // always match the lines (prevents hex drift between the two). ——
   const CHART_TX_COLOR = '#4f8cff';
   const CHART_RX_COLOR = '#3fb972';
 
-  // —— API 封装（错误信封解析）——
+  // —— API wrapper (error envelope parsing) ——
   async function api(method, path, body) {
     const headers = {};
     if (method === 'POST') {
@@ -38,13 +48,14 @@
       throw err;
     }
     let data = null;
-    try { data = await resp.json(); } catch (e) { /* 非 JSON（网络层/空体） */ }
+    try { data = await resp.json(); } catch (e) { /* not JSON (network layer / empty body) */ }
     if (!resp.ok) {
       const err = new Error((data && data.error && data.error.code) || 'http_' + resp.status);
       err.code = (data && data.error && data.error.code) || 'http_' + resp.status;
       err.status = resp.status;
-      // 服务端信封的 message（英文诊断短语）透传——错误 Toast 括注原因
-      //（round2 评审项 9：中文主文案仍走 i18n err.*）。
+      // The server envelope's message (English diagnostic phrase) is passed
+      // through —— error toasts annotate the reason with it (round2 review
+      // item 9: the localized main copy still comes from i18n err.*).
       err.serverMessage = (data && data.error && data.error.message) || '';
       err.retryAfter = data && data.error && data.error.retry_after_secs;
       throw err;
@@ -54,7 +65,7 @@
 
   function flockApp() {
     return {
-      // ================= 全局态 =================
+      // ================= Global state =================
       booted: false,
       authed: false,
       route: 'login',
@@ -70,7 +81,11 @@
       actionBusy: false,
       busyKey: '',
 
-      // 登录
+      // Active UI language (pack id from i18n.js: 'en' | 'zh'). Reactive: the
+      // t() method reads this.lang so a switch re-renders every copy binding.
+      lang: (window.FLOCK_LANG && window.FLOCK_LANG()) || 'en',
+
+      // Login
       loginUser: '',
       loginPass: '',
       loginBusy: false,
@@ -78,7 +93,7 @@
       loginRetrySecs: 0,
       retryTimer: null,
 
-      // 设置口令
+      // Set password
       pwUser: '',
       pwToken: '',
       pwPass: '',
@@ -86,7 +101,7 @@
       pwBusy: false,
       pwError: '',
 
-      // 仪表盘
+      // Dashboard
       summary: null,
       dashError: false,
       dashBusy: false,
@@ -95,18 +110,19 @@
       uplot: null,
       pollTimer: null,
       resizeBound: null,
-      // 自绘图例实时读数（🔴 round2 评审项 1）：hover 时与 tooltip 同源取值，
-      // 离开画布/换序列回落 '--'。
+      // Hand-drawn legend live readouts (round2 review item 1): on hover they
+      // read from the same source as the tooltip; leaving the canvas or
+      // switching the series falls back to '--'.
       legendTx: '--',
       legendRx: '--',
 
-      // 设备
+      // Devices
       peers: [],
       peersLoaded: false,
       peersBusy: false,
       peersError: '',
 
-      // 账号
+      // Accounts
       users: [],
       usersForbidden: false,
       usersError: '',
@@ -115,32 +131,59 @@
       createUserBusy: false,
       createUserError: '',
 
-      // 审计
+      // Audit
       audit: [],
       auditLoaded: false,
       auditForbidden: false,
       auditError: '',
       auditBusy: false,
 
-      // 设置
+      // Settings
       config: null,
 
       get isAdmin() { return !!(this.me && this.me.admin); },
 
-      // 当前登录用户自身行判定（round2 评审项 4）：取消管理员/禁用对自身
-      // 前端置灰（后端 409 cannot_demote_self 已兜底）；重置口令保留可用。
+      // Self-row detection for the signed-in user (round2 review item 4):
+      // remove-admin / disable are greyed out for self on the frontend (the
+      // backend 409 cannot_demote_self remains the backstop); reset password
+      // stays available.
       isSelf(u) { return !!(this.me && u && u.username === this.me.user); },
 
-      // ================= 启动与路由 =================
+      // ================= Language =================
+      // Switch the active pack + persist the choice (localStorage); then sync
+      // <html lang> and the document title. Templates re-render automatically
+      // because t() depends on this.lang.
+      setLang(l) {
+        const applied = window.FLOCK_SET_LANG(l);
+        if (applied && applied !== this.lang) {
+          this.lang = applied;
+          this.applyLangToDocument();
+        }
+      },
+
+      applyLangToDocument() {
+        document.documentElement.lang = this.lang === 'zh' ? 'zh-CN' : 'en';
+        document.title = window.t('app.name');
+      },
+
+      // ================= Boot & routing =================
       async boot() {
         window.addEventListener('hashchange', () => this.navigate());
-        // bootstrap（公共面）——登录页展示集群标识；wasm 预热并行。
+        this.applyLangToDocument();
+        // bootstrap (public surface) —— the login page shows the cluster
+        // identity; wasm warm-up runs in parallel. The bootstrap `lang` field
+        // is the server's initial hint (ignored once a choice is stored).
         api('GET', '/api/bootstrap').then((b) => {
           this.bootstrap = b;
           this.bootstrapOk = true;
+          const hinted = window.FLOCK_APPLY_BOOTSTRAP_LANG(b && b.lang);
+          if (hinted !== this.lang) {
+            this.lang = hinted;
+            this.applyLangToDocument();
+          }
         }).catch(() => { this.bootstrapOk = false; });
         if (window.FlockPake) { window.FlockPake.init().catch(() => {}); }
-        // 会话验活：401 ⇒ 登录页。
+        // Session probe: 401 ⇒ login page.
         try {
           this.me = await api('GET', '/api/me');
           this.authed = true;
@@ -156,14 +199,16 @@
         const hash = (location.hash || '').replace(/^#\/?/, '').split('?')[0];
         const known = ['login', 'set-password', 'dashboard', 'peers', 'users', 'audit', 'settings'];
         let route = known.indexOf(hash) >= 0 ? hash : '';
-        // 公共页（login/set-password）之外的页面需登录。
+        // Pages beyond the public ones (login/set-password) require a session.
         if (!this.authed && route !== 'login' && route !== 'set-password') {
           route = 'login';
         }
         if (!route) { route = this.authed ? 'dashboard' : 'login'; }
-        // 已登录访问登录页 ⇒ 回仪表盘（切账号请先登出）。
+        // Signed-in users hitting the login page ⇒ back to dashboard (sign out
+        // first to switch accounts).
         if (this.authed && route === 'login') { route = 'dashboard'; }
-        // 管理页守卫（非 admin 直击 → 留给页面数据的 403 呈现「无权限」态）。
+        // Admin page guard (non-admin direct hit → left for the page data's
+        // 403 to render the "no permission" state).
         this.route = route;
         this.navOpen = false;
         this.confirmModal = null;
@@ -198,7 +243,7 @@
         setTimeout(() => { this.toasts = this.toasts.filter((x) => x.id !== id); }, 4200);
       },
 
-      // ================= 登录（wasm OPAQUE 全流程）=================
+      // ================= Login (full wasm OPAQUE flow) =================
       async submitLogin() {
         if (this.loginBusy) { return; }
         const user = this.loginUser.trim();
@@ -217,11 +262,12 @@
             this.bootstrap = b;
             this.bootstrapOk = true;
           }
-          // ① ke1（wasm，熵池驱动）
+          // ① ke1 (wasm, entropy-pool driven)
           const ke1 = await window.FlockPake.loginBegin(user, pass);
-          // ② login-begin → ke2 + anchor 四件套
+          // ② login-begin → ke2 + the anchor four-tuple
           const r = await api('POST', '/api/login-begin', { user: user, ke1_b64: ke1 });
-          // ③ wasm 内 anchor 验签（identity_pub 来自 bootstrap）→ ke3
+          // ③ anchor signature verified inside wasm (identity_pub from
+          //    bootstrap) → ke3
           const ke3 = await window.FlockPake.loginFinish({
             ke2_b64: r.ke2_b64,
             server_id_hex: r.server_id,
@@ -229,10 +275,10 @@
             bind_token_hex: r.bind_token,
             anchor_sig_hex: r.anchor_sig,
           });
-          // ④ login-finish → 会话 cookie（浏览器自动持有）
+          // ④ login-finish → session cookie (held automatically by the browser)
           const me = await api('POST', '/api/login-finish', { user: user, ke3_b64: ke3 });
           this.me = { user: me.user, admin: me.admin, origin: '', expires_unix: 0 };
-          try { this.me = await api('GET', '/api/me'); } catch (e) { /* me 已有基本态 */ }
+          try { this.me = await api('GET', '/api/me'); } catch (e) { /* me already has the basic state */ }
           this.authed = true;
           this.loginPass = '';
           location.hash = '#/dashboard';
@@ -263,14 +309,15 @@
         if (this.loginError === 'rate_limited') {
           return t('err.rate_limited', { secs: Math.max(1, this.loginRetrySecs) });
         }
-        // wasm -2 在登录语境≈错口令（客户端 finish 拒——与 401 login_failed 同文案，
-        // 不泄漏具体阶段）。
+        // wasm -2 in the login context ≈ wrong password (client-side finish
+        // rejected —— same copy as the 401 login_failed, leaking no phase
+        // detail).
         if (this.loginError === 'pake') { return t('err.login_failed'); }
         return t('err.' + this.loginError);
       },
 
       async logout() {
-        try { await api('POST', '/api/logout', {}); } catch (e) { /* 尽力 */ }
+        try { await api('POST', '/api/logout', {}); } catch (e) { /* best effort */ }
         this.authed = false;
         this.me = null;
         this.stopPolling();
@@ -278,7 +325,7 @@
         if (location.hash === '#/login') { this.navigate(); }
       },
 
-      // ================= 设置口令（pw-begin/commit 引导流）=================
+      // ================= Set password (pw-begin/commit bootstrap flow) =================
       async submitSetPw() {
         if (this.pwBusy) { return; }
         const user = this.pwUser.trim();
@@ -316,14 +363,16 @@
         if (this.tokenModal) { this.pwUser = this.tokenModal.user; }
       },
 
-      // ================= 仪表盘 =================
+      // ================= Dashboard =================
       async loadDashboard() {
         this.dashBusy = true;
         this.dashError = false;
         try {
-          // 先加载 peers（图表候选源）再取 summary——修复登录后首进 dashboard 的
-          // chartVip 空竞态（🔴 UI 评审项 4：旧行为在 peers 未就绪时取默认选中，
-          // chartVip 永不回填 → 图表空态直至手动刷新）。
+          // Load peers first (chart candidate source) then summary —— fixes
+          // the empty-chartVip race on the first dashboard entry after login
+          // (UI review item 4: the old behavior picked a default selection
+          // while peers were not ready yet, chartVip was never backfilled →
+          // empty chart until a manual refresh).
           await this.loadPeersQuiet();
           this.summary = await api('GET', '/api/dashboard/summary');
           this.pickDefaultChartVip();
@@ -335,7 +384,8 @@
         }
       },
 
-      // 默认选中：第一台在线设备（无在线则第一台候选）；已有有效选中保持不变。
+      // Default selection: the first online device (or the first candidate
+      // when none is online); an existing valid selection is kept.
       pickDefaultChartVip() {
         const ps = this.chartPeers();
         if (this.chartVip && ps.some((p) => p.vip === this.chartVip)) { return; }
@@ -361,7 +411,8 @@
       },
 
       chartPeers() {
-        // 曲线候选：全部 peers（设备 + 服务器），VIP 升序（服务端已排序）。
+        // Chart candidates: all peers (devices + servers), ascending by VIP
+        // (already sorted server-side).
         return this.peers || [];
       },
 
@@ -406,19 +457,24 @@
           return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
         };
 
-        // X 轴显式刻度（🔴 round2 评审项 1）：不依赖 uPlot 自动时间分度（标签
-        // 密度随宽度/字体浮动，round2 桌面全页截图曾表现为零可见时间刻度）——
-        // 自产等间隔「整分」刻度，任何视口恒 4–6 个。
+        // Explicit X-axis ticks (round2 review item 1): do not rely on uPlot's
+        // automatic time division (label density floats with width/font —— the
+        // round2 full-page desktop screenshot once showed zero visible time
+        // ticks) —— produce evenly spaced "whole-minute" ticks, always 4–6 of
+        // them in any viewport.
         const timeTickSplits = (u, axisIdx, min, max) => {
           const span = max - min;
-          // 目标刻度数：约 150px/刻度的标签预算取整，再夹到 4–6。
+          // Target tick count: round a label budget of ~150px/tick, then clamp
+          // to 4–6.
           const target = Math.min(6, Math.max(4, Math.floor(u.width / 150)));
-          // 步长梯：60s 采样数据 1 分钟起的最小可读步长；窗口 ≤2h 封顶 2h 档。
+          // Step ladder: smallest readable step for 60s-sampled data starts at
+          // 1 minute; capped at the 2h tier for windows ≤2h.
           const steps = [60, 120, 300, 600, 900, 1800, 3600, 7200];
           const step = steps.find((s) => span / s <= target) || steps[steps.length - 1];
           const out = [];
           for (let v = Math.ceil(min / step) * step; v <= max; v += step) { out.push(v); }
-          // 退化保护（span < step 的极窄序列）：首尾兜底两刻度。
+          // Degenerate guard (extremely narrow series where span < step):
+          // fall back to first/last ticks.
           return out.length >= 2 ? out : [min, max];
         };
 
@@ -427,31 +483,40 @@
           height: height,
           padding: [8, 8, 0, 8],
           cursor: { drag: { x: false, y: false } },
-          // uPlot 内建图例关闭（🔴 round2 评审项 1）：双系列图例改 DOM 自绘
-          //（index.html .chart-legend）——桌面/手机一致呈现，不被画布层吞掉。
+          // uPlot's built-in legend is off (round2 review item 1): the
+          // two-series legend is hand-drawn DOM (index.html .chart-legend) ——
+          // identical on desktop and mobile, never swallowed by the canvas
+          // layer.
           legend: { show: false },
           plugins: [uplotTooltip(tooltip, this)],
           scales: {
             x: { time: true },
-            // Y 恒从 0 起（🔴 round2 评审项 1：0 刻度线常驻轴面）；平坦/全 0 序列
-            // 保持 round1 的 1 单位抬头（0 值系列 ≥1.5px 可见），抬头值域形
-            // [0, hi+1]——+1 不再把 0 挤出轴。
+            // Y always starts at 0 (round2 review item 1: the 0 gridline is a
+            // permanent axis feature); flat / all-zero series keep round1's
+            // 1-unit headroom (a 0-valued series stays ≥1.5px visible), with
+            // the value range shaped [0, hi+1] —— the +1 no longer squeezes 0
+            // out of the axis.
             y: { range: (u, lo, hi) => [0, hi - lo < 1 ? hi + 1 : hi] },
           },
           axes: [
             {
-              // —— X 轴（时间）——
-              // time:true 只声明语义（刻度面由 splits/values 自管）。
+              // —— X axis (time) ——
+              // time:true only declares semantics (the tick face is managed
+              // by splits/values).
               time: true,
-              // 轴线弱灰；网格 5% 白——不与曲线抢对比度。
+              // Faint-grey axis line; 5% white grid —— no contrast competition
+              // with the lines.
               stroke: '#8a93a1',
               grid: { show: true, stroke: 'rgba(255,255,255,0.05)' },
               ticks: { stroke: '#303a4e' },
-              // 显式 splits：4–6 个等间隔整分刻度（见上 timeTickSplits 注释）。
+              // Explicit splits: 4–6 evenly spaced whole-minute ticks (see the
+              // timeTickSplits comment above).
               splits: timeTickSplits,
-              // 本地时区：unix 秒 → Date 本地格式化（uPlot 数值轴默认 UTC 面——显式覆写）。
-              // 标签按「唯一分钟」去重（60s 采样下相邻刻度可能落同一分钟——
-              // 显式 splits 下不会发生，保留为防御性去重）。
+              // Local timezone: unix seconds → Date local formatting (uPlot's
+              // numeric-axis default is the UTC face —— explicitly overridden).
+              // Labels deduplicated by "unique minute" (adjacent ticks can
+              // land in the same minute at 60s sampling —— cannot happen with
+              // explicit splits; kept as defensive dedup).
               values: (u, vals) => {
                 const seen = {};
                 return vals.map((v) => {
@@ -464,20 +529,23 @@
               },
             },
             {
-              // —— Y 轴（速率）——
+              // —— Y axis (rate) ——
               stroke: '#8a93a1',
-              // 轴宽预算 68px：「20.0 Mbps」「500 Kbps」完整单位标签的最长形
-              //（🔴 round2 评审项 1：弃用「60.0 M」紧凑形，单位写法全 UI 统一）。
+              // Axis width budget 68px: the longest shape of full-unit labels
+              // like "20.0 Mbps" / "500 Kbps" (round2 review item 1: the
+              // compact "60.0 M" form is dropped, unit spelling is uniform
+              // across the UI).
               size: 68,
               grid: { show: true, stroke: 'rgba(255,255,255,0.05)' },
               ticks: { stroke: '#303a4e' },
-              // 刻度与统计卡/tooltip 同源 fmtBps（完整 bps/Kbps/Mbps/Gbps）。
+              // Ticks share fmtBps with the stat cards / tooltip (full
+              // bps/Kbps/Mbps/Gbps).
               values: (u, vals) => vals.map((v) => fmtBps(v)),
             },
           ],
           series: [
-            // x 系列标签：uPlot 默认 "Time" →「时间」（🟡 UI 评审项 12；图例已
-            // 自绘，此 label 仅存语义面）。
+            // x series label: uPlot's default "Time" → localized (UI review
+            // item 12; the legend is hand-drawn, this label is semantic only).
             { label: t('dash.chart.time'), values: (u, v) => (v == null ? '--' : hhmmss(v)) },
             { label: t('dash.chart.tx'), stroke: CHART_TX_COLOR, width: 1.6, fill: 'rgba(79,140,255,0.10)', points: { show: false }, values: (u, v) => (v == null ? '--' : fmtBps(v)) },
             { label: t('dash.chart.rx'), stroke: CHART_RX_COLOR, width: 1.6, fill: 'rgba(63,185,114,0.08)', points: { show: false }, values: (u, v) => (v == null ? '--' : fmtBps(v)) },
@@ -497,7 +565,7 @@
         }
       },
 
-      // ================= 设备 =================
+      // ================= Devices =================
       async loadPeers() {
         this.peersBusy = true;
         this.peersError = '';
@@ -514,8 +582,9 @@
 
       confirmPeer(p, action) {
         const key = 'peers.confirm.' + action;
-        // 确认按钮色阶（🟡 UI 评审项 14）：吊销=红（终态）；禁用=琥珀（警示）；
-        // 其余（启用/强制下线）=主色。
+        // Confirm-button color tiers (UI review item 14): revoke = red
+        // (terminal); disable = amber (warning); the rest (enable / kick) =
+        // primary.
         const level = { revoke: 'danger', disable: 'warn' }[action] || null;
         this.confirmModal = {
           kind: 'peer', action: action, peer: p,
@@ -550,7 +619,7 @@
         }
       },
 
-      // ================= 账号 =================
+      // ================= Accounts =================
       async loadUsers() {
         this.usersBusy = true;
         this.usersError = '';
@@ -591,7 +660,7 @@
           kind: 'user-disable', user: u,
           title: t('users.confirm.disable.title'),
           body: t('users.confirm.disable.body', { user: u.username }),
-          level: 'warn', // 警示级：琥珀（与吊销红同阶梯——🟡 UI 评审项 14）
+          level: 'warn', // warning tier: amber (same ladder as revoke red —— UI review item 14)
         };
       },
 
@@ -641,12 +710,13 @@
           await navigator.clipboard.writeText(this.tokenModal.token);
           this.copied = true;
         } catch (e) {
-          // 剪贴板 API 不可用（非安全上下文 http://）——退化为全选提示。
+          // Clipboard API unavailable (insecure context http://) —— fall back
+          // to showing the full value.
           this.toast('info', this.tokenModal.token);
         }
       },
 
-      // ================= 审计 =================
+      // ================= Audit =================
       async loadAudit() {
         this.auditBusy = true;
         this.auditError = '';
@@ -664,26 +734,32 @@
         }
       },
 
-      // ================= 设置 =================
+      // ================= Settings =================
       async loadConfig() {
         try { this.config = await api('GET', '/api/config'); }
         catch (e) { this.handleAuthErr(e); }
       },
 
-      // ================= 展示工具 =================
-      t: function (key, params) { return window.t(key, params); },
+      // ================= Display helpers =================
+      t: function (key, params) {
+        void this.lang; // reactive dependency —— re-renders on language switch
+        return window.t(key, params);
+      },
 
       errMsg(code) { return t('err.' + (code || 'network')); },
 
-      // 错误文案带原因（round2 评审项 9）：API 错误信封的 message（英文诊断
-      // 短语，如 "cannot demote self"）透传为括注；中文主文案仍走 i18n err.*。
+      // Error copy with reason (round2 review item 9): the API error
+      // envelope's message (English diagnostic phrase, e.g. "cannot demote
+      // self") is passed through as a parenthetical; the localized main copy
+      // still comes from i18n err.*.
       errText(e) {
         const base = t('err.' + ((e && e.code) || 'network'));
         const why = e && e.serverMessage;
-        return why && why !== base ? base + '（' + why + '）' : base;
+        return why && why !== base ? base + ' (' + why + ')' : base;
       },
 
-      // 图例色片取线色常量（🔴 round2 评审项 1：模板 :style 绑定用）。
+      // Legend swatches read the line-color constants (round2 review item 1:
+      // used by the template's :style bindings).
       chartTxColor() { return CHART_TX_COLOR; },
       chartRxColor() { return CHART_RX_COLOR; },
 
@@ -691,22 +767,26 @@
 
       shortTarget(s) { return s && s.length > 16 ? s.slice(0, 8) + '…' : (s || '—'); },
 
-      // —— u64 标识（字符串形态下发，🔴 UI 评审项 1）——
-      // node_id 等 >2^53 的 u64 标识以字符串往返；展示统一「前 4…后 4」截断，
-      // title 悬停给全值（4 位分组），点击复制。≥10 位阈值：node_id 实际
-      // 19~20 位（u64 均匀分布），纯数字用户名（≤32 位合法字符集）不误判。
+      // —— u64 identifiers (delivered as strings, UI review item 1) ——
+      // node_id and other >2^53 u64 identifiers round-trip as strings;
+      // display is uniformly "first 4…last 4" truncated, with the full value
+      // (4-digit grouped) in the hover title, click to copy. ≥10 digit
+      // threshold: node_id is actually 19–20 digits (uniform u64), pure-digit
+      // usernames (≤32 legal charset) never misclassify.
       isNumId(s) { return typeof s === 'string' && /^\d{10,}$/.test(s); },
 
       shortNum(s) { return this.isNumId(s) ? s.slice(0, 4) + '…' + s.slice(-4) : (s || '—'); },
 
-      // 4 位分组（从右起断组）：8458693432428654888 → 845 8693 4324 2865 4888，
-      // mono + tabular-nums 下等宽对齐。
+      // 4-digit grouping (groups broken from the right):
+      // 8458693432428654888 → 845 8693 4324 2865 4888, monospace + tabular-nums
+      // for even alignment.
       groupNum(s) {
         if (!this.isNumId(s)) { return s || ''; }
         return s.replace(/\B(?=(\d{4})+(?!\d))/g, ' ');
       },
 
-      // 表格/卡片里的可复制标识芯片：文字为截断形，title 全值分组形。
+      // Copyable ID chip inside tables/cards: truncated text, grouped full
+      // value in the title.
       idChipTitle(s) { return this.groupNum(s) + ' · ' + t('app.copy.full'); },
 
       copyText(text) {
@@ -715,7 +795,8 @@
         if (navigator.clipboard && navigator.clipboard.writeText) {
           navigator.clipboard.writeText(v).then(done, () => { this.toast('info', v); });
         } else {
-          // 剪贴板 API 不可用（非安全上下文 http://）——退化为 toast 展示全值。
+          // Clipboard API unavailable (insecure context http://) —— fall back
+          // to a toast showing the full value.
           this.toast('info', v);
         }
       },
@@ -725,14 +806,17 @@
       },
 
       resultBadge(r) {
-        // 语义分离（🟡 UI 评审项 10）：琥珀仅用于警示操作——审计「拒绝/错误」一律红。
+        // Semantic separation (UI review item 10): amber is reserved for
+        // warning-tier operations —— audit "denied"/"error" are always red.
         return { ok: 'badge-success', denied: 'badge-danger', error: 'badge-danger' }[r] || 'badge-muted';
       },
 
-      // 审计高危 action 词表（round2 评审项 7）：吊销/禁用/重置口令/角色变更等
-      // 破坏性或敏感操作即使结果「成功」也用琥珀档——绿色只留给常规/低危操作
-      //（登录/登出/创建/启用等）。set_admin 覆盖设/取消两个方向（词表不区分，
-      // 权限变更本身即高危）。
+      // High-risk audit action vocabulary (round2 review item 7): destructive
+      // or sensitive operations (revoke / disable / reset password / role
+      // change) use the amber tier even when the result is "ok" —— green is
+      // reserved for routine / low-risk operations (login / logout / create /
+      // enable, etc.). set_admin covers both directions (the vocabulary does
+      // not distinguish; a permission change is itself high-risk).
       auditHighRisk(action) {
         return !!{
           'peer.revoke': 1, 'peer.disable': 1, 'user.disable': 1,
@@ -745,8 +829,9 @@
         return this.resultBadge(e && e.result);
       },
 
-      // 统计卡速率值：数值 + 小一号弱化单位（🟡 UI 评审项 6：<small>Mbps</small>）。
-      // 自产 HTML（无用户输入面）——x-html 安全。
+      // Stat-card rate values: number + smaller subdued unit (UI review item
+      // 6: <small>Mbps</small>). Self-produced HTML (no user-input surface)
+      // —— safe for x-html.
       fmtBpsStat(v) {
         const s = fmtBps(v);
         const i = s.lastIndexOf(' ');
@@ -760,8 +845,9 @@
         return t('nav.session.expire', { time: fmtDur(remain) });
       },
 
-      // 主机名占位（🟡 UI 评审项 15）：服务端 (unknown)（目录未收敛的远端服务器）
-      // →「未上报」弱灰展示。
+      // Hostname placeholder (UI review item 15): the server's "(unknown)"
+      // (remote servers not yet converged in the directory) → "Not reported"
+      // shown in subdued grey.
       hostName(h) { return h && h !== '(unknown)' ? h : t('peers.hostname.unreported'); },
       hostUnknown(h) { return !h || h === '(unknown)'; },
 
@@ -776,12 +862,15 @@
     };
   }
 
-  // —— uPlot tooltip 插件（鼠标 + 触控统一；本地时区）——
-  // uPlot 1.6.9 的实例**不暴露 u.over**（u-select 挂载点在库内闭包）——旧实现读
-  // u.over.getBoundingClientRect() 恒抛 TypeError，tooltip 卡在图表盒左上角
-  //（🔴 UI 评审项 4）。正确 API 面：u.root（根节点）+ u.bbox（绘图区盒，相对
-  // root 的 CSS 像素）+ u.cursor.left/top（相对绘图区）——三者合成 .chart-box
-  // 内坐标，与自管 div 定位一致。
+  // —— uPlot tooltip plugin (unified mouse + touch; local timezone) ——
+  // uPlot 1.6.9 instances do **not expose u.over** (the u-select mount point
+  // is closed over inside the library) —— the old implementation reading
+  // u.over.getBoundingClientRect() always threw TypeError, leaving the
+  // tooltip stuck in the chart box's top-left corner (UI review item 4). The
+  // correct API surface: u.root (root node) + u.bbox (plot-area box, CSS
+  // pixels relative to root) + u.cursor.left/top (relative to the plot area)
+  // —— the three combine into coordinates inside .chart-box, matching the
+  // self-managed div positioning.
   function uplotTooltip(el, ctx) {
     return {
       hooks: {
@@ -803,11 +892,12 @@
             '<b>' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '</b><br>' +
             t('dash.chart.tx') + ' ' + fmtBps(tx) + '<br>' +
             t('dash.chart.rx') + ' ' + fmtBps(rx);
-          // 自绘图例实时读数（🔴 round2 评审项 1）：与 tooltip 同源同单位。
+          // Hand-drawn legend live readouts (round2 review item 1): same
+          // source and units as the tooltip.
           ctx.legendTx = fmtBps(tx);
           ctx.legendRx = fmtBps(rx);
           el.style.display = 'block';
-          const host = el.parentElement; // .chart-box（tooltip 与图同容器）
+          const host = el.parentElement; // .chart-box (tooltip shares the chart container)
           const hostRect = host.getBoundingClientRect();
           const rootRect = u.root.getBoundingClientRect();
           const plotLeft = rootRect.left - hostRect.left + (u.bbox ? u.bbox.left : 0) + u.cursor.left;
@@ -826,9 +916,10 @@
     };
   }
 
-  // —— 格式化工具 ——
-  // 速率完整单位形（🔴 round2 评审项 1：图表 Y 轴 / tooltip / 统计卡三处同源，
-  // 单位写法统一 bps/Kbps/Mbps/Gbps——不再有「60.0 M」紧凑形）。
+  // —— Formatting helpers ——
+  // Full-unit rate formatting (round2 review item 1: chart Y axis / tooltip /
+  // stat cards share one source; unit spelling is uniformly
+  // bps/Kbps/Mbps/Gbps —— no more compact "60.0 M" forms).
   function fmtBps(v) {
     v = Number(v) || 0;
     if (v < 1000) { return Math.round(v) + ' bps'; }

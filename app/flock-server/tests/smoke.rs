@@ -1,21 +1,29 @@
-//! M2 冒烟（#[ignore]，宿主对容器实跑；docs/design.md §7-M2 完成标准）。
+//! M2 smoke tests (#[ignore], host runs against containers; docs/design.md
+//! §7-M2 completion criteria).
 //!
-//! 用法（测试名即 harness 参数——libtest 过滤器选端点 profile）：
+//! Usage (the test name is the harness argument —— the libtest filter
+//! selects the endpoint profile):
 //!
 //! ```text
-//! docker compose -f deploy/m2.yml        up -d --build   # 先起 frp 中转变体（需 prepare）
+//! docker compose -f deploy/m2.yml        up -d --build   # start the frp relay variant first (needs prepare)
 //! cargo test -p flock-server --test smoke -- --ignored relay
 //!
-//! docker compose -f deploy/m2-direct.yml up -d --build   # 直连变体（零 frp，免 prepare）
+//! docker compose -f deploy/m2-direct.yml up -d --build   # the direct variant (zero frp, no prepare)
 //! cargo test -p flock-server --test smoke -- --ignored direct
 //! ```
 //!
-//! 断言集与 in-process `tests/control_flow.rs` 完全同源（同一 CtrlClient 驱动），差异仅在：
-//! 端点 = 宿主映射口；管理面 = 容器内 CLI（`docker compose exec`）而非进程内调用。
+//! The assertion set shares its provenance entirely with the in-process
+//! `tests/control_flow.rs` (the same CtrlClient driver); the only
+//! differences: endpoints = host-mapped ports; the management surface =
+//! the in-container CLI (`docker compose exec`) instead of in-process
+//! calls.
 //!
-//! 环境变量：`FLOCK_SMOKE_HOST`（默认 127.0.0.1；远程 docker host 时改指）。
+//! Environment variable: `FLOCK_SMOKE_HOST` (default 127.0.0.1; repoint
+//! for a remote docker host).
 //!
-//! TOFU 残余风险声明（§3.8，不可静默）：TOFU 不防首登在线 MITM；组织场景走邀请强路径。
+//! TOFU residual-risk statement (§3.8, not to be silenced): TOFU does not
+//! defend against an online MITM on first login; organizational scenarios
+//! take the invite strong path.
 
 mod common;
 
@@ -46,7 +54,9 @@ impl Profile {
         }
     }
 
-    /// 宿主侧端点（目录内条目 = 同一映射口；端点 #2 = 第二暴露口，§7-M2 换端点模拟）。
+    /// Host-side endpoints (the directory entries = the same mapped port;
+    /// endpoint #2 = the second exposure opening, the §7-M2
+    /// endpoint-switching simulation).
     fn endpoints(self) -> (String, String) {
         let host = std::env::var("FLOCK_SMOKE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
         match self {
@@ -57,14 +67,15 @@ impl Profile {
 }
 
 // ============================================================================
-// docker 辅助
+// docker helpers
 // ============================================================================
 
 fn compose_path(file: &str) -> std::path::PathBuf {
     std::path::Path::new(DEPLOY).join(file)
 }
 
-/// `docker compose -f <file> exec -T server <args...>`（stdout 捕获；非零退出 = panic）。
+/// `docker compose -f <file> exec -T server <args...>` (stdout captured; a
+/// non-zero exit = panic).
 fn compose_exec(profile: Profile, args: &[&str]) -> String {
     let out = std::process::Command::new("docker")
         .arg("compose")
@@ -73,10 +84,10 @@ fn compose_exec(profile: Profile, args: &[&str]) -> String {
         .args(["exec", "-T", "server"])
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("docker 调用失败（Docker Desktop 是否在跑？）：{e}"));
+        .unwrap_or_else(|e| panic!("docker invocation failed (is Docker Desktop running?): {e}"));
     assert!(
         out.status.success(),
-        "docker compose exec {:?} 失败：{}{}",
+        "docker compose exec {:?} failed: {}{}",
         args,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
@@ -84,7 +95,8 @@ fn compose_exec(profile: Profile, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-/// `docker compose exec` 允许失败（pgrep 无命中退出码 1 = 期望结果）。
+/// `docker compose exec` where failure is allowed (pgrep's exit code 1 on
+/// no match = the expected outcome).
 fn compose_exec_status(profile: Profile, args: &[&str]) -> (bool, String) {
     let out = std::process::Command::new("docker")
         .arg("compose")
@@ -93,7 +105,7 @@ fn compose_exec_status(profile: Profile, args: &[&str]) -> (bool, String) {
         .args(["exec", "-T", "server"])
         .args(args)
         .output()
-        .expect("docker 调用失败");
+        .expect("docker invocation failed");
     (
         out.status.success(),
         format!(
@@ -122,13 +134,14 @@ async fn wait_tcp(addr: &str) {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "端点 {addr} 90s 内未就绪"
+            "endpoint {addr} not ready within 90s"
         );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
-/// 每次运行唯一的用户名（named volume 跨次保留状态 ⇒ 冒烟必须可重入：同库再开户）。
+/// A username unique per run (named volumes keep state across runs ⇒ the
+/// smoke must be re-entrant: account creation against the same store).
 fn uname(base: &str) -> String {
     use flock_protocol::rand::RngCore as _;
     let mut rng = flock_protocol::rand::rng();
@@ -137,7 +150,7 @@ fn uname(base: &str) -> String {
     format!("{base}-{}", hex::encode(b))
 }
 
-/// 解析 CLI 输出中的 `vip=a.b.c.d`。
+/// Parse `vip=a.b.c.d` out of CLI output.
 fn parse_vip(out: &str) -> Option<u32> {
     out.lines()
         .find_map(|l| l.trim().strip_prefix("vip="))
@@ -145,11 +158,15 @@ fn parse_vip(out: &str) -> Option<u32> {
         .map(u32::from)
 }
 
-/// VIP 必须落在 100.64.0.0/10 池（RFC 6598，§2.1；.1 起保留给服务器）。
+/// The VIP must fall inside the 100.64.0.0/10 pool (RFC 6598, §2.1; from
+/// .1 reserved for the server).
 fn assert_vip_in_pool(vip: u32) {
     let lo = u32::from_be_bytes([100, 64, 0, 0]);
     let hi = u32::from_be_bytes([100, 127, 255, 255]);
-    assert!((lo..=hi).contains(&vip), "VIP {vip} 不在 100.64.0.0/10 池");
+    assert!(
+        (lo..=hi).contains(&vip),
+        "VIP {vip} not in the 100.64.0.0/10 pool"
+    );
 }
 
 fn now() -> i64 {
@@ -159,7 +176,7 @@ fn now() -> i64 {
 fn expect_err(resp: CtrlResponse) -> CtrlError {
     match resp {
         CtrlResponse::Err { code, .. } => code,
-        other => panic!("期望 Err，得 {other:?}"),
+        other => panic!("expected Err, got {other:?}"),
     }
 }
 
@@ -168,7 +185,8 @@ fn dev_id(d: &DeviceStaticKeys) -> [u8; 32] {
 }
 
 // ============================================================================
-// 全链（邀请 → 1-RTT → OPAQUE 登录 → key-bind → 注册表 → SR-SIG1 → 吊销）
+// The full chain (invite → 1-RTT → OPAQUE login → key-bind → registry →
+// SR-SIG1 → revocation)
 // ============================================================================
 
 async fn smoke_full_chain(profile: Profile) {
@@ -176,17 +194,22 @@ async fn smoke_full_chain(profile: Profile) {
     wait_tcp(&ep1).await;
 
     let user = uname("smoke-alice");
-    // 邀请（容器内 CLI 签发；admin 端点 = 进程内单写者入口）。
+    // Invite (minted by the in-container CLI; the admin endpoint = the
+    // in-process single-writer entry).
     let invite_b64 = cli(profile, &["invite", "--ttl-secs", "3600"])
         .trim()
         .to_string();
-    assert!(!invite_b64.is_empty(), "invite 输出非空");
+    assert!(!invite_b64.is_empty(), "invite output non-empty");
     let invite_bytes = common_b64d(&invite_b64);
     let invite = InviteFile::from_bytes(&invite_bytes).expect("invite parse");
-    assert_eq!(invite.directory.servers.len(), 2, "目录含双端点");
+    assert_eq!(
+        invite.directory.servers.len(),
+        2,
+        "the directory holds both endpoints"
+    );
     let pin = pin_from_invite(&invite, 0);
 
-    // 开户：兑换邀请（CLI redeem：建用户/设备 + VIP）。
+    // Account creation: redeem the invite (CLI redeem: user/device + VIP).
     let dev_a = DeviceStaticKeys::generate();
     let out = cli(
         profile,
@@ -202,11 +225,14 @@ async fn smoke_full_chain(profile: Profile) {
             &common_b64(dev_a.ed25519_public().as_bytes()),
         ],
     );
-    // VIP 在 100.64.0.0/10 池内（named volume 跨次运行保留分配 ⇒ 断言池归属而非绝对值；
-    // 「IP 不复用」由下方 key-bind 的单调性断言承担）。
-    let vip_a = parse_vip(&out).expect("redeem 输出 vip=");
+    // The VIP is inside the 100.64.0.0/10 pool (named volumes keep
+    // allocations across runs ⇒ assert pool membership, not an absolute
+    // value; "the IP is not reused" is carried by the monotonicity
+    // assertion of the key-bind below).
+    let vip_a = parse_vip(&out).expect("redeem outputs vip=");
     assert_vip_in_pool(vip_a);
-    // 同 invite_id 二次兑换拒（邀请一次性，容器内实证）。
+    // A second redemption of the same invite_id is rejected (the one-time
+    // invite, proven in-container).
     let dev_x = DeviceStaticKeys::generate();
     let dup = cli_status(
         profile,
@@ -222,9 +248,10 @@ async fn smoke_full_chain(profile: Profile) {
             &common_b64(dev_x.ed25519_public().as_bytes()),
         ],
     );
-    assert!(!dup.0, "二次兑换必须失败：{}", dup.1);
+    assert!(!dup.0, "the second redemption must fail: {}", dup.1);
 
-    // 1-RTT 首连（经中转/直连的宿主映射口——协议层同构）。
+    // 1-RTT first connection (through the relay/direct host-mapped port ——
+    // protocol-level isomorphic).
     let tunnel_a = connect(&dev_a, &pin).await;
     let mut a = CtrlClient::open(tunnel_a).await.expect("ctrl open");
     a.hello().await;
@@ -233,7 +260,8 @@ async fn smoke_full_chain(profile: Profile) {
         CtrlResponse::Ok
     ));
 
-    // anchor 负路径（容器路径同样生效）：篡改 anchor_sig ⇒ 客户端拒绝。
+    // anchor negative path (equally effective on the container path):
+    // tampered anchor_sig ⇒ the client rejects.
     {
         let mut rng = rand::rngs::OsRng;
         let (state, ke1) = login_start(&mut rng, "pw", &user).unwrap();
@@ -266,17 +294,18 @@ async fn smoke_full_chain(profile: Profile) {
                         },
                     )
                     .is_err(),
-                    "篡改 anchor ⇒ 拒"
+                    "tampered anchor ⇒ rejected"
                 );
             }
             other => panic!("{other:?}"),
         }
     }
 
-    // OPAQUE 登录（anchor）→ 票据（部署 TTL 6s，见 deploy/server-*.toml）。
+    // OPAQUE login (anchor) → ticket (the deployment TTL is 6s, see
+    // deploy/server-*.toml).
     let (ticket_a, bind_token) = a.login_anchored(&user, "pw", &pin).await.expect("login");
 
-    // key-bind：设备 B 公钥登记。
+    // key-bind: device B's public keys registered.
     let dev_b = DeviceStaticKeys::generate();
     let sr_key = UserKey::generate();
     match a
@@ -293,20 +322,26 @@ async fn smoke_full_chain(profile: Profile) {
         CtrlResponse::KeyBound { device_id, vip } => {
             assert_eq!(device_id, dev_id(&dev_b));
             let vip_b = u32::from_be_bytes(vip);
-            assert!(vip_b > vip_a, "VIP 单调不复用：{vip_b} > {vip_a}");
+            assert!(
+                vip_b > vip_a,
+                "VIP monotonic, not reused: {vip_b} > {vip_a}"
+            );
             assert_vip_in_pool(vip_b);
         }
         other => panic!("key bind: {other:?}"),
     }
 
-    // 设备 B 入注册表：1-RTT 可连 + dir_pull。
+    // Device B enters the registry: 1-RTT connectable + dir_pull.
     let tunnel_b = connect(&dev_b, &pin).await;
     let mut b = CtrlClient::open(tunnel_b).await.expect("ctrl open B");
     b.hello().await;
     let dir = b.dir_pull().await;
-    assert!(dir.verify(&invite.cluster_root_pub), "dir_pull 根验签");
+    assert!(
+        dir.verify(&invite.cluster_root_pub),
+        "dir_pull root signature check"
+    );
 
-    // SR-SIG1 验签通过。
+    // SR-SIG1 verification passes.
     let auth = CtrlClient::sr_auth(
         &user,
         &sr_key,
@@ -320,8 +355,8 @@ async fn smoke_full_chain(profile: Profile) {
         CtrlResponse::TicketRenewed { .. }
     ));
 
-    // 票据三态：
-    // (1) 无票据。
+    // The three ticket states:
+    // (1) No ticket.
     let no_tkt = CtrlClient::sr_auth(
         &user,
         &sr_key,
@@ -334,7 +369,8 @@ async fn smoke_full_chain(profile: Profile) {
         expect_err(a.ticket_renew(None, no_tkt).await),
         CtrlError::TicketMissing
     );
-    // (2) 坏票据 + 全新 nonce ⇒ 拒；同 nonce 好票据 ⇒ 过（顺序契约的端到端实证）。
+    // (2) Bad ticket + fresh nonce ⇒ rejected; the same nonce with a good
+    //     ticket ⇒ passes (the end-to-end proof of the order contract).
     let mut bad = ticket_a.clone();
     if let flock_server::ticket::TicketWire::Local(t) = &mut bad {
         t.exp += 100;
@@ -356,7 +392,7 @@ async fn smoke_full_chain(profile: Profile) {
         a.ticket_renew(Some(ticket_a.clone()), auth_n).await,
         CtrlResponse::TicketRenewed { .. }
     ));
-    // (3) 过期票据（部署 TTL 6s）。
+    // (3) Expired ticket (the deployment TTL is 6s).
     tokio::time::sleep(std::time::Duration::from_secs(7)).await;
     let late = CtrlClient::sr_auth(
         &user,
@@ -371,7 +407,8 @@ async fn smoke_full_chain(profile: Profile) {
         CtrlError::TicketBad
     );
 
-    // 吊销后握手被拒（重新登录拿新票据——旧票据已因 (3) 过期）。
+    // After revocation the handshake is rejected (log in again for a fresh
+    // ticket —— the old one already expired in (3)).
     let (ticket2, _) = a.login_anchored(&user, "pw", &pin).await.expect("re-login");
     let (ticket_b, _) = b.login_anchored(&user, "pw", &pin).await.expect("B login");
     let body = postcard::to_allocvec(&DeviceOp::Revoke {
@@ -397,7 +434,8 @@ async fn smoke_full_chain(profile: Profile) {
         .await,
         CtrlResponse::Ok
     ));
-    // 低 epoch 票据：吊销推进 epoch ⇒ B 的旧票据失效。
+    // Low-epoch ticket: the revocation advanced the epoch ⇒ B's old ticket
+    // is void.
     let lb = postcard::to_allocvec(&DeviceOp::List).unwrap();
     let stale = CtrlClient::sr_auth(
         &user,
@@ -413,24 +451,25 @@ async fn smoke_full_chain(profile: Profile) {
     );
     let _ = ticket2;
 
-    // A 重连被拒（respond Revoked ⇒ 客户端观察为连接失败，§3.5 防枚举）。
+    // A's reconnect is rejected (respond Revoked ⇒ the client observes a
+    // connection failure, §3.5 anti-enumeration).
     let io = tokio::net::TcpStream::connect(&pin.entry.relay_endpoint)
         .await
         .unwrap();
     let err = initiate(io, &dev_a, &pin, TunnelConfig::default())
         .await
-        .expect_err("吊销后握手必拒");
+        .expect_err("the handshake must be rejected after revocation");
     assert!(
         matches!(err, SessionError::DeviceRejected | SessionError::Io(_)),
         "got {err:?}"
     );
-    // 对照：B 仍可连。
+    // Control: B can still connect.
     let io_b = tokio::net::TcpStream::connect(&pin.entry.relay_endpoint)
         .await
         .unwrap();
     initiate(io_b, &dev_b, &pin, TunnelConfig::default())
         .await
-        .expect("B 仍可连");
+        .expect("B can still connect");
 }
 
 fn common_b64(b: &[u8]) -> String {
@@ -456,14 +495,16 @@ fn cli_status(profile: Profile, sub: &[&str]) -> (bool, String) {
 }
 
 // ============================================================================
-// TOFU（I0→R0 → 指纹确认 → 钉扎落盘 → 二连 1-RTT → dir_pull → 换端点仍 1-RTT）
+// TOFU (I0→R0 → fingerprint confirmation → pin persisted → second
+// connection 1-RTT → dir_pull → still 1-RTT after switching endpoints)
 // ============================================================================
 
 async fn smoke_tofu(profile: Profile) {
     let (ep1, ep2) = profile.endpoints();
     wait_tcp(&ep1).await;
 
-    // TOFU 设备管理面预置（TOFU 解决信任引导，非账号开通）。
+    // The TOFU device's management-side pre-provisioning (TOFU solves
+    // trust bootstrapping, not account creation).
     let dev = DeviceStaticKeys::generate();
     let tofu_user = uname("smoke-tofu");
     let out = cli(
@@ -478,9 +519,9 @@ async fn smoke_tofu(profile: Profile) {
             &common_b64(dev.ed25519_public().as_bytes()),
         ],
     );
-    assert!(out.contains("vip=100.64."), "device-add：{out}");
+    assert!(out.contains("vip=100.64."), "device-add: {out}");
 
-    // 首连 I0→R0（客户端无邀请/无钉扎）。
+    // First connection I0→R0 (the client has no invite/no pin).
     let io = tokio::net::TcpStream::connect(&ep1).await.unwrap();
     let boot = initiate_tofu(
         io,
@@ -496,7 +537,8 @@ async fn smoke_tofu(profile: Profile) {
     let entry0 = boot.server_entry().clone();
     assert_eq!(entry0.relay_endpoint, ep1);
 
-    // 根指纹确认 + 钉扎落盘（宿主临时目录）。
+    // Root fingerprint confirmation + pin persisted (a host temp
+    // directory).
     let pins_dir = tempfile::tempdir().unwrap();
     let pins_path = pins_dir.path().join("pins.bin");
     let mut pins = PinStore::new();
@@ -509,12 +551,12 @@ async fn smoke_tofu(profile: Profile) {
             .unwrap()
             .verify_pinned(&cluster_id, &root_pub),
         PinVerdict::Match,
-        "钉扎落盘"
+        "pin persisted"
     );
     let mut c1 = CtrlClient::open(t1).await.unwrap();
     c1.hello().await;
 
-    // 二连 1-RTT（已钉扎形态）。
+    // Second connection 1-RTT (the pinned form).
     let pin1 = ServerPin {
         cluster_id,
         cluster_root_pub: root_pub,
@@ -524,7 +566,8 @@ async fn smoke_tofu(profile: Profile) {
     let mut c2 = CtrlClient::open(t2).await.unwrap();
     c2.hello().await;
 
-    // dir_pull → 换端点（第二暴露口）仍 1-RTT。
+    // dir_pull → still 1-RTT after switching endpoints (the second
+    // exposure opening).
     let dir = c2.dir_pull().await;
     assert!(dir.verify(&root_pub));
     pins.record_directory(&root_pub, &dir).unwrap();
@@ -536,49 +579,57 @@ async fn smoke_tofu(profile: Profile) {
 }
 
 // ============================================================================
-// 入口（测试名 = harness profile 过滤器）
+// Entries (the test names = the harness profile filters)
 // ============================================================================
 
-#[ignore = "对容器实跑：先 docker compose up（见文件头）；cargo test -- --ignored relay|direct"]
+#[ignore = "runs against containers: docker compose up first (see the file header); cargo test -- --ignored relay|direct"]
 #[tokio::test]
 async fn relay_full_chain() {
     smoke_full_chain(Profile::Relay).await;
 }
 
-#[ignore = "对容器实跑：见文件头"]
+#[ignore = "runs against containers: see the file header"]
 #[tokio::test]
 async fn relay_tofu_dirpull_endpoint_switch() {
     smoke_tofu(Profile::Relay).await;
 }
 
-#[ignore = "对容器实跑：见文件头"]
+#[ignore = "runs against containers: see the file header"]
 #[tokio::test]
 async fn relay_frpc_supervisor_process_running() {
     let (ep1, _) = Profile::Relay.endpoints();
     wait_tcp(&ep1).await;
-    // Frp 模式运行时证明：frpc 子进程在 server 容器内由 Supervisor 托管运行。
+    // Frp-mode runtime proof: the frpc subprocess runs Supervisor-managed
+    // inside the server container.
     let (ok, out) = compose_exec_status(Profile::Relay, &["pgrep", "-f", "frpc"]);
-    assert!(ok, "frpc 进程应在运行（Supervisor 托管）：{out}");
+    assert!(
+        ok,
+        "the frpc process should be running (Supervisor-managed): {out}"
+    );
 }
 
-#[ignore = "对容器实跑：见文件头"]
+#[ignore = "runs against containers: see the file header"]
 #[tokio::test]
 async fn direct_full_chain() {
     smoke_full_chain(Profile::Direct).await;
 }
 
-#[ignore = "对容器实跑：见文件头"]
+#[ignore = "runs against containers: see the file header"]
 #[tokio::test]
 async fn direct_tofu_dirpull_endpoint_switch() {
     smoke_tofu(Profile::Direct).await;
 }
 
-#[ignore = "对容器实跑：见文件头（§7-M2：Direct 形态容器内 pgrep -f frp 无进程）"]
+#[ignore = "runs against containers: see the file header (§7-M2: the Direct-form container has no `pgrep -f frp` process)"]
 #[tokio::test]
 async fn direct_no_frp_process_in_container() {
     let (ep1, _) = Profile::Direct.endpoints();
     wait_tcp(&ep1).await;
-    // Direct 代码路径零 frp 逻辑的运行时证明（§7-M2）：容器内无任何 frp 进程。
+    // Runtime proof that the Direct code path has zero frp logic (§7-M2):
+    // no frp process inside the container.
     let (ok, out) = compose_exec_status(Profile::Direct, &["pgrep", "-f", "frp"]);
-    assert!(!ok, "Direct 容器内不得出现 frp 进程：{out}");
+    assert!(
+        !ok,
+        "no frp process may appear in the Direct container: {out}"
+    );
 }

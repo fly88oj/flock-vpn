@@ -1,15 +1,21 @@
-//! M8 webui 模块根（docs/design.md §7-M8.2/M8.8——装配与文件落位）。
+//! M8 webui module root (docs/design.md §7-M8.2/M8.8 —— assembly and file
+//! placement).
 //!
-//! 装配（`serve`）：
-//! - **loopback 监听启动即绑定**（`127.0.0.1:port`；失败 ⇒ Err——装配方拒起）；
-//! - **VIP 绑定由重试任务补上**（周期 5s：tun 未就绪/地址未配 ⇒ 绑定失败重试；失败
-//!   记日志一次、状态变化时再记，**永不 crash**——loopback 面不受影响）；
-//! - 会话清扫（60s）+ 时序采样（series_interval）；
-//! - 并发上限 = 独立信号量（缺省 64）+ 单请求总时限 30s（慢速滴注不占许可，
-//!   §M8.4）；handler panic 隔离为 500。
+//! Assembly (`serve`):
+//! - **the loopback listener binds at startup** (`127.0.0.1:port`; failure ⇒
+//!   Err —— the assembler refuses to start);
+//! - **the VIP bind is added by a retry task** (period 5s: tun not ready /
+//!   address unassigned ⇒ bind fails and retries; a failure is logged once,
+//!   re-logged on state change, **never crashes** —— the loopback surface is
+//!   unaffected);
+//! - session sweep (60s) + series sampling (series_interval);
+//! - concurrency cap = an independent semaphore (default 64) + a 30s total
+//!   per-request time limit (slow trickle does not hold a permit, §M8.4);
+//!   handler panics are isolated as 500.
 //!
-//! 访问路径（W-A1/W-A2）：loopback 与本机 tun VIP:port；数据路径 peer → … → 目标
-//! 服务器 tun0 → 内核 TCP 栈 → VIP:9800——与「peer ping 服务器 VIP」同路径。
+//! Access paths (W-A1/W-A2): loopback and the local tun VIP:port; the data
+//! path is peer → … → target server tun0 → kernel TCP stack → VIP:9800 ——
+//! the same path as "peer pings the server VIP".
 
 pub mod access;
 pub mod api;
@@ -29,23 +35,28 @@ use crate::server::ServerCore;
 use api::WebState;
 use http::Response;
 
-/// VIP 绑定重试周期（§M8.2 定死 5s）。
+/// VIP bind retry period (fixed at 5s by §M8.2).
 const VIP_REBIND_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
-/// accept 瞬态错误退避（fd 耗尽/连接竞态——等上收连接腾出句柄后自愈）。
+/// Accept transient-error backoff (fd exhaustion / connection race —— heals
+/// itself once incoming connections are drained and handles free up).
 const ACCEPT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// accept 错误 errno 面：EMFILE/ENFILE（fd 耗尽——瞬态，退避续跑）。
-/// 平台值不同（unix EMFILE=24/ENFILE=23；Windows EMFILE=4，无 ENFILE）——测试
-/// 经同常量构造，跨平台确定性。
+/// Accept error errno surface: EMFILE/ENFILE (fd exhaustion —— transient,
+/// back off and keep running). Platform values differ (unix EMFILE=24/ENFILE=23;
+/// Windows EMFILE=4, no ENFILE) —— tests construct via the same constants for
+/// cross-platform determinism.
 #[cfg(unix)]
 const ACCEPT_TRANSIENT_ERRNOS: [i32; 2] = [24, 23];
 #[cfg(windows)]
 const ACCEPT_TRANSIENT_ERRNOS: [i32; 1] = [4];
 
-/// accept 错误分类（🟡 评审项 2）：瞬态（WouldBlock/Interrupted/ConnAborted/
-/// ConnReset/EMFILE/ENFILE——fd 耗尽或单连接竞态，记日志 + 退避续跑）vs 致命
-/// （其余——监听面失效，退出；VIP 面由重试任务 5s 重绑兜回，与 loopback 面
-/// 「任一错误即永久退出」的旧缺陷对齐消除）。
+/// Accept error classification (UI/review item 2): transient
+/// (WouldBlock/Interrupted/ConnAborted/ConnReset/EMFILE/ENFILE —— fd
+/// exhaustion or a single-connection race: log + back off and keep running)
+/// vs fatal (everything else —— the listening surface is dead, exit; the VIP
+/// surface is brought back by the retry task's 5s rebind, eliminating the old
+/// defect where "any error exits permanently" applied to the loopback surface
+/// as well).
 fn accept_error_transient(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(
@@ -59,22 +70,25 @@ fn accept_error_transient(e: &std::io::Error) -> bool {
         .is_some_and(|n| ACCEPT_TRANSIENT_ERRNOS.contains(&n))
 }
 
-/// 起服装配（`server::run` / `sync::run_raft` 经 `run` 调用；`[webui] enabled=false`
-/// 时由调用方跳过）。返回 loopback accept 任务句柄 + 实际绑定地址（port=0 时
-/// 调用方取随机端口；VIP/清扫/采样任务 detached）。
+/// Assembly entry (`server::run` / `sync::run_raft` call via `run`; skipped
+/// by the caller when `[webui] enabled=false`). Returns the loopback accept
+/// task handle + the actually bound address (the caller takes a random port
+/// when port=0; the VIP/sweep/sampling tasks are detached).
 pub async fn serve(core: Arc<ServerCore>) -> Result<(JoinHandle<()>, SocketAddr), String> {
     let state = Arc::new(WebState::new(core.clone()));
     serve_state(core, state).await
 }
 
-/// [`serve`] 的注入态变体（tests/webui.rs 持有 WebState 驱动采样/断言）。
+/// Injected-state variant of [`serve`] (tests/webui.rs holds a WebState to
+/// drive sampling/assertions).
 pub async fn serve_state(
     core: Arc<ServerCore>,
     state: Arc<WebState>,
 ) -> Result<(JoinHandle<()>, SocketAddr), String> {
     let port = core.cfg.webui.port;
 
-    // ① loopback：启动即绑定（失败 ⇒ 装配失败——refuse to start）。
+    // ① loopback: bind at startup (failure ⇒ assembly fails —— refuse to
+    //    start).
     let lo_addr: SocketAddr = (std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port).into();
     let listener = TcpListener::bind(lo_addr)
         .await
@@ -84,11 +98,13 @@ pub async fn serve_state(
         .map_err(|e| format!("webui local_addr: {e}"))?;
     eprintln!("flock-server: webui listening on http://{local}");
 
-    // ② VIP 重试任务（tun 未就绪 ⇒ 5s 重试，永不 crash）。
+    // ② VIP retry task (tun not ready ⇒ retry every 5s, never crash).
     tokio::spawn(vip_rebind_loop(core.clone(), state.clone()));
 
-    // ③ 会话清扫 + 退避/令牌桶清扫（60s 周期——SWEEP_PERIOD 同档复用，🟡 评审项 5：
-    //     两表容量上限在写路径惰性执行，周期清扫兜底回收过期/惰性行）。
+    // ③ session sweep + backoff/token-bucket sweep (60s period —— SWEEP_PERIOD
+    //    reused at the same tier; review item 5: both tables' capacity caps
+    //    run lazily on the write path, the periodic sweep reclaims expired/
+    //    lazy rows as a backstop).
     {
         let st = state.clone();
         tokio::spawn(async move {
@@ -104,39 +120,45 @@ pub async fn serve_state(
         });
     }
 
-    // ④ 时序采样（series_interval 周期）。
+    // ④ Series sampling (series_interval period).
     tokio::spawn(state.series.clone().sampler_loop(core.clone()));
 
-    // ⑤ accept 循环（独立信号量 64；handler panic 隔离为 500）。
+    // ⑤ Accept loop (independent semaphore of 64; handler panics isolated as
+    //    500).
     Ok((tokio::spawn(accept_loop(listener, state)), local))
 }
 
-/// accept 循环（loopback 与 VIP 面共用语义：独立信号量 + panic 隔离 + 满载 429 +
-/// 瞬态 accept 错误退避续跑——分类见 [`accept_error_transient`]）。
+/// Accept loop (shared semantics for the loopback and VIP surfaces:
+/// independent semaphore + panic isolation + 429 when saturated + transient
+/// accept errors back off and keep running —— classification in
+/// [`accept_error_transient`]).
 async fn accept_loop(listener: TcpListener, state: Arc<WebState>) {
     let permits = Arc::new(tokio::sync::Semaphore::new(api::MAX_CONCURRENCY));
     loop {
-        // 瞬态错误（fd 耗尽/连接竞态）记日志 + 退避续跑；致命错误才退出循环
-        //（VIP 面退出后由重试任务重绑；loopback 面退出 ⇒ serve 返回的任务句柄结束）。
+        // Transient errors (fd exhaustion / connection race): log + back off
+        // and keep running; only fatal errors exit the loop (the VIP surface
+        // is rebound by the retry task after exit; a loopback-surface exit ⇒
+        // the task handle returned by serve ends).
         let (mut io, remote) = match listener.accept().await {
             Ok(v) => v,
             Err(e) if accept_error_transient(&e) => {
                 eprintln!(
-                    "flock-server: webui accept 瞬态错误（{e}）——{}ms 退避续跑",
+                    "flock-server: webui transient accept error ({e}) - backing off {}ms and continuing",
                     ACCEPT_RETRY_BACKOFF.as_millis()
                 );
                 tokio::time::sleep(ACCEPT_RETRY_BACKOFF).await;
                 continue;
             }
             Err(e) => {
-                eprintln!("flock-server: webui accept 致命错误（{e}）——accept 循环退出");
+                eprintln!("flock-server: webui fatal accept error ({e}) - accept loop exiting");
                 return;
             }
         };
         let permit = match permits.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                // 满载：429 立即回并关连接——与接入面「礼貌关闭」同语义。
+                // Saturated: reply 429 immediately and close —— same semantics
+                // as the "polite close" on the access surface.
                 let resp = too_many();
                 write_and_close(&mut io, &resp).await;
                 continue;
@@ -148,7 +170,8 @@ async fn accept_loop(listener: TcpListener, state: Arc<WebState>) {
             let handler: http::Handler = Box::new(move |req, remote| {
                 let st = st.clone();
                 Box::pin(async move {
-                    // panic 隔离：单请求故障不杀连接循环（500 信封）。
+                    // Panic isolation: a single request failure does not kill
+                    // the connection loop (500 envelope).
                     match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
                         st.dispatch(req, remote),
                     ))
@@ -178,7 +201,7 @@ fn internal_err() -> Response {
     )
 }
 
-/// 写一条响应并关连接（并发满载路径）。
+/// Write one response and close the connection (saturated-concurrency path).
 async fn write_and_close(io: &mut tokio::net::TcpStream, resp: &Response) {
     use tokio::io::AsyncWriteExt as _;
     let mut out =
@@ -193,10 +216,12 @@ async fn write_and_close(io: &mut tokio::net::TcpStream, resp: &Response) {
     let _ = io.shutdown().await;
 }
 
-/// VIP 绑定重试（周期 5s；状态变化才记日志——避免每 5s 刷屏）。
+/// VIP bind retry (period 5s; logs only on state change —— avoids spamming
+/// every 5s).
 ///
-/// 数据面路径与「peer ping 服务器 VIP」相同（tun → 内核 TCP 栈）；无 tun 的部署
-/// （控制流-only 宿主形态）该任务持续重试——loopback 面不受影响。
+/// The data-plane path is the same as "peer pings the server VIP" (tun →
+/// kernel TCP stack); on deployments without a tun (control-plane-only host
+/// form) this task keeps retrying —— the loopback surface is unaffected.
 async fn vip_rebind_loop(core: Arc<ServerCore>, state: Arc<WebState>) {
     let vip = core.cfg.vip;
     let port = core.cfg.webui.port;
@@ -205,16 +230,17 @@ async fn vip_rebind_loop(core: Arc<ServerCore>, state: Arc<WebState>) {
     loop {
         match TcpListener::bind(addr).await {
             Ok(listener) => {
-                eprintln!("flock-server: webui VIP listener on http://{addr}（VPN 段可达）");
+                eprintln!("flock-server: webui VIP listener on http://{addr} (reachable on the VPN segment)");
                 logged_fail = false;
                 accept_loop(listener, state.clone()).await;
-                // accept 循环退出（监听句柄失效）⇒ 落回重试。
-                eprintln!("flock-server: webui VIP listener 退出——5s 后重绑");
+                // Accept loop exited (listen handle dead) ⇒ fall back to
+                // retrying.
+                eprintln!("flock-server: webui VIP listener exited - rebinding in 5s");
             }
             Err(e) => {
                 if !logged_fail {
                     eprintln!(
-                        "flock-server: webui VIP bind {addr} 失败（tun 未就绪？{e}）——每 5s 重试（loopback 面不受影响）"
+                        "flock-server: webui VIP bind {addr} failed (tun not ready? {e}) - retrying every 5s (loopback surface unaffected)"
                     );
                     logged_fail = true;
                 }
@@ -225,7 +251,8 @@ async fn vip_rebind_loop(core: Arc<ServerCore>, state: Arc<WebState>) {
 }
 
 // ============================================================================
-// 单元测试：装配级（dispatch 序：来源矩阵/CSRF/会话/角色先后——注入连接源地址）
+// Unit tests: assembly level (dispatch order: origin matrix / CSRF / session /
+// role precedence —— injected connection source addresses)
 // ============================================================================
 
 #[cfg(test)]
@@ -234,13 +261,15 @@ mod tests {
     use super::http::Request;
     use super::*;
 
-    /// accept 错误分类（🟡 评审项 2）：瞬态面（WouldBlock/Interrupted/
-    /// ConnAborted/ConnReset/EMFILE/ENFILE-unix）退避续跑；其余（PermissionDenied/
-    /// AddrInUse/其它 errno）致命退出——「任一错误即永久退出」缺陷消除。
+    /// Accept error classification (review item 2): the transient surface
+    /// (WouldBlock/Interrupted/ConnAborted/ConnReset/EMFILE/ENFILE-unix)
+    /// backs off and keeps running; the rest (PermissionDenied/AddrInUse/
+    /// other errnos) exit fatally —— the "any error exits permanently" defect
+    /// eliminated.
     #[test]
     fn accept_error_classification_transient_vs_fatal() {
         use std::io::ErrorKind;
-        // 瞬态：ErrorKind 面。
+        // Transient: the ErrorKind surface.
         for kind in [
             ErrorKind::WouldBlock,
             ErrorKind::Interrupted,
@@ -248,24 +277,26 @@ mod tests {
             ErrorKind::ConnectionReset,
         ] {
             let e = std::io::Error::from(kind);
-            assert!(accept_error_transient(&e), "瞬态（kind）: {e}");
+            assert!(accept_error_transient(&e), "transient (kind): {e}");
         }
-        // 瞬态：errno 面（fd 耗尽——同常量构造，跨平台确定性）。
+        // Transient: the errno surface (fd exhaustion —— constructed via the
+        // same constants, cross-platform deterministic).
         for n in ACCEPT_TRANSIENT_ERRNOS {
             assert!(
                 accept_error_transient(&std::io::Error::from_raw_os_error(n)),
-                "errno {n} 瞬态"
+                "errno {n} transient"
             );
         }
-        // 致命：监听面失效类。
+        // Fatal: dead-listening-surface classes.
         for e in [
             std::io::Error::from(ErrorKind::PermissionDenied),
             std::io::Error::from(ErrorKind::AddrInUse),
             std::io::Error::from(ErrorKind::Unsupported),
         ] {
-            assert!(!accept_error_transient(&e), "致命: {e}");
+            assert!(!accept_error_transient(&e), "fatal: {e}");
         }
-        // 致命：未分类 errno（例 13=EACCES——不在瞬态白名单）。
+        // Fatal: unclassified errno (e.g. 13=EACCES —— not on the transient
+        // allowlist).
         assert!(!accept_error_transient(&std::io::Error::from_raw_os_error(
             13
         )));
@@ -310,48 +341,55 @@ mod tests {
         Arc::new(WebState::new(core))
     }
 
-    /// 来源矩阵经注入源地址（伪造 XFF 不影响——RemoteAddr 是唯一判定输入）。
+    /// Origin matrix via injected source addresses (a forged XFF changes
+    /// nothing —— RemoteAddr is the sole decision input).
     #[tokio::test]
     async fn dispatch_origin_matrix_with_injected_remote() {
         let st = state().await;
-        // loopback / VPN 段放行（未登录 → 401 not_logged_in——非 403 origin）。
+        // loopback / VPN segment allowed (not logged in → 401 not_logged_in ——
+        // not a 403 origin).
         for ip in ["127.0.0.1", "127.9.9.9", "100.64.0.11", "100.127.255.254"] {
             let resp = st.dispatch(req("GET", "/api/me"), remote(ip)).await;
-            assert_eq!(resp.status, 401, "{ip} 放行（会话层 401）");
+            assert_eq!(resp.status, 401, "{ip} allowed (session-layer 401)");
         }
-        // 越界（LAN/公网）⇒ 403 forbidden_origin（先于会话判定）。
+        // Out of bounds (LAN / public internet) ⇒ 403 forbidden_origin (ahead
+        // of the session check).
         for ip in ["192.168.1.5", "8.8.8.8", "100.128.0.1", "10.1.2.3"] {
             let resp = st.dispatch(req("GET", "/api/me"), remote(ip)).await;
-            assert_eq!(resp.status, 403, "{ip} 拒");
+            assert_eq!(resp.status, 403, "{ip} rejected");
             let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or_default();
             assert_eq!(body["error"]["code"], "forbidden_origin");
         }
-        // 伪造 XFF：header 存在也不改变判定。
+        // Forged XFF: the header's presence changes nothing.
         let mut r = req("GET", "/api/me");
         r.headers
             .push(("X-Forwarded-For".into(), "127.0.0.1".into()));
         let resp = st.dispatch(r, remote("8.8.8.8")).await;
-        assert_eq!(resp.status, 403, "XFF 不参与判定");
+        assert_eq!(resp.status, 403, "XFF does not participate in the decision");
     }
 
-    /// 分发序：CSRF（400）先于会话（401）先于角色（403）——三态注入。
+    /// Dispatch order: CSRF (400) before session (401) before role (403) ——
+    /// three-state injection.
     #[tokio::test]
     async fn dispatch_order_csrf_session_role() {
         let st = state().await;
         let mut r = req("POST", "/api/users");
         r.headers
             .push(("Content-Type".into(), "application/json".into()));
-        // ① 缺 X-Flock-Web ⇒ 400（未登录也 400——CSRF 槽在前）。
+        // ① Missing X-Flock-Web ⇒ 400 (even when not logged in —— the CSRF
+        //    slot comes first).
         let resp = st.dispatch(r.clone(), remote("127.0.0.1")).await;
         assert_eq!(resp.status, 400);
-        // ② 双门槛齐但无会话 ⇒ 401。
+        // ② Both gates present but no session ⇒ 401.
         r.headers.push(("X-Flock-Web".into(), "1".into()));
         r.body = br#"{"username":"bob"}"#.to_vec();
         let resp = st.dispatch(r.clone(), remote("127.0.0.1")).await;
         assert_eq!(resp.status, 401);
-        // ③ 有会话非 admin ⇒ 403（先会话后角色：注入非 admin 会话；iat 取真实
-        // 墙钟——惰性过期按 lookup 时的 now 校验。会话 user 须在注册表在册——
-        // 评审项 6 起 dispatch 会话档回读 UserRow）。
+        // ③ Session present but not admin ⇒ 403 (session before role: inject a
+        //    non-admin session; iat takes the real wall clock —— lazy expiry is
+        //    validated against now at lookup time. The session user must exist
+        //    in the registry —— since review item 6 the dispatch session slot
+        //    reads back the UserRow).
         st.core.net.create_user("plain", [2; 16]).await.unwrap();
         st.core.net.create_user("boss", [3; 16]).await.unwrap();
         st.core.net.set_user_admin("boss", true).await.unwrap();
@@ -363,7 +401,7 @@ mod tests {
             .push(("Cookie".into(), format!("flock_session={sid}")));
         let resp = st.dispatch(r.clone(), remote("127.0.0.1")).await;
         assert_eq!(resp.status, 403);
-        // ④ admin 会话 ⇒ 200（创建成功——username 合法）。
+        // ④ Admin session ⇒ 200 (creation succeeds —— username valid).
         let sid2 = st
             .sessions
             .issue("boss", true, session::Origin::Loopback, now, 3600);
@@ -374,9 +412,10 @@ mod tests {
         assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
     }
 
-    /// 静态资产与 SPA fallback：/ 与 /static/* 200（no-cache）；未知非 /api 路径
-    /// 回 index.html（hash 路由接管——M8b）；未知 /api/* 404 JSON（API 客户端
-    /// 不吞 HTML）；越界来源对静态资产同样 403。
+    /// Static assets and SPA fallback: / and /static/* are 200 (no-cache);
+    /// unknown non-/api paths fall back to index.html (hash routing takes
+    /// over —— M8b); unknown /api/* gets 404 JSON (API clients never swallow
+    /// HTML); out-of-bounds origins also get 403 on static assets.
     #[tokio::test]
     async fn dispatch_static_spa_fallback_and_404() {
         let st = state().await;
@@ -394,13 +433,14 @@ mod tests {
             .dispatch(req("GET", "/static/index.html"), remote("127.0.0.1"))
             .await;
         assert_eq!(resp.status, 200);
-        // SPA fallback：直击任意未知路径（如 /peers 刷新）⇒ index.html 200。
+        // SPA fallback: directly hitting any unknown path (e.g. a /peers
+        // refresh) ⇒ index.html 200.
         for path in ["/nope", "/peers", "/static/missing.js"] {
             let resp = st.dispatch(req("GET", path), remote("127.0.0.1")).await;
             assert_eq!(resp.status, 200, "{path} SPA fallback 200");
             assert!(
                 String::from_utf8_lossy(&resp.body).contains("flockApp"),
-                "{path} 回 index"
+                "{path} falls back to index"
             );
         }
         let resp = st.dispatch(req("GET", "/"), remote("8.8.8.8")).await;

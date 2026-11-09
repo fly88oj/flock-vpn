@@ -1,28 +1,29 @@
-//! M8 webui HTTP-OPAQUE 驱动器（docs/design.md §7-M8.8/§M8.9——`webui_assert.sh`
-//! 的 CLI 载具：登录/CRUD 探针）。
+//! M8 webui HTTP-OPAQUE driver (docs/design.md §7-M8.8/§M8.9 —— the CLI
+//! vehicle of `webui_assert.sh`: login/CRUD probes).
 //!
-//! 用法（`--base` 缺省 `http://127.0.0.1:9800`）：
+//! Usage (`--base` defaults to `http://127.0.0.1:9800`):
 //!
 //! ```text
-//! webui_login [--base URL] [--user U --pass P] <子命令> [参数…]
-//!   bootstrap                      GET /api/bootstrap（打印 cluster/server）
-//!   login                          OPAQUE 登录（anchor 验签；失败退出码非 0）
-//!   me [--expect-admin 0|1]        /api/me（角色断言）
-//!   users                          /api/users（admin）
+//! webui_login [--base URL] [--user U --pass P] <subcommand> [args...]
+//!   bootstrap                      GET /api/bootstrap (prints cluster/server)
+//!   login                          OPAQUE login (anchor verification; failure exits non-zero)
+//!   me [--expect-admin 0|1]        /api/me (role assertion)
+//!   users                          /api/users (admin)
 //!   user-create <name>             POST /api/users → stdout: token=<hex32>
 //!   user-disable <u> / user-enable <u> / user-reset-password <u>
-//!   user-set-admin <u> <0|1>       （cannot_demote_self ⇒ 退出码 42）
-//!   pw-set --user U --token T --pass P   公共引导链（pw-begin/commit，原生 OPAQUE）
-//!   peers / summary / series --vip V     只读面
-//!   peer-op <revoke|disable|enable|kick> <dev_hex>   设备操作（admin；invalid_state ⇒ 42）
-//!   audit-grep <action> [target]   /api/audit 行匹配（无匹配 ⇒ 退出码 3）
-//!   probe-readonly                 me/peers/summary/series/config 全 200 断言
-//!   probe-admin-denied             users/audit/user-create/peer-op 全 403 断言
-//!   probe-unauth-401               未登录全部端点 401 断言（W1）
-//!   logout                         /api/logout 后原 sid 401 断言
+//!   user-set-admin <u> <0|1>       (cannot_demote_self ⇒ exit code 42)
+//!   pw-set --user U --token T --pass P   the public bootstrap chain (pw-begin/commit, native OPAQUE)
+//!   peers / summary / series --vip V     the read-only surface
+//!   peer-op <revoke|disable|enable|kick> <dev_hex>   device operations (admin; invalid_state ⇒ 42)
+//!   audit-grep <action> [target]   /api/audit line matching (no match ⇒ exit code 3)
+//!   probe-readonly                 me/peers/summary/series/config all-200 assertions
+//!   probe-admin-denied             users/audit/user-create/peer-op all-403 assertions
+//!   probe-unauth-401               all endpoints 401 when not logged in (W1)
+//!   logout                         /api/logout then the original sid 401 assertion
 //! ```
 //!
-//! 退出码：0 成功；1 断言/协议失败；2 参数/连接失败；3 audit 无匹配；42 业务 409。
+//! Exit codes: 0 success; 1 assertion/protocol failure; 2 argument/
+//! connection failure; 3 audit no-match; 42 business 409.
 
 use std::io::{Read, Write};
 
@@ -34,7 +35,8 @@ use flock_protocol::pake::{login_start, reg_start};
 use flock_protocol::rand;
 
 // ============================================================================
-// 最小 HTTP 客户端（std::net——无 tokio 依赖面；每请求一连接）
+// Minimal HTTP client (std::net —— no tokio dependency surface; one
+// connection per request)
 // ============================================================================
 
 struct Resp {
@@ -77,7 +79,7 @@ fn http(
 ) -> Result<Resp, String> {
     let hostport = base
         .strip_prefix("http://")
-        .ok_or_else(|| format!("base 需以 http:// 开头: {base}"))?;
+        .ok_or_else(|| format!("base must start with http://: {base}"))?;
     let mut io =
         std::net::TcpStream::connect(hostport).map_err(|e| format!("connect {hostport}: {e}"))?;
     let _ = io.set_read_timeout(Some(std::time::Duration::from_secs(20)));
@@ -98,13 +100,15 @@ fn http(
 
 fn parse(raw: &[u8]) -> Result<Resp, String> {
     let text = String::from_utf8_lossy(raw);
-    let (head, body) = text.split_once("\r\n\r\n").ok_or("响应无头体分隔")?;
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or("response has no head/body separator")?;
     let mut lines = head.split("\r\n");
     let status: u16 = lines
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
-        .ok_or("坏状态行")?;
+        .ok_or("bad status line")?;
     let headers = lines
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
@@ -143,10 +147,11 @@ fn get(path: &str, cookie: Option<&str>, base: &str) -> Result<Resp, String> {
 }
 
 // ============================================================================
-// OPAQUE 登录（anchor 验签）
+// OPAQUE login (anchor verification)
 // ============================================================================
 
-/// 登录 → cookie。Err 携带可读失败（用于断言 401 面）。
+/// Login → cookie. Err carries a readable failure (for asserting the 401
+/// surface).
 fn pake_login(base: &str, user: &str, pw: &str) -> Result<(String, Value), (u16, String)> {
     let boot = get("/api/bootstrap", None, base).map_err(|e| (0, e))?;
     let pub_bytes = base64::engine::general_purpose::STANDARD_NO_PAD
@@ -173,7 +178,8 @@ fn pake_login(base: &str, user: &str, pw: &str) -> Result<(String, Value), (u16,
         .ok_or((0, "bad bind_token".into()))?;
     let anchor_sig = hex::decode(v["anchor_sig"].as_str().unwrap_or(""))
         .map_err(|_| (0, "bad anchor_sig".into()))?;
-    // server_id：bootstrap 已取（anchor canonical 用 ServerId 16B——从 bootstrap 行取）。
+    // server_id: already fetched from bootstrap (the anchor canonical uses
+    // the 16B ServerId —— taken from the bootstrap line).
     let server_id: [u8; 16] = hex::decode(boot.json()["server_id"].as_str().unwrap_or(""))
         .ok()
         .and_then(|b| b.try_into().ok())
@@ -206,7 +212,7 @@ fn pake_login(base: &str, user: &str, pw: &str) -> Result<(String, Value), (u16,
 }
 
 // ============================================================================
-// main：子命令分派
+// main: subcommand dispatch
 // ============================================================================
 
 fn main() {
@@ -229,17 +235,17 @@ fn run() -> Result<u32, String> {
     let mut it = std::env::args().skip(1).peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--base" => base = it.next().ok_or("--base 值")?,
-            "--user" => user = it.next().ok_or("--user 值")?,
-            "--pass" => pass = it.next().ok_or("--pass 值")?,
-            "--vip" => args.push(format!("--vip={}", it.next().ok_or("--vip 值")?)),
-            "--token" => args.push(format!("--token={}", it.next().ok_or("--token 值")?)),
+            "--base" => base = it.next().ok_or("--base value")?,
+            "--user" => user = it.next().ok_or("--user value")?,
+            "--pass" => pass = it.next().ok_or("--pass value")?,
+            "--vip" => args.push(format!("--vip={}", it.next().ok_or("--vip value")?)),
+            "--token" => args.push(format!("--token={}", it.next().ok_or("--token value")?)),
             other if cmd.is_empty() => cmd = other.to_string(),
             other => args.push(other.to_string()),
         }
     }
     if cmd.is_empty() {
-        return Err("缺少子命令（bootstrap/login/me/users/user-create/pw-set/peers/summary/series/audit-grep/probe-*/logout）".into());
+        return Err("missing subcommand (bootstrap/login/me/users/user-create/pw-set/peers/summary/series/audit-grep/probe-*/logout)".into());
     }
     let arg = |i: usize| args.get(i).map(|s| s.as_str()).unwrap_or("");
     let flag = |name: &str| {
@@ -258,9 +264,10 @@ fn run() -> Result<u32, String> {
         }
         "login" => {
             if user.is_empty() || pass.is_empty() {
-                return Err("login 需要 --user/--pass".into());
+                return Err("login requires --user/--pass".into());
             }
-            // login 子命令恒新登录（缓存复用走其余子命令的 logged 路径）。
+            // The login subcommand always logs in fresh (cached reuse goes
+            // through the logged path of the other subcommands).
             match pake_login(&base, &user, &pass) {
                 Ok((sid, v)) => {
                     CookieJar::new(&base, &user).store(&sid);
@@ -367,13 +374,14 @@ fn run() -> Result<u32, String> {
         }
         "pw-set" => {
             let target = user.clone();
-            let token = flag("--token").ok_or("pw-set 需要 --token")?;
+            let token = flag("--token").ok_or("pw-set requires --token")?;
             let pw2 = if pass.is_empty() {
-                return Err("pw-set 需要 --pass（新口令）".into());
+                return Err("pw-set requires --pass (the new password)".into());
             } else {
                 pass.clone()
             };
-            // 原生 OPAQUE 注册：pw-begin（令牌预检）→ reg_finish → pw-commit。
+            // Native OPAQUE registration: pw-begin (token pre-check) →
+            // reg_finish → pw-commit.
             let (cstate, m1) = reg_start(&mut rand::rngs::OsRng, &pw2, &target)
                 .map_err(|e| format!("reg_start: {e}"))?;
             let r = post(
@@ -409,7 +417,8 @@ fn run() -> Result<u32, String> {
             Ok(0)
         }
         "peer-op" => {
-            // peer-op <revoke|disable|enable|kick> <device_hex64>（admin；W2 载具）。
+            // peer-op <revoke|disable|enable|kick> <device_hex64> (admin;
+            // the W2 vehicle).
             let (ck, _) = logged(&base, &user, &pass)?;
             let action = arg(0);
             let dev = arg(1);
@@ -525,7 +534,7 @@ fn run() -> Result<u32, String> {
         "probe-admin-denied" => {
             let (ck, _) = logged(&base, &user, &pass)?;
             let mut bad = 0;
-            // GET 面（users/audit）。
+            // The GET surface (users/audit).
             for path in ["/api/users", "/api/audit"] {
                 let r = get(path, Some(&ck), &base)?;
                 let okk = r.status == 403 && r.code() == "forbidden";
@@ -536,7 +545,7 @@ fn run() -> Result<u32, String> {
                 );
                 bad += u32::from(!okk);
             }
-            // POST 面（建号/设 admin/设备操作）。
+            // The POST surface (create account/set admin/device operations).
             for (path, body) in [
                 ("/api/users", json!({"username": "probe-denied"})),
                 ("/api/users/probe-self/admin", json!({"admin": true})),
@@ -602,12 +611,14 @@ fn run() -> Result<u32, String> {
             println!("logout => sid-invalidated={} ({})", okk, after.status);
             Ok(u32::from(!okk))
         }
-        other => Err(format!("未知子命令 {other:?}")),
+        other => Err(format!("unknown subcommand {other:?}")),
     }
 }
 
-/// 会话 cookie 缓存（per base+user，进程外落 $TMPDIR——一次登录在 TTL 内复用：
-/// 登录-begin 受 per-IP 桶限 10/min，逐子命令登录会耗尽配额；登出即删）。
+/// Session cookie cache (per base+user, persisted under $TMPDIR —— one
+/// login is reused within the TTL: login-begin is bucket-limited to 10/min
+/// per IP, and logging in per subcommand would exhaust the quota; deleted on
+/// logout).
 struct CookieJar {
     path: std::path::PathBuf,
 }
@@ -636,10 +647,11 @@ impl CookieJar {
     }
 }
 
-/// 登录态获取：缓存 sid 经 /api/me 验活 ⇒ 复用；否则新登录（写缓存）。
+/// Login-state acquisition: a cached sid probed via /api/me ⇒ reused;
+/// otherwise a fresh login (writing the cache).
 fn logged(base: &str, user: &str, pass: &str) -> Result<(String, Value), String> {
     if user.is_empty() || pass.is_empty() {
-        return Err("该子命令需要 --user/--pass（登录）".into());
+        return Err("this subcommand requires --user/--pass (login)".into());
     }
     let jar = CookieJar::new(base, user);
     if let Some(sid) = jar.load() {
@@ -649,13 +661,14 @@ fn logged(base: &str, user: &str, pass: &str) -> Result<(String, Value), String>
             }
         }
     }
-    let (sid, v) =
-        pake_login(base, user, pass).map_err(|(s, c)| format!("登录失败 status={s} code={c}"))?;
+    let (sid, v) = pake_login(base, user, pass)
+        .map_err(|(s, c)| format!("login failed status={s} code={c}"))?;
     jar.store(&sid);
     Ok((sid, v))
 }
 
-/// 列表面打印：`<key>[ n]=…`（脚本 grep 面）+ 200/403 断言退出码。
+/// List-surface printing: `<key>[ n]=…` (the script grep surface) + the
+/// 200/403 assertion exit codes.
 fn print_list(r: Resp, key: &str) -> Result<u32, String> {
     if r.status != 200 {
         println!("{key} status={} code={}", r.status, r.code());

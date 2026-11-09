@@ -1,18 +1,26 @@
-//! NetBackend：控制面/管理面的统一**异步**写读门面（docs/design.md §2.2/§3.11 M4 批次）。
+//! NetBackend: the unified **async** read/write facade of the control/admin
+//! planes (docs/design.md §2.2/§3.11 M4 batch).
 //!
-//! 两形态（`server.toml [sync].mode`，缺省 `single`——m2/m2-direct 部署不受影响）：
+//! Two forms (`server.toml [sync].mode`, default `single` —— m2/m2-direct
+//! deployments unaffected):
 //!
-//! - [`NetBackend::Single`]：M2 本地 redb 状态库（同步 [`StateStore`]——方法立即完成）；
-//! - [`NetBackend::Sync`]（feature `multi-primary`）：写经 Raft 提交（任意节点进入，
-//!   非 leader 自动转发 leader，§4 写转发）；读按一致性档位——注册表行/用户面走
-//!   **线性一致读**（任意节点进入，跨节点读后写正确），目录三态走
-//!   `SyncNode::device_directory()` 的**两级读**（记录缓存 + epoch + apply-lag 熔断，
-//!   §4 读与缓存——正是 `session::respond` 的注入点）。
+//! - [`NetBackend::Single`]: the M2 local redb state store (synchronous
+//!   [`StateStore`] —— methods complete immediately);
+//! - [`NetBackend::Sync`] (feature `multi-primary`): writes committed over
+//!   Raft (enter at any node, non-leaders automatically forward to the
+//!   leader, §4 write forwarding); reads by consistency tier —— registry
+//!   rows/user surface take the **linearizable read** (enter at any node,
+//!   cross-node read-then-write correct), the directory three-state takes
+//!   the **two-level read** of `SyncNode::device_directory()` (record
+//!   cache + epoch + apply-lag breaker, §4 reads and caching —— precisely
+//!   the injection point of `session::respond`).
 //!
-//! 为什么是异步门面而非给 [`crate::netstate::NetState`] 加 async：单服形态的同步 trait
-//! 保持不动（redb 是同步 IO），Raft 写/线性一致读是网络往返——同步 trait 上 block_on
-//! 在异步派发路径内是死锁陷阱，故门面在装配层异步化（`§1.3.3c` lookup 接缝本就要求
-//! BoxFuture 的同一理由）。
+//! Why an async facade instead of making [`crate::netstate::NetState`] async:
+//! the single-server form's synchronous trait stays untouched (redb is
+//! synchronous IO), while Raft writes/linearizable reads are network round
+//! trips —— block_on over a synchronous trait inside async dispatch paths is
+//! a deadlock trap, so the facade goes async at the assembly layer (the same
+//! reason the `§1.3.3c` lookup seam already demanded BoxFuture).
 
 use flock_protocol::ed25519_dalek::VerifyingKey;
 use flock_protocol::session::{DeviceId, LookupVerdict};
@@ -25,17 +33,19 @@ use crate::netstate::{
 #[cfg(feature = "multi-primary")]
 use flock_sync::proto as sync_proto;
 
-/// 形态分派的统一后端。
+/// The unified backend behind the form dispatch.
 pub enum NetBackend {
-    /// 单服：本地状态库（M2 形态；m2-direct.yml 等部署）。
+    /// Single server: the local state store (M2 form; m2-direct.yml and
+    /// similar deployments).
     Single(std::sync::Arc<StateStore>),
-    /// 多主：flock-sync Raft 状态机（feature `multi-primary`）。
+    /// Multi-primary: the flock-sync Raft state machine (feature
+    /// `multi-primary`).
     #[cfg(feature = "multi-primary")]
     Sync(std::sync::Arc<SyncNetState>),
 }
 
 impl NetBackend {
-    /// 当前全局 revocation_epoch（Sync = 本机已 apply 的 epoch）。
+    /// Current global revocation_epoch (Sync = this node's applied epoch).
     pub async fn epoch(&self) -> u64 {
         match self {
             NetBackend::Single(s) => s.epoch(),
@@ -44,7 +54,8 @@ impl NetBackend {
         }
     }
 
-    /// 目录三态（respond/票据设备态数据源）。Sync 走两级读（缓存+epoch+熔断）。
+    /// Directory three-state (the respond/ticket device-state data source).
+    /// Sync takes the two-level read (cache+epoch+breaker).
     pub async fn lookup(&self, id: &DeviceId) -> LookupVerdict {
         match self {
             NetBackend::Single(s) => s.lookup(id),
@@ -53,7 +64,7 @@ impl NetBackend {
         }
     }
 
-    /// 注册表行（owner 面板/VIP）。Sync = 线性一致读。
+    /// Registry row (owner panel/VIP). Sync = linearizable read.
     pub async fn device_row(&self, id: &DeviceId) -> Option<DeviceRow> {
         match self {
             NetBackend::Single(s) => s.device_row(id),
@@ -69,7 +80,7 @@ impl NetBackend {
         }
     }
 
-    /// owner 名下全部设备（DeviceList）。
+    /// All devices under an owner (DeviceList).
     pub async fn devices_of(&self, owner: &str) -> Vec<(DeviceId, DeviceRow)> {
         match self {
             NetBackend::Single(s) => s.devices_of(owner),
@@ -90,7 +101,8 @@ impl NetBackend {
         }
     }
 
-    /// 注册设备（分配 VIP；M7 增 hostname——空串落 "(unknown)"）。
+    /// Register a device (assigns a VIP; M7 adds hostname —— empty string
+    /// lands as "(unknown)").
     pub async fn register_device(
         &self,
         owner: &str,
@@ -108,7 +120,9 @@ impl NetBackend {
                         x25519,
                         ed25519,
                         hostname: hostname.to_string(),
-                        // 注册时刻由提交方注入（apply 无时钟——确定性；回收器锚）。
+                        // Registration time injected by the submitting side
+                        // (apply has no clock —— deterministic; the reaper's
+                        // anchor).
                         registered_at_unix: flock_protocol::trust::now_unix(),
                     })
                     .await?;
@@ -121,7 +135,8 @@ impl NetBackend {
         }
     }
 
-    /// M7：更新设备 hostname（re-register 路径；仅非终态行）。
+    /// M7: update a device hostname (the re-register path; non-terminal rows
+    /// only).
     pub async fn set_hostname(&self, id: &DeviceId, hostname: &str) -> Result<DeviceRow, NetError> {
         match self {
             NetBackend::Single(s) => s.set_hostname(id, hostname),
@@ -144,7 +159,8 @@ impl NetBackend {
         }
     }
 
-    /// M7：过期设备（回收器提交；行保留审计 + VIP 归还池 + epoch 推进——幂等）。
+    /// M7: expire a device (submitted by the reaper; row retained for audit +
+    /// VIP returned to the pool + epoch advance —— idempotent).
     pub async fn expire(&self, id: &DeviceId, now_unix: u64) -> Result<u64, NetError> {
         match self {
             NetBackend::Single(s) => s.expire(id, now_unix),
@@ -165,17 +181,18 @@ impl NetBackend {
         }
     }
 
-    /// 吊销（行保留、VIP 不回收、epoch +1；本地杀会话经 apply 钩子，§2.2）。
+    /// Revoke (row retained, VIP not recycled, epoch +1; local session kills
+    /// via the apply hook, §2.2).
     pub async fn revoke(&self, id: &DeviceId) -> Result<u64, NetError> {
         self.set_status(id, DeviceStatus::Revoked).await
     }
 
-    /// 禁用（不删除；epoch +1）。
+    /// Disable (no deletion; epoch +1).
     pub async fn disable(&self, id: &DeviceId) -> Result<u64, NetError> {
         self.set_status(id, DeviceStatus::Disabled).await
     }
 
-    /// 重新启用（仅 Disabled → Active；不动 epoch）。
+    /// Re-enable (Disabled → Active only; epoch untouched).
     pub async fn enable(&self, id: &DeviceId) -> Result<(), NetError> {
         self.set_status(id, DeviceStatus::Active).await.map(|_| ())
     }
@@ -186,9 +203,10 @@ impl NetBackend {
                 DeviceStatus::Revoked => s.revoke(id),
                 DeviceStatus::Disabled => s.disable(id),
                 DeviceStatus::Active => s.enable(id).map(|_| s.epoch()),
-                // Expired 走 [`NetBackend::expire`]（携带 now_unix——时间语义转移）。
+                // Expired goes through [`NetBackend::expire`] (carries
+                // now_unix —— time semantics moved there).
                 DeviceStatus::Expired => Err(NetError::InvalidState(
-                    "expire 经 expire()（需 now_unix）".into(),
+                    "expire goes through expire() (needs now_unix)".into(),
                 )),
             },
             #[cfg(feature = "multi-primary")]
@@ -199,7 +217,7 @@ impl NetBackend {
                     DeviceStatus::Active => sync_proto::SyncRequest::Enable { device: id.0 },
                     DeviceStatus::Expired => {
                         return Err(NetError::InvalidState(
-                            "expire 经 expire()（需 now_unix）".into(),
+                            "expire goes through expire() (needs now_unix)".into(),
                         ))
                     }
                 };
@@ -212,8 +230,8 @@ impl NetBackend {
         }
     }
 
-    /// 邀请兑换（查重+吊销+expiry → 建用户/设备+分 VIP；Raft 单次提交 = 原子；
-    /// M7 增 hostname）。
+    /// Invite redemption (dedup+revocation+expiry checks → create user/device
+    /// + assign VIP; one Raft commit = atomic; M7 adds hostname).
     pub async fn redeem_invite(
         &self,
         req: RedeemRequest<'_>,
@@ -222,7 +240,9 @@ impl NetBackend {
             NetBackend::Single(s) => s.redeem_invite(req),
             #[cfg(feature = "multi-primary")]
             NetBackend::Sync(s) => {
-                // 集群身份钉扎由状态机 bootstrap 身份承担（apply_redeem 内比对根公钥）。
+                // Cluster identity pinning is carried by the state machine's
+                // bootstrap identity (root public key compared inside
+                // apply_redeem).
                 let resp = s
                     .write(sync_proto::SyncRequest::RedeemInvite {
                         invite_bytes: req.invite_bytes.to_vec(),
@@ -251,18 +271,21 @@ impl NetBackend {
         }
     }
 
-    /// 吊销未兑换邀请（根签管理操作——多主形态须运维侧根密钥，服务器不持有）。
+    /// Revoke an unredeemed invite (a root-signed admin operation —— the
+    /// multi-primary form requires the operations-side root key; servers do
+    /// not hold it).
     pub async fn revoke_invite(&self, invite_id: &[u8; 16]) -> Result<(), NetError> {
         match self {
             NetBackend::Single(s) => s.revoke_invite(invite_id),
             #[cfg(feature = "multi-primary")]
             NetBackend::Sync(_) => Err(NetError::InvalidState(
-                "多主形态 revoke_invite 为根签管理操作（运维侧执行）".into(),
+                "revoke_invite in multi-primary form is a root-signed admin operation (run on the ops side)".into(),
             )),
         }
     }
 
-    /// 邀请登记（单服 mint 路径；多主形态 mint 在根密钥侧）。
+    /// Invite registration (the single-server mint path; in multi-primary
+    /// form minting happens on the root-key side).
     pub async fn record_invite(
         &self,
         invite_id: &[u8; 16],
@@ -289,7 +312,8 @@ impl NetBackend {
         }
     }
 
-    /// 设置口令记录（仅未设置时；跨节点登录 ⇒ 复制形态，§2.4 OPRF 共享）。
+    /// Set the password record (only when unset; cross-node login ⇒ the
+    /// replication form, §2.4 shared OPRF).
     pub async fn set_password(
         &self,
         user: &str,
@@ -318,7 +342,7 @@ impl NetBackend {
         }
     }
 
-    /// 口令记录（线性一致读）。
+    /// Password record (linearizable read).
     pub async fn password(&self, user: &str) -> Option<(String, u16)> {
         match self {
             NetBackend::Single(s) => s.password(user),
@@ -336,7 +360,7 @@ impl NetBackend {
         }
     }
 
-    /// 登记 SR-SIG1 用户公钥（key-bind 路径）。
+    /// Register an SR-SIG1 user public key (the key-bind path).
     pub async fn add_user_sig_key(&self, user: &str, pub32: [u8; 32]) -> Result<(), NetError> {
         match self {
             NetBackend::Single(s) => s.add_user_sig_key(user, pub32),
@@ -359,7 +383,7 @@ impl NetBackend {
         }
     }
 
-    /// SR-SIG1 验签公钥集（线性一致读）。
+    /// SR-SIG1 verification public key set (linearizable read).
     pub async fn user_sig_pubs(&self, user: &str) -> Vec<VerifyingKey> {
         match self {
             NetBackend::Single(s) => s.user_sig_pubs(user),
@@ -379,7 +403,7 @@ impl NetBackend {
         }
     }
 
-    /// bind_token 一次性消费（§2.4 线性一致查重）。
+    /// One-time bind_token consumption (§2.4 linearizable dedup).
     pub async fn consume_bind_token(&self, token: &[u8; 16]) -> bool {
         match self {
             NetBackend::Single(s) => s.consume_bind_token(token),
@@ -394,7 +418,7 @@ impl NetBackend {
         }
     }
 
-    /// VIP 分配（单调水位；不回收）。
+    /// VIP allocation (monotonic watermark; not recycled).
     pub async fn allocate_ip(&self) -> Result<std::net::Ipv4Addr, NetError> {
         match self {
             NetBackend::Single(s) => s.allocate_ip(),
@@ -407,8 +431,10 @@ impl NetBackend {
         }
     }
 
-    /// 原样写透传（feature `multi-primary`；admin SignedWrite → 运维侧根签操作：
-    /// Bootstrap/SetOprf/RecordInvite——签名验证全部在 Raft 状态机内）。
+    /// Verbatim write pass-through (feature `multi-primary`; admin
+    /// SignedWrite → operations-side root-signed operations:
+    /// Bootstrap/SetOprf/RecordInvite —— signature verification entirely
+    /// inside the Raft state machine).
     #[cfg(feature = "multi-primary")]
     pub async fn write_sync(
         &self,
@@ -417,17 +443,20 @@ impl NetBackend {
         match self {
             NetBackend::Sync(s) => s.write(req).await,
             NetBackend::Single(_) => Err(NetError::InvalidState(
-                "单服形态无 SignedWrite（管理操作走 invite/redeem/device-add/revoke）".into(),
+                "no SignedWrite in single-server form (admin operations go through invite/redeem/device-add/revoke)".into(),
             )),
         }
     }
 
     // ------------------------------------------------------------------
-    // M8（§7-M8.3）：Web 管理面用户操作（与 DeviceOp 同型双臂：Single = 本地 redb
-    // 直写；Sync = Raft 五写。授权在提交方 handler/CLI 层——与控制流 DeviceOp 同型）
+    // M8 (§7-M8.3): Web admin-plane user operations (dual-armed like
+    // DeviceOp: Single = local redb direct write; Sync = the five Raft
+    // writes. Authorization at the submitting handler/CLI layer —— same
+    // shape as the control-plane DeviceOp)
     // ------------------------------------------------------------------
 
-    /// 用户行（admin/disabled/pw_bootstrap；登录 disabled 判定 + webui 列表面）。
+    /// User row (admin/disabled/pw_bootstrap; the login disabled decision +
+    /// the webui list surface).
     pub async fn user_row(&self, user: &str) -> Option<StateStoreUserRow> {
         match self {
             NetBackend::Single(s) => s.user_row(user),
@@ -443,7 +472,8 @@ impl NetBackend {
         }
     }
 
-    /// 全部用户行（本地已 apply 视图——展示面档位，与名册同 §7-M7.4 档位）。
+    /// All user rows (locally applied view —— the display tier, same tier as
+    /// the roster in §7-M7.4).
     pub async fn users_all(&self) -> Vec<(String, StateStoreUserRow)> {
         match self {
             NetBackend::Single(s) => s.users_all(),
@@ -452,8 +482,10 @@ impl NetBackend {
         }
     }
 
-    /// 创建用户（携一次性引导令牌）；已存在 ⇒ [`UserOpError::UserExists`]（提交方
-    /// 按需幂等忽略——`web-admin-add` 的多主路径）。
+    /// Create a user (carrying the one-time bootstrap token); already exists
+    /// ⇒ [`UserOpError::UserExists`] (the submitting side ignores it
+    /// idempotently as needed —— the multi-primary path of
+    /// `web-admin-add`).
     pub async fn create_user(&self, username: &str, token: [u8; 16]) -> Result<(), UserOpError> {
         match self {
             NetBackend::Single(s) => s.create_user(username, token),
@@ -475,7 +507,9 @@ impl NetBackend {
         }
     }
 
-    /// 引导令牌落口令记录（原子消费：令牌匹配且记录为空 ⇒ 落记录 + 清令牌）。
+    /// Persist the password record via the bootstrap token (atomic
+    /// consumption: token matches and record empty ⇒ persist the record +
+    /// clear the token).
     pub async fn set_password_bootstrap(
         &self,
         user: &str,
@@ -505,7 +539,8 @@ impl NetBackend {
         }
     }
 
-    /// 管理员重置口令（清记录 + 置新令牌——旧口令即刻失效）。
+    /// Administrator password reset (clears the record + sets a new token ——
+    /// the old password stops working immediately).
     pub async fn reset_password(&self, user: &str, new_token: [u8; 16]) -> Result<(), UserOpError> {
         match self {
             NetBackend::Single(s) => s.reset_password(user, new_token),
@@ -527,7 +562,7 @@ impl NetBackend {
         }
     }
 
-    /// 设/撤 Web 管理角色。
+    /// Grant/revoke the Web admin role.
     pub async fn set_user_admin(&self, user: &str, admin: bool) -> Result<(), UserOpError> {
         match self {
             NetBackend::Single(s) => s.set_user_admin(user, admin),
@@ -549,7 +584,8 @@ impl NetBackend {
         }
     }
 
-    /// 禁用/启用用户（阻断登录；不追溯断开已建会话）。
+    /// Disable/enable a user (blocks login; does not retroactively drop
+    /// established sessions).
     pub async fn set_user_disabled(&self, user: &str, disabled: bool) -> Result<(), UserOpError> {
         match self {
             NetBackend::Single(s) => s.set_user_disabled(user, disabled),
@@ -572,7 +608,8 @@ impl NetBackend {
     }
 }
 
-/// 用户行类型再导出（netstate 与 flock-sync 同源定义；避免在 backend 顶头引两个名）。
+/// User row type re-export (netstate and flock-sync share the definition;
+/// avoids importing two names at the top of backend).
 use crate::netstate::UserRow as StateStoreUserRow;
 
 #[cfg(feature = "multi-primary")]
@@ -593,7 +630,7 @@ fn user_op_err(e: &sync_proto::StateError) -> UserOpError {
 }
 
 // ============================================================================
-// 多主适配（feature multi-primary）
+// Multi-primary adapter (feature multi-primary)
 // ============================================================================
 
 #[cfg(feature = "multi-primary")]
@@ -607,7 +644,8 @@ mod adapter {
 
     use crate::netstate::NetError;
 
-    /// SyncNode 的 NetBackend 适配体（写转发 leader / 线性一致读经节点门面）。
+    /// The NetBackend adapter over SyncNode (leader-forwarding writes /
+    /// linearizable reads via the node facade).
     pub struct SyncNetState {
         pub node: Arc<flock_sync::SyncNode>,
     }
@@ -617,7 +655,7 @@ mod adapter {
             Arc::new(SyncNetState { node })
         }
 
-        /// 写（任意节点进入；非 leader 自动转发，§4）。
+        /// Write (enter at any node; non-leaders auto-forward, §4).
         pub async fn write(&self, req: SyncRequest) -> Result<SyncResponse, NetError> {
             self.node.write(req).await.map_err(net_of_sync)
         }
@@ -628,10 +666,11 @@ mod adapter {
     }
 }
 
-// （评审项 12：原 `mod conv` 的 flock-sync 行 → 服务器行 From 转换黏合层删除——
-// netstate.rs 的行类型已直接再导出自 flock_sync::proto，两臂同一类型。）
+// (Review item 12: the former `mod conv` glue layer converting flock-sync
+// rows → server rows was deleted —— netstate.rs's row types are re-exported
+// directly from flock_sync::proto, one type for both arms.)
 
-// —— StateError → 服务器错误面映射 ——
+// —— StateError → server error surface mapping ——
 
 #[cfg(feature = "multi-primary")]
 fn net_err(e: &flock_sync::proto::StateError) -> NetError {

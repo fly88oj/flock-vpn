@@ -1,14 +1,21 @@
-//! init-cluster / enroll 的节点捆绑文件（docs/design.md §4 集群引导 / §3.11 进程入口）。
+//! Node bundle files for init-cluster / enroll (docs/design.md §4 cluster
+//! bootstrap / §3.11 process entry).
 //!
-//! §4-1：运维运行 `init-cluster --voters N` 生成**集群根密钥**（离线保管）与每台初始
-//! voter 的**入群凭证**——本 crate 的落盘形态 = [`NodeBundle`]：集群根公钥 + 本机身份
-//! 材料（identity/static hybrid 种子）+ 根签 [`ServerEntry`]（`entry_sig`，即入群凭证
-//! 公开部分的签名）+ 根签 ClusterDirectory 全文。**根密钥签名钥不出运维侧**（bundle 只
-//! 含 root_pub——§4-3 红线：被入侵的单台在册服务器没有根密钥）。
+//! §4-1: operations runs `init-cluster --voters N` to generate the
+//! **cluster root key** (kept offline) and each initial voter's **enrollment
+//! credential** —— this crate's on-disk form = [`NodeBundle`]: the cluster
+//! root public key + this node's identity material (identity/static hybrid
+//! seeds) + the root-signed [`ServerEntry`] (`entry_sig`, the signature over
+//! the public part of the enrollment credential) + the root-signed full
+//! ClusterDirectory. **The root signing key never leaves the operations
+//! side** (bundles contain only root_pub —— the §4-3 red line: a single
+//! compromised on-record server holds no root key).
 //!
-//! `enroll --bundle <file>`：装载并**验证**（目录根验签 + 入群凭证验签 + 一致性比对），
-//! 通过后写入状态目录供 raft 形态起服使用（进程内装配见 tests/multi_primary.rs；
-//! TCP/中转织物随 §6/§7-M5 部署批次接 `flock_sync::wire::Fabric`）。
+//! `enroll --bundle <file>`: load and **verify** (directory root-signature
+//! check + enrollment credential check + consistency comparison), then write
+//! into the state directory for the raft form's startup (the in-process
+//! assembly is in tests/multi_primary.rs; the TCP/relay fabric connects to
+//! `flock_sync::wire::Fabric` with the §6/§7-M5 deployment batches).
 
 use flock_protocol::ed25519_dalek::Signature;
 use flock_protocol::kem::HybridKeypair;
@@ -17,44 +24,48 @@ use flock_protocol::session::{verify_server_entry, ServerEntry, ServerId, Server
 use flock_protocol::trust::ClusterDirectory;
 use serde::{Deserialize, Serialize};
 
-/// 节点捆绑文件（postcard 线/盘格式）。
+/// Node bundle file (postcard wire/disk format).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeBundle {
     pub cluster_id: [u8; 16],
-    /// 集群根公钥（钉扎本体；签名钥在运维侧）。
+    /// Cluster root public key (the pinning subject; the signing key stays
+    /// on the operations side).
     pub root_pub: [u8; 32],
     pub server_id: [u8; 16],
-    /// 本机身份 Ed25519 种子（32B）。
+    /// This node's identity Ed25519 seed (32B).
     pub identity_seed: [u8; 32],
-    /// 本机静态混合密钥（96B，`HybridKeypair::to_bytes`；serde 数组限 32B ⇒ Vec 承载）。
+    /// This node's static hybrid key (96B, `HybridKeypair::to_bytes`; serde
+    /// arrays are capped at 32B ⇒ carried as Vec).
     pub hybrid_sk: Vec<u8>,
-    /// 接入端点（ServerEntry.relay_endpoint）。
+    /// Access endpoint (ServerEntry.relay_endpoint).
     pub endpoint: String,
-    /// 根对本 ServerEntry 的签名（入群凭证；64B ⇒ Vec 承载）。
+    /// Root signature over this ServerEntry (the enrollment credential; 64B
+    /// ⇒ carried as Vec).
     pub entry_sig: Vec<u8>,
-    /// 根签 ClusterDirectory 全文（`ClusterDirectory::to_bytes`）。
+    /// Root-signed full ClusterDirectory (`ClusterDirectory::to_bytes`).
     pub directory: Vec<u8>,
 }
 
 impl NodeBundle {
-    /// 序列化（落盘格式）。
+    /// Serialize (the on-disk format).
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).expect("bundle serialize")
     }
 
-    /// 反序列化。
+    /// Deserialize.
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
         postcard::from_bytes(b).ok()
     }
 
-    /// 还原 [`ServerIdentity`]（entry_sig 重签比对在 [`NodeBundle::verify`]）。
+    /// Restore the [`ServerIdentity`] (the entry_sig re-signature comparison
+    /// is in [`NodeBundle::verify`]).
     pub fn identity(&self) -> Result<ServerIdentity, String> {
         let identity = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&self.identity_seed);
         let hybrid_sk: [u8; 96] = self
             .hybrid_sk
             .clone()
             .try_into()
-            .map_err(|_| "hybrid_sk 长度非法（期望 96B）".to_string())?;
+            .map_err(|_| "invalid hybrid_sk length (expected 96B)".to_string())?;
         let static_hybrid = HybridKeypair::from_bytes(&hybrid_sk).map_err(|e| e.to_string())?;
         let entry = ServerEntry {
             server_id: ServerId(self.server_id),
@@ -74,49 +85,58 @@ impl NodeBundle {
                     .entry_sig
                     .clone()
                     .try_into()
-                    .map_err(|_| "entry_sig 长度非法（期望 64B）".to_string())?,
+                    .map_err(|_| "invalid entry_sig length (expected 64B)".to_string())?,
             ),
         })
     }
 
-    /// 完整验证：根公钥可构 + 根签目录验签 + 入群凭证（entry_sig）验签 + 一致性比对
-    /// （目录含本端点条目、集群标识一致——防拼接「他集群目录 + 本凭证」）。
+    /// Full verification: the root public key constructs + root-signed
+    /// directory signature check + enrollment credential (entry_sig) check +
+    /// consistency comparison (the directory contains this endpoint's entry,
+    /// cluster identity matches —— defends against splicing "another
+    /// cluster's directory + this credential").
     pub fn verify(&self) -> Result<flock_protocol::session::ClusterId, String> {
         let root = root_vk(&self.root_pub)?;
-        let dir =
-            ClusterDirectory::from_bytes(&self.directory).map_err(|e| format!("目录解码: {e}"))?;
+        let dir = ClusterDirectory::from_bytes(&self.directory)
+            .map_err(|e| format!("directory decode: {e}"))?;
         if !dir.verify(&root) {
-            return Err("根签目录验签失败".into());
+            return Err("root-signed directory signature check failed".into());
         }
         if dir.cluster_id.0 != self.cluster_id {
-            return Err("目录集群标识与捆绑不一致".into());
+            return Err("directory cluster identity does not match the bundle".into());
         }
         let ident = self.identity()?;
         if !verify_server_entry(&root, &ident.cluster_id, &ident.entry, &ident.entry_sig) {
-            return Err("入群凭证（根签 ServerEntry）验签失败".into());
+            return Err(
+                "enrollment credential (root-signed ServerEntry) signature check failed".into(),
+            );
         }
         if !dir.servers.iter().any(|e| {
             e.server_id == ident.server_id && e.relay_endpoint == ident.entry.relay_endpoint
         }) {
-            return Err("根签目录不含本节点端点条目".into());
+            return Err("root-signed directory has no entry for this node's endpoint".into());
         }
         Ok(ident.cluster_id)
     }
 
-    /// 根签目录（已验签前提由调用方保证；[`NodeBundle::verify`]）。
+    /// Root-signed directory (the verified precondition is the caller's
+    /// responsibility; [`NodeBundle::verify`]).
     pub fn directory(&self) -> Result<ClusterDirectory, String> {
-        ClusterDirectory::from_bytes(&self.directory).map_err(|e| format!("目录解码: {e}"))
+        ClusterDirectory::from_bytes(&self.directory).map_err(|e| format!("directory decode: {e}"))
     }
 }
 
 fn root_vk(pub32: &[u8; 32]) -> Result<flock_protocol::ed25519_dalek::VerifyingKey, String> {
     flock_protocol::ed25519_dalek::VerifyingKey::from_bytes(pub32)
-        .map_err(|_| "根公钥编码非法".to_string())
+        .map_err(|_| "invalid root public key encoding".to_string())
 }
 
-/// init-cluster 集群材料（内存形态；`bundle()` 逐 voter 取走）。
+/// init-cluster cluster material (in-memory form; `bundle()` takes each
+/// voter's copy away).
 pub struct ClusterMaterial {
-    /// 集群根密钥（**仅运维侧持有**；写盘时 0600 语义由调用方负责，bundle 不含签名钥）。
+    /// Cluster root key (**held by the operations side only**; 0600 disk
+    /// semantics at write time are the caller's responsibility; bundles
+    /// contain no signing key).
     pub root: flock_protocol::ed25519_dalek::SigningKey,
     pub cluster_id: flock_protocol::session::ClusterId,
     idents: Vec<ServerIdentity>,
@@ -124,7 +144,8 @@ pub struct ClusterMaterial {
 }
 
 impl ClusterMaterial {
-    /// 生成 N voter 的集群材料（根密钥 + 各 voter 身份 + 根签目录，§4-1）。
+    /// Generate the cluster material for N voters (root key + per-voter
+    /// identities + root-signed directory, §4-1).
     pub fn generate(
         voters: usize,
         cluster_id: Option<flock_protocol::session::ClusterId>,
@@ -154,7 +175,7 @@ impl ClusterMaterial {
         }
     }
 
-    /// 取第 i 个 voter 的捆绑文件。
+    /// Take voter i's bundle file.
     pub fn bundle(&self, i: usize) -> NodeBundle {
         let ident = &self.idents[i];
         NodeBundle {
@@ -169,14 +190,14 @@ impl ClusterMaterial {
         }
     }
 
-    /// 根签目录。
+    /// The root-signed directory.
     pub fn directory(&self) -> &ClusterDirectory {
         &self.directory
     }
 }
 
-/// voter i 的确定性 ServerId（前 8B = 大端 i+1——与 flock_sync::node_id_of 同映射，
-/// openraft NodeId = i+1）。
+/// The deterministic ServerId of voter i (first 8B = big-endian i+1 —— the
+/// same mapping as flock_sync::node_id_of; openraft NodeId = i+1).
 pub fn voter_server_id(i: usize) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&((i + 1) as u64).to_be_bytes());
@@ -194,15 +215,18 @@ mod tests {
         let bytes = bundle.to_bytes();
         let back = NodeBundle::from_bytes(&bytes).expect("roundtrip");
         assert_eq!(back, bundle);
-        // 验证通过 + 身份还原一致。
+        // Verification passes + the restored identity matches.
         assert_eq!(back.verify().unwrap(), m.cluster_id);
         let ident = back.identity().unwrap();
         assert_eq!(ident.server_id.0, voter_server_id(1));
-        // 篡改端点 ⇒ 入群凭证验签失败。
+        // Tampered endpoint ⇒ enrollment credential check fails.
         let mut tampered = back.clone();
         tampered.endpoint = "evil.test:9".into();
-        assert!(tampered.verify().is_err(), "端点被改 ⇒ entry_sig 验签失败");
-        // 换目录（他集群）⇒ 拒。
+        assert!(
+            tampered.verify().is_err(),
+            "endpoint changed ⇒ entry_sig check fails"
+        );
+        // Swapped directory (another cluster) ⇒ rejected.
         let other = ClusterMaterial::generate(2, None, |i| format!("x-{i}:1"));
         let mut mixed = back.clone();
         mixed.directory = other.directory().to_bytes();

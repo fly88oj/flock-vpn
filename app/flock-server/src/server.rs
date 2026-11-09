@@ -1,11 +1,15 @@
-//! 服务端装配核心（docs/design.md §2.2/§3.11）。
+//! Server assembly core (docs/design.md §2.2/§3.11).
 //!
-//! 职责链：接入（每入连一个 E2E 会话，`session::respond` + redb NetState 目录适配器）→
-//! 认证（控制流 OPAQUE 登录 + anchor）→ 注册表（NetState）→ 会话（票据/杀会话）→
-//! （M4：转发/同步）。
+//! Responsibility chain: access (one E2E session per inbound connection,
+//! `session::respond` + the redb NetState directory adapter) →
+//! authentication (control-flow OPAQUE login + anchor) → registry
+//! (NetState) → sessions (tickets/kill sessions) → (M4:
+//! forwarding/sync).
 //!
-//! 吊销传播界（§2.2，单机形态）：revoke 在**同一进程内**推进 revocation_epoch + 杀本地该
-//! 设备会话（[`LiveSessions::kill`]）；「票据 epoch < 当前 epoch 即拒」兜住跨连接重放。
+//! Revocation propagation bound (§2.2, single-machine form): revoke
+//! advances the revocation_epoch **inside the same process** + kills that
+//! device's local sessions ([`LiveSessions::kill`]); "ticket epoch <
+//! current epoch ⇒ reject" backstops cross-connection replay.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
@@ -30,7 +34,8 @@ use crate::dataplane::PeerRouter;
 use crate::netstate::{DirAdapter, StateStore};
 use crate::ticket::TicketIssuer;
 
-/// META 键（集群身份材料 + 票据根种子；bootstrap 一次写入）。
+/// META keys (cluster identity material + ticket root seed; a one-time
+/// bootstrap write).
 mod keys {
     pub const ROOT_SEED: &str = "root_seed";
     pub const IDENTITY_SEED: &str = "identity_seed";
@@ -41,33 +46,39 @@ mod keys {
     pub const TICKET_SEED: &str = "ticket_seed";
 }
 
-/// 会话层 keepalive（记录层 PING/PONG 周期；flock-protocol session::KEEPALIVE = 10s）。
+/// Session-layer keepalive (the record-layer PING/PONG period;
+/// flock-protocol session::KEEPALIVE = 10s).
 const KEEPALIVE: std::time::Duration = flock_protocol::session::KEEPALIVE;
-/// E2E 握手预算（评审项 8）：超时归类拒绝。
+/// E2E handshake budget (review item 8): a timeout is rejected as a class.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// TCP keepalive（尽力而为——失败仅少一层死链探测，不影响功能）。
+/// TCP keepalive (best-effort —— failure only loses one layer of dead-link
+/// detection, no functional impact).
 fn set_tcp_keepalive(io: &TcpStream) {
     let sock = socket2::SockRef::from(io);
     let ka = socket2::TcpKeepalive::new().with_time(KEEPALIVE);
-    // 探测间隔对齐会话层 keepalive（10s）；探测次数用内核缺省。
+    // Probe interval aligned with the session-layer keepalive (10s); probe
+    // count uses the kernel default.
     #[cfg(any(unix, windows))]
     let ka = ka.with_interval(KEEPALIVE);
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
-/// 每设备本地会话表（吊销即杀，§2.2 apply 回调语义的单机对应物）。
+/// Per-device local session table (kill on revocation, the single-machine
+/// counterpart of the §2.2 apply-callback semantics).
 ///
-/// kill 经 `watch` 广播（保留状态，注册/通知竞态下不丢事件）；会话任务在
-/// `serve_conn` 的 select 臂消费它并拆隧道。
+/// kill broadcasts via `watch` (state retained; no events lost in
+/// register/notify races); the session task consumes it in a `serve_conn`
+/// select arm and tears down the tunnel.
 #[derive(Default)]
 pub struct LiveSessions {
     inner: Mutex<std::collections::HashMap<[u8; 32], Vec<tokio::sync::watch::Sender<bool>>>>,
 }
 
 impl LiveSessions {
-    /// 登记（会话任务）；`pub`——M7 名册单测与 M8 webui 集成测试驱动「在线」态
-    ///（serve_conn 之外的登记面只服务测试）。
+    /// Register (the session task); `pub` —— the M7 roster unit tests and
+    /// the M8 webui integration tests drive the "online" state (the only
+    /// registration surface outside serve_conn serves tests).
     pub fn register(&self, device: [u8; 32]) -> tokio::sync::watch::Receiver<bool> {
         let (tx, rx) = tokio::sync::watch::channel(false);
         self.inner
@@ -89,7 +100,8 @@ impl LiveSessions {
         }
     }
 
-    /// 杀死该设备全部本地会话（revoke/disable 后由控制流/admin 调用）。
+    /// Kill all local sessions of this device (called by the control
+    /// flow/admin after revoke/disable).
     pub fn kill(&self, device: &[u8; 32]) {
         if let Some(senders) = self
             .inner
@@ -103,7 +115,7 @@ impl LiveSessions {
         }
     }
 
-    /// 在线设备会话数（诊断/测试）。
+    /// Online session count of a device (diagnostics/tests).
     pub fn online(&self, device: &[u8; 32]) -> usize {
         self.inner
             .lock()
@@ -113,17 +125,21 @@ impl LiveSessions {
             .unwrap_or(0)
     }
 
-    /// 在线设备数（M5 断言面：admin stats 的 sessions_online）。
+    /// Number of online devices (the M5 assertion surface: admin stats'
+    /// sessions_online).
     pub fn device_count(&self) -> usize {
         self.inner.lock().expect("live sessions poisoned").len()
     }
 }
 
-/// 多主 apply/租约钩子（§2.2 吊销传播界 + vpn-mesh §5.2 租约冲突）。
+/// Multi-primary apply/lease hooks (the §2.2 revocation propagation bound +
+/// vpn-mesh §5.2 lease conflicts).
 ///
-/// 每台服务器在**自己的日志 apply 现场**触发：(a) 杀死本地该设备会话（watch 广播 →
-/// serve_conn 拆隧道）；(b) 票据清拒由「票据 epoch < 当前 epoch 即拒」承担（TicketAuthority
-/// 以本机 apply 后的 epoch 校验）。
+/// Each server triggers them **at its own log apply site**: (a) kill the
+/// device's local sessions (watch broadcast → serve_conn tears down the
+/// tunnel); (b) ticket rejection is carried by "ticket epoch < current
+/// epoch ⇒ reject" (TicketAuthority verifies against the locally-applied
+/// epoch).
 #[cfg(feature = "multi-primary")]
 struct ServerSyncHooks {
     sessions: Arc<LiveSessions>,
@@ -141,26 +157,33 @@ impl flock_sync::hooks::SyncHooks for ServerSyncHooks {
         self.node.detach_session(&ev.device);
     }
     fn on_lease_evicted(&self, device: &[u8; 32]) {
-        // 租约冲突新者胜（设备已迁往他机）：旧端踢出（§3.10 LeaseTable）。
+        // Lease conflict, newest wins (the device has moved to another
+        // server): the old end is kicked (§3.10 LeaseTable).
         eprintln!("flock-server: lease evicted (device moved) killing local session");
         self.sessions.kill(device);
     }
 }
 
 // ============================================================================
-// OPRF key 逐服务器封装（评审项 2：design §2.4「加密封装到各服务器混合公钥」）
+// OPRF key per-server sealing (review item 2: design §2.4 "encrypt-sealed
+// to each server's hybrid public key")
 // ============================================================================
 
-/// `open_sync` transient 错误前缀（sync.rs 的就绪重试循环据此区分「未就绪可重试」
-/// 与「永久错误立即上抛」）。
+/// The transient-error prefix of `open_sync` (sync.rs's ready-retry loop
+/// distinguishes "not ready, retryable" from "permanent error, propagate
+/// now" by it).
 #[cfg(feature = "multi-primary")]
-pub const SYNC_NOT_READY_PREFIX: &str = "集群未就绪：";
+pub const SYNC_NOT_READY_PREFIX: &str = "cluster not ready: ";
 
-/// 把 OPRF key（b64 ServerSetup）以 envelope v2 密封到一台服务器的混合公钥。
+/// Seal the OPRF key (a b64 ServerSetup) to one server's hybrid public key
+/// with envelope v2.
 ///
-/// 产物即 `AdminOp::Rewrap { server_id, wrapped }` 的 `wrapped`——Raft 状态机只存
-/// 封装字节（明文不出现在任何持久层）；收件人服务器的 `server_keys` 登记与
-/// rewrap 提交均需集群根密钥签名（§4-3 红线：被入侵的单台无法自授/重封）。
+/// The product is the `wrapped` of `AdminOp::Rewrap { server_id, wrapped }`
+/// —— the Raft state machine stores only the sealed bytes (the plaintext
+/// never appears in any persistent layer); both the recipient server's
+/// `server_keys` registration and the rewrap submission require the cluster
+/// root key's signature (the §4-3 red line: a single compromised server
+/// cannot self-grant or re-seal).
 #[cfg(feature = "multi-primary")]
 pub fn seal_oprf_wrap(
     oprf_b64: &str,
@@ -176,8 +199,10 @@ pub fn seal_oprf_wrap(
     Ok(sealed)
 }
 
-/// [`seal_oprf_wrap`] 的逆：本机 hybrid sk 解封取出 OPRF b64（仅内存使用）。
-/// 错误 = 收件人不匹配/封装损坏/明文非 UTF-8——对服务器即「OPAQUE 不可用」。
+/// The inverse of [`seal_oprf_wrap`]: unseal with the local hybrid sk to
+/// retrieve the OPRF b64 (in-memory use only). An error = recipient
+/// mismatch / corrupted seal / plaintext not UTF-8 —— for the server that
+/// means "OPAQUE unavailable".
 #[cfg(feature = "multi-primary")]
 pub fn open_oprf_wrap(
     sk: &flock_protocol::kem::HybridKeypair,
@@ -186,50 +211,67 @@ pub fn open_oprf_wrap(
     let mut plain = Vec::new();
     flock_protocol::envelope::open_v2(sk, std::io::Cursor::new(wrapped), &mut plain)
         .map_err(|e| format!("envelope open: {e}"))?;
-    String::from_utf8(plain).map_err(|_| "oprf 明文非 UTF-8".to_string())
+    String::from_utf8(plain).map_err(|_| "oprf plaintext is not UTF-8".to_string())
 }
 
-/// 服务端核心（装配期构建；Arc 共享给 accept/admin 任务）。
+/// The server core (built at assembly time; Arc-shared with the accept/admin
+/// tasks).
 pub struct ServerCore {
     pub cfg: ServerConfig,
-    /// 写读后端（§2.2/§3.11）：Single = 本地 redb（M2 形态）；Sync = flock-sync Raft
-    /// （feature `multi-primary`——写转发 leader / 线性一致读 / 两级读目录）。
+    /// The read/write backend (§2.2/§3.11): Single = local redb (the M2
+    /// form); Sync = flock-sync Raft (feature `multi-primary` ——
+    /// leader-forwarding writes / linearizable reads / two-level-read
+    /// directory).
     pub net: NetBackend,
-    /// 集群根密钥签名钥（单服 = 库内根；多主 = **None**——根密钥离线保管，目录/邀请
-    /// 签发走运维侧 init-cluster 流程，服务器只持 root_pub）。
+    /// Cluster root signing key (single server = the in-store root;
+    /// multi-primary = **None** —— the root key is kept offline, directory/
+    /// invite issuance goes through the operations-side init-cluster flow,
+    /// servers hold only root_pub).
     pub root: Option<SigningKey>,
     pub identity: ServerIdentity,
-    /// OPAQUE 服务端 OPRF key（§2.4：常驻；轮换使全部 pass.opaque 失效。
-    /// 多主形态 = Raft 内共享（SetOprf 根签登记）——OPAQUE 记录全网可验）。
+    /// The OPAQUE server-side OPRF key (§2.4: resident; rotation voids all
+    /// pass.opaque. Multi-primary form = shared inside Raft (SetOprf
+    /// root-signed registration) —— OPAQUE records verifiable
+    /// network-wide).
     pub oprf: flock_protocol::opaque_ke::ServerSetup<Suite>,
-    /// 票据权威（Local = 状态库种子；Sync = Raft 内票据根，任何服务器都验得了）。
+    /// Ticket authority (Local = the state-store seed; Sync = the ticket
+    /// root inside Raft, verifiable by any server).
     pub guard: CtrlGuard,
-    /// 本地会话表（Arc：SyncHooks 装配侧共享——apply 回调杀会话/租约冲突踢出）。
+    /// Local session table (Arc: shared with the SyncHooks assembly side ——
+    /// apply-callback session kills / lease-conflict kicks).
     pub sessions: Arc<LiveSessions>,
-    /// M7：单服形态流量计（per-VIP EWMA/last_seen——名册数据源；多主形态走租约表，
-    /// 此计仅服务单服 PeerRouter 计数）。1s tick 由 [`run`] 装配的任务驱动。
+    /// M7: the single-server traffic meter (per-VIP EWMA/last_seen —— the
+    /// roster data source; multi-primary uses the lease table, this meter
+    /// serves only single-server PeerRouter counting). The 1s tick is driven
+    /// by the task assembled in [`run`].
     pub traffic: Arc<flock_sync::lease::TrafficMeter>,
-    /// 多主同步节点（feature `multi-primary`；单服 = None）。
+    /// Multi-primary sync node (feature `multi-primary`; single-server =
+    /// None).
     #[cfg(feature = "multi-primary")]
     pub sync: Option<Arc<flock_sync::SyncNode>>,
-    /// M3 数据面路由器（run() 装配 tun 后注入；None = 控制流-only——宿主测试路径）。
+    /// M3 data-plane router (injected by run() after assembling the tun;
+    /// None = control-flow-only —— the host-test path).
     router: RwLock<Option<Arc<PeerRouter>>>,
 }
 
 impl ServerCore {
-    /// 当前数据面路由器（未装配 ⇒ None）。
+    /// The current data-plane router (unassembled ⇒ None).
     pub fn router(&self) -> Option<Arc<PeerRouter>> {
         self.router.read().expect("router lock poisoned").clone()
     }
 
-    /// 装配数据面（tun + 路由；失败在 [`PeerRouter::open`] 内降级并记日志）。
+    /// Assemble the data plane (tun + routes; a failure degrades and logs
+    /// inside [`PeerRouter::open`]).
     pub fn set_router(&self, router: Arc<PeerRouter>) {
         *self.router.write().expect("router lock poisoned") = Some(router);
     }
 
-    /// 吊销-register 竞态的注册后准入（评审项 5）：`sessions.register` 之后的二次
-    /// directory 判定——`respond` 的首次 lookup 与 register 之间存在毫秒级窗口，
-    /// revoke 落在窗口内时 kill 广播 miss，本判定兜底拆连接。false ⇒ 调用方拆隧道。
+    /// Post-registration admission for the revoke-register race (review
+    /// item 5): a second directory verdict after `sessions.register` ——
+    /// there is a millisecond-scale window between `respond`'s first lookup
+    /// and the register; when a revoke lands inside the window the kill
+    /// broadcast misses, and this verdict backstops by tearing down the
+    /// connection. false ⇒ the caller tears down the tunnel.
     pub async fn post_register_admission(&self, device: &DeviceId) -> bool {
         matches!(
             self.net.lookup(device).await,
@@ -239,19 +281,24 @@ impl ServerCore {
 }
 
 impl ServerCore {
-    /// 打开既有状态或引导新集群（`init-cluster` 语义；已初始化则原样加载）。
-    /// 返回 `(core, created)`。
+    /// Open the existing state or bootstrap a new cluster
+    /// (`init-cluster` semantics; already initialized loads as-is). Returns
+    /// `(core, created)`.
     pub fn open_or_init(cfg: ServerConfig) -> Result<(Arc<Self>, bool), String> {
-        // 单服形态 VIP 校验（server_vip_of 一致性面的另一半）：cfg.vip 不得落入设备
-        // 分配段（VIP_FIRST..=VIP_LAST）——服务器自身 VIP 与设备池撞段 ⇒ 首台设备注册
-        // 即同 IP，路由/名册/源 VIP 校验全体错位。服务器自身用 100.64.0.1（§2.2）。
+        // Single-server VIP validation (the other half of the
+        // server_vip_of consistency surface): cfg.vip must not fall inside
+        // the device allocation segment (VIP_FIRST..=VIP_LAST) —— the
+        // server's own VIP colliding with the device pool means the first
+        // device registration gets the same IP, misaligning routing/roster/
+        // source VIP validation wholesale. The server itself uses
+        // 100.64.0.1 (§2.2).
         let vip_u32 = u32::from(cfg.vip);
         if (crate::netstate::VIP_FIRST..=crate::netstate::VIP_LAST).contains(&vip_u32) {
             let lo = std::net::Ipv4Addr::from(crate::netstate::VIP_FIRST);
             let hi = std::net::Ipv4Addr::from(crate::netstate::VIP_LAST);
             return Err(format!(
-                "cfg.vip {} 落入设备分配段 {lo}..={hi}（VIP_FIRST..=VIP_LAST）——\
-                 服务器自身 VIP 与设备池撞段即冲突，拒绝起服（服务器自身用 100.64.0.1）",
+                "cfg.vip {} falls inside the device allocation segment {lo}..={hi} (VIP_FIRST..=VIP_LAST) - \
+                 the server's own VIP colliding with the device pool is a conflict; refusing to start (the server itself uses 100.64.0.1)",
                 cfg.vip
             ));
         }
@@ -260,7 +307,7 @@ impl ServerCore {
         let created = store.meta_get(keys::CLUSTER_ID).is_none();
 
         let cluster_id: ClusterId = match store.meta_get(keys::CLUSTER_ID) {
-            Some(b) => ClusterId(b.try_into().map_err(|_| "cluster_id 长度")?),
+            Some(b) => ClusterId(b.try_into().map_err(|_| "cluster_id length")?),
             None => {
                 let v: [u8; 16] = rand::random();
                 store
@@ -270,7 +317,7 @@ impl ServerCore {
             }
         };
         let server_id: ServerId = match store.meta_get(keys::SERVER_ID) {
-            Some(b) => ServerId(b.try_into().map_err(|_| "server_id 长度")?),
+            Some(b) => ServerId(b.try_into().map_err(|_| "server_id length")?),
             None => {
                 let v: [u8; 16] = rand::random();
                 store
@@ -280,7 +327,7 @@ impl ServerCore {
             }
         };
         let root = match store.meta_get(keys::ROOT_SEED) {
-            Some(b) => SigningKey::from_bytes(&b.try_into().map_err(|_| "root_seed 长度")?),
+            Some(b) => SigningKey::from_bytes(&b.try_into().map_err(|_| "root_seed length")?),
             None => {
                 let seed: [u8; 32] = rand::random();
                 store
@@ -290,7 +337,7 @@ impl ServerCore {
             }
         };
         let identity = match store.meta_get(keys::IDENTITY_SEED) {
-            Some(b) => SigningKey::from_bytes(&b.try_into().map_err(|_| "identity_seed 长度")?),
+            Some(b) => SigningKey::from_bytes(&b.try_into().map_err(|_| "identity_seed length")?),
             None => {
                 let seed: [u8; 32] = rand::random();
                 store
@@ -301,7 +348,7 @@ impl ServerCore {
         };
         let static_hybrid = match store.meta_get(keys::HYBRID_SK) {
             Some(b) => {
-                let sk: [u8; 96] = b.try_into().map_err(|_| "hybrid_sk 长度")?;
+                let sk: [u8; 96] = b.try_into().map_err(|_| "hybrid_sk length")?;
                 HybridKeypair::from_bytes(&sk).map_err(|e| e.to_string())?
             }
             None => {
@@ -314,7 +361,7 @@ impl ServerCore {
         };
         let oprf = match store.meta_get(keys::OPRF_B64) {
             Some(b) => {
-                let s = String::from_utf8(b).map_err(|_| "oprf_b64 编码")?;
+                let s = String::from_utf8(b).map_err(|_| "oprf_b64 encoding")?;
                 server_setup_load(&s).map_err(|e| format!("oprf key: {e}"))?
             }
             None => {
@@ -326,7 +373,7 @@ impl ServerCore {
             }
         };
         let ticket_seed: [u8; 32] = match store.meta_get(keys::TICKET_SEED) {
-            Some(b) => b.try_into().map_err(|_| "ticket_seed 长度")?,
+            Some(b) => b.try_into().map_err(|_| "ticket_seed length")?,
             None => {
                 let s = TicketIssuer::generate_seed();
                 store
@@ -336,7 +383,8 @@ impl ServerCore {
             }
         };
 
-        // ServerEntry（advertise 端点；root 重签 entry_sig——根密钥在库，确定性重建）。
+        // ServerEntry (the advertise endpoint; the root re-signs entry_sig
+        // —— the root key is in-store, deterministic reconstruction).
         let entry = ServerEntry {
             server_id,
             relay_endpoint: cfg.advertise_endpoint.clone(),
@@ -371,19 +419,25 @@ impl ServerCore {
         Ok((Arc::new(core), created))
     }
 
-    /// 多主装配（feature `multi-primary`；§2.2/§3.11 M4 批次）。
+    /// Multi-primary assembly (feature `multi-primary`; the §2.2/§3.11 M4
+    /// batch).
     ///
-    /// - 目录 = `session::respond` 注入 [`flock_sync::SyncNode::device_directory`]
-    ///   （两级读：记录缓存 + epoch + apply-lag 熔断降级线性一致读，§4）；
-    /// - 票据根 = Raft 状态内（Bootstrap 落库）；
-    /// - OPRF key = **逐服务器封装在 Raft 状态内**（§2.4「加密封装到各服务器混合
-    ///   公钥」——envelope v2 seal 到每台在册服务器，状态机只存 wraps（AdminOp::
-    ///   Rewrap）；本机启动时用自己的 hybrid sk 解封进内存，解封失败 ⇒ OPAQUE 不可
-    ///   用并明确报错，评审项 2）；
-    /// - 吊销/租约冲突经 [`flock_sync::hooks::SyncHooks`] 在 apply 现场杀本地会话（§2.2）。
+    /// - Directory = [`flock_sync::SyncNode::device_directory`] injected
+    ///   into `session::respond` (two-level read: record cache + epoch +
+    ///   apply-lag breaker degrading to linearizable reads, §4);
+    /// - Ticket root = inside Raft state (Bootstrap persists it);
+    /// - OPRF key = **sealed per server inside Raft state** (§2.4
+    ///   "encrypt-sealed to each server's hybrid public key" —— envelope
+    ///   v2 sealed to every on-record server, the state machine stores only
+    ///   wraps (AdminOp::Rewrap); at startup this node unseals into memory
+    ///   with its own hybrid sk, an unsealing failure ⇒ OPAQUE unavailable
+    ///   with an explicit error, review item 2);
+    /// - Revocations/lease conflicts kill local sessions at the apply site
+    ///   via [`flock_sync::hooks::SyncHooks`] (§2.2).
     ///
-    /// 前置：集群已 Bootstrap + ServerKeys 登记 + 本服务器的 Rewrap 落库——
-    /// `cluster-bootstrap`（根密钥侧）或装配方（tests/multi_primary.rs）完成。
+    /// Preconditions: the cluster has Bootstrap + ServerKeys registered +
+    /// this server's Rewrap persisted —— done by `cluster-bootstrap` (the
+    /// root-key side) or the assembling side (tests/multi_primary.rs).
     #[cfg(feature = "multi-primary")]
     pub async fn open_sync(
         cfg: ServerConfig,
@@ -393,9 +447,11 @@ impl ServerCore {
         Self::open_sync_with_wait(cfg, ident, node, std::time::Duration::from_secs(15)).await
     }
 
-    /// [`ServerCore::open_sync`] 的可调等待窗变体（测试用短窗验证「无 wrap 明确失败」；
-    /// 错误约定：transient 错误以 [`SYNC_NOT_READY_PREFIX`] 起头——sync.rs 的重试循环
-    /// 只重试该类，永久错误（wrap 解封失败等）立即上抛）。
+    /// The adjustable-wait variant of [`ServerCore::open_sync`] (tests use
+    /// a short window to verify "no wrap ⇒ explicit failure"; error
+    /// convention: transient errors start with [`SYNC_NOT_READY_PREFIX`] ——
+    /// the sync.rs retry loop retries only that class, permanent errors
+    /// (wrap unsealing failures etc.) propagate immediately).
     #[cfg(feature = "multi-primary")]
     pub async fn open_sync_with_wait(
         cfg: ServerConfig,
@@ -403,33 +459,40 @@ impl ServerCore {
         node: Arc<flock_sync::SyncNode>,
         wait: std::time::Duration,
     ) -> Result<Arc<Self>, String> {
-        // 本机 node_id（wrap 的键 = node_id_of(server_id)——与 ServerKeys/Rewrap 同键）。
+        // This node's node_id (the wrap's key = node_id_of(server_id) —— the
+        // same key as ServerKeys/Rewrap).
         let my_node = flock_sync::node::node_id_of(&ident.server_id);
-        // server_vip_of 一致性断言（§6.2 服务器段 .1–.10 确定性推导）：cfg.vip 必须等于
-        // 本机 node_id 的推导值——根签 ServerKeys 登记与名册 Server 条目均按推导值，
-        // 配置漂移会造成「登记 VIP ≠ 本机实配 VIP」的路由/名册错位。不匹配 ⇒ 拒起，
-        // 错误给出期望值（永久错误——非 SYNC_NOT_READY 前缀，就绪重试循环不吞它）。
+        // server_vip_of consistency assertion (the §6.2 server segment .1–
+        // .10 deterministic derivation): cfg.vip must equal the derived
+        // value for this node_id —— both the root-signed ServerKeys
+        // registration and the roster Server entries use the derived value,
+        // and configuration drift would misalign routing/rosters as
+        // "registered VIP ≠ locally configured VIP". Mismatch ⇒ refuse to
+        // start, the error names the expected value (a permanent error ——
+        // not the SYNC_NOT_READY prefix; the ready-retry loop must not
+        // swallow it).
         match flock_sync::proto::server_vip_of(my_node) {
             Some(expected) if expected == cfg.vip.octets() => {}
             Some(expected) => {
                 let want = std::net::Ipv4Addr::from(expected);
                 return Err(format!(
-                    "cfg.vip {my_vip} 与 node {my_node} 的确定性服务器 VIP {want} 不一致\
-                     （§6.2 服务器段 .1–.10——ServerKeys 登记与名册 Server 条目均按推导值）\
-                     ——拒绝起服，请把 vip 改为 {want}",
+                    "cfg.vip {my_vip} does not match the deterministic server VIP {want} of node {my_node} \
+                     (the §6.2 server segment .1–.10 — ServerKeys registration and the roster Server entries both use the derived value) \
+                     — refusing to start; change vip to {want}",
                     my_vip = cfg.vip
                 ));
             }
             None => {
                 return Err(format!(
-                    "node_id {my_node} 超出服务器 VIP 保留段（1..=10）——无法推导服务器 \
-                     VIP（server_vip_of），拒绝起服"
+                    "node_id {my_node} is outside the reserved server VIP segment (1..=10) - no server VIP can be derived \
+                     (server_vip_of); refusing to start"
                 ));
             }
         }
-        // 等本服务器的 OPRF 封装在本节点 apply（Bootstrap → ServerKeys → Rewrap 的提交
-        // 序 ⇒ wrap 可见蕴含 Bootstrap/票据根就位）。能力经 SyncNode 白名单方法
-        // （评审项 13）。
+        // Wait for this server's OPRF wrap to apply on this node (the
+        // Bootstrap → ServerKeys → Rewrap submission order ⇒ wrap visibility
+        // implies Bootstrap/ticket-root readiness). Capabilities go through
+        // SyncNode whitelisted methods (review item 13).
         let deadline = std::time::Instant::now() + wait;
         let wrapped = loop {
             if let Some(w) = node.local_wrap(my_node) {
@@ -437,22 +500,24 @@ impl ServerCore {
             }
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
-                    "{SYNC_NOT_READY_PREFIX}{wait:?} 内未见本服务器（node {my_node}）的 \
-                     OPRF 封装（AdminOp::Rewrap 未在本节点 apply——cluster-bootstrap 需以 \
-                     ServerKeys 登记各服务器混合公钥并逐台 rewrap）"
+                    "{SYNC_NOT_READY_PREFIX}no OPRF wrap for this server (node {my_node}) seen within {wait:?} \
+                     (AdminOp::Rewrap not applied on this node — cluster-bootstrap must register each server's \
+                     hybrid public key via ServerKeys and rewrap them one by one)"
                 ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
-        // 用本机 hybrid sk 解封（评审项 2：明文只在内存——不落 Raft 状态/状态库）。
+        // Unseal with the local hybrid sk (review item 2: the plaintext
+        // lives only in memory —— never persisted into Raft state/the state
+        // store).
         let oprf_b64 = open_oprf_wrap(&ident.static_hybrid, &wrapped).map_err(|e| {
             format!(
-                "OPRF 封装解封失败（本机 hybrid 私钥与 wrap 不匹配或封装损坏）——\
-                 OPAQUE 不可用: {e}"
+                "OPRF wrap unsealing failed (local hybrid private key does not match the wrap, or the seal is corrupted) - \
+                 OPAQUE unavailable: {e}"
             )
         })?;
         let oprf = flock_protocol::pake::server_setup_load(&oprf_b64)
-            .map_err(|e| format!("集群 OPRF key: {e}"))?;
+            .map_err(|e| format!("cluster OPRF key: {e}"))?;
         let sessions = Arc::new(LiveSessions::default());
         node.register_hook(Arc::new(ServerSyncHooks {
             sessions: sessions.clone(),
@@ -488,10 +553,13 @@ impl ServerCore {
         Ok(Arc::new(core))
     }
 
-    /// 根签集群目录。
+    /// The root-signed cluster directory.
     ///
-    /// - 单服：现签（advertise + extras——同一服务器的其他暴露口；根密钥在库）；
-    /// - 多主：**已安装的根签目录**（init-cluster 全网分发；服务器不持根密钥，不可自签）。
+    /// - Single server: signed now (advertise + extras —— the same server's
+    ///   other exposure openings; the root key is in-store);
+    /// - Multi-primary: **the installed root-signed directory**
+    ///   (network-wide distribution by init-cluster; the server holds no
+    ///   root key and cannot self-sign).
     pub fn build_directory(&self) -> ClusterDirectory {
         #[cfg(feature = "multi-primary")]
         if let Some(node) = &self.sync {
@@ -502,7 +570,7 @@ impl ServerCore {
         self.local_directory()
     }
 
-    /// 单服形态的现签目录。
+    /// The freshly-signed directory of the single-server form.
     fn local_directory(&self) -> ClusterDirectory {
         let mut servers = vec![self.identity.entry.clone()];
         for ep in &self.cfg.extra_endpoints {
@@ -516,7 +584,7 @@ impl ServerCore {
         let root = self
             .root
             .as_ref()
-            .expect("单服形态根密钥在库（多主形态经已安装目录返回）");
+            .expect("single-server form keeps the root key in-store (multi-primary returns via the installed directory)");
         ClusterDirectory::issue(
             root,
             self.identity.cluster_id,
@@ -525,13 +593,15 @@ impl ServerCore {
         )
     }
 
-    /// 签发邀请（admin 路径；§1.3.3f 邀请生成 = 根密钥语境的管理操作）。
+    /// Mint an invite (the admin path; §1.3.3f invite generation = an admin
+    /// operation in the root-key context).
     ///
-    /// 多主形态服务器**不持根密钥** ⇒ 拒绝（签发走运维侧 init-cluster 流程）；
-    /// 邀请登记（Raft RecordInvite）仍可经 NetBackend 完成。
+    /// Multi-primary servers **hold no root key** ⇒ rejected (issuance goes
+    /// through the operations-side init-cluster flow); invite registration
+    /// (Raft RecordInvite) can still be done through the NetBackend.
     pub async fn mint_invite(&self, ttl_secs: u64) -> Result<Vec<u8>, String> {
         let Some(root) = &self.root else {
-            return Err("多主形态邀请签发需集群根密钥（运维侧 init-cluster 产物）".into());
+            return Err("invite minting in multi-primary form requires the cluster root key (an operations-side init-cluster product)".into());
         };
         let invite_id: [u8; 16] = rand::random();
         let expiry = flock_protocol::trust::now_unix() + ttl_secs;
@@ -551,21 +621,31 @@ impl ServerCore {
         Ok(inv.to_bytes())
     }
 
-    /// 单条入连：E2E 握手（respond）→ 会话登记（可被吊销信号杀）→ 流分派。
+    /// One inbound connection: E2E handshake (respond) → session
+    /// registration (killable by revocation signals) → stream dispatch.
     ///
-    /// 流分派（M3）：**首条**被接受的 yamux 流 = 控制流（M2 语义不变，客户端
-    /// initiate 后先 `open_stream(Prio::Control)`——排序契约见 flock-client
-    /// connector）；余流 = 数据面包通道（[`PeerRouter::serve_stream`]）。
+    /// Stream dispatch (M3): the **first** accepted yamux stream = the
+    /// control flow (M2 semantics unchanged; the client, after initiate,
+    /// first calls `open_stream(Prio::Control)` —— the ordering contract is
+    /// in the flock-client connector); the remaining streams = data-plane
+    /// packet channels ([`PeerRouter::serve_stream`]).
     pub async fn serve_conn(self: Arc<Self>, io: TcpStream) {
-        // TCP keepalive（评审项 8）：接受连接即设置——间隔对齐会话层 keepalive
-        // （10s）。会话层的 PING/PONG 只能发现「双方都在发」的静默；对端整机死机/
-        // NAT 表项过期场景下，本端记录层发送不报错、对端无回包，需 TCP keepalive
-        // 让内核在 3×interval 无 ACK 时报错拆链，死链才不至于占住会话槽位。
+        // TCP keepalive (review item 8): set right after accepting —— the
+        // interval aligned with the session-layer keepalive (10s). The
+        // session layer's PING/PONG can only detect silence when "both sides
+        // are sending"; when the peer machine dies outright or the NAT table
+        // entry expires, this end's record-layer sends report no error while
+        // the peer sends nothing back —— TCP keepalive lets the kernel error
+        // out the link after 3×interval without ACK, so dead links do not
+        // hold session slots.
         set_tcp_keepalive(&io);
-        // respond 的目录注入分派：Single = redb 适配器；Sync = flock-sync 两级读
-        // （缓存 + epoch + apply-lag 熔断降级线性一致读，§4——本批次的接入点）。
-        // 外包 10s 握手预算（评审项 8）：超时归类拒绝——半开的沉默连接不得占用
-        // 会话许可与线程面（与协议拒绝同一日志/行为面）。
+        // respond's directory-injection dispatch: Single = the redb adapter;
+        // Sync = flock-sync's two-level read (cache + epoch + apply-lag
+        // breaker degrading to linearizable reads, §4 —— this batch's hookup
+        // point). Wrapped in a 10s handshake budget (review item 8): a
+        // timeout is rejected as a class —— a silently half-open connection
+        // must not occupy session permits or thread surfaces (the same
+        // log/behavior surface as protocol rejections).
         let handshake = match tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
             match &self.net {
                 NetBackend::Single(store) => {
@@ -608,9 +688,13 @@ impl ServerCore {
             return;
         };
         let mut kill = self.sessions.register(device.0);
-        // 吊销-register 竞态闭合（评审项 5）：respond 的目录 lookup 与此处 register 之间
-        // 存在毫秒级窗口——revoke 恰好落在窗口内时 kill 广播先于 register 发生（miss），
-        // 旧实现会话静默存活。register 之后立即二次 lookup，非 Active 即拆连接。
+        // Revoke-register race closure (review item 5): there is a
+        // millisecond-scale window between respond's directory lookup and
+        // the register here —— when a revoke lands exactly inside the
+        // window the kill broadcast happens before the register (missed),
+        // and the old implementation let the session survive silently. A
+        // second lookup right after the register tears down the connection
+        // unless Active.
         if !self.post_register_admission(&device).await {
             eprintln!(
                 "flock-server: device not Active after session register \
@@ -620,10 +704,13 @@ impl ServerCore {
             tunnel.shutdown().await;
             return;
         }
-        // 该会话设备的注册行（VIP = 数据面源校验/路由键；查不到 ⇒ 仅控制流）。
+        // This session device's registration row (the VIP = the data-plane
+        // source-check/routing key; not found ⇒ control flow only).
         let device_row = self.net.device_row(&device).await;
         let device_vip = device_row.as_ref().map(|r| r.vip);
-        // 多主：发布本机租约（gossip 事件 ≤1s + 反熵兜底；设备当前位置唯一真相源，§2.2-1）。
+        // Multi-primary: publish the local lease (gossip events ≤1s +
+        // anti-entropy backstop; the device's current location is the single
+        // source of truth, §2.2-1).
         #[cfg(feature = "multi-primary")]
         if let Some(node) = &self.sync {
             let _ = node.publish_lease(&device.0).await;
@@ -631,14 +718,20 @@ impl ServerCore {
         let mut handlers = Vec::new();
         loop {
             tokio::select! {
-                // 吊销/禁用 ⇒ 杀本地会话（§2.2）：拆隧道即断记录层/复用器。
+                // Revoke/disable ⇒ kill the local session (§2.2): tearing
+                // down the tunnel cuts the record layer/muxer.
                 _ = kill.changed() => break,
                 stream = tunnel.accept_stream() => match stream {
                     Some(s) => {
-                        // 流分派（M3）：按 yamux 流 ID 而非到达序——客户端首条流（id=1）
-                        // = 控制流（M2 语义）；id≥3 = 数据面包通道。按 ID 分派对 yamux
-                        // 惰性 SYN 免疫：被静默持有的控制流（M3 客户端不发控制业务）
-                        // 不物化时，首个物化的数据流不会被误派给控制流处理器。
+                        // Stream dispatch (M3): by yamux stream ID, not
+                        // arrival order —— the client's first stream (id=1)
+                        // = the control flow (M2 semantics); id≥3 =
+                        // data-plane packet channels. Dispatching by ID is
+                        // immune to yamux lazy SYN: when the control stream
+                        // is silently held (the M3 client sends no control
+                        // business) and never materializes, the first
+                        // materializing data stream is not mis-dispatched to
+                        // the control-flow handler.
                         if s.id() == 1 {
                             let core = self.clone();
                             handlers.push(tokio::spawn(async move {
@@ -646,9 +739,11 @@ impl ServerCore {
                                 let _ = serve_control(&core, device, &mut s).await;
                             }));
                         } else {
-                            // 多主：包通道走 flock-sync 转发面（attach_session sink +
-                            // ingest：第 0 步源 VIP 校验 → 租约定位 → 本机投递或
-                            // ForwardEnvelope 跨服，§2.2 判定序）。
+                            // Multi-primary: packet channels go through the
+                            // flock-sync forwarding plane (attach_session
+                            // sink + ingest: step-0 source VIP check → lease
+                            // location → local delivery or ForwardEnvelope
+                            // cross-server, the §2.2 decision order).
                             #[cfg(feature = "multi-primary")]
                             if let Some(node) = self.sync.clone() {
                                 let dev = device.0;
@@ -657,7 +752,8 @@ impl ServerCore {
                                 }));
                                 continue;
                             }
-                            // 单服：本机路由器（tun 注入/回程）。
+                            // Single server: the local router (tun
+                            // injection/return path).
                             let router = self.router();
                             let has_router = router.is_some();
                             match (router, device_vip) {
@@ -666,11 +762,14 @@ impl ServerCore {
                                         router.serve_stream(vip, s).await;
                                     }));
                                 }
-                                // 无数据面（宿主/无 NET_ADMIN）或注册表缺行：拆流
-                                //（客户端数据面观察通道 EOF → 退避重连，控制流不受影响）。
+                                // No data plane (host/no NET_ADMIN) or a
+                                // missing registry row: drop the stream (the
+                                // client's data plane observes channel EOF →
+                                // backoff-reconnects; the control flow is
+                                // unaffected).
                                 _ => {
                                     eprintln!(
-                                        "flock-server: 数据面流被拆（router={has_router} vip={}）",
+                                        "flock-server: data-plane stream dropped (router={has_router} vip={})",
                                         device_vip.is_some()
                                     );
                                     drop(s)
@@ -682,16 +781,20 @@ impl ServerCore {
                 },
             }
         }
-        // 优雅收尾（顺序关键——**不得 abort 数据面任务**）：先拆隧道（流全关 ⇒
-        // serve_stream/serve_stream_sync 自然退出并 detach——abort 会跳过 detach，
-        // forward.sessions 残留死会话；租约续期循环会把残留项当在线设备反复重发布，
-        // 与新持有者打「租约战」互踢活会话——M5 e2e 实测风暴根因）。
+        // Graceful wind-down (order is critical —— **never abort the
+        // data-plane tasks**): tear down the tunnel first (all streams close
+        // ⇒ serve_stream/serve_stream_sync exit naturally and detach —— an
+        // abort skips the detach, leaving dead sessions in forward.sessions;
+        // the lease-renewal loop would repeatedly republish the leftovers as
+        // online devices, fighting "lease wars" with the new holder and
+        // kicking live sessions —— the root cause of the M5 e2e storm).
         let close_reason = tunnel.stats().closed;
         tunnel.shutdown().await;
         for h in handlers {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
         }
-        // 会话终止原因（A9 服务端侧：静默死链 ⇒ "dead-link" 可 grep）。
+        // Session end reason (A9 server side: a silent dead link ⇒
+        // "dead-link" greppable).
         let reason = close_reason;
         eprintln!(
             "flock-server: session ended device={device} reason={}",
@@ -702,14 +805,18 @@ impl ServerCore {
         self.sessions.deregister(device.0);
     }
 
-    /// accept 循环（每入连一个会话任务）。
+    /// Accept loop (one session task per inbound connection).
     ///
-    /// 鲁棒性（评审项 7）：
-    /// - **瞬时 accept 错误容错**：EMFILE/ENFILE/ConnAborted/WouldBlock/Interrupted
-    ///   等记日志 + 指数退避（50ms→1s 封顶）后 continue——单次入连故障不再永久杀死
-    ///   入连服务；仅不可恢复错误向上返回退出。
-    /// - **并发会话上限**：`cfg.max_sessions`（缺省 1024）个许可的 Semaphore——超限的
-    ///   入连**接受后立即礼貌关闭**（FIN）并计数（[`sessions_overlimit`]，admin stats 面）。
+    /// Robustness (review item 7):
+    /// - **transient accept errors tolerated**: EMFILE/ENFILE/ConnAborted/
+    ///   WouldBlock/Interrupted etc. log + exponential backoff (50ms→1s
+    ///   capped) then continue —— a single inbound failure no longer
+    ///   permanently kills the inbound service; only unrecoverable errors
+    ///   propagate up and out;
+    /// - **concurrent session cap**: a Semaphore of `cfg.max_sessions`
+    ///   (default 1024) permits —— inbound connections over the cap are
+    ///   **politely closed right after acceptance** (FIN) and counted
+    ///   ([`sessions_overlimit`], the admin stats surface).
     pub async fn serve_listener(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
         let permits = Arc::new(tokio::sync::Semaphore::new(self.cfg.max_sessions.max(1)));
         let mut backoff_ms = 50u64;
@@ -717,7 +824,9 @@ impl ServerCore {
             let (mut io, _peer) = match listener.accept().await {
                 Ok(a) => a,
                 Err(e) if is_transient_accept_error(&e) => {
-                    eprintln!("flock-server: accept 瞬时错误（{e}）——{backoff_ms}ms 后继续");
+                    eprintln!(
+                        "flock-server: transient accept error ({e}) - continuing in {backoff_ms}ms"
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(1000);
                     continue;
@@ -725,13 +834,15 @@ impl ServerCore {
                 Err(e) => return Err(e),
             };
             backoff_ms = 50;
-            // 并发上限：满载时接受后礼貌关闭（让对端立刻看到 FIN 而非挂死在 SYN 队列）。
+            // Concurrency cap: when saturated, politely close after
+            // accepting (the peer sees a FIN immediately instead of hanging
+            // on the SYN queue).
             let permit = match permits.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
                     SESSIONS_OVERLIMIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     eprintln!(
-                        "flock-server: 并发会话上限 {} 已满——礼貌关闭新入连并计数",
+                        "flock-server: concurrent session cap {} saturated - politely closing new inbound connection and counting",
                         self.cfg.max_sessions
                     );
                     let _ = io.shutdown().await;
@@ -740,30 +851,34 @@ impl ServerCore {
             };
             let core = self.clone();
             tokio::spawn(async move {
-                let _permit = permit; // 会话任务存活期间持许可
+                let _permit = permit; // the permit is held for the session task's lifetime
                 core.serve_conn(io).await;
             });
         }
     }
 }
 
-/// 并发上限礼貌关闭的入连累计（admin stats 面，评审项 7）。
+/// Cumulative inbound connections politely closed at the concurrency cap
+/// (the admin stats surface, review item 7).
 pub fn sessions_overlimit() -> u64 {
     SESSIONS_OVERLIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static SESSIONS_OVERLIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// accept 瞬时错误判定（评审项 7）：资源耗尽/对端先行关闭/会重启的阻塞类——
-/// 记日志退避后继续；其余（监听句柄失效等）视为不可恢复。
+/// Transient accept-error verdict (review item 7): resource exhaustion /
+/// peer closed first / blockable-restartable classes —— log, back off,
+/// continue; the rest (a dead listen handle etc.) is treated as
+/// unrecoverable.
 fn is_transient_accept_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::*;
     matches!(
         e.kind(),
         ConnectionAborted | ConnectionReset | WouldBlock | Interrupted | NotConnected
     ) || {
-        // EMFILE(24)/ENFILE(23)：fd 表耗尽——经典瞬时故障（unix 语义；Windows 原生
-        // 错误号空间不含此对，不误判）。
+        // EMFILE(24)/ENFILE(23): fd-table exhaustion —— the classic
+        // transient failure (unix semantics; the Windows native error-code
+        // space does not contain this pair, no misjudgment).
         #[cfg(unix)]
         {
             matches!(e.raw_os_error(), Some(23) | Some(24))
@@ -775,8 +890,10 @@ fn is_transient_accept_error(e: &std::io::Error) -> bool {
     }
 }
 
-/// 运行中的监听端点（Direct 分支零 flock-frpc 类型；Frp 分支持托管句柄——Arc 使
-/// 健康监控任务与装配方共享存亡，评审项 11）。
+/// The running listen endpoint (the Direct branch has zero flock-frpc
+/// types; the Frp branch holds the managed handle —— Arc lets the health
+/// monitoring task and the assembling side share its lifetime, review item
+/// 11).
 pub enum RunningListener {
     Direct {
         local: SocketAddr,
@@ -788,7 +905,7 @@ pub enum RunningListener {
 }
 
 impl RunningListener {
-    /// 本地监听地址。
+    /// The local listen address.
     pub fn local_addr(&self) -> SocketAddr {
         match self {
             RunningListener::Direct { local } | RunningListener::Frp { local, .. } => *local,
@@ -796,9 +913,11 @@ impl RunningListener {
     }
 }
 
-/// 按模式起服（装配期分派；admin 端点随之启动；M3 起附带数据面装配）。
+/// Start the server by mode (assembly-time dispatch; the admin endpoint
+/// starts with it; since M3 the data plane is assembled along the way).
 ///
-/// `serve_listener` 为无限循环——`run` 返回的 JoinHandle 正常不结束；abort 即停 accept。
+/// `serve_listener` is an infinite loop —— the JoinHandle returned by `run`
+/// does not normally end; abort stops the accepts.
 pub async fn run(
     core: Arc<ServerCore>,
     mode: ListenerMode,
@@ -810,14 +929,17 @@ pub async fn run(
     ),
     String,
 > {
-    // M3 数据面（§2.2 服务端自身也是 peer）：tun + 路由；失败在 PeerRouter::open
-    // 内降级控制流-only 并记日志（宿主测试路径即此形态）。
-    // 多主形态（sync::run_raft）已按自身 peer 面装配 tun（router 预置）⇒ 此处跳过，
-    // 避免二次开同名设备。
+    // M3 data plane (§2.2 the server itself is also a peer): tun + routes;
+    // a failure degrades to control-flow-only and logs inside
+    // PeerRouter::open (the host-test path is exactly this form).
+    // The multi-primary form (sync::run_raft) has already assembled the tun
+    // for its own peer surface (router pre-set) ⇒ skip here, avoiding
+    // opening a same-named device twice.
     if core.router().is_none() {
         core.set_router(PeerRouter::open(&core.cfg.tun_name, core.cfg.vip).await);
     }
-    // M7：路由器挂流量计（单服形态计数）+ 折叠循环 + 回收器（§7-M7.3/§7-M7.5）。
+    // M7: hang the traffic meter on the router (single-server counting) +
+    // the folding loop + the reaper (§7-M7.3/§7-M7.5).
     if let Some(router) = core.router() {
         router.set_traffic_meter(core.traffic.clone());
     }
@@ -825,18 +947,22 @@ pub async fn run(
     if core.cfg.peer_retention_days > 0 {
         tokio::spawn(reaper_loop(core.clone()));
     }
-    // admin loopback 端点（CLI 子命令的进程内单写者入口）。
+    // The admin loopback endpoint (the in-process single-writer entry for
+    // CLI subcommands).
     let admin = crate::admin::serve(core.clone(), core.cfg.admin_bind)
         .await
         .map_err(|e| format!("admin bind {}: {e}", core.cfg.admin_bind))?;
-    // M8（§7-M8.2）：Web UI 管理面——loopback 即绑（失败拒起）+ VIP 5s 重试任务。
-    // （sync::run_raft 的多主装配最终也经本 run() ⇒ 两形态同一接入点。）
+    // M8 (§7-M8.2): the Web UI admin surface —— loopback binds immediately
+    // (a failure refuses to start) + the VIP 5s retry task. (The
+    // multi-primary assembly of sync::run_raft ultimately goes through this
+    // run() too ⇒ one hookup point for both forms.)
     if core.cfg.webui.enabled {
         crate::webui::serve(core.clone()).await?;
     }
     match mode {
         ListenerMode::Direct { bind } => {
-            // Direct 装配路径：bind 即监听——零 frp 逻辑（§2.1/§3.11 硬约束）。
+            // Direct assembly path: bind is listen —— zero frp logic (the
+            // §2.1/§3.11 hard constraint).
             let listener = TcpListener::bind(bind)
                 .await
                 .map_err(|e| format!("bind {bind}: {e}"))?;
@@ -850,7 +976,9 @@ pub async fn run(
             let (listener, managed) = crate::frp::start(plan, bind)
                 .await
                 .map_err(|e| format!("frp: {e}"))?;
-            // 低频健康监控（评审项 11）：10s 轮询 RelayStatus——不健康/恢复均留痕+计数。
+            // Low-frequency health monitoring (review item 11): poll
+            // RelayStatus every 10s —— unhealthy/recovery both leave a trail
+            // + count.
             let managed = Arc::new(managed);
             managed.spawn_health_monitor();
             let local = listener
@@ -862,45 +990,64 @@ pub async fn run(
     }
 }
 
-/// 签名便利：根密钥对任意字节签名（邀请/目录扩展用；测试亦可断言）。
+/// Signing convenience: the root key signs arbitrary bytes (for
+/// invite/directory extensions; tests can assert it too).
 pub fn root_sign(root: &SigningKey, bytes: &[u8]) -> [u8; 64] {
     root.sign(bytes).to_bytes()
 }
 
 // ============================================================================
-// M7：回收器（§7-M7.5——离线超过保留期的设备经 Raft/本地写操作置 Expired + VIP 归还池）
+// M7: the reaper (§7-M7.5 —— devices offline past the retention period are
+// set to Expired via Raft/local write operations + their VIPs return to the
+// pool)
 // ============================================================================
 
-/// 回收器周期（低频任务，§7-M7.5：60s）。
+/// Reaper period (a low-frequency task, §7-M7.5: 60s).
 pub const REAPER_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
-/// 保留期换算（天 → 秒）。
+/// Retention conversion (days → seconds).
 const SECS_PER_DAY: u64 = 86_400;
 
-/// 回收单趟（注入时钟可测）：把「Active 且 last_seen 距今 > 保留期」的设备逐个提交
-/// Expire。`retention_days = 0` ⇒ 永不过期（空趟）。多台服务器并发回收幂等（状态机
-/// Expire 重放放行）。返回本趟提交 Expire 的设备。
+/// One reaper pass (injectable clock for tests): submits Expire one by one
+/// for devices that are "Active with last_seen older than the retention
+/// period". `retention_days = 0` ⇒ never expires (an empty pass). Concurrent
+/// reaping by multiple servers is idempotent (the state machine admits
+/// Expire replays). Returns the devices expired in this pass.
 ///
-/// last_seen 语义（§7-M7.5 修正——「注册即起算」的落地）：
-/// - 有观测（单服 = TrafficMeter；多主 = 本地租约行）⇒ 观测值（与 registered_at 取大
-///   ——观测值早于注册时刻属时钟异常，按更近的锚取值）；
-/// - **无观测 ⇒ 以 `DeviceRow.registered_at` 为起算锚**。旧实现 `map_or(0)` 按纪元 0
-///   起算：`0 <= cutoff` 恒真 ⇒ 单服重启（TrafficMeter 纯内存清空）或多主租约表未及
-///   反熵回填时，**首拍把全部 Active 设备（含在线者）Expire 终态化**——邀请已消费即
-///   用户砖死（Expired 不可逆、VIP 已归还池）。
+/// last_seen semantics (the §7-M7.5 correction —— landing "counted from
+/// registration"):
+/// - With an observation (single server = the TrafficMeter; multi-primary =
+///   the local lease row) ⇒ the observed value (maxed with registered_at
+///   —— an observation older than the registration time is a clock anomaly;
+///   take the nearer anchor);
+/// - **No observation ⇒ `DeviceRow.registered_at` is the starting anchor**.
+///   The old implementation's `map_or(0)` counted from epoch 0: `0 <=
+///   cutoff` always held ⇒ when the single server restarted (TrafficMeter
+///   purely in-memory, cleared) or the multi-primary lease table had not yet
+///   been anti-entropy backfilled, the **first pass terminalized every
+///   Active device (including online ones)** —— with the invite already
+///   consumed, the user was bricked (Expired irreversible, the VIP already
+///   returned to the pool).
 ///
-/// 重启/视图未就绪闸门（纵深防御，最小可靠形态）：
-/// - 单服：TrafficMeter 自创建起**零观测**（空表且注册表非空 ⇒ 刚重启）⇒ 本趟跳过。
-///   残余：无任何流量的部署（含无 tun 的控制流-only 形态）闸门恒关、保留期暂不生效
-///   ——一旦出现首个观测（任意设备/服务器自身流量）即开；
-/// - 多主：本地租约表空**或**自启动起未收到任何远端租约事件（反熵回填 ≤1 周期 5s
-///   与回收首拍的赛跑窗）⇒ 本趟跳过（见 `LeaseTable::reaper_view_ready` 的残留注记）。
+/// Restart/view-not-ready gate (defense in depth, minimal reliable form):
+/// - Single server: the TrafficMeter has had **zero observations** since
+///   creation (empty table with a non-empty registry ⇒ just restarted) ⇒
+///   skip this pass. Residue: deployments with no traffic at all (including
+///   the no-tun control-flow-only form) keep the gate closed and the
+///   retention period inert for now —— it opens as soon as the first
+///   observation arrives (any device's / the server's own traffic);
+/// - Multi-primary: the local lease table is empty **or** no remote lease
+///   events have been received since startup (the race window between the
+///   ≤1-period 5s anti-entropy backfill and the reaper's first pass) ⇒ skip
+///   this pass (see the residue note on
+///   `LeaseTable::reaper_view_ready`).
 pub async fn reap_once(core: &ServerCore, retention_days: u64, now_unix: u64) -> Vec<DeviceId> {
     if retention_days == 0 {
         return Vec::new();
     }
     let retention_secs = retention_days.saturating_mul(SECS_PER_DAY);
     let cutoff = now_unix.saturating_sub(retention_secs);
-    // 候选 = 本地已 apply 视图的 Active 行（名册同款快照——展示面一致性档位）。
+    // Candidates = the locally-applied view's Active rows (the same roster
+    // snapshot —— the display-surface consistency tier).
     let rows: Vec<(DeviceId, flock_sync::proto::DeviceRow)> = match &core.net {
         NetBackend::Single(s) => s.devices_all(),
         #[cfg(feature = "multi-primary")]
@@ -911,14 +1058,15 @@ pub async fn reap_once(core: &ServerCore, retention_days: u64, now_unix: u64) ->
             .map(|(id, row)| (DeviceId(id), row))
             .collect(),
     };
-    // 重启/视图未就绪闸门（见函数文档）：跳过整趟，下一趟（60s 后）再判。
+    // Restart/view-not-ready gate (see the function docs): skip the whole
+    // pass; re-judge on the next one (60s later).
     if !rows.is_empty() {
         match &core.net {
             NetBackend::Single(_) => {
                 if !core.traffic.has_any() {
                     eprintln!(
-                        "flock-server: reaper: 流量计自启动起零观测（疑似刚重启）——\
-                         本趟跳过（防首拍误终态化在线设备）"
+                        "flock-server: reaper: zero traffic observations since startup (likely just restarted) - \
+                         skipping this pass (prevents the first pass from terminalizing online devices)"
                     );
                     return Vec::new();
                 }
@@ -927,8 +1075,8 @@ pub async fn reap_once(core: &ServerCore, retention_days: u64, now_unix: u64) ->
             NetBackend::Sync(s) => {
                 if !s.node.lease().reaper_view_ready() {
                     eprintln!(
-                        "flock-server: reaper: 本地租约视图未就绪（表空/未收到远端事件）\
-                         ——本趟跳过（防反熵回填前误终态化远端托管设备）"
+                        "flock-server: reaper: local lease view not ready (empty table / no remote events) - \
+                         skipping this pass (prevents terminalizing remotely-hosted devices before anti-entropy backfill)"
                     );
                     return Vec::new();
                 }
@@ -940,8 +1088,9 @@ pub async fn reap_once(core: &ServerCore, retention_days: u64, now_unix: u64) ->
         if row.status != crate::netstate::DeviceStatus::Active {
             continue;
         }
-        // last_seen：多主 = 本地租约视图；单服 = TrafficMeter；无观测 ⇒ registered_at
-        // 锚（注册即起算）。
+        // last_seen: multi-primary = the local lease view; single server =
+        // the TrafficMeter; no observation ⇒ the registered_at anchor
+        // (counted from registration).
         let last_seen = match &core.net {
             NetBackend::Single(_) => core
                 .traffic
@@ -959,18 +1108,20 @@ pub async fn reap_once(core: &ServerCore, retention_days: u64, now_unix: u64) ->
         if last_seen <= cutoff {
             match core.net.expire(&id, now_unix).await {
                 Ok(_) => {
-                    // 本地会话兜底（多主的 apply 钩子亦会杀；单服即时）。
+                    // Local session backstop (multi-primary's apply hook
+                    // also kills; single server immediately).
                     core.sessions.kill(&id.0);
                     expired.push(id);
                 }
-                Err(e) => eprintln!("flock-server: reaper: expire {id} 失败: {e}"),
+                Err(e) => eprintln!("flock-server: reaper: expire {id} failed: {e}"),
             }
         }
     }
     expired
 }
 
-/// 回收循环（run 装配；`peer_retention_days = 0` 时不装配）。
+/// The reaper loop (assembled by run; not assembled when
+/// `peer_retention_days = 0`).
 async fn reaper_loop(core: Arc<ServerCore>) {
     let mut tick = tokio::time::interval(REAPER_PERIOD);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -980,14 +1131,15 @@ async fn reaper_loop(core: Arc<ServerCore>) {
         let expired = reap_once(&core, core.cfg.peer_retention_days, now).await;
         if !expired.is_empty() {
             eprintln!(
-                "flock-server: reaper: {} 台设备过期（VIP 已归还池）",
+                "flock-server: reaper: {} device(s) expired (VIPs returned to the pool)",
                 expired.len()
             );
         }
     }
 }
 
-/// M7：单服流量计折叠循环（1s 窗——与 flock-sync LeaseTable 同数学，§7-M7.3）。
+/// M7: the single-server traffic-meter folding loop (a 1s window —— the
+/// same math as flock-sync's LeaseTable, §7-M7.3).
 async fn traffic_meter_loop(meter: Arc<flock_sync::lease::TrafficMeter>) {
     let mut tick = tokio::time::interval(flock_sync::lease::EWMA_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1005,8 +1157,11 @@ async fn traffic_meter_loop(meter: Arc<flock_sync::lease::TrafficMeter>) {
 mod tests {
     use super::*;
 
-    /// 评审项 2：OPRF 逐服务器封装——密封产物不含明文（Raft 状态里的 wraps 读不出
-    /// b64 明文）；正确收件人解封还原；错误收件人（无对应 wrap 的服务器）明确失败。
+    /// Review item 2: per-server OPRF sealing —— the sealed product
+    /// contains no plaintext (the b64 plaintext cannot be read out of the
+    /// wraps in Raft state); the correct recipient unseals and recovers;
+    /// the wrong recipient (a server without a matching wrap) fails
+    /// explicitly.
     #[test]
     fn oprf_wrap_sealed_not_plaintext_and_recipient_bound() {
         let recipient = HybridKeypair::generate(&mut flock_protocol::rand::rngs::OsRng);
@@ -1015,41 +1170,47 @@ mod tests {
             flock_protocol::pake::server_setup_new(&mut flock_protocol::rand::rngs::OsRng);
 
         let wrapped = seal_oprf_wrap(&oprf_b64, &recipient.public()).expect("seal");
-        // 密封存储不可读出明文：明文 b64 的任意长子串都不出现在封装字节里。
+        // The sealed store is unreadable as plaintext: no long substring of
+        // the plaintext b64 appears in the sealed bytes.
         let probe = &oprf_b64[oprf_b64.len() / 2..];
         assert!(
             !wrapped.windows(probe.len()).any(|w| w == probe.as_bytes()),
-            "封装字节不得包含明文片段"
+            "the sealed bytes must not contain plaintext fragments"
         );
         assert_eq!(
             wrapped[0],
             flock_protocol::envelope::V2_VER,
-            "envelope v2 头"
+            "envelope v2 header"
         );
-        // 收件人解封还原（往返）。
+        // The recipient unseals and recovers (round trip).
         assert_eq!(
             open_oprf_wrap(&recipient, &wrapped).expect("open"),
             oprf_b64,
-            "正确收件人解封还原 OPRF b64"
+            "the correct recipient unseals and recovers the OPRF b64"
         );
-        // 非收件人明确失败（无对应 wrap 的服务器 ⇒ OPAQUE 不可用路径）。
+        // A non-recipient fails explicitly (a server without a matching
+        // wrap ⇒ the OPAQUE-unavailable path).
         let err = open_oprf_wrap(&other, &wrapped).expect_err("wrong recipient");
         assert!(
             err.contains("envelope open"),
-            "错误需可归因（envelope 认证失败）: {err}"
+            "the error must be attributable (envelope authentication failed): {err}"
         );
-        // 损坏封装明确失败。
+        // A corrupted seal fails explicitly.
         let mut tampered = wrapped.clone();
         let n = tampered.len();
         tampered[n - 1] ^= 1;
-        assert!(open_oprf_wrap(&recipient, &tampered).is_err(), "篡改拒");
-        // server_setup_load 接受解封产物（真实 OPRF 语义闭环）。
+        assert!(
+            open_oprf_wrap(&recipient, &tampered).is_err(),
+            "tampering rejected"
+        );
+        // server_setup_load accepts the unsealed product (closing the real
+        // OPRF semantic loop).
         assert!(flock_protocol::pake::server_setup_load(&oprf_b64).is_ok());
     }
 }
 
 // ============================================================================
-// M7 单元测试：回收器窗口逻辑（注入时钟，§7-M7.5）
+// M7 unit tests: the reaper window logic (injected clock, §7-M7.5)
 // ============================================================================
 
 #[cfg(test)]
@@ -1089,14 +1250,19 @@ mod reaper_tests {
         *vk.verifying_key().as_bytes()
     }
 
-    /// 窗口逻辑（§7-M7.5 修正后的正确语义）：保留期内不动；越界（last_seen 距今 >
-    /// 保留期）⇒ Expire 提交 + 行置 Expired + VIP 归还池（新注册拿到该 VIP）；
-    /// retention=0 ⇒ 永不过期。
+    /// Window logic (the corrected §7-M7.5 semantics): untouched within the
+    /// retention period; out of bounds (last_seen older than the retention
+    /// period) ⇒ an Expire submission + row set Expired + the VIP returned
+    /// to the pool (a new registration gets that VIP); retention=0 ⇒ never
+    /// expires.
     ///
-    /// 旧→新（被修正的固化行为）：旧断言「从未在线的 B（last_seen=0）第一趟即回收
-    /// （按纪元 0 起算）」——那正是重启砖死缺陷的窗口语义（0 <= cutoff 恒真）；新语义
-    /// 下从未在线的设备以 `registered_at` 为起算锚：锚龄 29d < 30d 保留期 ⇒ **不动**，
-    /// 锚龄超窗才回收。
+    /// Old→new (the corrected, frozen behavior): the old assertion "B,
+    /// never online (last_seen=0), is reaped on the very first pass
+    /// (counted from epoch 0)" —— that was precisely the restart-bricking
+    /// defect's window semantics (0 <= cutoff always true); under the new
+    /// semantics a never-online device uses `registered_at` as its anchor:
+    /// anchor age 29d < the 30d retention period ⇒ **untouched**, reaped
+    /// only once the anchor passes the window.
     #[tokio::test]
     async fn reaper_window_logic_with_injected_clock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1107,70 +1273,93 @@ mod reaper_tests {
             #[cfg(feature = "multi-primary")]
             _ => panic!("single"),
         };
-        // 设备 A（活跃——流量计近期 last_seen）、B（从未在线——registered_at 锚）、
-        // C（吊销——不可 Expire）。
+        // Devices A (active —— the traffic meter has a recent last_seen),
+        // B (never online —— the registered_at anchor), C (revoked ——
+        // cannot Expire).
         let row_a = store.register_device("u", [1; 32], ed_of(1), "a").unwrap();
         let row_b = store.register_device("u", [2; 32], ed_of(2), "b").unwrap();
         let _row_c = store.register_device("u", [3; 32], ed_of(3), "c").unwrap();
         store.revoke(&dev_id(3)).unwrap();
         assert!(
             store.device_row(&dev_id(2)).unwrap().registered_at > 0,
-            "注册即落 registered_at 锚"
+            "registration lands the registered_at anchor"
         );
-        // A 的 last_seen = 真实墙钟「当前」（流量计——note 即抬）。
+        // A's last_seen = the real wall clock's "now" (the traffic meter ——
+        // a note lifts it).
         core.traffic.note_tx(&row_a.vip, 100);
         let now_real = flock_protocol::trust::now_unix();
 
-        // ① 29 天后：A（观测 29d < 30d）与 B（锚 29d < 30d）都在保留期内 ⇒ 空趟
-        //    （旧语义此处会把从未在线的 B 回收掉——见测试文档）；吊销的 C 不动。
+        // ① 29 days later: A (observed 29d < 30d) and B (anchor 29d < 30d)
+        //    are both within the retention period ⇒ an empty pass (the old
+        //    semantics would have reaped the never-online B here —— see the
+        //    test docs); the revoked C untouched.
         let now1 = now_real + 29 * 86_400;
         let expired = reap_once(&core, 30, now1).await;
-        assert!(expired.is_empty(), "29d < 30d：A/B 均在窗内: {expired:?}");
+        assert!(
+            expired.is_empty(),
+            "29d < 30d: both A/B inside the window: {expired:?}"
+        );
         assert_eq!(
             store.device_row(&dev_id(1)).unwrap().status,
             DeviceStatus::Active,
-            "A（观测 29d < 30d）不过期"
+            "A (observed 29d < 30d) does not expire"
         );
         assert_eq!(
             store.device_row(&dev_id(2)).unwrap().status,
             DeviceStatus::Active,
-            "B（registered_at 锚 29d < 30d）不过期——注册即起算，非纪元 0 起算"
+            "B (registered_at anchor 29d < 30d) does not expire - counted from registration, not epoch 0"
         );
         assert_eq!(
             store.device_row(&dev_id(3)).unwrap().status,
             DeviceStatus::Revoked,
-            "C 保持 Revoked（不转 Expired）"
+            "C stays Revoked (does not become Expired)"
         );
 
-        // ② 31 天后：A（观测超窗）与 B（锚超窗）均回收；C 仍不动。
+        // ② 31 days later: A (observation past the window) and B (anchor
+        //    past the window) are both reaped; C still untouched.
         let now2 = now_real + 31 * 86_400;
         let expired = reap_once(&core, 30, now2).await;
-        assert_eq!(expired.len(), 2, "A 与 B 均越界: {expired:?}");
-        assert!(expired.contains(&dev_id(1)), "A 观测超窗回收");
+        assert_eq!(expired.len(), 2, "both A and B out of bounds: {expired:?}");
+        assert!(
+            expired.contains(&dev_id(1)),
+            "A reaped, observation past the window"
+        );
         assert!(
             expired.contains(&dev_id(2)),
-            "B 锚超窗回收（从未在线且超窗）"
+            "B reaped, anchor past the window (never online and past the window)"
         );
         for id in [dev_id(1), dev_id(2)] {
             let row = store.device_row(&id).unwrap();
             assert_eq!(row.status, DeviceStatus::Expired);
-            assert_eq!(row.expired_at, Some(now2), "注入时钟确定性落 expired_at");
+            assert_eq!(
+                row.expired_at,
+                Some(now2),
+                "the injected clock lands expired_at deterministically"
+            );
         }
         assert_eq!(
             store.device_row(&dev_id(3)).unwrap().status,
             DeviceStatus::Revoked
         );
-        // 幂等：同窗再跑一趟 ⇒ 空趟。
+        // Idempotent: another pass in the same window ⇒ an empty pass.
         let expired = reap_once(&core, 30, now2).await;
-        assert!(expired.is_empty(), "幂等（已 Expired 不再提交）");
-        // VIP 归还池：新注册从池取最小（A 的 .2 先于 B 的 .3 入池序无关——键序最小）。
+        assert!(
+            expired.is_empty(),
+            "idempotent (already-Expired rows are not resubmitted)"
+        );
+        // VIPs returned to the pool: a new registration takes the pool's
+        // smallest (A's .2 before B's .3 regardless of pool-entry order ——
+        // the smallest key wins).
         let row_d = store.register_device("u", [4; 32], ed_of(4), "d").unwrap();
-        assert_eq!(row_d.vip, row_a.vip, "池内最小 VIP 重派（A 的 .2）");
-        // 池内剩余（B 的 .3）派给下一台。
+        assert_eq!(
+            row_d.vip, row_a.vip,
+            "the pool's smallest VIP reassigned (A's .2)"
+        );
+        // The pool's remainder (B's .3) goes to the next device.
         let row_e = store.register_device("u", [5; 32], ed_of(5), "e").unwrap();
-        assert_eq!(row_e.vip, row_b.vip, "池序继续（B 的 .3）");
+        assert_eq!(row_e.vip, row_b.vip, "the pool order continues (B's .3)");
 
-        // ③ retention = 0 ⇒ 永不过期（空趟）。
+        // ③ retention = 0 ⇒ never expires (an empty pass).
         let (core0, _) =
             ServerCore::open_or_init(m7_cfg(tempfile::tempdir().unwrap().path().to_path_buf(), 0))
                 .expect("core0");
@@ -1181,17 +1370,21 @@ mod reaper_tests {
         };
         store0.register_device("u", [1; 32], ed_of(1), "a").unwrap();
         let expired = reap_once(&core0, 0, u64::MAX / 2).await;
-        assert!(expired.is_empty(), "0 = 永不过期（兼容旧行为）");
+        assert!(expired.is_empty(), "0 = never expires (legacy-compatible)");
         assert_eq!(
             store0.device_row(&dev_id(1)).unwrap().status,
             DeviceStatus::Active
         );
     }
 
-    /// 单服重启闸门：TrafficMeter 纯内存——重启即清空而注册表落盘。重启后首拍（零
-    /// 观测 + 注册表非空 ⇒ 刚重启）**必须跳过**——旧行为 `last_seen=0 <= cutoff` 恒真，
-    /// 即使时钟远超保留期也会把全部 Active 设备（含在线者）终态化（邀请已消费 = 用户
-    /// 砖死）。闸门开启（首个观测到达）后同刻回收恢复。
+    /// Single-server restart gate: the TrafficMeter is purely in-memory ——
+    /// a restart clears it while the registry persists on disk. The first
+    /// pass after a restart (zero observations + non-empty registry ⇒ just
+    /// restarted) **must be skipped** —— the old behavior's `last_seen=0 <=
+    /// cutoff` was always true and terminalized every Active device
+    /// (including online ones) even with the clock far past the retention
+    /// period (invite consumed = user bricked). After the gate opens (the
+    /// first observation arrives), reaping at the same instant resumes.
     #[tokio::test]
     async fn reaper_skips_fresh_restart_single_form() {
         let dir = tempfile::tempdir().unwrap();
@@ -1205,44 +1398,66 @@ mod reaper_tests {
             };
             let row_a = store.register_device("u", [1; 32], ed_of(1), "a").unwrap();
             store.register_device("u", [2; 32], ed_of(2), "b").unwrap();
-            // 在线设备的流量观测（重启前的世界）。
+            // Traffic observation of an online device (the pre-restart
+            // world).
             core.traffic.note_tx(&row_a.vip, 100);
         }
-        // 「重启」：同状态目录重开（注册表两行仍在），TrafficMeter 全新（零观测）。
+        // "Restart": reopen the same state directory (the registry's two
+        // rows survive), the TrafficMeter brand new (zero observations).
         let (core2, _) = ServerCore::open_or_init(m7_cfg(state_dir, 30)).expect("reopen");
         let store2 = match &core2.net {
             crate::backend::NetBackend::Single(s) => s.clone(),
             #[cfg(feature = "multi-primary")]
             _ => panic!("single"),
         };
-        assert_eq!(store2.devices_all().len(), 2, "注册表跨重启保留");
-        assert!(!core2.traffic.has_any(), "流量计重启清空（零观测）");
+        assert_eq!(
+            store2.devices_all().len(),
+            2,
+            "the registry survives the restart"
+        );
+        assert!(
+            !core2.traffic.has_any(),
+            "the traffic meter cleared by the restart (zero observations)"
+        );
 
-        // 时钟远超保留期（100 天）也不回收任何行——闸门生效（旧行为此处砖死两台）。
+        // Even a clock far past the retention period (100 days) reaps no
+        // row —— the gate is in effect (the old behavior bricked both
+        // here).
         let now = flock_protocol::trust::now_unix() + 100 * 86_400;
         let expired = reap_once(&core2, 30, now).await;
-        assert!(expired.is_empty(), "刚重启 ⇒ 本趟跳过: {expired:?}");
+        assert!(
+            expired.is_empty(),
+            "just restarted ⇒ this pass skipped: {expired:?}"
+        );
         for seed in 1u8..=2 {
             assert_eq!(
                 store2.device_row(&dev_id(seed)).unwrap().status,
                 DeviceStatus::Active,
-                "重启后首拍不终态化任何行"
+                "the first pass after restart terminalizes no row"
             );
         }
 
-        // 闸门开启（首个观测——任何设备的任意流量）后同刻回收恢复：A 有观测
-        // （last_seen=now_real）但 100d 前的观测已超窗、B 锚超窗 ⇒ 两者均回收——证明
-        // 先前的空趟确由闸门承担（而非窗口判定失效）。
+        // After the gate opens (the first observation —— any traffic of any
+        // device), reaping at the same instant resumes: A has an observation
+        // (last_seen=now_real) but a 100d-old observation is past the
+        // window, and B's anchor is past the window ⇒ both reaped —— proving
+        // the earlier empty pass was carried by the gate (not a broken
+        // window verdict).
         let row_a = store2.device_row(&dev_id(1)).unwrap();
         core2.traffic.note_tx(&row_a.vip, 1);
         let expired = reap_once(&core2, 30, now).await;
-        assert_eq!(expired.len(), 2, "闸门开后按窗回收: {expired:?}");
+        assert_eq!(
+            expired.len(),
+            2,
+            "after the gate opens, reaping by window: {expired:?}"
+        );
     }
 }
 
 // ============================================================================
-// 单元测试：server_vip_of 一致性——单服形态的 VIP 撞段拒起（多主断言面在
-// tests/multi_primary.rs::open_sync_rejects_vip_mismatch_with_expected_value）
+// Unit tests: server_vip_of consistency —— the single-server VIP
+// collision-segment start refusal (the multi-primary assertion surface is in
+// tests/multi_primary.rs::open_sync_rejects_vip_mismatch_with_expected_value)
 // ============================================================================
 
 #[cfg(test)]
@@ -1270,23 +1485,35 @@ mod vip_guard_tests {
         }
     }
 
-    /// 单服：cfg.vip 落入设备分配段（VIP_FIRST..=VIP_LAST，即 100.64.0.2 起）⇒ 拒起且
-    /// 错误点名段界与正确值；.1（服务器自身保留位）放行。
+    /// Single server: cfg.vip inside the device allocation segment
+    /// (VIP_FIRST..=VIP_LAST, i.e. from 100.64.0.2) ⇒ refuses to start and
+    /// the error names the segment bounds and the correct value; .1 (the
+    /// server's own reserved slot) passes.
     #[test]
     fn single_form_vip_in_device_segment_refuses_start() {
-        // 段首（100.64.0.2 = 首台设备的 VIP）与段中段尾均拒。
+        // Segment head (100.64.0.2 = the first device's VIP), middle, and
+        // tail all rejected.
         for bad in ["100.64.0.2", "100.64.0.11", "100.127.255.254"] {
             let err = match ServerCore::open_or_init(cfg_with_vip(bad)) {
                 Err(e) => e,
-                Ok(_) => panic!("{bad} 落入设备分配段必须拒起"),
+                Ok(_) => panic!("{bad} inside the device allocation segment must refuse to start"),
             };
-            assert!(err.contains("设备分配段"), "{bad} 拒: {err}");
-            assert!(err.contains("100.64.0.1"), "错误给出正确值: {err}");
+            assert!(
+                err.contains("device allocation segment"),
+                "{bad} rejected: {err}"
+            );
+            assert!(
+                err.contains("100.64.0.1"),
+                "the error gives the correct value: {err}"
+            );
         }
-        // 服务器自身保留位放行。
-        ServerCore::open_or_init(cfg_with_vip("100.64.0.1")).expect(".1 = 服务器自身 VIP，放行");
-        // 段外（如 100.128.0.1——/10 之外）放行：校验只管撞段，不管选址合理性。
+        // The server's own reserved slot passes.
+        ServerCore::open_or_init(cfg_with_vip("100.64.0.1"))
+            .expect(".1 = the server's own VIP, passes");
+        // Outside the segment (e.g. 100.128.0.1 —— beyond the /10) passes:
+        // the validation only guards segment collisions, not siting
+        // judgment.
         ServerCore::open_or_init(cfg_with_vip("100.128.0.1"))
-            .expect("段外地址不在本校验面（部署自担选址）");
+            .expect("addresses outside the segment are not on this validation surface (siting is the deployment's responsibility)");
     }
 }

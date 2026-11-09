@@ -4,27 +4,36 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Flock VPN 服务端装配（单服形态）：TCP :9443 E2E 会话 + 控制流（OPAQUE 登录锚/票据/设备注册表）+ ListenerMode 直连|frp（docs/design.md §2.2/§3.11/§7-M2）"
+description = "Flock VPN server assembly (single-server form): TCP :9443 E2E sessions + control flow (OPAQUE login anchor/tickets/device registry) + ListenerMode direct|frp (docs/design.md §2.2/§3.11/§7-M2)"
 
 [dependencies]
-# 独立协议仓（原 crates/flock-protocol，v0.1.0 起独立发布）：anchor feature
-# （OPAQUE 登录锚）照搬抽取前声明。
+# Standalone protocol repository (formerly crates/flock-protocol,
+# independently published since v0.1.0): the anchor feature (OPAQUE login
+# anchor) declaration carried over from before the extraction.
 flock-protocol = { git = "https://github.com/fly88oj/flock-protocol.git", tag = "v0.1.0", features = ["anchor"] }
 flock-frpc = { path = "../../crates/flock-frpc" }
-# M4 多主同步（§3.10/§4）：Raft 状态机 + 两级读目录 + 租约/转发承载 + Raft 内票据根。
-# 行类型（DeviceRow/DeviceStatus/UserRow，评审项 12 去重）为唯一权威定义——非 optional
-# 依赖；多主**装配面**（NetBackend::Sync/sync.rs/Raft 票据根）仍由 feature
-# `multi-primary` 门控，单服部署的行为不变。
+# M4 multi-primary sync (§3.10/§4): Raft state machine + two-level-read
+# directory + lease/forwarding carrier + the Raft-internal ticket root.
+# The row types (DeviceRow/DeviceStatus/UserRow, review item 12 dedup) are
+# the single authoritative definition —— a non-optional dependency; the
+# multi-primary **assembly surface** (NetBackend::Sync/sync.rs/Raft ticket
+# root) remains gated by the `multi-primary` feature, leaving single-server
+# deployments' behavior unchanged.
 flock-sync = { path = "../../crates/flock-sync" }
-# M3 数据面（§2.2 服务端自身也是 peer / §3.11「对上挂 tun 适配器」）：复用客户端 crate 的
-# TunDevice/route/TunIo 接缝（§3.12 接缝落位客户端 crate，本 crate 是其第二个消费者）。
+# M3 data plane (§2.2 the server itself is also a peer / §3.11 "hang a tun
+# adapter on top"): reuses the client crate's TunDevice/route/TunIo seams
+# (§3.12 places the seams in the client crate; this crate is their second
+# consumer).
 flock-client = { path = "../flock-client" }
-# 控制流消息编码（§2.2：yamux stream0 postcard）与 server.toml 反序列化。
+# Control-flow message encoding (§2.2: yamux stream0 postcard) and
+# server.toml deserialization.
 postcard = { workspace = true }
 serde = { workspace = true }
-# M8 webui（§7-M8.4）：统一 JSON 错误信封/端点请求响应体。
+# M8 webui (§7-M8.4): the unified JSON error envelope/endpoint request and
+# response bodies.
 serde_json = { workspace = true }
-# M8 webui（§7-M8.1/§M8.8）：前端资产内嵌（include_dir 定死；壳页阶段仅 index.html）。
+# M8 webui (§7-M8.1/§M8.8): frontend asset embedding (include_dir, fixed;
+# shell-page stage was index.html only).
 include_dir = { workspace = true }
 toml = { workspace = true }
 redb = { workspace = true }
@@ -32,25 +41,33 @@ base64 = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 futures = { workspace = true }
-# 每入连一会话任务 + accept 循环 + admin loopback 端点：workspace tokio 之上加多线程 rt。
+# One session task per inbound connection + accept loops + the admin
+# loopback endpoint: multi-thread rt on top of workspace tokio.
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
-# TCP keepalive（评审项 8：接受连接后设置——间隔对齐会话层 keepalive 10s）。
+# TCP keepalive (review item 8: set after accepting a connection —— the
+# interval aligned with the session-layer keepalive of 10s).
 socket2 = "0.6"
 
 [features]
 default = []
-# 多主装配（§2.2/§3.11 M4 批次）：NetBackend::Sync / Raft 票据根 / FRWD 转发面。
-# （flock-sync 本体自评审项 12 起为常驻依赖——行类型去重；feature 只门控装配面。）
+# Multi-primary assembly (the §2.2/§3.11 M4 batch): NetBackend::Sync / the
+# Raft ticket root / the FRWD forwarding surface.
+# (flock-sync itself has been a resident dependency since review item 12 ——
+# row-type dedup; the feature only gates the assembly surface.)
 multi-primary = []
 
 [dev-dependencies]
-# 集成测试（tests/control_flow.rs 全链 in-process；tests/multi_primary.rs 3 节点内存
-# 集群——test-util = MemoryFabric 织物 + RTT 注入）多线程运行时。
+# Integration tests (tests/control_flow.rs full-chain in-process;
+# tests/multi_primary.rs a 3-node in-memory cluster —— test-util =
+# MemoryFabric + RTT injection) multi-threaded runtime.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
 flock-sync = { path = "../../crates/flock-sync", features = ["test-util"] }
 
-# Direct 模式零 frp 逻辑（§2.1/§3.11 硬约束）：flock-frpc 的类型只允许出现在 src/frp.rs
-# （Frp 分支装配）与 src/config.rs 的 FrpPlan 字段；Direct 代码路径（listener.rs 的
-# Direct 分派、server.rs 的 accept/会话/控制流）不引用之——tests/listener_mode.rs 以
-# 「Direct 起服后 frp run 目录不存在、监听句柄为 Direct 变体」做运行时守门。
+# Direct mode has zero frp logic (the §2.1/§3.11 hard constraint):
+# flock-frpc's types are allowed only in src/frp.rs (the Frp-branch
+# assembly) and src/config.rs's FrpPlan fields; Direct code paths (the
+# Direct dispatch in listener.rs, accept/sessions/control flow in
+# server.rs) must not reference them —— tests/listener_mode.rs guards this
+# at runtime with "after a Direct-mode server start, no frp run directory
+# exists and the listen handle is the Direct variant".

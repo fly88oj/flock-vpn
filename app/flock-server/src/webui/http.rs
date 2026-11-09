@@ -1,21 +1,30 @@
-//! M8 webui：自研最小 HTTP/1.1 子集（docs/design.md §7-M8.1/M8.4）。
+//! M8 webui: a hand-rolled minimal HTTP/1.1 subset (docs/design.md
+//! §7-M8.1/M8.4).
 //!
-//! 裁决（设计定死）：**非 axum**——暴露面仅 loopback + tun VIP、约 22 个 JSON 端点，
-//! 为此引入整条 tower 栈与仓库纪律相悖（§3.6「一个适配器=假想缝」；admin.rs 自研帧
-//! 协议先例）。子集边界（不实现歧义特性即无请求走私面）：
+//! Decision (fixed by design): **not axum** —— the exposed surface is only
+//! loopback + the tun VIP with ~22 JSON endpoints; pulling in the whole tower
+//! stack for that contradicts the repository discipline (§3.6 "an adapter per
+//! imagined seam"; the hand-rolled frame protocol in admin.rs is the
+//! precedent). Subset boundary (not implementing ambiguous features means no
+//! request-smuggling surface):
 //!
-//! - HTTP/1.0 与 HTTP/1.1、方法 GET/POST、keep-alive、`Content-Length` 定长体；
-//! - **拒绝 `Transfer-Encoding`（任何值）与重复 `Content-Length`（含逗号多值）**
-//!   ⇒ 400 并关连接；
-//! - 上限：请求行 ≤ 2KiB、头块 ≤ 8KiB、体 ≤ 64KiB——超限 400/413 并关连接；
-//! - 头名大小写不敏感查读；无 cookie 解析（cookie 的单键解析在 api.rs——
-//!   [`super::api`] 的会话判定）；
-//! - 读超时双层：单 read 15s（半开连接）+ **单请求总时限 30s**（head+body 整体
-//!   读循环——逐字节滴注每 read 都在单读超时内也绕不过总预算）⇒ 超时静默关连接
-//!   （总时限到期关连接并计数）。
+//! - HTTP/1.0 and HTTP/1.1, methods GET/POST, keep-alive, `Content-Length`
+//!   fixed-length bodies;
+//! - **rejects `Transfer-Encoding` (any value) and duplicate
+//!   `Content-Length` (including comma multi-values)** ⇒ 400 and close;
+//! - limits: request line ≤ 2KiB, header block ≤ 8KiB, body ≤ 64KiB —— over
+//!   the limit 400/413 and close;
+//! - header names read case-insensitively; no cookie parsing (the single-key
+//!   cookie parse lives in api.rs —— the session decision of [`super::api`]);
+//! - two-layer read timeouts: 15s per read (half-open connections) + **a 30s
+//!   total per-request time limit** (the whole head+body read loop —— a
+//!   byte-by-byte drip that keeps every read within the per-read timeout
+//!   still cannot get past the total budget) ⇒ on timeout, silently close
+//!   (total-limit expiry closes the connection and counts it).
 //!
-//! 解析器与连接循环分离：[`parse_head`] 是纯函数（畸形向量单测面），
-//! [`serve_conn`] 是带超时/上限/keep-alive 的连接循环。
+//! Parser and connection loop are separate: [`parse_head`] is a pure function
+//! (the malformed-vector unit-test surface), [`serve_conn`] is the connection
+//! loop with timeouts/limits/keep-alive.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -24,46 +33,55 @@ use std::pin::Pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// 请求行上限（2KiB，§M8.4）。
+/// Request-line limit (2KiB, §M8.4).
 pub const MAX_REQUEST_LINE: usize = 2 * 1024;
-/// 头块上限（8KiB——请求行之后、`\r\n\r\n` 之前的全部头字节）。
+/// Header-block limit (8KiB —— all header bytes after the request line and
+/// before `\r\n\r\n`).
 pub const MAX_HEAD: usize = 8 * 1024;
-/// 请求体上限（64KiB）。
+/// Request-body limit (64KiB).
 pub const MAX_BODY: usize = 64 * 1024;
-/// 单次 read 超时（半开连接——超时静默关连接，不占并发许可）。
+/// Single read timeout (half-open connections —— on timeout, silently close;
+/// does not hold a concurrency permit).
 pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// 单请求总时限（head+body 整体读循环）：逐字节滴注每 read 都在 READ_TIMEOUT 内
-/// 也可无限期持连接耗尽 MAX_CONCURRENCY 许可（VIP 面任一 VPN 成员可 DoS 管理面）
-/// ⇒ 总预算到期关连接 + 计数（[`slow_request_kills`]）。keep-alive 每请求重置预算。
+/// Total per-request time limit (the whole head+body read loop): a
+/// byte-by-byte drip can keep every read within READ_TIMEOUT while holding
+/// the connection indefinitely, exhausting MAX_CONCURRENCY permits (on the
+/// VIP surface any VPN member could DoS the admin surface) ⇒ when the total
+/// budget expires, close the connection + count it ([`slow_request_kills`]).
+/// keep-alive resets the budget per request.
 pub const REQUEST_TOTAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// REQUEST_TOTAL 到期关连接的累计计数（诊断/测试面——慢速攻击向量被断的观测）。
+/// Cumulative counter of connections closed on REQUEST_TOTAL expiry
+/// (diagnostics/test surface —— observability of slow-attack vectors being
+/// cut).
 static SLOW_KILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 读取 [`SLOW_KILLS`] 当前值。
+/// Read the current value of [`SLOW_KILLS`].
 pub fn slow_request_kills() -> u64 {
     SLOW_KILLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ============================================================================
-// 请求/响应类型
+// Request/response types
 // ============================================================================
 
-/// 已解析请求（head + body；body 由连接循环按 Content-Length 补齐后合成）。
+/// Parsed request (head + body; the body is assembled by the connection loop
+/// after filling per Content-Length).
 #[derive(Debug, Clone)]
 pub struct Request {
     pub method: String,
-    /// 路径（不含 query；以 '/' 开头）。
+    /// Path (query excluded; starts with '/').
     pub path: String,
-    /// 原始 query（不含 '?'；空 = 无）。
+    /// Raw query (no '?'; empty = none).
     pub query: String,
-    /// 头（原名保留；查读经 [`Request::header`] 大小写不敏感）。
+    /// Headers (original names preserved; reads go through
+    /// [`Request::header`], case-insensitive).
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
 impl Request {
-    /// 大小写不敏感取头。
+    /// Case-insensitive header read.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -71,7 +89,8 @@ impl Request {
             .map(|(_, v)| v.as_str())
     }
 
-    /// `flock_session` cookie 的单键解析（值 = 64hex sid；无 ⇒ None）。
+    /// Single-key parse of the `flock_session` cookie (value = the 64-hex
+    /// sid; absent ⇒ None).
     pub fn session_cookie(&self) -> Option<&str> {
         let cookies = self.header("cookie")?;
         for pair in cookies.split(';') {
@@ -85,8 +104,8 @@ impl Request {
     }
 }
 
-/// 响应（http 层补 `Content-Length`/`Connection`；`Connection` 头归本层所有——
-/// handler 不得设置）。
+/// Response (the http layer adds `Content-Length`/`Connection`; the
+/// `Connection` header belongs to this layer —— handlers must not set it).
 #[derive(Debug, Clone)]
 pub struct Response {
     pub status: u16,
@@ -108,8 +127,8 @@ impl Response {
         self
     }
 
-    /// JSON 体（`application/json; charset=utf-8` + `Cache-Control: no-store`——
-    /// API 响应不缓存，§M8.1）。
+    /// JSON body (`application/json; charset=utf-8` + `Cache-Control:
+    /// no-store` —— API responses are not cached, §M8.1).
     pub fn json(status: u16, value: &serde_json::Value) -> Self {
         Response::new(status)
             .with_header("Content-Type", "application/json; charset=utf-8")
@@ -123,7 +142,7 @@ impl Response {
     }
 }
 
-/// 状态行 reason（仅本子集用到的码面）。
+/// Status-line reason (only the codes this subset uses).
 pub fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -141,25 +160,28 @@ pub fn reason(status: u16) -> &'static str {
 }
 
 // ============================================================================
-// head 解析（纯函数——畸形向量单测面）
+// Head parsing (pure function —— the malformed-vector unit-test surface)
 // ============================================================================
 
-/// head 解析失败（全部为「400/413 并关连接」语义；payload 超限单列供 413）。
+/// Head parse failure (all carry "400/413 and close" semantics; payload
+/// over-limit listed separately for 413).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
-    /// 坏请求行/坏版本/坏头形/坏 Content-Length 值。
+    /// Bad request line / bad version / bad header shape / bad
+    /// Content-Length value.
     BadRequest,
-    /// 请求走私面：存在 `Transfer-Encoding` 头。
+    /// Request-smuggling surface: a `Transfer-Encoding` header is present.
     TransferEncoding,
-    /// 请求走私面：重复/多值 `Content-Length`。
+    /// Request-smuggling surface: duplicate / multi-value `Content-Length`.
     DuplicateContentLength,
-    /// 体超 64KiB（413）。
+    /// Body over 64KiB (413).
     PayloadTooLarge,
-    /// 请求行/头块超限（400）。
+    /// Request line / header block over the limit (400).
     HeadTooLarge,
 }
 
-/// head 解析产物（body 未读——content_length 交给连接循环）。
+/// Head parse product (body not read —— content_length is handed to the
+/// connection loop).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedHead {
     pub method: String,
@@ -167,20 +189,22 @@ pub struct ParsedHead {
     pub query: String,
     pub headers: Vec<(String, String)>,
     pub content_length: Option<u64>,
-    /// keep-alive 缺省（按版本 + Connection 头裁定）。
+    /// keep-alive default (decided by version + Connection header).
     pub keep_alive: bool,
 }
 
-/// 解析 head（`\r\n\r\n` 结束的请求头块）。
+/// Parse the head (the request header block ending with `\r\n\r\n`).
 ///
-/// - `Ok(None)` = 字节不足（需继续读）；
-/// - `Ok(Some)` = 解析成功；
-/// - `Err` = 致命畸形（调用方回 400/413 并关连接）。
+/// - `Ok(None)` = insufficient bytes (keep reading);
+/// - `Ok(Some)` = parsed successfully;
+/// - `Err` = fatally malformed (the caller replies 400/413 and closes).
 ///
-/// 字节上限检查先于语法检查：已读字节超过「请求行 + 头块」上限仍未见到头块结束 ⇒
-/// `HeadTooLarge`（不继续耗内存）。
+/// The byte-limit check precedes the syntax check: if the bytes read so far
+/// exceed the "request line + header block" limit without the header block
+/// ending in sight ⇒ `HeadTooLarge` (stop burning memory).
 pub fn parse_head(buf: &[u8]) -> Result<Option<ParsedHead>, ParseError> {
-    // ① 头块结束定位（上限先于语法：给头块整体 2K+8K+4 的绝对界）。
+    // ① Locate the header-block end (limit before syntax: an absolute bound
+    //    of 2K+8K+4 for the whole block).
     let head_end = match find_sub(buf, b"\r\n\r\n") {
         Some(i) => i,
         None => {
@@ -191,10 +215,10 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<ParsedHead>, ParseError> {
         }
     };
     let head = &buf[..head_end];
-    // ② 请求行（≤ 2KiB；CRLF 分隔）。
+    // ② Request line (≤ 2KiB; CRLF-separated).
     let (line, rest) = match find_sub(head, b"\r\n") {
         Some(i) => (&head[..i], &head[i + 2..]),
-        None => (head, &head[head.len()..]), // 无头（仅请求行 + 空头块）
+        None => (head, &head[head.len()..]), // no headers (request line + empty block only)
     };
     if line.len() > MAX_REQUEST_LINE {
         return Err(ParseError::HeadTooLarge);
@@ -203,7 +227,8 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<ParsedHead>, ParseError> {
         return Err(ParseError::HeadTooLarge);
     }
     let line = std::str::from_utf8(line).map_err(|_| ParseError::BadRequest)?;
-    // 严格三 token（多余空格 ⇒ 拒——歧义请求行是走私面）。
+    // Strictly three tokens (extra spaces ⇒ reject —— an ambiguous request
+    // line is a smuggling surface).
     let mut parts = line.split(' ');
     let (method, target, version) = match (parts.next(), parts.next(), parts.next()) {
         (Some(m), Some(t), Some(v)) if parts.next().is_none() => (m, t, v),
@@ -215,7 +240,7 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<ParsedHead>, ParseError> {
     if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
         return Err(ParseError::BadRequest);
     }
-    // target 必须是 origin-form（绝对 URI/proxy 形 ⇒ 拒）。
+    // target must be origin-form (absolute URI / proxy form ⇒ reject).
     if !target.starts_with('/') || target.contains(' ') || target.contains('\t') {
         return Err(ParseError::BadRequest);
     }
@@ -223,10 +248,11 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<ParsedHead>, ParseError> {
         Some((p, q)) => (p, q),
         None => (target, ""),
     };
-    // ③ 头行（严格 `Name: value`；obs-fold（行首空白）⇒ 拒——走私面）。
+    // ③ Header lines (strict `Name: value`; obs-fold (leading whitespace) ⇒
+    //    reject —— smuggling surface).
     let rest_str = std::str::from_utf8(rest).map_err(|_| ParseError::BadRequest)?;
     let mut headers: Vec<(String, String)> = Vec::new();
-    let mut content_length: Option<Option<u64>> = None; // 外层 = 是否见过；内层 = 值
+    let mut content_length: Option<Option<u64>> = None; // outer = seen yet; inner = value
     let mut keep_alive = version == "HTTP/1.1";
     if !rest_str.is_empty() {
         for hl in rest_str.split("\r\n") {
@@ -237,7 +263,8 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<ParsedHead>, ParseError> {
                 return Err(ParseError::BadRequest); // obs-fold
             }
             let (name, value) = hl.split_once(':').ok_or(ParseError::BadRequest)?;
-            // 头名严格 token（名内空白 ⇒ 拒，RFC 7230 安全基线）。
+            // Header names strictly token (whitespace inside the name ⇒
+            // reject, RFC 7230 security baseline).
             if name.is_empty()
                 || !name
                     .bytes()
@@ -250,7 +277,8 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<ParsedHead>, ParseError> {
                 return Err(ParseError::TransferEncoding);
             }
             if name.eq_ignore_ascii_case("content-length") {
-                // 重复头或多值（逗号）⇒ 拒（走私面）。
+                // Duplicate header or multi-value (comma) ⇒ reject (smuggling
+                // surface).
                 if content_length.is_some() || value.contains(',') {
                     return Err(ParseError::DuplicateContentLength);
                 }
@@ -292,23 +320,30 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 // ============================================================================
-// 连接循环（单读超时 + 请求总时限/上限/keep-alive）
+// Connection loop (per-read timeout + request total limit / limits /
+// keep-alive)
 // ============================================================================
 
-/// handler 类型（api 分发；remote = 连接对端——访问矩阵的判定输入）。
+/// Handler type (api dispatch; remote = the connection peer —— the decision
+/// input of the access matrix).
 pub type HandlerReturn = Pin<Box<dyn Future<Output = Response> + Send>>;
 pub type Handler = Box<dyn Fn(Request, SocketAddr) -> HandlerReturn + Send + Sync>;
 
-/// 服务一条连接直到关闭（keep-alive 循环；畸形 ⇒ 400/413 并关连接）。
+/// Serve one connection until close (keep-alive loop; malformed ⇒ 400/413 and
+/// close).
 ///
-/// 每请求（head+body 整体读循环）套 [`REQUEST_TOTAL`] 总时限预算——逐字节滴注
-/// 可使每次 read 都落在单读超时内而无限期占用并发许可；预算到期关连接并计数
-/// （[`slow_request_kills`]）。分发/写响应不计入预算（读面才是攻击者控速面）。
+/// Every request (the whole head+body read loop) runs under the
+/// [`REQUEST_TOTAL`] total-budget deadline —— a byte-by-byte drip can keep
+/// every read inside the per-read timeout while holding a concurrency permit
+/// indefinitely; on budget expiry the connection is closed and counted
+/// ([`slow_request_kills`]). Dispatch/response writing does not count toward
+/// the budget (the read side is the attacker-controlled pace surface).
 pub async fn serve_conn(io: &mut TcpStream, remote: SocketAddr, handler: Handler) {
     serve_conn_with_budget(io, remote, handler, REQUEST_TOTAL).await
 }
 
-/// [`serve_conn`] 的预算注入变体（测试用短预算驱动慢速滴注向量）。
+/// Budget-injection variant of [`serve_conn`] (tests drive the slow-drip
+/// vector with a short budget).
 pub async fn serve_conn_with_budget(
     io: &mut TcpStream,
     remote: SocketAddr,
@@ -318,16 +353,17 @@ pub async fn serve_conn_with_budget(
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     loop {
-        // ①② head 累积 + body 补齐，整体套总时限预算。
+        // ①② head accumulation + body fill, all under the total-budget
+        //    deadline.
         let outcome =
             tokio::time::timeout(total_budget, read_request(io, &mut buf, &mut chunk)).await;
         let (head, body) = match outcome {
-            // 总预算到期（慢速滴注）：静默关连接 + 计数。
+            // Total budget expired (slow drip): silently close + count.
             Err(_) => {
                 SLOW_KILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
-            Ok(ReadOutcome::Closed) => return, // EOF / 单读超时 / 读错误：静默关
+            Ok(ReadOutcome::Closed) => return, // EOF / per-read timeout / read error: silent close
             Ok(ReadOutcome::Bad(e)) => {
                 let status = match e {
                     ParseError::PayloadTooLarge => 413,
@@ -346,7 +382,8 @@ pub async fn serve_conn_with_budget(
             headers: head.headers.clone(),
             body,
         };
-        // ③ 分发（handler panic 由装配面兜底为 500——见 mod.rs 的包装层）。
+        // ③ Dispatch (handler panics are backstopped as 500 by the assembly
+        //    layer —— see the wrapping in mod.rs).
         let resp = handler(req, remote).await;
         let keep = head.keep_alive;
         if write_response(io, &resp, keep).await.is_err() {
@@ -358,24 +395,27 @@ pub async fn serve_conn_with_budget(
     }
 }
 
-/// 单请求读循环产物（head 解析 + body 补齐的状态归并）。
+/// Single-request read-loop product (the merged state of head parsing + body
+/// filling).
 enum ReadOutcome {
-    /// 完整请求（head + body 齐备）。
+    /// Complete request (head + body ready).
     Request { head: ParsedHead, body: Vec<u8> },
-    /// 致命畸形（调用方回 400/413 并关连接）。
+    /// Fatally malformed (the caller replies 400/413 and closes).
     Bad(ParseError),
-    /// EOF / 单读超时 / 读错误（静默关连接）。
+    /// EOF / per-read timeout / read error (silent close).
     Closed,
 }
 
-/// 读一个完整请求（head 累积 → body 按 Content-Length 补齐）；`buf` 跨请求复用
-/// （管道化剩余字节自然衔接）。
+/// Read one complete request (head accumulation → body filled per
+/// Content-Length); `buf` is reused across requests (leftover pipelined
+/// bytes carry over naturally).
 async fn read_request(
     io: &mut TcpStream,
     buf: &mut Vec<u8>,
     chunk: &mut [u8; 4096],
 ) -> ReadOutcome {
-    // ① head 累积（上限内找不到头块结束 ⇒ 400 关连接）。
+    // ① Head accumulation (no header-block end found within limits ⇒ 400
+    //    and close).
     let head = loop {
         match parse_head(buf) {
             Ok(Some(h)) => break h,
@@ -383,20 +423,21 @@ async fn read_request(
             Err(e) => return ReadOutcome::Bad(e),
         }
         match tokio::time::timeout(READ_TIMEOUT, io.read(chunk)).await {
-            Ok(Ok(0)) | Err(_) => return ReadOutcome::Closed, // EOF / 读超时：静默关
+            Ok(Ok(0)) | Err(_) => return ReadOutcome::Closed, // EOF / read timeout: silent close
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
             Ok(Err(_)) => return ReadOutcome::Closed,
         }
     };
-    // 消费 head 字节（含结尾 \r\n\r\n）；剩余字节属于 body（或下一请求——
-    // 管道化场景自然衔接）。
+    // Consume the head bytes (including the trailing \r\n\r\n); leftover
+    // bytes belong to the body (or the next request —— the pipelined case
+    // carries over naturally).
     let head_len = find_sub(buf, b"\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     buf.drain(..head_len);
-    // ② body 按 Content-Length 补齐。
+    // ② Fill the body per Content-Length.
     let want = head.content_length.unwrap_or(0) as usize;
     while buf.len() < want {
         match tokio::time::timeout(READ_TIMEOUT, io.read(chunk)).await {
-            Ok(Ok(0)) | Err(_) => return ReadOutcome::Closed, // 半包超时/EOF：关连接
+            Ok(Ok(0)) | Err(_) => return ReadOutcome::Closed, // partial-packet timeout / EOF: close
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
             Ok(Err(_)) => return ReadOutcome::Closed,
         }
@@ -405,8 +446,9 @@ async fn read_request(
     ReadOutcome::Request { head, body }
 }
 
-/// 写响应（补 Content-Length/Connection；handler 设置的 Connection 头被剥离——
-/// 该头归连接层所有）。
+/// Write a response (adds Content-Length/Connection; a Connection header set
+/// by the handler is stripped —— that header belongs to the connection
+/// layer).
 async fn write_response(
     io: &mut TcpStream,
     resp: &Response,
@@ -434,7 +476,8 @@ async fn write_response(
     io.flush().await
 }
 
-/// 连接层自带的最小错误信封（畸形请求——分发层未参与；文案白名单）。
+/// The connection layer's own minimal error envelope (malformed request ——
+/// the dispatch layer never took part; whitelisted message).
 fn err_envelope(status: u16) -> serde_json::Value {
     let code = match status {
         413 => "payload_too_large",
@@ -446,7 +489,8 @@ fn err_envelope(status: u16) -> serde_json::Value {
 }
 
 // ============================================================================
-// 单元测试：解析器畸形向量 + 连接循环往返（合法/畸形/上限/走私/半包超时）
+// Unit tests: parser malformed vectors + connection-loop round trips
+// (valid / malformed / limits / smuggling / partial-packet timeout)
 // ============================================================================
 
 #[cfg(test)]
@@ -457,7 +501,8 @@ mod tests {
         parse_head(bytes)
     }
 
-    /// 合法 GET/POST 解析：路径/query/头查读/keep-alive 裁定/Content-Length。
+    /// Valid GET/POST parsing: path/query/header reads/keep-alive decision/
+    /// Content-Length.
     #[test]
     fn parse_valid_get_and_post() {
         let h = head(b"GET /api/peers HTTP/1.1\r\nHost: 127.0.0.1:9800\r\n\r\n")
@@ -472,9 +517,9 @@ mod tests {
                 .find(|(k, _)| k.eq_ignore_ascii_case("HOST"))
                 .map(|(_, v)| v.as_str()),
             Some("127.0.0.1:9800"),
-            "头查读大小写不敏感"
+            "header reads case-insensitive"
         );
-        assert!(h.keep_alive, "HTTP/1.1 缺省 keep-alive");
+        assert!(h.keep_alive, "HTTP/1.1 defaults to keep-alive");
         assert_eq!(h.content_length, None);
 
         let h = head(
@@ -486,39 +531,41 @@ mod tests {
         assert_eq!(h.path, "/api/login-begin");
         assert_eq!(h.query, "x=1");
         assert_eq!(h.content_length, Some(7));
-        assert!(!h.keep_alive, "Connection: close 关 keep-alive");
+        assert!(!h.keep_alive, "Connection: close disables keep-alive");
 
-        // HTTP/1.0：缺省关；显式 keep-alive 开。
+        // HTTP/1.0: defaults to close; explicit keep-alive enables it.
         let h10 = head(b"GET / HTTP/1.0\r\n\r\n").unwrap().unwrap();
         assert!(!h10.keep_alive);
         let h10k = head(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
             .unwrap()
             .unwrap();
         assert!(h10k.keep_alive);
-        // 不完整 ⇒ None（需继续读）。
+        // Incomplete ⇒ None (keep reading).
         assert!(head(b"GET / HTTP/1.1\r\nHost: x").unwrap().is_none());
     }
 
-    /// 坏请求行/坏版本/歧义 token/绝对 URI ⇒ BadRequest。
+    /// Bad request line / bad version / ambiguous tokens / absolute URI ⇒
+    /// BadRequest.
     #[test]
     fn parse_rejects_bad_request_line() {
         for bad in [
-            &b"GET  / HTTP/1.1\r\n\r\n"[..],           // 双空格（四 token）
-            &b"GET /\r\n\r\n"[..],                     // 两 token
-            &b"GET / HTTP/2.0\r\n\r\n"[..],            // 版本
-            &b"get / HTTP/1.1\r\n\r\n"[..],            // 小写方法
-            &b"GET http://evil/ HTTP/1.1\r\n\r\n"[..], // 绝对 URI（proxy 形）
-            &b"GET /a HTTP/1.1 extra\r\n\r\n"[..],     // 四 token
-            &b"GET\x00 / HTTP/1.1\r\n\r\n"[..],        // 控制字符
+            &b"GET  / HTTP/1.1\r\n\r\n"[..], // double space (four tokens)
+            &b"GET /\r\n\r\n"[..],           // two tokens
+            &b"GET / HTTP/2.0\r\n\r\n"[..],  // version
+            &b"get / HTTP/1.1\r\n\r\n"[..],  // lowercase method
+            &b"GET http://evil/ HTTP/1.1\r\n\r\n"[..], // absolute URI (proxy form)
+            &b"GET /a HTTP/1.1 extra\r\n\r\n"[..], // four tokens
+            &b"GET\x00 / HTTP/1.1\r\n\r\n"[..], // control character
             &b"GET / HTT\r\n\r\n"[..],
-            &b"GET /a b HTTP/1.1\r\n\r\n"[..], // target 含空格（歧义）
+            &b"GET /a b HTTP/1.1\r\n\r\n"[..], // target contains a space (ambiguous)
         ] {
-            assert_eq!(head(bad), Err(ParseError::BadRequest), "拒: {bad:?}");
+            assert_eq!(head(bad), Err(ParseError::BadRequest), "reject: {bad:?}");
         }
     }
 
-    /// 走私面拒绝：Transfer-Encoding（任何值/任何大小写）与重复 Content-Length
-    ///（含逗号多值）⇒ 专用错误码（连接层统一 400 关连接）。
+    /// Smuggling surfaces rejected: Transfer-Encoding (any value / any case)
+    /// and duplicate Content-Length (including comma multi-values) ⇒ dedicated
+    /// error codes (the connection layer uniformly 400s and closes).
     #[test]
     fn parse_rejects_smuggling_vectors() {
         assert_eq!(
@@ -537,19 +584,20 @@ mod tests {
             head(b"POST /x HTTP/1.1\r\nContent-Length: 5, 5\r\n\r\n"),
             Err(ParseError::DuplicateContentLength)
         );
-        // Content-Length 坏值（负号/十六进制/非数字）⇒ BadRequest。
+        // Bad Content-Length values (minus sign / hexadecimal / non-digit) ⇒
+        // BadRequest.
         for v in ["-1", "0x10", "abc", "+5", ""] {
             let req = format!("POST /x HTTP/1.1\r\nContent-Length: {v}\r\n\r\n");
             assert_eq!(
                 head(req.as_bytes()),
                 Err(ParseError::BadRequest),
-                "CL 值 {v:?} 拒"
+                "CL value {v:?} rejected"
             );
         }
     }
 
-    /// 上限：请求行 > 2KiB / 头块 > 8KiB ⇒ HeadTooLarge（400）；体 > 64KiB ⇒
-    /// PayloadTooLarge（413）。
+    /// Limits: request line > 2KiB / header block > 8KiB ⇒ HeadTooLarge
+    /// (400); body > 64KiB ⇒ PayloadTooLarge (413).
     #[test]
     fn parse_enforces_size_limits() {
         let long_line = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(MAX_REQUEST_LINE));
@@ -564,14 +612,14 @@ mod tests {
             MAX_BODY + 1
         );
         assert_eq!(head(big_body.as_bytes()), Err(ParseError::PayloadTooLarge));
-        // 恰在限内放行（边界：请求行总长恰 = MAX_REQUEST_LINE；"GET /" + pad +
-        // " HTTP/1.1" = 14 + pad）。
+        // Exactly within limits passes (boundary: total request-line length
+        // exactly MAX_REQUEST_LINE; "GET /" + pad + " HTTP/1.1" = 14 + pad).
         let pad = MAX_REQUEST_LINE - 14;
         let ok_line = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(pad));
         assert_eq!(
             ok_line.find("\r\n").unwrap(),
             MAX_REQUEST_LINE,
-            "边界自检：请求行恰 2KiB"
+            "boundary self-check: request line exactly 2KiB"
         );
         assert!(head(ok_line.as_bytes()).unwrap().is_some());
         let over = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(pad + 1));
@@ -580,36 +628,37 @@ mod tests {
         assert!(head(ok_body.as_bytes()).unwrap().is_some());
     }
 
-    /// 头形拒绝：obs-fold（行首空白）、名内空白、缺冒号、空头名。
+    /// Bad header shapes rejected: obs-fold (leading whitespace), whitespace
+    /// inside names, missing colon, empty header name.
     #[test]
     fn parse_rejects_bad_header_shapes() {
         assert_eq!(
             head(b"GET / HTTP/1.1\r\nX-A: 1\r\n folded\r\n\r\n"),
             Err(ParseError::BadRequest),
-            "obs-fold 拒"
+            "obs-fold rejected"
         );
         assert_eq!(
             head(b"GET / HTTP/1.1\r\nBad Header: 1\r\n\r\n"),
             Err(ParseError::BadRequest),
-            "名内空白拒"
+            "whitespace in name rejected"
         );
         assert_eq!(
             head(b"GET / HTTP/1.1\r\nNoColon\r\n\r\n"),
             Err(ParseError::BadRequest),
-            "缺冒号拒"
+            "missing colon rejected"
         );
         assert_eq!(
             head(b"GET / HTTP/1.1\r\n: v\r\n\r\n"),
             Err(ParseError::BadRequest),
-            "空头名拒"
+            "empty header name rejected"
         );
-        // 合法头名带 -/_ 放行。
+        // Legal header names with -/_ pass.
         assert!(head(b"GET / HTTP/1.1\r\nX-Flock-Web: 1\r\nX_A: 2\r\n\r\n")
             .unwrap()
             .is_some());
     }
 
-    /// cookie 单键解析。
+    /// Single-key cookie parsing.
     #[test]
     fn session_cookie_extraction() {
         let mut req = Request {
@@ -629,9 +678,10 @@ mod tests {
         assert_eq!(req.session_cookie(), Some(""));
     }
 
-    // —— 连接循环（真 socket）：合法往返/keep-alive/畸形关连接/半包超时 ——
+    // —— Connection loop (real socket): valid round trips / keep-alive /
+    // malformed close / partial-packet timeout ——
 
-    /// 测试载具：起一对 echo handler 服务，返回监听地址。
+    /// Test vehicle: start an echo-handler server, return the listen address.
     async fn spawn_echo() -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -667,27 +717,29 @@ mod tests {
         let mut out = Vec::new();
         let _ = io.read_to_end(&mut out).await;
         let text = String::from_utf8_lossy(&out).into_owned();
-        let closed = !text.is_empty(); // read_to_end 返回即对端已关
+        let closed = !text.is_empty(); // read_to_end returning means the peer closed
         (text, closed)
     }
 
     #[tokio::test]
     async fn conn_valid_roundtrip_and_keepalive() {
         let addr = spawn_echo().await;
-        // GET 往返（含 query 与头；roundtrip 以 close 收口避免 keep-alive 挂住读侧）。
+        // GET round trip (with query and headers; roundtrip closes to avoid
+        // the read side hanging on keep-alive).
         let (text, _) = roundtrip(
             addr,
             b"GET /api/x?v=1 HTTP/1.1\r\nHost: h\r\nX-Flock-Web: 1\r\nConnection: close\r\n\r\n",
         )
         .await;
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
-        assert!(text.contains("content-length:"), "补 Content-Length");
+        assert!(text.contains("content-length:"), "Content-Length added");
         assert!(
             text.contains("GET /api/x q=v=1 body= remote=127.0.0.1"),
             "{text}"
         );
 
-        // keep-alive：同一连接两个请求（第二个带 body）。
+        // keep-alive: two requests on one connection (the second with a
+        // body).
         let mut io = tokio::net::TcpStream::connect(addr).await.unwrap();
         io.write_all(
             b"POST /a HTTP/1.1\r\nContent-Type: application/json\r\ncontent-length: 3\r\n\r\nxyz",
@@ -705,10 +757,10 @@ mod tests {
         let second = String::from_utf8_lossy(&second[..n]).into_owned();
         assert!(
             second.contains("GET /b q= body="),
-            "keep-alive 第二请求: {second}"
+            "keep-alive second request: {second}"
         );
 
-        // Connection: close ⇒ 显式关。
+        // Connection: close ⇒ explicit close.
         let (text, closed) = roundtrip(addr, b"GET /c HTTP/1.1\r\nConnection: close\r\n\r\n").await;
         assert!(closed && text.contains("connection: close"), "{text}");
     }
@@ -716,7 +768,7 @@ mod tests {
     #[tokio::test]
     async fn conn_malformed_close_and_oversized() {
         let addr = spawn_echo().await;
-        // Transfer-Encoding ⇒ 400 + 关连接。
+        // Transfer-Encoding ⇒ 400 + close.
         let (text, _) = roundtrip(
             addr,
             b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
@@ -725,14 +777,14 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 400"), "{text}");
         assert!(text.contains("connection: close"), "{text}");
         assert!(text.contains("\"code\":\"bad_request\""), "{text}");
-        // 重复 Content-Length ⇒ 400。
+        // Duplicate Content-Length ⇒ 400.
         let (text, _) = roundtrip(
             addr,
             b"POST /x HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
         )
         .await;
         assert!(text.starts_with("HTTP/1.1 400"), "{text}");
-        // 体 > 64KiB（声明）⇒ 413。
+        // Body > 64KiB (declared) ⇒ 413.
         let big = format!(
             "POST /x HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
             MAX_BODY + 1
@@ -740,7 +792,7 @@ mod tests {
         let (text, _) = roundtrip(addr, big.as_bytes()).await;
         assert!(text.starts_with("HTTP/1.1 413"), "{text}");
         assert!(text.contains("\"code\":\"payload_too_large\""), "{text}");
-        // 头块超限 ⇒ 400。
+        // Header block over the limit ⇒ 400.
         let big_header = format!(
             "GET / HTTP/1.1\r\nX-Big: {}\r\n\r\n",
             "h".repeat(MAX_HEAD + 16)
@@ -749,27 +801,35 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 400"), "{text}");
     }
 
-    /// 半包超时：发出不完整 head 后静默——READ_TIMEOUT 后连接被关（EOF 到达）。
-    /// （READ_TIMEOUT=15s 对测试太长：本测试只验证「不完整请求不会永远挂着」的
-    /// 机制存在——发半包后等 300ms 断言连接仍开（未误杀），随后由对端关闭侧验证
-    /// 交给真实部署；缩短等待避免测试面 15s 阻塞。）
+    /// Partial-packet timeout: send an incomplete head then stay silent ——
+    /// after READ_TIMEOUT the connection is closed (EOF arrives).
+    /// (READ_TIMEOUT=15s is too long for tests: this test only verifies that
+    /// the "an incomplete request does not hang forever" mechanism exists ——
+    /// after sending the partial packet, wait 300ms and assert the connection
+    /// is still open (not killed by mistake); the peer-close side is left to
+    /// real deployments; the shortened wait avoids a 15s block on the test
+    /// surface.)
     #[tokio::test]
     async fn conn_partial_request_held_open_until_timeout_or_eof() {
         let addr = spawn_echo().await;
         let mut io = tokio::net::TcpStream::connect(addr).await.unwrap();
         io.write_all(b"GET / HTTP/1.1\r\nHost: x").await.unwrap();
-        // 半包：在超时窗口内连接不应被关（read 返回 WouldBlock/0 字节）。
+        // Partial packet: the connection must not be closed within the
+        // timeout window (read returns WouldBlock/0 bytes).
         io.async_read_no_close_probe().await;
-        // 对端关闭（EOF）⇒ 服务端静默收尾（无响应写出——不 panic）。
+        // Peer closes (EOF) ⇒ the server winds down silently (no response
+        // written —— no panic).
         drop(io);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    /// 慢速滴注向量（🔴 评审项 1）：每字节间隔 25ms（单 read 远未超 READ_TIMEOUT=15s）
-    /// 但 head 永不完整、总时长超总预算 ⇒ 连接被总时限切断 + 计数递增
-    /// （否则可无限期占用 MAX_CONCURRENCY=64 许可——VIP 面 DoS 管理面）。
-    /// 预算注入 300ms（serve_conn_with_budget）驱动——生产档 REQUEST_TOTAL=30s 的
-    /// 同一机制。
+    /// Slow-drip vector (review item 1): 25ms between bytes (each single read
+    /// is far inside READ_TIMEOUT=15s) but the head never completes and the
+    /// total duration exceeds the total budget ⇒ the connection is cut by the
+    /// total limit + the counter increments (otherwise a MAX_CONCURRENCY=64
+    /// permit could be held indefinitely —— a VIP-surface DoS on the admin
+    /// surface). Budget injected as 300ms (serve_conn_with_budget) —— the
+    /// same mechanism as the production REQUEST_TOTAL=30s.
     #[tokio::test]
     async fn conn_slow_drip_killed_by_request_total_budget() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -795,30 +855,33 @@ mod tests {
         });
         let mut io = tokio::net::TcpStream::connect(addr).await.unwrap();
         let before = slow_request_kills();
-        // 逐字节滴注：永不完整的 head（22B × 25ms = 550ms > 300ms 预算）。
+        // Byte-by-byte drip: a head that never completes (22B × 25ms = 550ms
+        // > 300ms budget).
         let drip = b"GET / HTTP/1.1\r\nHost: x\r\n";
         for b in drip.iter() {
             if io.write_all(&[*b]).await.is_err() {
-                break; // 服务端已断（预期路径——Windows 半关闭后写即 RST）
+                break; // server already cut (expected path —— writing after Windows half-close RSTs)
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        // 断言被断：读侧 EOF 或错误（2s 内），且计数器递增。
+        // Assert the cut: read-side EOF or error (within 2s), and the counter
+        // incremented.
         let mut probe = [0u8; 1];
         match tokio::time::timeout(std::time::Duration::from_secs(2), io.read(&mut probe)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => {} // EOF / 连接重置——均为「被断」
-            Ok(Ok(n)) => panic!("慢速滴注不应得到 {n}B 响应数据"),
-            Err(_) => panic!("慢速滴注连接未被总时限切断（许可仍被占用）"),
+            Ok(Ok(0)) | Ok(Err(_)) => {} // EOF / connection reset —— both count as "cut"
+            Ok(Ok(n)) => panic!("a slow drip should not receive {n}B of response data"),
+            Err(_) => panic!("slow-drip connection not cut by the total limit (permit still held)"),
         }
         assert!(
             slow_request_kills() > before,
-            "总时限到期关连接必须计数（{} → {}）",
+            "total-limit expiry closing a connection must count ({} → {})",
             before,
             slow_request_kills()
         );
     }
 
-    /// 辅助：非阻塞探测——短窗内读到 0 字节（无数据且未关）即认为连接仍开。
+    /// Helper: non-blocking probe —— reading 0 bytes within a short window
+    /// (no data and not closed) means the connection is still open.
     trait NoCloseProbe {
         async fn async_read_no_close_probe(&mut self);
     }
@@ -832,10 +895,11 @@ mod tests {
             )
             .await
             {
-                // 200ms 内无字节且未 EOF ⇒ 连接仍开（半包保持）。
+                // No bytes and no EOF within 200ms ⇒ connection still open
+                // (partial packet held).
                 Err(_) => {}
-                Ok(Ok(0)) => panic!("半包请求不应被立即关连接"),
-                Ok(Ok(n)) => panic!("不应有数据: {n}"),
+                Ok(Ok(0)) => panic!("a partial-packet request must not be closed immediately"),
+                Ok(Ok(n)) => panic!("no data expected: {n}"),
                 Ok(Err(e)) => panic!("probe err: {e}"),
             }
         }

@@ -1,15 +1,21 @@
-//! flock-server 进程入口（docs/design.md §3.11：`--config server.toml` / `init-cluster`
-//! / 运维子命令）。
+//! flock-server process entry (docs/design.md §3.11: `--config server.toml`
+//! / `init-cluster` / operations subcommands).
 //!
-//! 子命令：
-//! - （缺省 `run`）：起服——按 `listener.mode` 装配（Direct 缺省 / Frp 中转托管）；
-//! - `init-cluster`：引导状态库（集群根/身份/静态混合/OPRF/票据根种子；已初始化则报错）；
-//! - `invite [--ttl-secs N]`：签发邀请（admin 端点 → v3 邀请文件 b64 到 stdout）；
-//! - `redeem --user U --invite-b64 B --device-x B --device-ed B`：兑换邀请开户（admin 端点）；
-//! - `device-add --user U --device-x B --device-ed B`：直接注册设备（TOFU 预置；admin 端点）；
-//! - `revoke --device HEX32B`：吊销设备（admin 端点）。
+//! Subcommands:
+//! - (default `run`): start the server —— assembled per `listener.mode`
+//!   (Direct default / Frp relay managed);
+//! - `init-cluster`: bootstrap the state store (cluster root/identity/static
+//!   hybrid/OPRF/ticket-root seeds; errors if already initialized);
+//! - `invite [--ttl-secs N]`: mint an invite (admin endpoint → v3 invite file
+//!   b64 to stdout);
+//! - `redeem --user U --invite-b64 B --device-x B --device-ed B`: redeem an
+//!   invite to create an account (admin endpoint);
+//! - `device-add --user U --device-x B --device-ed B`: register a device
+//!   directly (TOFU pre-provisioning; admin endpoint);
+//! - `revoke --device HEX32B`: revoke a device (admin endpoint).
 //!
-//! `enroll`（多服入群）为 M4 范围（§4 准入流水），本里程碑不提供——如实声明。
+//! `enroll` (multi-server join) is M4 scope (the §4 admission pipeline), not
+//! provided in this milestone —— declared as-is.
 
 use std::path::PathBuf;
 
@@ -20,29 +26,34 @@ use flock_server::control::DevicePubs;
 const USAGE: &str = "\
 flock-server [--config <server.toml>] [<subcommand>]
 
-子命令：
-  (run)                          起服（缺省；listener.mode = direct 缺省 / frp；
-                                 [sync] mode=raft 时走多主装配——TCP 织物 + SyncNode）
-  init-cluster [--voters N --out DIR [--endpoints e1,e2,…]]
-                                 单服：引导状态库；--voters：生成多主集群材料
-                                 （根密钥 root.seed + 各 voter 入群捆绑 node-i.bundle；
-                                 endpoints = 各 voter 的客户端可见接入端点，§6.2）
-  enroll --bundle FILE           装载并验证节点捆绑（根签目录+入群凭证），落状态目录
+Subcommands:
+  (run)                          start the server (default; listener.mode = direct default / frp;
+                                 with [sync] mode=raft takes the multi-primary assembly - TCP fabric + SyncNode)
+  init-cluster [--voters N --out DIR [--endpoints e1,e2,...]]
+                                 single server: bootstrap the state store; --voters: generate
+                                 multi-primary cluster material (root key root.seed + per-voter
+                                 enrollment bundle node-i.bundle; endpoints = each voter's
+                                 client-visible access endpoint, section 6.2)
+  enroll --bundle FILE           load and verify the node bundle (root-signed directory +
+                                 enrollment credential), persist into the state directory
   cluster-bootstrap --root-seed FILE
-                                 多主运维：根密钥签 Bootstrap（票据根）+ SetOprf（共享
-                                 OPRF），经本机 admin 端点提交（幂等可重跑）
+                                 multi-primary ops: root-key-signed Bootstrap (ticket root) +
+                                 SetOprf (shared OPRF), submitted via the local admin endpoint
+                                 (idempotent, re-runnable)
   cluster-invite --root-seed FILE --bundle FILE [--ttl-secs N]
-                                 多主运维：以根密钥签 v3 邀请（目录取自捆绑）→ stdout b64
-  stats                          运行状态快照（epoch/leader/转发计数/在线会话）
-  invite [--ttl-secs N]          签发邀请 → stdout 单行 b64（单服形态）
+                                 multi-primary ops: sign a v3 invite with the root key
+                                 (directory taken from the bundle) -> stdout b64
+  stats                          runtime status snapshot (epoch/leader/forwarding counters/online sessions)
+  invite [--ttl-secs N]          mint an invite -> single-line b64 on stdout (single-server form)
   redeem --user U --invite-b64 B --device-x B32 --device-ed B32
-                                 兑换邀请开户（建用户/设备 + 分 VIP）
+                                 redeem an invite to create an account (user/device + VIP assignment)
   device-add --user U --device-x B32 --device-ed B32
-                                 直接注册设备（TOFU 预置）
-  revoke --device HEX64          吊销设备（推进 revocation_epoch + 杀会话）
-  web-admin-add <用户名>          M8 Web UI 首 admin 引导（stdin 两遍口令；原生 OPAQUE
-                                 注册；优先经 admin 端点；服务未跑 ⇒ 单服直写/
-                                 多主明确报错指引）
+                                 register a device directly (TOFU pre-provisioning)
+  revoke --device HEX64          revoke a device (advance revocation_epoch + kill sessions)
+  web-admin-add <username>       M8 Web UI first-admin bootstrap (password twice on stdin;
+                                 native OPAQUE registration; prefers the admin endpoint;
+                                 server not running => single-server direct write /
+                                 multi-primary errors with explicit guidance)
 ";
 
 fn main() {
@@ -95,7 +106,8 @@ enum Cmd {
     Revoke {
         device: [u8; 32],
     },
-    /// M8：Web UI 首 admin 引导（§7-M8.3——stdin 两遍口令 + 原生 OPAQUE 注册）。
+    /// M8: Web UI first-admin bootstrap (§7-M8.3 —— password twice on stdin +
+    /// native OPAQUE registration).
     WebAdminAdd {
         user: String,
     },
@@ -104,14 +116,15 @@ enum Cmd {
 fn parse_args() -> Result<Cli, String> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut config = PathBuf::from("server.toml");
-    // 全局旗标先行剥离；其余按位置参数/子命令旗标解析。
+    // Global flags peeled off first; the rest parsed as positional
+    // arguments/subcommand flags.
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < raw.len() {
         match raw[i].as_str() {
             "--config" => {
                 i += 1;
-                config = PathBuf::from(raw.get(i).ok_or("--config 值")?.clone());
+                config = PathBuf::from(raw.get(i).ok_or("--config value")?.clone());
             }
             other => rest.push(other.to_string()),
         }
@@ -124,18 +137,18 @@ fn parse_args() -> Result<Cli, String> {
             it.next();
             let (mut voters, mut out, mut endpoints) = (None, None, None);
             while let Some(k) = it.next() {
-                let v = it.next().ok_or(format!("{k} 值"))?;
+                let v = it.next().ok_or(format!("{k} value"))?;
                 match k.as_str() {
                     "--voters" => {
                         voters = Some(v.parse().map_err(|e| format!("voters: {e}"))?);
                     }
                     "--out" => out = Some(v),
                     "--endpoints" => endpoints = Some(v),
-                    other => return Err(format!("init-cluster: 未知参数 {other:?}")),
+                    other => return Err(format!("init-cluster: unknown argument {other:?}")),
                 }
             }
             if voters.is_some() && out.is_none() {
-                return Err("init-cluster --voters 需要 --out DIR".into());
+                return Err("init-cluster --voters requires --out DIR".into());
             }
             if let Some(n) = voters {
                 let eps = endpoints
@@ -144,7 +157,7 @@ fn parse_args() -> Result<Cli, String> {
                     .unwrap_or(0);
                 if eps != n {
                     return Err(format!(
-                        "init-cluster --endpoints 需与 --voters 同数（{eps} != {n}；逗号分隔，按 voter 序）"
+                        "init-cluster --endpoints must match --voters count ({eps} != {n}; comma-separated, in voter order)"
                     ));
                 }
             }
@@ -158,45 +171,45 @@ fn parse_args() -> Result<Cli, String> {
             it.next();
             let mut bundle = None;
             while let Some(k) = it.next() {
-                let v = it.next().ok_or(format!("{k} 值"))?;
+                let v = it.next().ok_or(format!("{k} value"))?;
                 match k.as_str() {
                     "--bundle" => bundle = Some(v),
-                    other => return Err(format!("enroll: 未知参数 {other:?}")),
+                    other => return Err(format!("enroll: unknown argument {other:?}")),
                 }
             }
             Cmd::Enroll {
-                bundle: bundle.ok_or("enroll 需要 --bundle FILE")?,
+                bundle: bundle.ok_or("enroll requires --bundle FILE")?,
             }
         }
         Some("cluster-bootstrap") => {
             it.next();
             let mut root_seed = None;
             while let Some(k) = it.next() {
-                let v = it.next().ok_or(format!("{k} 值"))?;
+                let v = it.next().ok_or(format!("{k} value"))?;
                 match k.as_str() {
                     "--root-seed" => root_seed = Some(v),
-                    other => return Err(format!("cluster-bootstrap: 未知参数 {other:?}")),
+                    other => return Err(format!("cluster-bootstrap: unknown argument {other:?}")),
                 }
             }
             Cmd::ClusterBootstrap {
-                root_seed: root_seed.ok_or("cluster-bootstrap 需要 --root-seed FILE")?,
+                root_seed: root_seed.ok_or("cluster-bootstrap requires --root-seed FILE")?,
             }
         }
         Some("cluster-invite") => {
             it.next();
             let (mut root_seed, mut bundle, mut ttl_secs) = (None, None, 7 * 24 * 3600);
             while let Some(k) = it.next() {
-                let v = it.next().ok_or(format!("{k} 值"))?;
+                let v = it.next().ok_or(format!("{k} value"))?;
                 match k.as_str() {
                     "--root-seed" => root_seed = Some(v),
                     "--bundle" => bundle = Some(v),
                     "--ttl-secs" => ttl_secs = v.parse().map_err(|e| format!("ttl: {e}"))?,
-                    other => return Err(format!("cluster-invite: 未知参数 {other:?}")),
+                    other => return Err(format!("cluster-invite: unknown argument {other:?}")),
                 }
             }
             Cmd::ClusterInvite {
-                root_seed: root_seed.ok_or("cluster-invite 需要 --root-seed FILE")?,
-                bundle: bundle.ok_or("cluster-invite 需要 --bundle FILE")?,
+                root_seed: root_seed.ok_or("cluster-invite requires --root-seed FILE")?,
+                bundle: bundle.ok_or("cluster-invite requires --bundle FILE")?,
                 ttl_secs,
             }
         }
@@ -210,10 +223,10 @@ fn parse_args() -> Result<Cli, String> {
             while let Some(k) = it.next() {
                 match k.as_str() {
                     "--ttl-secs" => {
-                        let v = it.next().ok_or("--ttl-secs 值")?;
+                        let v = it.next().ok_or("--ttl-secs value")?;
                         ttl_secs = v.parse().map_err(|e| format!("ttl: {e}"))?;
                     }
-                    other => return Err(format!("invite: 未知参数 {other:?}")),
+                    other => return Err(format!("invite: unknown argument {other:?}")),
                 }
             }
             Cmd::Invite { ttl_secs }
@@ -222,21 +235,21 @@ fn parse_args() -> Result<Cli, String> {
             it.next();
             let (mut invite_b64, mut username, mut dx, mut de) = (None, None, None, None);
             while let Some(k) = it.next() {
-                let v = it.next().ok_or(format!("{k} 值"))?;
+                let v = it.next().ok_or(format!("{k} value"))?;
                 match k.as_str() {
                     "--invite-b64" => invite_b64 = Some(v),
                     "--user" => username = Some(v),
                     "--device-x" => dx = Some(v),
                     "--device-ed" => de = Some(v),
-                    other => return Err(format!("redeem: 未知参数 {other:?}")),
+                    other => return Err(format!("redeem: unknown argument {other:?}")),
                 }
             }
             Cmd::Redeem {
-                invite_b64: invite_b64.ok_or("redeem 需要 --invite-b64")?,
-                username: username.ok_or("redeem 需要 --user")?,
+                invite_b64: invite_b64.ok_or("redeem requires --invite-b64")?,
+                username: username.ok_or("redeem requires --user")?,
                 device: DevicePubs {
-                    x25519: b32(&dx.ok_or("redeem 需要 --device-x")?)?,
-                    ed25519: b32(&de.ok_or("redeem 需要 --device-ed")?)?,
+                    x25519: b32(&dx.ok_or("redeem requires --device-x")?)?,
+                    ed25519: b32(&de.ok_or("redeem requires --device-ed")?)?,
                     hostname: String::new(),
                 },
             }
@@ -245,19 +258,19 @@ fn parse_args() -> Result<Cli, String> {
             it.next();
             let (mut username, mut dx, mut de) = (None, None, None);
             while let Some(k) = it.next() {
-                let v = it.next().ok_or(format!("{k} 值"))?;
+                let v = it.next().ok_or(format!("{k} value"))?;
                 match k.as_str() {
                     "--user" => username = Some(v),
                     "--device-x" => dx = Some(v),
                     "--device-ed" => de = Some(v),
-                    other => return Err(format!("device-add: 未知参数 {other:?}")),
+                    other => return Err(format!("device-add: unknown argument {other:?}")),
                 }
             }
             Cmd::DeviceAdd {
-                username: username.ok_or("device-add 需要 --user")?,
+                username: username.ok_or("device-add requires --user")?,
                 device: DevicePubs {
-                    x25519: b32(&dx.ok_or("device-add 需要 --device-x")?)?,
-                    ed25519: b32(&de.ok_or("device-add 需要 --device-ed")?)?,
+                    x25519: b32(&dx.ok_or("device-add requires --device-x")?)?,
+                    ed25519: b32(&de.ok_or("device-add requires --device-ed")?)?,
                     hostname: String::new(),
                 },
             }
@@ -266,22 +279,22 @@ fn parse_args() -> Result<Cli, String> {
             it.next();
             let mut device = None;
             while let Some(k) = it.next() {
-                let v = it.next().ok_or(format!("{k} 值"))?;
+                let v = it.next().ok_or(format!("{k} value"))?;
                 match k.as_str() {
                     "--device" => device = Some(hex32(&v)?),
-                    other => return Err(format!("revoke: 未知参数 {other:?}")),
+                    other => return Err(format!("revoke: unknown argument {other:?}")),
                 }
             }
             Cmd::Revoke {
-                device: device.ok_or("revoke 需要 --device")?,
+                device: device.ok_or("revoke requires --device")?,
             }
         }
         Some("web-admin-add") => {
             it.next();
-            let user = it.next().ok_or("web-admin-add 需要 <用户名>")?;
+            let user = it.next().ok_or("web-admin-add requires <username>")?;
             Cmd::WebAdminAdd { user }
         }
-        Some(other) => return Err(format!("未知子命令 {other:?}\n\n{USAGE}")),
+        Some(other) => return Err(format!("unknown subcommand {other:?}\n\n{USAGE}")),
     };
     Ok(Cli { config, cmd })
 }
@@ -294,36 +307,41 @@ fn b32(b64s: &str) -> Result<[u8; 32], String> {
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(t))
         .map_err(|e| format!("b64: {e}"))?;
     v.try_into()
-        .map_err(|v: Vec<u8>| format!("期望 32B，得 {}B", v.len()))
+        .map_err(|v: Vec<u8>| format!("expected 32B, got {}B", v.len()))
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], String> {
     let v = hex::decode(s.trim()).map_err(|e| format!("hex: {e}"))?;
     v.try_into()
-        .map_err(|v: Vec<u8>| format!("期望 64 hex（32B），得 {}B", v.len()))
+        .map_err(|v: Vec<u8>| format!("expected 64 hex (32B), got {}B", v.len()))
 }
 
-/// root.seed（init-cluster 产物，hex 32B）→ 根签名钥（运维侧离线保管的物化）。
+/// root.seed (init-cluster product, hex 32B) → the root signing key (the
+/// material kept offline on the operations side).
 #[cfg_attr(not(feature = "multi-primary"), allow(dead_code))]
 fn load_root_seed(path: &str) -> Result<flock_protocol::ed25519_dalek::SigningKey, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("读 {path}: {e}"))?;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     let bytes = hex::decode(text.trim()).map_err(|e| format!("root.seed hex: {e}"))?;
     let seed: [u8; 32] = bytes
         .try_into()
-        .map_err(|v: Vec<u8>| format!("root.seed 期望 64 hex（32B），得 {}B", v.len()))?;
+        .map_err(|v: Vec<u8>| format!("root.seed expects 64 hex (32B), got {}B", v.len()))?;
     Ok(flock_protocol::ed25519_dalek::SigningKey::from_bytes(&seed))
 }
 
-/// `web-admin-add <用户名>`：M8 Web UI 首 admin 引导（§7-M8.3）。
+/// `web-admin-add <username>`: M8 Web UI first-admin bootstrap (§7-M8.3).
 ///
-/// 流程：stdin 两遍口令（tty 有回显——本地信任域取舍，与 `flock-client login`
-/// 同语义）→ 原生 OPAQUE 注册（reg_start → admin 端点 m1→m2 → reg_finish →
-/// WebPwCommit（token 由本进程生成随消息携带））。服务在跑 ⇒ 经 admin 端点
-/// （多主亦经它——写走 Raft）；服务未跑 ⇒ 单服可直写状态库（Cmd::Invite 的
-/// fallback 先例）；**多主必须经在跑服务提交（Raft），否则明确报错指引**。
+/// Flow: password twice on stdin (the tty echoes —— a local-trust-domain
+/// trade-off, same semantics as `flock-client login`) → native OPAQUE
+/// registration (reg_start → admin endpoint m1→m2 → reg_finish → WebPwCommit
+/// (the token is generated by this process and carried in the message)).
+/// Server running ⇒ via the admin endpoint (multi-primary also goes through
+/// it —— writes go over Raft); server not running ⇒ single-server can write
+/// the state store directly (the fallback precedent of Cmd::Invite);
+/// **multi-primary must submit through a running service (Raft), otherwise
+/// an explicit error with guidance**.
 async fn cmd_web_admin_add(cfg: ServerConfig, user: String) -> Result<(), String> {
     use std::io::BufRead as _;
-    // 用户名约束与 Web API 一致（§M8.4）。
+    // Username constraints identical to the Web API (§M8.4).
     let valid = |u: &str| {
         !u.is_empty()
             && u.len() <= 32
@@ -332,10 +350,10 @@ async fn cmd_web_admin_add(cfg: ServerConfig, user: String) -> Result<(), String
     };
     if !valid(&user) {
         return Err(format!(
-            "用户名 {user:?} 不合法（1..=32B、[A-Za-z0-9_.-]，与 Web API 一致）"
+            "username {user:?} is invalid (1..=32B, [A-Za-z0-9_.-], same as the Web API)"
         ));
     }
-    // stdin 两遍口令。
+    // Password twice on stdin.
     let mut lines = std::io::stdin().lock().lines();
     let mut read_pw = |prompt: &str| -> Result<String, String> {
         eprint!("{prompt}");
@@ -344,26 +362,27 @@ async fn cmd_web_admin_add(cfg: ServerConfig, user: String) -> Result<(), String
             .next()
             .transpose()
             .map_err(|e| format!("stdin: {e}"))?
-            .ok_or_else(|| "stdin EOF（需要两行口令）".to_string())
+            .ok_or_else(|| "stdin EOF (two password lines required)".to_string())
     };
-    let pw = read_pw("口令（本地 tty 有回显，与 flock-client login 同取舍）: ")?;
-    let pw2 = read_pw("再输一遍: ")?;
+    let pw = read_pw("Password (the local tty echoes, same trade-off as flock-client login): ")?;
+    let pw2 = read_pw("Enter again: ")?;
     if pw.is_empty() {
-        return Err("口令为空".into());
+        return Err("password is empty".into());
     }
     if pw != pw2 {
-        return Err("两遍口令不一致".into());
+        return Err("the two passwords do not match".into());
     }
-    // 原生 OPAQUE 注册第一步（进程内）。
+    // First step of native OPAQUE registration (in-process).
     let mut rng = flock_protocol::rand::rngs::OsRng;
     let (cstate, m1_b64) = flock_protocol::pake::reg_start(&mut rng, &pw, &user)
         .map_err(|e| format!("OPAQUE reg_start: {e}"))?;
 
-    // 服务在跑 ⇒ admin 端点（多主写经 Raft）；未跑 ⇒ 单服直写。
+    // Server running ⇒ admin endpoint (multi-primary writes go over Raft);
+    // not running ⇒ single-server direct write.
     let admin_up = tokio::net::TcpStream::connect(cfg.admin_bind).await.is_ok();
     let token: [u8; 16] = flock_protocol::rand::random();
     if admin_up {
-        // ① m1 → m2（目标已有口令的拒答在此返回）。
+        // ① m1 → m2 (a target that already has a password is rejected here).
         let m2_b64 = match client(
             cfg.admin_bind,
             AdminRequest::WebPwBegin {
@@ -372,16 +391,17 @@ async fn cmd_web_admin_add(cfg: ServerConfig, user: String) -> Result<(), String
             },
         )
         .await
-        .map_err(|e| format!("admin 端点（{}）: {e}", cfg.admin_bind))?
+        .map_err(|e| format!("admin endpoint ({}): {e}", cfg.admin_bind))?
         {
             AdminResponse::WebPwM2 { m2_b64 } => m2_b64,
             AdminResponse::Err { msg } => return Err(msg),
-            other => return Err(format!("admin 响应形态不符: {other:?}")),
+            other => return Err(format!("unexpected admin response shape: {other:?}")),
         };
-        // ② reg_finish → record。
+        // ② reg_finish → record.
         let record_b64 = flock_protocol::pake::reg_finish(&mut rng, cstate, &pw, &user, &m2_b64)
             .map_err(|e| format!("OPAQUE reg_finish: {e}"))?;
-        // ③ 提交（token 随消息携带；admin=true——首 admin 引导）。
+        // ③ Commit (token carried in the message; admin=true —— first-admin
+        //    bootstrap).
         match client(
             cfg.admin_bind,
             AdminRequest::WebPwCommit {
@@ -395,28 +415,33 @@ async fn cmd_web_admin_add(cfg: ServerConfig, user: String) -> Result<(), String
         .await?
         {
             AdminResponse::WebPwDone { username } => {
-                println!("web admin 就绪: {username}（admin=true；Web UI 登录口令即上述输入）");
+                println!("web admin ready: {username} (admin=true; the Web UI login password is the input above)");
                 Ok(())
             }
             AdminResponse::Err { msg } => Err(msg),
-            other => Err(format!("admin 响应形态不符: {other:?}")),
+            other => Err(format!("unexpected admin response shape: {other:?}")),
         }
     } else {
-        // 服务未跑：多主必须经在跑服务（Raft）——明确报错指引。
+        // Server not running: multi-primary must go through a running service
+        // (Raft) —— explicit error with guidance.
         let raft = cfg.sync.as_ref().is_some_and(|s| s.mode == "raft");
         if raft {
             return Err(
-                "多主（[sync] mode=raft）形态的 web-admin-add 必须经在跑服务提交（写走 Raft）——请先启动 flock-server 再运行本命令"
+                "web-admin-add in multi-primary ([sync] mode=raft) form must be submitted through a running service (writes go over Raft) - start flock-server first, then run this command"
                     .into(),
             );
         }
-        // 单服直写（Cmd::Invite 的 fallback 先例：探测先于 redb 打开——服务若在跑，
-        // 库锁会被占用）。
+        // Single-server direct write (the fallback precedent of Cmd::Invite:
+        // probe before opening redb —— if the server is running, the database
+        // lock is held).
         let (core, created) = flock_server::server::ServerCore::open_or_init(cfg)?;
         if created {
-            eprintln!("note: 已引导新状态库（生产请先 init-cluster）");
+            eprintln!(
+                "note: bootstrapped a new state store (use init-cluster first in production)"
+            );
         }
-        // 目标已有口令 ⇒ 拒（与 admin 端点同语义）。
+        // Target already has a password ⇒ reject (same semantics as the admin
+        // endpoint).
         if core
             .net
             .user_row(&user)
@@ -424,16 +449,18 @@ async fn cmd_web_admin_add(cfg: ServerConfig, user: String) -> Result<(), String
             .is_some_and(|r| r.opaque_record.is_some())
         {
             return Err(format!(
-                "用户 {user} 已设置口令——web-admin-add 仅用于首次设置；已有口令的账户请经 Web UI 重置（管理员 /api/users/{user}/reset-password）"
+                "user {user} already has a password - web-admin-add is for first-time setup only; reset existing passwords via the Web UI (admin /api/users/{user}/reset-password)"
             ));
         }
-        // OPAQUE m2 由本进程 OPRF（同库同 key）生成——直写路径与服务端同一注册语义。
+        // The OPAQUE m2 is generated by this process's OPRF (same store, same
+        // key) —— the direct-write path has the same registration semantics
+        // as the server.
         let m2_b64 = flock_protocol::pake::server_reg_start(&core.oprf, &m1_b64, &user)
             .map_err(|e| format!("OPAQUE server_reg_start: {e}"))?;
         let record_b64 = flock_protocol::pake::reg_finish(&mut rng, cstate, &pw, &user, &m2_b64)
             .map_err(|e| format!("OPAQUE reg_finish: {e}"))?;
         flock_server::admin::web_pw_commit(&core, &user, token, &record_b64, 0, true).await?;
-        println!("web admin 就绪: {user}（admin=true；单服直写；Web UI 登录口令即上述输入）");
+        println!("web admin ready: {user} (admin=true; single-server direct write; the Web UI login password is the input above)");
         Ok(())
     }
 }
@@ -453,9 +480,12 @@ fn run_cli() -> Result<(), String> {
                 endpoints,
             } => {
                 if let (Some(n), Some(out)) = (voters, out) {
-                    // 多主集群材料（§4-1）：根密钥 + 各 voter 入群凭证 + 根签目录。
-                    // endpoints = 各 voter 的客户端可见接入端点（§6.2：Direct 直连地址
-                    // 或 Frp 中转用户口）——目录条目与入群凭证同根签名。
+                    // Multi-primary cluster material (§4-1): root key +
+                    // per-voter enrollment credentials + root-signed
+                    // directory. endpoints = each voter's client-visible
+                    // access endpoint (§6.2: a Direct dial address or an Frp
+                    // relay user port) —— directory entries and enrollment
+                    // credentials signed by the same root.
                     let eps: Vec<String> = match &endpoints {
                         Some(s) => s.split(',').map(|e| e.trim().to_string()).collect(),
                         None => (0..n).map(|i| format!("node-{i}:9443")).collect(),
@@ -464,8 +494,10 @@ fn run_cli() -> Result<(), String> {
                         eps[i].clone()
                     });
                     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-                    // 根密钥种子：仅此一份（运维离线保管；bundle 只含 root_pub——§4-3 红线）。
-                    // 0600 落盘（评审项 1：秘密文件创建即收紧，无「先写后收紧」窗口）。
+                    // Root key seed: exactly one copy (kept offline by ops;
+                    // bundles contain only root_pub —— the §4-3 red line).
+                    // Written 0600 (review item 1: secret files are tightened
+                    // at creation, no "write then tighten" window).
                     flock_server::write_private_file(
                         &std::path::Path::new(&out).join("root.seed"),
                         hex::encode(m.root.to_bytes()).as_bytes(),
@@ -473,19 +505,20 @@ fn run_cli() -> Result<(), String> {
                     .map_err(|e| e.to_string())?;
                     for i in 0..n {
                         let path = std::path::Path::new(&out).join(format!("node-{i}.bundle"));
-                        // 捆绑含本机身份/hybrid 种子 ⇒ 同按秘密文件 0600 落盘。
+                        // Bundles contain the node identity/hybrid seeds ⇒
+                        // also persisted as 0600 secret files.
                         flock_server::write_private_file(&path, &m.bundle(i).to_bytes())
                             .map_err(|e| format!("{}: {e}", path.display()))?;
                     }
                     println!("cluster_id={}", hex::encode(m.cluster_id.0));
                     println!("voters={n}");
                     println!("endpoints={}", eps.join(","));
-                    println!("out={out}（root.seed 保密；node-*.bundle 分发各机 + enroll）");
+                    println!("out={out} (keep root.seed secret; distribute node-*.bundle to each node + enroll)");
                     return Ok(());
                 }
                 let (core, created) = flock_server::server::ServerCore::open_or_init(cfg)?;
                 if !created {
-                    return Err("状态库已初始化（init-cluster 仅首次）".into());
+                    return Err("state store already initialized (init-cluster is first-time only)".into());
                 }
                 println!("cluster_id={}", hex::encode(core.identity.cluster_id.0));
                 println!("server_id={}", hex::encode(core.identity.server_id.0));
@@ -494,34 +527,43 @@ fn run_cli() -> Result<(), String> {
             Cmd::Enroll { bundle } => {
                 let bytes = std::fs::read(&bundle).map_err(|e| format!("read {bundle}: {e}"))?;
                 let b = flock_server::bundle::NodeBundle::from_bytes(&bytes)
-                    .ok_or("捆绑文件解码失败")?;
+                    .ok_or("bundle file failed to decode")?;
                 let cid = b.verify()?;
                 let ident = b.identity()?;
                 let dst = cfg.state_dir.join("bundle.bin");
-                // 捆绑含本机身份/hybrid 种子 ⇒ 0600 落盘（评审项 1）。
+                // The bundle contains the node identity/hybrid seeds ⇒
+                // persisted 0600 (review item 1).
                 flock_server::write_private_file(&dst, &bytes).map_err(|e| e.to_string())?;
                 println!("cluster_id={}", hex::encode(cid.0));
                 println!("server_id={}", hex::encode(ident.server_id.0));
                 println!("bundle={}", dst.display());
-                // 注：raft 形态的进程间织物（TCP/中转 Fabric）随 §6/§7-M5 部署批次接入；
-                // 进程内装配路径见 tests/multi_primary.rs。
+                // Note: the inter-process fabric of the raft form (TCP/relay
+                // Fabric) arrives with the §6/§7-M5 deployment batches; the
+                // in-process assembly path is in tests/multi_primary.rs.
                 Ok(())
             }
             Cmd::ClusterBootstrap { root_seed } => {
-                // 多主运维（§4-1/§4-3）：根密钥侧提交 Bootstrap（票据根）+ SetOprf（共享
-                // OPRF）。签名在本进程内做（root.seed 离线保管语义的运维入口），提交经
-                // 本机 admin 端点（SignedWrite 透传；幂等可重跑——状态机同值重放放行）。
+                // Multi-primary ops (§4-1/§4-3): root-key side submits
+                // Bootstrap (ticket root) + SetOprf (shared OPRF). Signing
+                // happens in this process (the operations entry point of the
+                // offline root.seed-keeping semantics); submission goes
+                // through the local admin endpoint (SignedWrite pass-through;
+                // idempotent and re-runnable —— the state machine allows
+                // same-value replays).
                 #[cfg(not(feature = "multi-primary"))]
                 {
                     let _ = root_seed;
-                    Err("cluster-bootstrap 需要 multi-primary 构建档".into())
+                    Err("cluster-bootstrap requires a multi-primary build".into())
                 }
                 #[cfg(feature = "multi-primary")]
                 {
                     let root = load_root_seed(&root_seed)?;
-                    // 票据密钥根：32B 随机（提交后全网共享；Bootstrap 幂等 ⇒ 重跑不换根）。
+                    // Ticket key root: 32B random (shared network-wide after
+                    // submission; Bootstrap is idempotent ⇒ re-running does
+                    // not change the root).
                     let ticket_root: [u8; 32] = flock_protocol::rand::random();
-                    // 本机 ServerIdentity 的 cluster_id（bundle.bin；捆绑与根密钥同源）。
+                    // cluster_id of this node's ServerIdentity (bundle.bin;
+                    // the bundle and the root key share provenance).
                     let cfg2 = cfg.clone();
                     let bundle_path = cfg2
                         .sync
@@ -529,9 +571,9 @@ fn run_cli() -> Result<(), String> {
                         .and_then(|s| s.bundle.clone())
                         .unwrap_or_else(|| cfg2.state_dir.join("bundle.bin"));
                     let bytes = std::fs::read(&bundle_path)
-                        .map_err(|e| format!("读 {}: {e}", bundle_path.display()))?;
+                        .map_err(|e| format!("read {}: {e}", bundle_path.display()))?;
                     let bundle = flock_server::bundle::NodeBundle::from_bytes(&bytes)
-                        .ok_or("捆绑文件解码失败")?;
+                        .ok_or("bundle file failed to decode")?;
                     let cluster_id = bundle.verify()?;
                     let dir = bundle.directory()?;
                     let boot = flock_sync::proto::SyncRequest::bootstrap_signed(
@@ -539,11 +581,17 @@ fn run_cli() -> Result<(), String> {
                         cluster_id.0,
                         ticket_root,
                     );
-                    // OPRF key（本进程生成）：**逐服务器封装提交**（评审项 2：design §2.4
-                    // 「加密封装到各服务器混合公钥」——不再明文 SetOprf 入 Raft 状态）。
-                    // ① ServerKeys（根签）：登记每台在册服务器的混合公钥（rewrap 的前置）。
-                    // ② AdminOp::Rewrap（根签）：对每台以 envelope v2 seal 一份——状态机
-                    //    只存 wraps，各服务器启动时用自己的 hybrid sk 解封。
+                    // OPRF key (generated in this process): **sealed and
+                    // submitted per server** (review item 2: design §2.4
+                    // "encrypt-sealed to each server's hybrid public key" ——
+                    // no more plaintext SetOprf into Raft state).
+                    // ① ServerKeys (root-signed): register every on-record
+                    //    server's hybrid public key (the precondition for
+                    //    rewrap).
+                    // ② AdminOp::Rewrap (root-signed): seal one copy per
+                    //    server with envelope v2 —— the state machine stores
+                    //    only wraps; each server unseals with its own hybrid
+                    //    sk at startup.
                     let oprf_b64 = flock_protocol::pake::server_setup_new(
                         &mut flock_protocol::rand::rngs::OsRng,
                     );
@@ -556,10 +604,11 @@ fn run_cli() -> Result<(), String> {
                                 server_id: node_id,
                                 identity_pub: *e.identity_pub.as_bytes(),
                                 hybrid_pub: e.static_hybrid_pub.to_bytes().to_vec(),
-                                // M7：服务器 mesh VIP 确定性推导（§6.2 服务器段 .1–.10；
-                                // 名册 Server 条目数据源）。
+                                // M7: deterministic derivation of the server
+                                // mesh VIP (§6.2 server segment .1–.10; the
+                                // roster Server-entry data source).
                                 vip: flock_sync::proto::server_vip_of(node_id)
-                                    .ok_or("服务器 node 号超出 VIP 保留段（1..=10）")?,
+                                    .ok_or("server node number outside the reserved VIP segment (1..=10)")?,
                             })
                         })
                         .collect();
@@ -578,7 +627,7 @@ fn run_cli() -> Result<(), String> {
                                         &root, node_id, wrapped,
                                     )
                                 })
-                                .map_err(|err| format!("seal OPRF 封装（node {node_id}）: {err}"))
+                                .map_err(|err| format!("seal OPRF wrap (node {node_id}): {err}"))
                         })
                         .collect();
                     let rewrap_reqs = rewrap_reqs?;
@@ -587,8 +636,10 @@ fn run_cli() -> Result<(), String> {
                     reqs.push(server_keys);
                     reqs.extend(rewrap_reqs);
                     for req in reqs {
-                        // admin（就绪后）优先；未就绪（Bootstrap 尚未 apply ⇒ admin 未起）
-                        // 回退到集群引导端点（admin 端口 +1，§6.2 编排序）。
+                        // Prefer admin (once ready); when not ready (Bootstrap
+                        // not yet applied ⇒ admin not started) fall back to
+                        // the cluster bootstrap endpoint (admin port + 1, the
+                        // §6.2 layout order).
                         let resp = match client(
                             cfg.admin_bind,
                             AdminRequest::SignedWrite { req: req.clone() },
@@ -604,26 +655,28 @@ fn run_cli() -> Result<(), String> {
                         };
                         match resp {
                             AdminResponse::WriteReceipt { text } => {
-                                // AlreadyBootstrapped = 幂等重跑（此前已提交过）——非错误。
+                                // AlreadyBootstrapped = idempotent re-run
+                                // (previously submitted) —— not an error.
                                 if text.contains("AlreadyBootstrapped") {
-                                    println!("{text}（幂等：此前已引导）");
+                                    println!("{text} (idempotent: already bootstrapped)");
                                 } else {
                                     println!("{text}");
                                 }
                             }
                             AdminResponse::Err { msg } => {
                                 if msg.contains("AlreadyBootstrapped") {
-                                    println!("{msg}（幂等：此前已引导）");
+                                    println!("{msg} (idempotent: already bootstrapped)");
                                 } else {
-                                    return Err(format!("cluster-bootstrap 提交被拒: {msg}"));
+                                    return Err(format!("cluster-bootstrap submission rejected: {msg}"));
                                 }
                             }
-                            _ => return Err("admin 响应形态不符".into()),
+                            _ => return Err("unexpected admin response shape".into()),
                         }
                     }
                     println!(
-                        "cluster-bootstrap ok（ticket_root + ServerKeys + {n_servers} 台 OPRF \
-                         逐服务器封装已提交；状态机只存 wraps；幂等可重跑）"
+                        "cluster-bootstrap ok (ticket_root + ServerKeys + per-server OPRF \
+                         sealing for {n_servers} servers submitted; the state machine stores only \
+                         wraps; idempotent and re-runnable)"
                     );
                     Ok(())
                 }
@@ -633,19 +686,21 @@ fn run_cli() -> Result<(), String> {
                 bundle,
                 ttl_secs,
             } => {
-                // 多主运维：邀请 = 根密钥签 v3 文件（服务器不持根密钥 ⇒ 多主形态
-                // `invite` 拒；本命令在运维侧完成「RecordInvite + 签发」）。
+                // Multi-primary ops: an invite = a root-key-signed v3 file
+                // (servers hold no root key ⇒ the multi-primary form rejects
+                // `invite`; this command does "RecordInvite + issuance" on
+                // the operations side).
                 #[cfg(not(feature = "multi-primary"))]
                 {
                     let _ = (root_seed, bundle, ttl_secs);
-                    Err("cluster-invite 需要 multi-primary 构建档".into())
+                    Err("cluster-invite requires a multi-primary build".into())
                 }
                 #[cfg(feature = "multi-primary")]
                 {
                     let root = load_root_seed(&root_seed)?;
-                    let bytes = std::fs::read(&bundle).map_err(|e| format!("读 {bundle}: {e}"))?;
+                    let bytes = std::fs::read(&bundle).map_err(|e| format!("read {bundle}: {e}"))?;
                     let b = flock_server::bundle::NodeBundle::from_bytes(&bytes)
-                        .ok_or("捆绑文件解码失败")?;
+                        .ok_or("bundle file failed to decode")?;
                     let cluster_id = b.verify()?;
                     let dir = b.directory()?;
                     let invite_id: [u8; 16] = flock_protocol::rand::random();
@@ -654,7 +709,8 @@ fn run_cli() -> Result<(), String> {
                         invite_id,
                         expiry_unix: expiry,
                     };
-                    // admin 优先；未就绪回退集群引导端点（同 cluster-bootstrap）。
+                    // Prefer admin; when not ready fall back to the cluster
+                    // bootstrap endpoint (same as cluster-bootstrap).
                     let resp =
                         match client(cfg.admin_bind, AdminRequest::SignedWrite { req: record })
                             .await
@@ -678,9 +734,9 @@ fn run_cli() -> Result<(), String> {
                     match resp {
                         AdminResponse::WriteReceipt { text } => println!("{text}"),
                         AdminResponse::Err { msg } => {
-                            return Err(format!("RecordInvite 被拒: {msg}"));
+                            return Err(format!("RecordInvite rejected: {msg}"));
                         }
-                        _ => return Err("admin 响应形态不符".into()),
+                        _ => return Err("unexpected admin response shape".into()),
                     }
                     let inv = flock_protocol::trust::InviteFile::issue(
                         &root,
@@ -706,11 +762,13 @@ fn run_cli() -> Result<(), String> {
                     Ok(())
                 }
                 AdminResponse::Err { msg } => Err(msg),
-                _ => Err("admin 响应形态不符".into()),
+                _ => Err("unexpected admin response shape".into()),
             },
             Cmd::Invite { ttl_secs } => {
-                // 服务在跑 ⇒ 先探 admin（单写者）——探测必须先于任何 redb 打开：
-                // 运行中的服务持库锁，先 open_or_init 会以「Database already open」失败。
+                // Server running ⇒ probe admin first (the single writer) ——
+                // the probe must precede any redb open: a running service
+                // holds the database lock, and an open_or_init first would
+                // fail with "Database already open".
                 if tokio::net::TcpStream::connect(cfg.admin_bind).await.is_ok() {
                     match client(cfg.admin_bind, AdminRequest::Invite { ttl_secs }).await? {
                         AdminResponse::Invite { invite_b64 } => {
@@ -718,14 +776,16 @@ fn run_cli() -> Result<(), String> {
                             Ok(())
                         }
                         AdminResponse::Err { msg } => Err(msg),
-                        _ => Err("admin 响应形态不符".into()),
+                        _ => Err("unexpected admin response shape".into()),
                     }
                 } else {
-                    // 服务未跑：本进程直写（状态库未初始化时先引导——首次签发的兜底路径）。
+                    // Server not running: this process writes directly (a
+                    // fresh state store is bootstrapped when uninitialized ——
+                    // the fallback path for a first issuance).
                     let (core, created) =
                         flock_server::server::ServerCore::open_or_init(cfg.clone())?;
                     if created {
-                        eprintln!("note: 已引导新状态库（建议改用 init-cluster）");
+                        eprintln!("note: bootstrapped a new state store (prefer init-cluster)");
                     }
                     let bytes = core.mint_invite(ttl_secs).await?;
                     use base64::Engine as _;
@@ -757,7 +817,7 @@ fn run_cli() -> Result<(), String> {
                         Ok(())
                     }
                     AdminResponse::Err { msg } => Err(msg),
-                    _ => Err("admin 响应形态不符".into()),
+                    _ => Err("unexpected admin response shape".into()),
                 }
             }
             Cmd::DeviceAdd { username, device } => {
@@ -770,7 +830,7 @@ fn run_cli() -> Result<(), String> {
                         Ok(())
                     }
                     AdminResponse::Err { msg } => Err(msg),
-                    _ => Err("admin 响应形态不符".into()),
+                    _ => Err("unexpected admin response shape".into()),
                 }
             }
             Cmd::Revoke { device } => {
@@ -781,14 +841,15 @@ fn run_cli() -> Result<(), String> {
                         Ok(())
                     }
                     AdminResponse::Err { msg } => Err(msg),
-                    _ => Err("admin 响应形态不符".into()),
+                    _ => Err("unexpected admin response shape".into()),
                 }
             }
             Cmd::WebAdminAdd { user } => cmd_web_admin_add(cfg, user).await,
             Cmd::Run => {
                 let mode = cfg.listener_mode()?;
-                // 多主形态（§6.2 M5 批次）：TCP 织物 + SyncNode + 服务器自身 peer 面；
-                // 单服路径（缺省）不变。
+                // Multi-primary form (§6.2 M5 batch): TCP fabric + SyncNode +
+                // the server's own peer surface; the single-server path
+                // (default) unchanged.
                 #[cfg(feature = "multi-primary")]
                 if let Some(sync) = &cfg.sync {
                     if sync.mode == "raft" {
@@ -813,15 +874,15 @@ fn run_cli() -> Result<(), String> {
                 if let Some(sync) = &cfg.sync {
                     if sync.mode == "raft" {
                         return Err(
-                            "server.toml [sync] mode = \"raft\" 需要 multi-primary 构建档\n\
-                             （镜像构建 --features multi-primary；单服部署用缺省 [sync] single）"
+                            "server.toml [sync] mode = \"raft\" requires a multi-primary build\n\
+                             (image build with --features multi-primary; single-server deployments use the default [sync] single)"
                                 .into(),
                         );
                     }
                 }
                 let (core, created) = flock_server::server::ServerCore::open_or_init(cfg)?;
                 if created {
-                    eprintln!("note: 状态库未初始化即起服——已引导（生产请先 init-cluster）");
+                    eprintln!("note: state store not initialized at startup - bootstrapped (use init-cluster first in production)");
                 }
                 let (running, task, _admin) = flock_server::server::run(core, mode).await?;
                 eprintln!(

@@ -1,28 +1,37 @@
-//! 会话票据（docs/design.md §2.2 / §3.10 `TicketIssuer::issue/verify`）。
+//! Session tickets (docs/design.md §2.2 / §3.10 `TicketIssuer::issue/verify`).
 //!
-//! 本地短 TTL 票据：登录成功后签发，绑定 `device + revocation_epoch`；SR-SIG1 保护的
-//! **状态变更**请求必须携带（票据强制契约）。校验序（§2.2，接口契约级，顺序不可换）：
+//! Local short-TTL tickets: issued after a successful login, bound to
+//! `device + revocation_epoch`; required on SR-SIG1-protected **state
+//! change** requests (the ticket enforcement contract). Verification order
+//! (§2.2, interface-contract level, order not interchangeable):
 //!
-//! 1. **签名**（票据根密钥 Ed25519；M2 单服 = 状态库内种子，M4 = Raft 密钥根下放）；
-//! 2. **TTL**（默认 60s 硬顶——跨服重放面的兜底，§2.4 等效重放窗 = min(±300s, 60s)）；
-//! 3. **epoch**（票据 epoch < 当前 revocation_epoch 即拒——吊销传播界 §2.2）；
-//! 4. **吊销/设备态**（设备不在 Active ⇒ 拒）。
+//! 1. **Signature** (ticket root key Ed25519; M2 single server = the seed in
+//!    the state store, M4 = the Raft key root handed down);
+//! 2. **TTL** (default 60s hard cap —— the backstop for the cross-server
+//!    replay surface, §2.4 equivalent replay window = min(±300s, 60s));
+//! 3. **epoch** (ticket epoch < current revocation_epoch ⇒ reject —— the
+//!    revocation propagation bound of §2.2);
+//! 4. **revocation/device state** (device not Active ⇒ reject).
 //!
-//! 该序先于 SR-SIG1 验签与 nonce 记账（`control::CtrlGuard::admit_state_change`）。
+//! This order precedes SR-SIG1 verification and nonce accounting
+//! (`control::CtrlGuard::admit_state_change`).
 
 use flock_protocol::ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use flock_protocol::session::DeviceId;
 
-// M7 类型上收：票据**线格式**（SignedTicket/TicketWire）定义在 flock_protocol::roster
-// （两端同类型）；本文件保留票据权威逻辑（签发/校验/nonce 记账——服务端内部面）。
+// M7 type uplift: the ticket **wire format** (SignedTicket/TicketWire) is
+// defined in flock_protocol::roster (same type on both ends); this file keeps
+// the authoritative ticket logic (issuing/verification/nonce accounting ——
+// the server-internal surface).
 pub use flock_protocol::roster::{SignedTicket, TicketWire};
 
-/// 票据签名域分离标签。
+/// Ticket signature domain-separation label.
 pub const TICKET_LABEL: &[u8] = b"flock-server/ticket/v1";
-/// 票据 TTL 默认 60s（§2.2「票据 TTL 60s 硬顶」；部署可调小以便过期路径验收）。
+/// Ticket TTL default 60s (§2.2 "ticket TTL 60s hard cap"; deployments may
+/// lower it to exercise the expiry path).
 pub const TICKET_TTL_SECS: u64 = 60;
 
-/// 票据声明。
+/// Ticket claims.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketClaims {
     pub user: String,
@@ -33,7 +42,7 @@ pub struct TicketClaims {
 }
 
 impl TicketClaims {
-    /// 签名覆盖的规范化字节（长度域防拼接）。
+    /// Canonical signed bytes (length fields prevent splicing).
     fn canonical_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(TICKET_LABEL.len() + 4 + self.user.len() + 64);
         v.extend_from_slice(TICKET_LABEL);
@@ -47,7 +56,8 @@ impl TicketClaims {
     }
 }
 
-/// 已签名票据 → 声明（形状校验；`SignedTicket` 线格式上收后 claims 为服务端侧自由函数）。
+/// Signed ticket → claims (shape validation; after the SignedTicket wire
+/// format was uplifted, claims became a server-side free function).
 fn claims_of(t: &SignedTicket) -> Result<TicketClaims, TicketReason> {
     Ok(TicketClaims {
         user: t.user.clone(),
@@ -62,17 +72,19 @@ fn claims_of(t: &SignedTicket) -> Result<TicketClaims, TicketReason> {
     })
 }
 
-/// 票据拒绝原因（三态契约测试逐项断言：无票据/过期/低 epoch/签名坏/设备吊销）。
+/// Ticket rejection reason (the three-state contract tests assert each item:
+/// no ticket / expired / low epoch / bad signature / revoked device).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketReason {
     Malformed,
     BadSignature,
     Expired,
-    /// 票据 epoch < 当前 revocation_epoch（吊销已传播）。
+    /// Ticket epoch < current revocation_epoch (revocation already
+    /// propagated).
     StaleEpoch,
-    /// 设备非 Active（吊销/禁用后的目录判定）。
+    /// Device not Active (the directory verdict after revoke/disable).
     DeviceNotActive,
-    /// 票据绑定的设备与当前会话设备不符。
+    /// The ticket's bound device does not match the current session device.
     DeviceMismatch,
 }
 
@@ -89,25 +101,27 @@ impl std::fmt::Display for TicketReason {
     }
 }
 
-/// 票据签发/校验器（种子进状态库；M4 换 Raft 密钥根时仅本结构替换）。
+/// Ticket issuer/verifier (seed goes into the state store; when M4 switches
+/// to the Raft key root, only this structure is replaced).
 pub struct TicketIssuer {
     key: SigningKey,
 }
 
 impl TicketIssuer {
-    /// 由 32B 种子构造。
+    /// Construct from a 32B seed.
     pub fn from_seed(seed: [u8; 32]) -> Self {
         TicketIssuer {
             key: SigningKey::from_bytes(&seed),
         }
     }
 
-    /// 随机种子（bootstrap 用；持久化由调用方负责）。
+    /// Random seed (for bootstrap; persistence is the caller's
+    /// responsibility).
     pub fn generate_seed() -> [u8; 32] {
         flock_protocol::rand::random::<[u8; 32]>()
     }
 
-    /// 签发（`now` 注入：测试可拨）。
+    /// Issue (`now` injected: tests can dial it).
     pub fn issue(
         &self,
         user: &str,
@@ -134,7 +148,8 @@ impl TicketIssuer {
         }
     }
 
-    /// 校验序（签名 → TTL → epoch → 设备态；§2.2 契约序）。返回通过的声明。
+    /// Verification order (signature → TTL → epoch → device state; the §2.2
+    /// contract order). Returns the passing claims.
     #[allow(clippy::too_many_arguments)]
     pub fn verify(
         &self,
@@ -144,7 +159,7 @@ impl TicketIssuer {
         lookup: impl FnOnce(&DeviceId) -> flock_protocol::session::LookupVerdict,
     ) -> Result<TicketClaims, TicketReason> {
         let claims = claims_of(ticket)?;
-        // 1) 签名
+        // 1) Signature
         let sig = Signature::from_slice(&ticket.sig).map_err(|_| TicketReason::BadSignature)?;
         if self
             .key
@@ -158,11 +173,12 @@ impl TicketIssuer {
         if now >= claims.exp {
             return Err(TicketReason::Expired);
         }
-        // 3) epoch（票据 epoch < 当前 ⇒ 吊销已传播，拒）
+        // 3) epoch (ticket epoch < current ⇒ revocation already propagated,
+        //    reject)
         if claims.epoch < current_epoch {
             return Err(TicketReason::StaleEpoch);
         }
-        // 4) 设备态（吊销/禁用 ⇒ 拒）
+        // 4) Device state (revoked/disabled ⇒ reject)
         let dev = DeviceId(claims.device);
         match lookup(&dev) {
             flock_protocol::session::LookupVerdict::Active(_) => Ok(claims),
@@ -171,19 +187,23 @@ impl TicketIssuer {
     }
 }
 
-/// 票据校验通过的产物（user 对 Local 内嵌于票据；Sync 票据绑定 device，
-/// user 由注册表 owner 解析——调用方兜底）。
+/// The product of a passing ticket verification (user is embedded in the
+/// ticket for Local; Sync tickets bind the device, and the user is resolved
+/// from the registry owner —— the caller backstops).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketPrincipal {
     pub user: Option<String>,
     pub device: [u8; 32],
 }
 
-/// 票据签发/校验权威（装配期按 sync 模式选定）。
+/// The ticket issuing/verification authority (chosen at assembly time by the
+/// sync mode).
 pub enum TicketAuthority {
-    /// 单服：本地种子（状态库 META；盒装——dalek SigningKey 体积大于 Arc 变体）。
+    /// Single server: local seed (state store META; boxed —— the dalek
+    /// SigningKey is larger than the Arc variant).
     Local(Box<TicketIssuer>),
-    /// 多主：密钥根在 Raft（Bootstrap 落库；签发/校验经 SyncNode——不依赖 leader）。
+    /// Multi-primary: the key root is in Raft (Bootstrap persists it;
+    /// issue/verify go through the SyncNode —— no leader dependency).
     #[cfg(feature = "multi-primary")]
     Sync(std::sync::Arc<flock_sync::SyncNode>),
 }
@@ -197,7 +217,8 @@ impl TicketAuthority {
         }
     }
 
-    /// 签发。`epoch` = 当前 revocation_epoch（Local 进 claims；Sync 由节点内部取）。
+    /// Issue. `epoch` = the current revocation_epoch (Local goes into the
+    /// claims; Sync takes it internally from the node).
     pub fn issue(
         &self,
         user: &str,
@@ -219,7 +240,8 @@ impl TicketAuthority {
         }
     }
 
-    /// 校验序（Local：签名→TTL→epoch→设备态；Sync：flock-sync 同语义 + 本机 epoch）。
+    /// Verification order (Local: signature→TTL→epoch→device state; Sync:
+    /// same semantics in flock-sync + the local epoch).
     #[allow(clippy::too_many_arguments)]
     pub fn verify(
         &self,
@@ -231,7 +253,8 @@ impl TicketAuthority {
     ) -> Result<TicketPrincipal, TicketReason> {
         match ticket {
             TicketWire::Local(t) => {
-                // 复用 TicketIssuer::verify 的完整序（签名→TTL→epoch→设备态）。
+                // Reuse TicketIssuer::verify's full order
+                // (signature→TTL→epoch→device state).
                 let issuer = self.local_issuer()?;
                 let claims = issuer.verify(t, now, current_epoch, lookup)?;
                 if claims.device != session_device.0 {
@@ -261,7 +284,8 @@ impl TicketAuthority {
                             TicketReason::DeviceMismatch
                         }
                     })?;
-                // 设备态（吊销/禁用 ⇒ 拒）——与 Local 序第 4 步对齐。
+                // Device state (revoked/disabled ⇒ reject) —— aligned with
+                // step 4 of the Local order.
                 match lookup(session_device) {
                     flock_protocol::session::LookupVerdict::Active(_) => {}
                     _ => return Err(TicketReason::DeviceNotActive),
@@ -277,42 +301,51 @@ impl TicketAuthority {
     }
 }
 
-/// 用户 → {nonce → ts}。窗口外条目在写入时惰性清理（§1.3.2 SIG_WINDOW_SECS=300）。
+/// user → {nonce → ts}. Out-of-window entries are lazily cleaned on write
+/// (§1.3.2 SIG_WINDOW_SECS=300).
 ///
-/// 上限纪律（评审项 9）：per-user 条目上限 [`NonceLedger::MAX_PER_USER`]（4096）——
-/// 伪造新鲜 nonce 的洪泛在窗口内也只能撑到上限，之后拒绝请求并计数告警
-/// （[`NonceLedger::overflow_rejects`]）；清理后为空的 user entry 即时移除（防
-/// 「曾经活跃的用户」条目永驻）。
+/// Cap discipline (review item 9): per-user entry cap
+/// [`NonceLedger::MAX_PER_USER`] (4096) —— a flood of forged fresh nonces can
+/// only reach the cap within the window; afterwards requests are rejected and
+/// the alert counter increments ([`NonceLedger::overflow_rejects`]); a user
+/// entry emptied by cleanup is removed immediately (prevents "once-active
+/// user" entries from lingering forever).
 #[derive(Default)]
 pub struct NonceLedger {
     inner:
         std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, i64>>>,
-    /// 超限拒绝计数（告警面：admin stats / 日志）。
+    /// Over-cap rejection counter (alert surface: admin stats / logs).
     overflow_rejects: std::sync::atomic::AtomicU64,
 }
 
 impl NonceLedger {
-    /// per-user 条目上限（评审项 9：4096 ≫ ±300s 窗内合法请求速率的合理上界）。
+    /// Per-user entry cap (review item 9: 4096 ≫ a reasonable upper bound on
+    /// legitimate request rates within the ±300s window).
     pub const MAX_PER_USER: usize = 4096;
 
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 查重 + 入账（false = 重放或超限拒绝）。仅在票据与签名校验**之后**调用
-    /// （§2.2 契约序）。
+    /// Dedup + record (false = replay or over-cap rejection). Called only
+    /// **after** ticket and signature verification (the §2.2 contract
+    /// order).
     pub fn check_and_record(&self, user: &str, nonce: &str, ts: i64, now: i64) -> bool {
         const WINDOW: i64 = flock_protocol::SIG_WINDOW_SECS;
         let mut g = self.inner.lock().expect("nonce ledger poisoned");
         let entry = g.entry(user.to_string()).or_default();
-        // 惰性清理：滑出 ±300s 窗的旧 nonce（重放窗之外本就由时间窗拒绝）。
+        // Lazy cleanup: old nonces that slid out of the ±300s window
+        // (outside the replay window they are rejected by the time window
+        // anyway).
         entry.retain(|_, t| (now - *t).abs() <= WINDOW);
-        // 清理后为空的 user entry 即时回收（评审项 9：不留「幽灵用户」条目）。
+        // A user entry emptied by cleanup is reclaimed immediately (review
+        // item 9: no "ghost user" entries left behind).
         if entry.is_empty() {
             g.remove(user);
         }
         let Some(entry) = g.get_mut(user) else {
-            // 刚回收（或本来就没有历史）且即将成为该 user 首条 ⇒ 直接入账。
+            // Just reclaimed (or never had history) and about to become this
+            // user's first entry ⇒ record directly.
             g.insert(
                 user.to_string(),
                 std::iter::once((nonce.to_string(), ts)).collect(),
@@ -322,12 +355,13 @@ impl NonceLedger {
         if entry.contains_key(nonce) {
             return false;
         }
-        // per-user 上限：超限拒绝 + 告警计数（洪泛者不得无限膨胀 per-user 内存）。
+        // Per-user cap: over-cap rejection + alert counter (a flooder cannot
+        // grow per-user memory without bound).
         if entry.len() >= Self::MAX_PER_USER {
             self.overflow_rejects
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             eprintln!(
-                "flock-server: nonce ledger per-user 上限拒绝（user={user}, cap={}）",
+                "flock-server: nonce ledger per-user cap rejection (user={user}, cap={})",
                 Self::MAX_PER_USER
             );
             return false;
@@ -336,7 +370,8 @@ impl NonceLedger {
         true
     }
 
-    /// 某 nonce 是否已入账（契约顺序断言用：错误票据 ⇒ 不入账）。
+    /// Whether some nonce is already recorded (for contract-order
+    /// assertions: a bad ticket ⇒ not recorded).
     pub fn contains(&self, user: &str, nonce: &str) -> bool {
         self.inner
             .lock()
@@ -346,20 +381,23 @@ impl NonceLedger {
             .unwrap_or(false)
     }
 
-    /// 超限拒绝累计（告警计数面；admin stats 消费）。
+    /// Cumulative over-cap rejections (alert counter surface; consumed by
+    /// admin stats).
     pub fn overflow_rejects(&self) -> u64 {
         self.overflow_rejects
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 当前 user entry 数（空 entry 已清理的断言面）。
+    /// Current user-entry count (assertion surface for emptied entries being
+    /// cleaned).
     pub fn user_entries(&self) -> usize {
         self.inner.lock().expect("nonce ledger poisoned").len()
     }
 }
 
 // ============================================================================
-// 单元测试：票据四态 + 契约序（错误票据 + 全新 nonce ⇒ 拒且不入账）
+// Unit tests: the four ticket states + contract order (bad ticket + fresh
+// nonce ⇒ rejected and not recorded)
 // ============================================================================
 
 #[cfg(test)]
@@ -384,25 +422,28 @@ mod tests {
             })
         };
         let ok = t.issue("alice", dev, 3, 1000, 60);
-        assert!(t.verify(&ok, 1010, 3, active).is_ok(), "新鲜票据通过");
-        // TTL：now >= exp ⇒ Expired
+        assert!(
+            t.verify(&ok, 1010, 3, active).is_ok(),
+            "fresh ticket passes"
+        );
+        // TTL: now >= exp ⇒ Expired
         assert_eq!(
             t.verify(&ok, 1060, 3, active).unwrap_err(),
             TicketReason::Expired
         );
-        // 低 epoch（吊销后）：current_epoch 前进 ⇒ StaleEpoch
+        // Low epoch (after revocation): current_epoch advanced ⇒ StaleEpoch
         assert_eq!(
             t.verify(&ok, 1010, 4, active).unwrap_err(),
             TicketReason::StaleEpoch
         );
-        // 签名坏：篡改任意覆盖字段
+        // Bad signature: tamper any covered field
         let mut bad = ok.clone();
         bad.epoch += 1;
         assert_eq!(
             t.verify(&bad, 1010, 3, active).unwrap_err(),
             TicketReason::BadSignature
         );
-        // 设备吊销/禁用 ⇒ DeviceNotActive
+        // Device revoked/disabled ⇒ DeviceNotActive
         assert_eq!(
             t.verify(&ok, 1010, 3, |_: &DeviceId| LookupVerdict::Revoked {
                 since_epoch: 4
@@ -410,7 +451,7 @@ mod tests {
             .unwrap_err(),
             TicketReason::DeviceNotActive
         );
-        // 形状坏
+        // Malformed shape
         let mut junk = ok.clone();
         junk.device = vec![1, 2, 3];
         assert_eq!(
@@ -425,46 +466,69 @@ mod tests {
         assert!(l.check_and_record("u", "n1", 1000, 1000));
         assert!(
             !l.check_and_record("u", "n1", 1000, 1000),
-            "同 nonce 重放拒"
+            "same-nonce replay rejected"
         );
         assert!(l.check_and_record("u", "n2", 1000, 1000));
-        // 滑出 ±300s 窗 ⇒ 惰性清理后可用（时间窗本身另有 SIG_WINDOW_SECS 拒绝——
-        // 此处只验证记账不无限膨胀）。
-        assert!(l.check_and_record("u", "n1", 1400, 1401), "窗外条目被清理");
-        assert!(!l.contains("u", "n2"), "n2 亦随清理滑出");
-        let _ = DeviceStatus::Active; // 引用 netstate（同批模块联编可见性）
+        // Slid out of the ±300s window ⇒ usable again after lazy cleanup
+        // (outside the window the time window itself rejects via
+        // SIG_WINDOW_SECS —— this only verifies the ledger does not grow
+        // without bound).
+        assert!(
+            l.check_and_record("u", "n1", 1400, 1401),
+            "out-of-window entry cleaned"
+        );
+        assert!(!l.contains("u", "n2"), "n2 also slid out with the cleanup");
+        let _ = DeviceStatus::Active; // reference netstate (same-batch module visibility)
     }
 
-    /// 评审项 9：per-user 条目上限（4096）——超限拒绝 + 告警计数；窗口滑出后条目
-    /// 惰性清理、空 user entry 即时回收（洪泛者在窗口内的内存占用被钉死在上限）。
+    /// Review item 9: per-user entry cap (4096) —— over-cap rejection + alert
+    /// counter; entries lazily cleaned once the window slides, emptied user
+    /// entries reclaimed immediately (a flooder's in-window memory footprint
+    /// is pinned at the cap).
     #[test]
     fn ledger_per_user_cap_and_aged_cleanup() {
         let l = NonceLedger::new();
         for i in 0..NonceLedger::MAX_PER_USER {
             assert!(
                 l.check_and_record("flood", &format!("n{i:05}"), 1000, 1000),
-                "上限内第 {i} 条应入账"
+                "entry {i} within the cap should be recorded"
             );
         }
         assert_eq!(l.overflow_rejects(), 0);
-        // 超限：拒绝 + 计数（洪泛不得继续膨胀 per-user 内存）。
-        assert!(!l.check_and_record("flood", "over-1", 1000, 1000), "超限拒");
+        // Over the cap: reject + count (the flood cannot keep growing
+        // per-user memory).
+        assert!(
+            !l.check_and_record("flood", "over-1", 1000, 1000),
+            "over-cap rejected"
+        );
         assert!(
             !l.check_and_record("flood", "over-2", 1000, 1000),
-            "持续超限拒"
+            "persistent over-cap rejected"
         );
-        assert_eq!(l.overflow_rejects(), 2, "告警计数累计");
-        assert_eq!(l.user_entries(), 1, "单 user entry");
-        // ±300s 窗滑出 ⇒ 惰性清理腾空（含空 entry 回收路径），随后首条重新入账。
+        assert_eq!(l.overflow_rejects(), 2, "alert counter accumulates");
+        assert_eq!(l.user_entries(), 1, "single user entry");
+        // ±300s window slid out ⇒ lazy cleanup empties it (including the
+        // empty-entry reclaim path); the next first entry records again.
         assert!(
             l.check_and_record("flood", "fresh", 100_000, 100_000),
-            "窗滑出后重新可入账"
+            "recordable again after the window slides out"
         );
-        assert!(!l.contains("flood", "n00000"), "旧条目已随窗口清理");
-        assert!(!l.contains("flood", "over-1"), "超限拒绝的条目从未入账");
-        // 多用户互不影响：另一用户正常入账。
+        assert!(
+            !l.contains("flood", "n00000"),
+            "old entries cleaned with the window"
+        );
+        assert!(
+            !l.contains("flood", "over-1"),
+            "over-cap-rejected entries were never recorded"
+        );
+        // Multiple users do not affect each other: another user records
+        // normally.
         assert!(l.check_and_record("other", "n1", 100_000, 100_000));
         assert_eq!(l.user_entries(), 2);
-        assert_eq!(l.overflow_rejects(), 2, "正常用户不计超限");
+        assert_eq!(
+            l.overflow_rejects(),
+            2,
+            "legitimate users do not count as over-cap"
+        );
     }
 }

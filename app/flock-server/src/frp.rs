@@ -1,9 +1,12 @@
-//! Frp 模式装配（docs/design.md §2.1/§3.9/§5）。
+//! Frp-mode assembly (docs/design.md §2.1/§3.9/§5).
 //!
-//! **本模块是 flock-server 唯一触碰 flock-frpc 类型的地方**（§3.11：仅 Frp 模式装配，
-//! Direct 分支无 flock-frpc 类型引用——Direct 代码路径在 `server.rs` 的 accept/会话/控制流，
-//! 不经过本文件）。职责：把 config 层 [`FrpPlan`]（自有类型）翻译成
-//! `RelaySpec::Original{toml}` + `Supervisor`，并把内嵌 TOML 落到 run 目录。
+//! **This module is the only place flock-server touches flock-frpc types**
+//! (§3.11: Frp-mode assembly only; the Direct branch has no flock-frpc type
+//! references —— the Direct code path is the accept/session/control-flow in
+//! `server.rs` and never passes through this file). Responsibilities:
+//! translate the config-layer [`FrpPlan`] (an own type) into
+//! `RelaySpec::Original{toml}` + `Supervisor`, and persist the embedded TOML
+//! into the run directory.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -20,15 +23,17 @@ use tokio::net::TcpListener;
 
 use crate::config::FrpPlan;
 
-/// 健康监控轮询间隔（评审项 11：低频 10s——对齐会话层 keepalive 节奏；RelayStatus
-/// 读取是内存快照，无子进程开销）。
+/// Health-monitor polling interval (review item 11: low-frequency 10s ——
+/// aligned with the session-layer keepalive cadence; RelayStatus reads are
+/// in-memory snapshots with no subprocess cost).
 const HEALTH_POLL: Duration = Duration::from_secs(10);
 
-/// 健康事件计数（admin stats 消费面）。
+/// Health event counters (the admin stats consumption surface).
 static RELAY_UNHEALTHY_EVENTS: AtomicU64 = AtomicU64::new(0);
 static RELAY_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 
-/// 健康监控事件计数快照 `(unhealthy_events, recoveries)`（admin stats）。
+/// Snapshot of the health-monitor event counters `(unhealthy_events,
+/// recoveries)` (admin stats).
 pub fn relay_health_events() -> (u64, u64) {
     (
         RELAY_UNHEALTHY_EVENTS.load(Ordering::Relaxed),
@@ -36,25 +41,30 @@ pub fn relay_health_events() -> (u64, u64) {
     )
 }
 
-/// phase ⇒ 健康判定（Running = 健康；Starting/Backoff/Stopped = 不健康）。
+/// phase ⇒ health verdict (Running = healthy; Starting/Backoff/Stopped =
+/// unhealthy).
 fn phase_healthy(phase: &RelayPhase) -> bool {
     matches!(phase, RelayPhase::Running { .. })
 }
 
-/// Frp 模式的运行时句柄（包装 flock-frpc 类型；Drop 即托管拆除）。
+/// The Frp-mode runtime handle (wrapping the flock-frpc types; Drop tears
+/// the management down).
 pub struct Managed {
     relay: ManagedRelay,
 }
 
 impl Managed {
-    /// 托管健康快照（诊断面）。
+    /// Managed health snapshot (diagnostics surface).
     pub fn health(&self) -> flock_frpc::RelayStatus {
         self.relay.health()
     }
 
-    /// 低频健康监控（评审项 11）：每 [`HEALTH_POLL`] 轮询一次 [`Managed::health`]，
-    /// 健康态迁移（健康→不健康 / 不健康→健康）eprintln 留痕并计数——不健康事件
-    /// 与恢复均进 admin stats（[`relay_health_events`]）。任务随 Arc<Managed> 存亡。
+    /// Low-frequency health monitoring (review item 11): poll
+    /// [`Managed::health`] every [`HEALTH_POLL`]; health-state transitions
+    /// (healthy→unhealthy / unhealthy→healthy) leave an eprintln trail and
+    /// count —— unhealthy events and recoveries both feed admin stats
+    /// ([`relay_health_events`]). The task lives and dies with the
+    /// Arc<Managed>.
     pub fn spawn_health_monitor(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let managed = self.clone();
         tokio::spawn(async move {
@@ -69,14 +79,14 @@ impl Managed {
                     (Some(false), true) => {
                         RELAY_RECOVERIES.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
-                            "flock-server: frp relay 恢复（phase={:?} restarts={}）",
+                            "flock-server: frp relay recovered (phase={:?} restarts={})",
                             st.phase, st.restarts
                         );
                     }
                     (Some(true), false) => {
                         RELAY_UNHEALTHY_EVENTS.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
-                            "flock-server: frp relay 不健康（phase={:?} failures={} last_exit={:?}）",
+                            "flock-server: frp relay unhealthy (phase={:?} failures={} last_exit={:?})",
                             st.phase, st.failures, st.last_exit
                         );
                     }
@@ -87,14 +97,16 @@ impl Managed {
         })
     }
 
-    /// 显式停止（Drop 亦会停——`kill_on_drop` 语义由 flock-frpc 保证）。
+    /// Explicit stop (Drop also stops —— the `kill_on_drop` semantics are
+    /// guaranteed by flock-frpc).
     pub async fn stop(self) {
         let _ = self.relay.stop().await;
     }
 }
 
-/// [`chmlfrp_spec_of`] 的测试暴露面（tests/listener_mode 的「配置解析 → RelaySpec
-/// 构造」断言，评审项 14）。
+/// Test exposure surface of [`chmlfrp_spec_of`] (the "config parsing →
+/// RelaySpec construction" assertions of tests/listener_mode, review item
+/// 14).
 pub fn chmlfrp_spec_for_test(
     ini: &Option<std::path::PathBuf>,
     user_token_auto: &Option<crate::config::UserTokenAuto>,
@@ -102,9 +114,11 @@ pub fn chmlfrp_spec_for_test(
     chmlfrp_spec_of(ini, user_token_auto)
 }
 
-/// config 层 ChmlFrp 参数 → flock-frpc `RelaySpec::ChmlFrp`（评审项 14：ChmlFrp
-/// 装配接线；纯函数——测试断言面）。缺省 `ConfigFile(ini)`，显式 `user_token_auto`
-/// opt-in 才走 `UserTokenAuto`（R20 风险已在上游 flock-frpc 文档化）。
+/// Config-layer ChmlFrp parameters → flock-frpc `RelaySpec::ChmlFrp` (review
+/// item 14: ChmlFrp assembly wiring; a pure function —— the test assertion
+/// surface). Defaults to `ConfigFile(ini)`; only an explicit
+/// `user_token_auto` opt-in takes the `UserTokenAuto` path (the R20 risk is
+/// documented upstream in flock-frpc).
 fn chmlfrp_spec_of(
     ini: &Option<std::path::PathBuf>,
     user_token_auto: &Option<crate::config::UserTokenAuto>,
@@ -113,7 +127,7 @@ fn chmlfrp_spec_of(
         mode: match user_token_auto {
             None => ChmlFrpMode::ConfigFile(
                 ini.clone()
-                    .expect("config 层已校验：无 user_token_auto 时 chmlfrp_ini 必填"),
+                    .expect("config layer already validated: chmlfrp_ini is required when user_token_auto is absent"),
             ),
             Some(uta) => ChmlFrpMode::UserTokenAuto {
                 usertoken: uta.usertoken.clone(),
@@ -123,10 +137,12 @@ fn chmlfrp_spec_of(
     }
 }
 
-/// Frp 模式启动：bind 本地监听 + （Original 时）内嵌 TOML 落盘 + Supervisor 托管
-/// 对应栈代的 frpc（评审项 14：Original / ChmlFrp 双栈代分派）。
+/// Frp-mode startup: bind the local listener + (for Original) persist the
+/// embedded TOML + Supervisor-managed frpc of the corresponding stack
+/// generation (review item 14: Original / ChmlFrp dual-generation dispatch).
 ///
-/// 内嵌 TOML 写到 `run_base/embedded/frpc.toml`（Supervisor 对该文件只读，§3.9）。
+/// The embedded TOML is written to `run_base/embedded/frpc.toml` (the
+/// Supervisor only reads that file, §3.9).
 pub async fn start(plan: FrpPlan, bind: SocketAddr) -> Result<(TcpListener, Managed), String> {
     let listener = TcpListener::bind(bind)
         .await
@@ -134,12 +150,15 @@ pub async fn start(plan: FrpPlan, bind: SocketAddr) -> Result<(TcpListener, Mana
 
     std::fs::create_dir_all(&plan.run_base)
         .map_err(|e| format!("frp run dir {}: {e}", plan.run_base.display()))?;
-    // 双栈声明（flock-frpc 的 FrpcBinaries 需两栈齐备；只有 plan.relay 对应的栈代会被
-    // 校验/使用，另一槽位恒不触碰——见 flock-frpc spec.rs validate_spec 的 match 分派）。
+    // Dual-stack declaration (flock-frpc's FrpcBinaries requires both
+    // generations present; only the generation matching plan.relay is
+    // validated/used, the other slot is never touched —— see the match
+    // dispatch in flock-frpc spec.rs validate_spec).
     let (spec, bins) = match &plan.relay {
         crate::config::FrpRelayPlan::Original { toml } => {
             let toml_path = plan.run_base.join("embedded").join("frpc.toml");
-            // frpc.toml 可含服务端 token/凭证 ⇒ 0600 落盘（评审项 1；创建即收紧）。
+            // frpc.toml may contain server tokens/credentials ⇒ persisted
+            // 0600 (review item 1; tightened at creation).
             crate::write_private_file(&toml_path, toml.as_bytes())
                 .map_err(|e| format!("write {}: {e}", toml_path.display()))?;
             (
@@ -179,7 +198,9 @@ pub async fn start(plan: FrpPlan, bind: SocketAddr) -> Result<(TcpListener, Mana
     Ok((listener, Managed { relay }))
 }
 
-/// 未使用栈代的占位二进制声明（该槽位不参与校验/启动——R9 矩阵按 spec 分派）。
+/// Placeholder binary declaration for the unused generation (that slot
+/// participates in neither validation nor startup —— the R9 matrix dispatches
+/// by spec).
 fn unused_bin(run_base: &Path, flavor: RelayFlavor) -> FrpcBinary {
     FrpcBinary {
         path: run_base.join(match flavor {
@@ -191,16 +212,19 @@ fn unused_bin(run_base: &Path, flavor: RelayFlavor) -> FrpcBinary {
     }
 }
 
-// （评审项 15：零引用死项 run_dir_exists 已删——启动期自检由 tests/listener_mode.rs
-// 的「run 目录/内嵌 TOML 落盘」断言承担；`Managed` 包装保留：评审项 11 的健康
-// 监控即经其 health()。）
+// (Review item 15: the zero-reference dead item run_dir_exists was deleted ——
+// startup-time self-checks are carried by the "run directory / embedded TOML
+// persisted" assertions in tests/listener_mode.rs; the `Managed` wrapper
+// stays: review item 11's health monitoring goes through its health().)
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 评审项 11：phase ⇒ 健康判定——Running 健康；Starting/Backoff/Stopped 不健康
-    /// （Supervisor 的退避重试期按不健康上报，admin stats/日志面据此告警）。
+    /// Review item 11: phase ⇒ health verdict —— Running healthy;
+    /// Starting/Backoff/Stopped unhealthy (the Supervisor's backoff-retry
+    /// period reports unhealthy, so admin stats/log surfaces can alert on
+    /// it).
     #[test]
     fn phase_health_classification() {
         use std::time::Duration as D;

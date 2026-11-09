@@ -1,20 +1,27 @@
-//! M8 webui API 分发与全部 handler（docs/design.md §7-M8.4 契约逐字）。
+//! M8 webui API dispatch and all handlers (docs/design.md §7-M8.4, contract
+//! verbatim).
 //!
-//! 分发序（定死，测试断言「先会话后角色」）：
-//! **来源矩阵（403 forbidden_origin）→ 路由（404）→ 方法（405）→ CSRF 双门槛
-//!（400）→ 会话（401 not_logged_in）→ 角色（403 forbidden）→ handler**。
-//! 会话档在 lookup 后**回读 UserRow**（本地已 apply 视图）：降权/禁用对旧会话
-//! 即刻生效（403/401 user_disabled）——不滞留至 TTL（🟡 评审项 6）。
+//! Dispatch order (fixed; tests assert "session before role"):
+//! **origin matrix (403 forbidden_origin) → routing (404) → method (405) →
+//! CSRF double gate (400) → session (401 not_logged_in) → role (403
+//! forbidden) → handler**. The session slot **reads back the UserRow** after
+//! lookup (the locally-applied view): demotion/disable take effect on old
+//! sessions immediately (403/401 user_disabled) —— no lingering until the TTL
+//! (review item 6).
 //!
-//! 写操作双臂（§M8.3 裁决 2）：Raft 普通写（多主）/ 单服直写——全部经
-//! [`crate::backend::NetBackend`]（与控制流 DeviceOp 同型）；授权在 handler 层
-//!（会话 user 须 admin），不经也不放宽 `admin_op` 根签操作。
+//! Dual write arms (§M8.3 decision 2): ordinary Raft writes (multi-primary) /
+//! direct single-server writes —— all through [`crate::backend::NetBackend`]
+//! (same shape as the control-plane DeviceOp); authorization happens at the
+//! handler layer (the session user must be admin), neither going through nor
+//! loosening the `admin_op` root-signature operations.
 //!
-//! 登录链（§M8.3）：`login-begin/finish` 调同一组 `pake::server_*`（dummy 同形防
-//! 枚举）；anchor = 服务端身份签名（`anchor_sign`）——/api/bootstrap 提供
-//! `identity_pub` 验签材料。pending 登录态按 user 单槽（末次 begin 覆盖）+ 5min
-//! 过期 + 256 上限（满载按 exp/插入序逐出最旧、put/take 惰性清过期行——🟡 评审
-//! 项 3：字典序最小 ≠ 最旧）。
+//! Login chain (§M8.3): `login-begin/finish` call the same `pake::server_*`
+//! group (dummy same-shape prevents enumeration); anchor = the server
+//! identity signature (`anchor_sign`) —— /api/bootstrap provides the
+//! `identity_pub` verification material. Pending login state is one slot per
+//! user (the last begin overwrites) + 5min expiry + a 256 cap (when full, the
+//! oldest is evicted by exp/insertion order; put/take lazily clear expired
+//! rows —— review item 3: lexicographically smallest ≠ oldest).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -41,13 +48,14 @@ use super::http::{Request, Response};
 use super::series::Series;
 use super::session::{clear_cookie_value, set_cookie_value, Origin, Session, Sessions};
 
-/// webui 并发上限（独立信号量；§M8.1 缺省 64）。
+/// webui concurrency cap (independent semaphore; §M8.1 default 64).
 pub const MAX_CONCURRENCY: usize = 64;
-/// pending 登录态过期（login-begin → login-finish 的窗口）。
+/// Pending login state expiry (the login-begin → login-finish window).
 const PENDING_LOGIN_TTL: u64 = 300;
-/// pending 登录态表上限（未认证攻击面——超限逐出最旧）。
+/// Pending login state table cap (unauthenticated attack surface —— evict the
+/// oldest beyond the cap).
 const PENDING_LOGIN_CAP: usize = 256;
-/// 用户名字符集（§M8.4：1..=32B、[A-Za-z0-9_.-]）。
+/// Username character set (§M8.4: 1..=32B, [A-Za-z0-9_.-]).
 fn valid_username(u: &str) -> bool {
     !u.is_empty()
         && u.len() <= 32
@@ -55,21 +63,25 @@ fn valid_username(u: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
 }
 
-/// 公开认证端点（login-begin/finish、pw-begin/commit）的 `user` 入参校验
-/// （🟡 评审项 4 + 🟢 评审项 7 对齐）：1..=64B 且拒 ASCII 控制字符（含 `\n`/`\r`
-/// ——审计 stderr 行注入面；login-begin 的 ≤64 上限对齐到其余三个端点）。
-/// 不复用 [`valid_username`] 的 32B/[A-Za-z0-9_.-] 全集：控制流 device owner 名
-/// 不受该字符集约束（reset-password 后此类用户同样走 Web 登录链）——以「长度上限
-/// + 拒控制字符」为四端点一致下界（纵深第二层在 `AuditLog::record` 输出清洗）。
+/// Validation of the `user` parameter on the public auth endpoints
+/// (login-begin/finish, pw-begin/commit) (review item 4 + green item 7
+/// alignment): 1..=64B and ASCII control characters rejected (including
+/// `\n`/`\r` —— an audit stderr line-injection surface; login-begin's ≤64 cap
+/// aligned with the other three endpoints). Does not reuse the full
+/// [`valid_username`] 32B/[A-Za-z0-9_.-] set: control-plane device owner names
+/// are not bound by that charset (such users also use the web login chain
+/// after reset-password) —— "length cap + reject control characters" is the
+/// common lower bound of the four endpoints (the second defense layer is the
+/// output sanitization in `AuditLog::record`).
 fn sane_user_param(u: &str) -> bool {
     !u.is_empty() && u.len() <= 64 && !u.bytes().any(|b| b.is_ascii_control())
 }
 
 // ============================================================================
-// 错误信封（§M8.4 逐字）
+// Error envelope (§M8.4 verbatim)
 // ============================================================================
 
-/// 错误码 → HTTP 映射（定死）。
+/// Error code → HTTP mapping (fixed).
 fn status_of(code: &str) -> u16 {
     match code {
         "bad_request" => 400,
@@ -84,7 +96,7 @@ fn status_of(code: &str) -> u16 {
     }
 }
 
-/// 白名单文案（不含路径/内部错误串——§M8.7-5）。
+/// Whitelisted messages (no paths / internal error strings —— §M8.7-5).
 fn message_of(code: &str) -> &'static str {
     match code {
         "bad_request" => "malformed request",
@@ -110,7 +122,7 @@ fn err(code: &str) -> Response {
     err_with(code, None)
 }
 
-/// 带附加字段（rate_limited 的 retry_after_secs）。
+/// With extra fields (rate_limited's retry_after_secs).
 fn err_with(code: &str, retry_after: Option<u64>) -> Response {
     let mut error = json!({"code": code, "message": message_of(code)});
     if let Some(secs) = retry_after {
@@ -127,22 +139,25 @@ fn ok_json(value: serde_json::Value) -> Response {
 // WebState
 // ============================================================================
 
-/// pending 登录态（user 单槽——末次 begin 覆盖）。
+/// Pending login state (one slot per user —— the last begin overwrites).
 struct PendingLogin {
     state: Vec<u8>,
     exp_unix: u64,
-    /// 插入序（同秒 exp 并列时「逐出最旧」的确定性破平——自增计数）。
+    /// Insertion order (a deterministic tie-break for "evict the oldest" when
+    /// exps tie in the same second —— a monotonically increasing counter).
     seq: u64,
 }
 
-/// pending 表内态（seq 与 map 同锁——插入序无需原子面）。
+/// Pending table internal state (seq shares the map lock —— no atomics needed
+/// for insertion order).
 #[derive(Default)]
 struct PendingTable {
     seq: u64,
     map: std::collections::HashMap<String, PendingLogin>,
 }
 
-/// webui 装配态（serve/mod.rs 构建；测试直接构造以注入源地址）。
+/// webui assembly state (built by serve/mod.rs; tests construct it directly to
+/// inject source addresses).
 pub struct WebState {
     pub core: Arc<ServerCore>,
     pub sessions: Arc<Sessions>,
@@ -178,9 +193,11 @@ impl WebState {
         flock_protocol::trust::now_unix()
     }
 
-    /// 满载逐出最旧（按 `(exp_unix, seq)`——exp=begin 时刻+TTL，即最早 begin 的
-    /// 在途槽位；字典序 keys().min() 会误逐「名字靠前的新 begin」，🟡 评审项 3）。
-    /// 入口先惰性清过期行（过期槽位优先回收）。
+    /// Evict the oldest when saturated (by `(exp_unix, seq)` —— exp = begin
+    /// time + TTL, i.e. the in-flight slot that began earliest; a
+    /// lexicographic keys().min() would wrongly evict "a recent begin with a
+    /// lexicographically early name", review item 3). The entry point first
+    /// lazily clears expired rows (expired slots are reclaimed first).
     fn put_pending(&self, user: &str, state: Vec<u8>) {
         let now = self.now();
         let mut g = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -209,7 +226,8 @@ impl WebState {
         );
     }
 
-    /// 取走在途态（末次 begin 的）；顺带惰性清全部过期行（🟡 评审项 3）。
+    /// Take the in-flight state (from the last begin); lazily clears all
+    /// expired rows along the way (review item 3).
     fn take_pending(&self, user: &str) -> Option<Vec<u8>> {
         let now = self.now();
         let mut g = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -218,7 +236,7 @@ impl WebState {
         tab.map.remove(user).map(|p| p.state)
     }
 
-    /// 在册行数（测试/诊断面——仅测试引用）。
+    /// Rows on record (test/diagnostics surface —— referenced by tests only).
     #[cfg(test)]
     fn pending_len(&self) -> usize {
         self.pending
@@ -229,22 +247,24 @@ impl WebState {
     }
 
     // ========================================================================
-    // 分发（契约序：来源 → 路由 → 方法 → CSRF → 会话 → 角色 → handler）
+    // Dispatch (contract order: origin → routing → method → CSRF → session →
+    // role → handler)
     // ========================================================================
 
     pub async fn dispatch(&self, req: Request, remote: SocketAddr) -> Response {
-        // ① 来源矩阵（W-A3 纵深防御；XFF 一律不读——W-A4）。
+        // ① Origin matrix (W-A3 defense in depth; XFF never read —— W-A4).
         let Some(origin) = classify_origin(&remote) else {
             return err("forbidden_origin");
         };
-        // ② 静态资产与 SPA fallback（非 /api/*）。
+        // ② Static assets and SPA fallback (non /api/*).
         if !req.path.starts_with("/api/") {
             return self.static_route(&req);
         }
-        // ③ 路由档（未知 /api/* → 404）+ ④ 方法（已知路径方法错档 → 405——
-        // required_role 把方法并入档位判定，Unknown 需再分流：路径形状已知 ⇒
-        // 方法错档 405 method_not_allowed（§M8.4 错误码表对齐，🟢 评审项 7），
-        // 否则 404 not_found）。
+        // ③ Routing slot (unknown /api/* → 404) + ④ method (wrong method on a
+        //    known path → 405 —— required_role folds the method into slot
+        //    determination; Unknown needs re-splitting: path shape known ⇒
+        //    wrong-method 405 method_not_allowed (aligned with the §M8.4
+        //    error-code table, green review item 7), otherwise 404 not_found).
         let role = required_role(&req.method, &req.path);
         if role == Role::Unknown {
             return err(if path_known(&req.path) {
@@ -253,7 +273,7 @@ impl WebState {
                 "not_found"
             });
         }
-        // ⑤ CSRF 双门槛（变更类 = 全部 POST）。
+        // ⑤ CSRF double gate (mutating class = all POSTs).
         if !csrf_gate_ok(
             &req.method,
             req.header("x-flock-web"),
@@ -261,7 +281,7 @@ impl WebState {
         ) {
             return err("bad_request");
         }
-        // ⑥ 会话（401）先于 ⑦ 角色（403）。
+        // ⑥ Session (401) before ⑦ role (403).
         let sess = match role {
             Role::Public => None,
             _ => {
@@ -271,15 +291,22 @@ impl WebState {
                 let Some(mut s) = self.sessions.lookup(sid, self.now()) else {
                     return err("not_logged_in");
                 };
-                // 降权/禁用即时生效（🟡 评审项 6——会话权限不滞留至 TTL 8h）：
-                // 授权判定回读 UserRow。Raft 形态用本地已 apply 视图即可，**不必
-                // linearizable**——取舍：本机提交的 demote/disable 写后回读立即可见；
-                // 他机提交的变更在本机 apply 后（亚秒~秒级，与名册/peers 同视图档）
-                // 生效。相比旧行为（admin 快照滞留在 8h 会话行内）是数量级收敛。
-                // disabled 用户任何登录档端点同路径拒绝（401 user_disabled）。
+                // Demotion/disable take effect immediately (review item 6 ——
+                // session permissions do not linger until the 8h TTL): the
+                // authorization check reads back the UserRow. In Raft form the
+                // locally-applied view suffices, **no need for
+                // linearizability** —— trade-off: a demote/disable committed on
+                // this machine is visible on read-back immediately; changes
+                // committed on another machine take effect once applied locally
+                // (sub-second to seconds, same view tier as the roster/peers).
+                // Compared to the old behavior (the admin snapshot lingering
+                // inside the 8h session row) this is an order-of-magnitude
+                // convergence. A disabled user is rejected on the same path at
+                // any login-tier endpoint (401 user_disabled).
                 match self.core.net.user_row(&s.user).await {
                     Some(row) if !row.disabled => {
-                        // 会话行内 admin 快照不作准——以注册表当前值为准。
+                        // The admin snapshot inside the session row is not
+                        // authoritative —— the registry's current value wins.
                         s.admin = row.admin;
                         Some(s)
                     }
@@ -291,7 +318,7 @@ impl WebState {
         if role == Role::Admin && !sess.as_ref().is_some_and(|s| s.admin) {
             return err("forbidden");
         }
-        // ⑧ handler。
+        // ⑧ Handler.
         self.handle(&req, remote, origin, sess).await
     }
 
@@ -299,9 +326,10 @@ impl WebState {
         if req.method != "GET" {
             return err("method_not_allowed");
         }
-        // SPA fallback（§M8.6 hash 路由的直击/刷新面）：未知非 /api 路径一律回
-        // index.html（200）——浏览器端 hash 路由接管；/api/* 不经本函数（404 JSON
-        // 面不fallback——API 客户端不吞 HTML）。
+        // SPA fallback (the direct-hit/refresh surface of §M8.6 hash routing):
+        // any unknown non-/api path returns index.html (200) —— the browser's
+        // hash routing takes over; /api/* never reaches this function (no
+        // fallback on the 404-JSON face —— API clients never swallow HTML).
         let (body, ctype) = match req.path.as_str() {
             "/" | "/index.html" => (assets::index(), "text/html; charset=utf-8"),
             p if p.starts_with("/static/") => match assets::static_file(&p["/static/".len()..]) {
@@ -343,7 +371,8 @@ impl WebState {
             "/api/dashboard/series" => self.h_series(&req.query).await,
             "/api/config" => self.h_config(),
             _ => {
-                // 路径参数形（required_role 已确认档位）。
+                // Path-parameter shapes (required_role already confirmed the
+                // slot).
                 if let Some(rest) = path.strip_prefix("/api/users/") {
                     let (user, action) = rest.rsplit_once('/').unwrap_or((rest, ""));
                     return self
@@ -368,21 +397,24 @@ impl WebState {
     }
 
     // ========================================================================
-    // 公共端点
+    // Public endpoints
     // ========================================================================
 
-    /// `GET /api/bootstrap`：本服务器身份（wasm 侧 anchor 验签材料）。
+    /// `GET /api/bootstrap`: this server's identity (wasm-side anchor
+    /// verification material). The `lang` field is the server's initial UI
+    /// language hint (consumed by i18n.js on first visit, before any explicit
+    /// user choice).
     fn h_bootstrap(&self) -> Response {
         ok_json(json!({
             "cluster_id": hex::encode(self.core.identity.cluster_id.0),
             "server_id": hex::encode(self.core.identity.server_id.0),
             "identity_pub": b64_std(self.core.identity.identity.verifying_key().as_bytes()),
-            "lang": "zh-CN",
+            "lang": "en",
         }))
     }
 
-    /// `POST /api/login-begin`：OPAQUE ke1 → ke2 + anchor（dummy 同形防枚举；
-    /// per-IP 令牌桶 + 用户名退避）。
+    /// `POST /api/login-begin`: OPAQUE ke1 → ke2 + anchor (dummy same-shape
+    /// prevents enumeration; per-IP token bucket + username backoff).
     async fn h_login_begin(&self, body: &serde_json::Value, remote: SocketAddr) -> Response {
         let (Some(user), Some(ke1_b64)) = (body["user"].as_str(), body["ke1_b64"].as_str()) else {
             return err("bad_request");
@@ -390,18 +422,22 @@ impl WebState {
         if !sane_user_param(user) || ke1_b64.len() > 64 * 1024 {
             return err("bad_request");
         }
-        // per-IP 令牌桶（login-begin/pw-begin 共用档）。
+        // Per-IP token bucket (shared tier by login-begin/pw-begin).
         if let Err(retry) = self.buckets.allow(remote.ip(), self.now()) {
             return err_with("rate_limited", Some(retry));
         }
-        // 用户名退避（锁定中 ⇒ 429）。
+        // Username backoff (locked ⇒ 429).
         if let Some(retry) = self.backoff.check(user, self.now()) {
             return err_with("rate_limited", Some(retry));
         }
-        // 记录侧：未知用户/未设密码 ⇒ dummy（ke2 同形防枚举）；**disabled 用户仍用
-        // 真记录**——ke2 同形不泄漏禁用态，且诚实客户端得以完成 ke3、在 login-finish
-        // 收到 401 user_disabled（§M8.3「login-begin 仍 dummy 同形不泄漏」指未知
-        // 用户面；禁用判定发生在口令证明成立之后——不泄漏任何额外信息）。
+        // Record side: unknown user / no password set ⇒ dummy (ke2
+        // same-shape prevents enumeration); **disabled users still use the
+        // real record** —— the same-shape ke2 leaks no disabled state, and an
+        // honest client gets to complete ke3 and receive 401 user_disabled at
+        // login-finish (§M8.3's "login-begin still dummy same-shape, leaking
+        // nothing" refers to the unknown-user face; the disabled decision
+        // happens after the password proof holds —— no extra information
+        // leaked).
         let record = self
             .core
             .net
@@ -417,7 +453,7 @@ impl WebState {
             user,
         ) {
             Ok(v) => v,
-            Err(_) => return err("bad_request"), // 坏 ke1（b64/结构）
+            Err(_) => return err("bad_request"), // bad ke1 (b64/structure)
         };
         let bind_token: [u8; 16] = rand::random();
         let sig = anchor_sign(
@@ -436,7 +472,8 @@ impl WebState {
         }))
     }
 
-    /// `POST /api/login-finish`：ke3 验证 → 会话签发（统一 401；退避/审计联动）。
+    /// `POST /api/login-finish`: ke3 verification → session issuance (uniform
+    /// 401; backoff/audit interplay).
     async fn h_login_finish(&self, body: &serde_json::Value, origin: Origin) -> Response {
         let (Some(user), Some(ke3_b64)) = (body["user"].as_str(), body["ke3_b64"].as_str()) else {
             return err("bad_request");
@@ -448,17 +485,19 @@ impl WebState {
             return err_with("rate_limited", Some(retry));
         }
         let Some(state) = self.take_pending(user) else {
-            return err("login_failed"); // 无在途 begin（未 begin/已消费/过期）
+            return err("login_failed"); // no in-flight begin (never began / consumed / expired)
         };
         let finish_ts = self.now();
         if server_login_finish(&state, ke3_b64).is_err() {
-            // 失败记账（第 5 次起锁定）+ 审计 error 行。
+            // Failure accounting (lockout from the 5th attempt) + an audit
+            // error line.
             self.backoff.on_failure(user, finish_ts);
             self.audit
                 .record(finish_ts, user, "session.login", user, origin, "error");
             return err("login_failed");
         }
-        // 口令证明成立——退避清零；随后账号态判定（disabled 不计失败）。
+        // Password proof holds —— backoff reset; account state decided next
+        // (disabled does not count as a failure).
         self.backoff.on_success(user);
         let Some(row) = self.core.net.user_row(user).await else {
             return err("login_failed");
@@ -477,7 +516,8 @@ impl WebState {
             .with_header("Set-Cookie", &set_cookie_value(&sid, self.ttl_secs))
     }
 
-    /// `POST /api/pw-begin`：引导令牌预检（只读、不消费）→ m2。
+    /// `POST /api/pw-begin`: bootstrap-token pre-check (read-only, does not
+    /// consume) → m2.
     async fn h_pw_begin(&self, body: &serde_json::Value, remote: SocketAddr) -> Response {
         let (Some(user), Some(token_hex), Some(m1_b64)) = (
             body["user"].as_str(),
@@ -498,7 +538,8 @@ impl WebState {
         if let Err(retry) = self.buckets.allow(remote.ip(), self.now()) {
             return err_with("rate_limited", Some(retry));
         }
-        // 只读预检：令牌匹配（未知用户同错——不枚举）；记录已有 ⇒ password_exists。
+        // Read-only pre-check: token matches (unknown user same error —— no
+        // enumeration); record already present ⇒ password_exists.
         let row_ok = self
             .core
             .net
@@ -523,7 +564,8 @@ impl WebState {
         }
     }
 
-    /// `POST /api/pw-commit`：原子消费令牌 + 落记录（Raft/直写单点提交）。
+    /// `POST /api/pw-commit`: atomically consume the token + persist the
+    /// record (single commit point for Raft/direct-write).
     async fn h_pw_commit(&self, body: &serde_json::Value) -> Response {
         let (Some(user), Some(token_hex), Some(record_b64)) = (
             body["user"].as_str(),
@@ -542,7 +584,8 @@ impl WebState {
         let Ok(token): Result<[u8; 16], _> = token.try_into() else {
             return err("bad_token");
         };
-        // 记录规范化（解码验证——坏 b64 ⇒ 400，不进写路径）。
+        // Record canonicalization (decode validation —— bad b64 ⇒ 400, never
+        // enters the write path).
         let canonical = match server_reg_canonical(record_b64) {
             Ok(c) => c,
             Err(_) => return err("bad_request"),
@@ -556,16 +599,16 @@ impl WebState {
             Ok(()) => ok_json(json!({"ok": true})),
             Err(UserOpError::BadBootstrapToken) => err("bad_token"),
             Err(UserOpError::PasswordExists) => err("password_exists"),
-            Err(UserOpError::NoSuchUser) => err("bad_token"), // 不枚举
+            Err(UserOpError::NoSuchUser) => err("bad_token"), // no enumeration
             Err(_) => err("internal"),
         }
     }
 
     // ========================================================================
-    // 登录端点
+    // Login endpoints
     // ========================================================================
 
-    /// `POST /api/logout`：删会话 + 清 cookie。
+    /// `POST /api/logout`: delete session + clear cookie.
     fn h_logout(&self, req: &Request, sess: Session) -> Response {
         if let Some(sid) = req.session_cookie() {
             self.sessions.logout(sid);
@@ -581,7 +624,7 @@ impl WebState {
         Response::json(200, &json!({"ok": true})).with_header("Set-Cookie", &clear_cookie_value())
     }
 
-    /// `GET /api/me`。
+    /// `GET /api/me`.
     fn h_me(&self, sess: Session) -> Response {
         ok_json(json!({
             "user": sess.user,
@@ -592,10 +635,10 @@ impl WebState {
     }
 
     // ========================================================================
-    // 管理端点（users）
+    // Admin endpoints (users)
     // ========================================================================
 
-    /// `GET /api/users`（username 升序）。
+    /// `GET /api/users` (username ascending).
     async fn h_users_list(&self) -> Response {
         let users = self.core.net.users_all().await;
         let devices = self.all_devices().await;
@@ -616,7 +659,8 @@ impl WebState {
         ok_json(json!({"users": items}))
     }
 
-    /// `POST /api/users`：创建（响应一次性返回引导令牌——仅此一次，线下交付用户）。
+    /// `POST /api/users`: create (the response returns the bootstrap token
+    /// once —— only this once, delivered to the user out of band).
     async fn h_users_create(
         &self,
         body: &serde_json::Value,
@@ -649,7 +693,7 @@ impl WebState {
         }
     }
 
-    /// `/api/users/{u}/disable|enable|reset-password|admin`。
+    /// `/api/users/{u}/disable|enable|reset-password|admin`.
     async fn h_user_action(
         &self,
         user: &str,
@@ -700,8 +744,9 @@ impl WebState {
                 let Some(admin) = body["admin"].as_bool() else {
                     return err("bad_request");
                 };
-                // cannot_demote_self：目标 == 会话用户且 admin=false（handler 层裁决
-                //——状态机不知会话主体，§M8.3）。
+                // cannot_demote_self: target == session user and admin=false
+                // (adjudicated at the handler layer —— the state machine knows
+                // nothing of the session principal, §M8.3).
                 if user == sess.user && !admin {
                     self.audit
                         .record(now, &sess.user, "user.set_admin", user, origin, "denied");
@@ -721,11 +766,13 @@ impl WebState {
     }
 
     // ========================================================================
-    // peers（注册表全行 ⋈ 本地租约视图——名册同装配源、不同投影：含 device_id/
-    // status 全状态 + VIP 升序，§M8.4）
+    // peers (full registry rows ⋈ local lease view —— same assembly source as
+    // the roster, different projection: includes device_id/status across all
+    // states + VIP ascending, §M8.4)
     // ========================================================================
 
-    /// 设备行快照（全状态；单服 redb / 多主本地已 apply 视图）。
+    /// Device-row snapshot (all states; single-server redb / multi-primary
+    /// locally-applied view).
     async fn all_devices(&self) -> Vec<(DeviceId, crate::netstate::DeviceRow)> {
         match &self.core.net {
             NetBackend::Single(s) => s.devices_all(),
@@ -779,8 +826,9 @@ impl WebState {
                     "device_id": hex::encode(server_self_device_id_single(&self.core)),
                     "vip": vip_str(&self.core.cfg.vip.octets()),
                     "hostname": self.core.cfg.advertise_endpoint,
-                    // owner = node_id（u64 >2^53）的十进制字符串——String 形态无损，
-                    // 前端按「纯数字串」识别并做分组/截断展示。
+                    // owner = the decimal string of node_id (u64 >2^53) ——
+                    // lossless as a String; the frontend detects "pure digit
+                    // string" and renders it grouped/truncated.
                     "owner": flock_sync::node::node_id_of(&self.core.identity.server_id).to_string(),
                     "kind": "server",
                     "online": true,
@@ -831,7 +879,7 @@ impl WebState {
                         "vip": vip_str(&entry.vip),
                         "hostname": dir_hosts.get(&node_id).cloned()
                             .unwrap_or_else(|| flock_sync::HOSTNAME_UNKNOWN.to_string()),
-                        // owner = node_id 十进制字符串（>2^53 无损，前端分组展示）。
+                        // owner = node_id decimal string (>2^53 lossless, frontend renders grouped).
                         "owner": node_id.to_string(),
                         "kind": "server",
                         "online": st.is_some_and(|x| x.online),
@@ -847,7 +895,7 @@ impl WebState {
         out
     }
 
-    /// `/api/peers/{device_id}/revoke|disable|enable|kick`。
+    /// `/api/peers/{device_id}/revoke|disable|enable|kick`.
     async fn h_peer_action(
         &self,
         dev_hex: &str,
@@ -902,8 +950,10 @@ impl WebState {
                 Err(_) => audit("error", None, "peer.enable"),
             },
             "kick" => {
-                // 尽力本地：杀本机会话 + detach 本机租约（多主他机不追溯——设备自动
-                // 重连会重新上线；kick ≠ 封禁，确定断离用 disable/revoke，§M8.4）。
+                // Best-effort local: kill local sessions + detach the local
+                // lease (multi-primary other machines not traced —— the device
+                // comes back online on automatic reconnection; kick ≠ ban, use
+                // disable/revoke for a definitive cutoff, §M8.4).
                 self.core.sessions.kill(&dev);
                 #[cfg(feature = "multi-primary")]
                 if let Some(node) = &self.core.sync {
@@ -943,8 +993,9 @@ impl WebState {
         let sync_mode = sync_mode_of(&self.core);
         let servers = match &self.core.net {
             NetBackend::Single(_) => vec![json!({
-                // node_id 是 ServerId 前 8B 派生的 u64（>2^53 防 JS 精度丢失——
-                // JSON number 在 JS 端按 double 解析，必须以字符串形态下发）。
+                // node_id is a u64 derived from the first 8B of ServerId
+                // (>2^53 to dodge JS precision loss —— JSON numbers parse as
+                // double on the JS side, must be delivered as strings).
                 "node_id": flock_sync::node::node_id_of(&self.core.identity.server_id).to_string(),
                 "vip": format!("{}", self.core.cfg.vip),
                 "endpoint": self.core.cfg.advertise_endpoint,
@@ -979,12 +1030,12 @@ impl WebState {
                             .peer_stats(&flock_sync::lease::server_self_device_id(node_id))
                             .is_some_and(|x| x.online);
                         json!({
-                            // node_id 为 u64（>2^53 防 JS 精度丢失——字符串下发）。
+                            // node_id is a u64 (>2^53 to dodge JS precision loss —— delivered as string).
                             "node_id": node_id.to_string(),
                             "vip": format!("{}.{}.{}.{}", entry.vip[0], entry.vip[1], entry.vip[2], entry.vip[3]),
                             "endpoint": dir_eps.get(&node_id).cloned().unwrap_or_default(),
                             "leader": leader == Some(node_id),
-                            "epoch": epoch, // 本机已 apply 视图（展示面档位）
+                            "epoch": epoch, // locally-applied view (display tier)
                             "online": online,
                         })
                     })
@@ -1014,7 +1065,7 @@ impl WebState {
     }
 
     async fn h_series(&self, query: &str) -> Response {
-        // query 形如 vip=100.64.0.11。
+        // query is shaped like vip=100.64.0.11.
         let vip_str = query.split('&').find_map(|kv| kv.strip_prefix("vip="));
         let Some(vip_str) = vip_str else {
             return err("bad_request");
@@ -1023,7 +1074,8 @@ impl WebState {
             return err("bad_request");
         };
         let vip = vip.octets();
-        // 404 判定：既无序列也不在注册表（设备全状态 + 服务器 VIP）。
+        // 404 decision: neither a series nor in the registry (devices across
+        // all states + server VIPs).
         let in_registry = self.vip_in_registry(&vip).await;
         if !in_registry && !self.series.knows(&vip).await {
             return err("not_found");
@@ -1042,9 +1094,11 @@ impl WebState {
         }))
     }
 
-    /// 404 判定的注册表支：本机 VIP + 设备全状态 +（多主）远端服务器 VIP
-    ///（server_keys 本地视图——🟢 评审项 7：Series 重启清零 ⇒ 重启后首样本前
-    /// knows()=false，远端服务器 VIP 查询须命中本支返回空 points 而非 404）。
+    /// Registry arm of the 404 decision: local VIP + devices across all
+    /// states + (multi-primary) remote server VIPs (server_keys local view ——
+    /// green review item 7: Series resets on restart ⇒ before the first
+    /// sample after a restart knows()=false, so remote-server VIP queries
+    /// must hit this arm and return empty points rather than 404).
     async fn vip_in_registry(&self, vip: &[u8; 4]) -> bool {
         if *vip == self.core.cfg.vip.octets() {
             return true;
@@ -1066,7 +1120,8 @@ impl WebState {
     }
 
     fn h_config(&self) -> Response {
-        // 字段白名单（§M8.7-5：无密钥/无 srvmesh 对端表/无根材料）。
+        // Field whitelist (§M8.7-5: no keys / no srvmesh peer table / no root
+        // material).
         ok_json(json!({
             "listen_mode": self.core.cfg.mode,
             "advertise_endpoint": self.core.cfg.advertise_endpoint,
@@ -1101,7 +1156,7 @@ impl WebState {
     }
 }
 
-/// sync_mode（feature 门控的字段访问收敛）。
+/// sync_mode (converged field access gated by feature).
 #[cfg(feature = "multi-primary")]
 fn sync_mode_of(core: &ServerCore) -> &'static str {
     if core.sync.is_some() {
@@ -1119,15 +1174,18 @@ fn b64_std(b: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(b)
 }
 
-/// 单服形态服务器自身的 device_id 面（peers 的 Server 条目 device_id——诊断寻址用）。
+/// The server-self device_id surface in single-server form (the device_id of
+/// the peers' Server entry —— for diagnostic addressing).
 fn server_self_device_id_single(core: &ServerCore) -> [u8; 32] {
     let node_id = flock_sync::node::node_id_of(&core.identity.server_id);
-    // server_self_device_id 是 node_id 的确定性推导（flock-sync lease）；复用之。
+    // server_self_device_id is a deterministic derivation of node_id
+    // (flock-sync lease); reuse it.
     flock_sync::lease::server_self_device_id(node_id)
 }
 
 // ============================================================================
-// 单元测试（评审项 3 的 pending 表面——满载逐出最旧/惰性清过期）
+// Unit tests (the pending-table surface of review item 3 —— evict the oldest
+// when saturated / lazy expiry clearing)
 // ============================================================================
 
 #[cfg(test)]
@@ -1142,7 +1200,7 @@ mod tests {
             state_dir,
             bind: "127.0.0.1:0".parse().unwrap(),
             mode: "direct".into(),
-            advertise_endpoint: "127.0.0.1:9443".parse().unwrap(),
+            advertise_endpoint: "127.0.0.1:9443".into(),
             extra_endpoints: vec![],
             dir_version: 1,
             ticket_ttl_secs: 60,
@@ -1159,37 +1217,48 @@ mod tests {
         Arc::new(WebState::new(core))
     }
 
-    /// 满载逐出按「最旧」而非字典序最小（🟡 评审项 3）：预填大字典序名至满载后，
-    /// admin（字典序最小）登录不被驱逐——旧实现 keys().min() 会逐掉 admin 的
-    /// 在途态（其 login-finish 无故 login_failed）。
+    /// Saturated eviction picks the "oldest", not the lexicographic minimum
+    /// (review item 3): after pre-filling large-lexicographic names to
+    /// saturation, admin (lexicographically smallest) logging in is not
+    /// evicted —— the old keys().min() implementation would evict admin's
+    /// in-flight state (whose login-finish fails with login_failed for no
+    /// reason).
     #[tokio::test]
     async fn pending_evicts_oldest_not_lexicographic_min() {
         let st = state().await;
-        // 预填 PENDING_LOGIN_CAP-1 个大字典序名（z-user-NNNN）。
+        // Pre-fill PENDING_LOGIN_CAP-1 large-lexicographic names (z-user-NNNN).
         for i in 0..PENDING_LOGIN_CAP - 1 {
             st.put_pending(&format!("z-user-{i:04}"), vec![i as u8]);
         }
         assert_eq!(st.pending_len(), PENDING_LOGIN_CAP - 1);
-        // admin 末位 begin（字典序最小——旧实现下一轮逐出的就是它）。
+        // admin begins last (lexicographically smallest —— what the old
+        // implementation would evict on the next round).
         st.put_pending("admin", vec![0xAA]);
         assert_eq!(st.pending_len(), PENDING_LOGIN_CAP);
-        // 再触发一次满载逐出：应逐最旧（z-user-0000），非 admin。
+        // Trigger one more saturated eviction: should evict the oldest
+        // (z-user-0000), not admin.
         st.put_pending("z-zzz", vec![0xBB]);
-        assert_eq!(st.pending_len(), PENDING_LOGIN_CAP, "逐一插一维持上限");
+        assert_eq!(
+            st.pending_len(),
+            PENDING_LOGIN_CAP,
+            "one in, one out keeps the cap"
+        );
         assert_eq!(
             st.take_pending("admin"),
             Some(vec![0xAA]),
-            "admin 不因字典序被逐（逐出的是最旧 z-user-0000）"
+            "admin not evicted for lexicographic reasons (the evicted one is the oldest z-user-0000)"
         );
     }
 
-    /// take_pending 惰性清过期行：过期行（含请求者自身）不返回且被顺带清出。
+    /// take_pending lazily expires stale rows: expired rows (including the
+    /// requester's own) are neither returned nor left behind.
     #[tokio::test]
     async fn pending_take_lazy_expires_stale_rows() {
         let st = state().await;
         st.put_pending("fresh", vec![1]);
         st.put_pending("stale", vec![2]);
-        // 直接置过期（同模块测试面——不引入时钟注入缝）。
+        // Force expiry directly (same-module test surface —— no clock-injection
+        // seam introduced).
         st.pending
             .lock()
             .unwrap()
@@ -1197,17 +1266,19 @@ mod tests {
             .get_mut("stale")
             .unwrap()
             .exp_unix = 1;
-        assert_eq!(st.take_pending("stale"), None, "过期行不返回");
-        // 任意 take 顺带清全部过期行（fresh 保留）。
+        assert_eq!(st.take_pending("stale"), None, "expired rows not returned");
+        // Any take lazily clears all expired rows (fresh kept).
         assert_eq!(st.take_pending("nobody"), None);
         assert_eq!(st.pending_len(), 1);
         assert_eq!(st.take_pending("fresh"), Some(vec![1]));
         assert_eq!(st.pending_len(), 0);
     }
 
-    /// 方法错档 405（🟢 评审项 7）：已知路径异方法 ⇒ 405 method_not_allowed
-    ///（对齐 §M8.4 错误码表；先于 CSRF/会话——未登录亦 405）；未知路径/未知
-    /// 动作 ⇒ 404（不误吞）。
+    /// Wrong method on a known path ⇒ 405 (green review item 7): known path
+    /// with a foreign method ⇒ 405 method_not_allowed (aligned with the
+    /// §M8.4 error-code table; ahead of CSRF/session —— 405 even when not
+    /// logged in); unknown path / unknown action ⇒ 404 (no mistaken
+    /// swallowing).
     #[tokio::test]
     async fn method_mismatch_returns_405_not_404() {
         let st = state().await;
@@ -1236,7 +1307,7 @@ mod tests {
             assert_eq!(resp.status, 405, "{method} {path}");
             assert_eq!(code_of(&resp), "method_not_allowed", "{method} {path}");
         }
-        // 未知路径 / 未知动作后缀 ⇒ 404 not_found。
+        // Unknown path / unknown action suffix ⇒ 404 not_found.
         for (method, path) in [
             ("GET", "/api/nope"),
             ("POST", "/api/peers/abcd/rename"),
@@ -1260,14 +1331,16 @@ mod tests {
         "127.0.0.1:40000".parse().unwrap()
     }
 
-    /// extra 对象合并 user 字段（serde_json 宏无 struct-update 语法）。
+    /// Merge a user field into an extra object (the serde_json macro has no
+    /// struct-update syntax).
     fn user_body(extra: &serde_json::Value, user: &str) -> serde_json::Value {
         let mut v = extra.clone();
         v["user"] = json!(user);
         v
     }
 
-    /// 公共认证端点 CSRF 双门槛齐备的 POST 载具。
+    /// POST carrier with both CSRF double-gate headers for the public auth
+    /// endpoints.
     fn post_req(path: &str, body: &serde_json::Value) -> Request {
         Request {
             method: "POST".into(),
@@ -1290,8 +1363,10 @@ mod tests {
             .to_string()
     }
 
-    /// 降权/禁用对旧会话即刻生效（🟡 评审项 6）：会话行内 admin 快照不作准、
-    /// disabled 不等 TTL——dispatch 会话档回读 UserRow（本地已 apply 视图）。
+    /// Demotion/disable take effect on old sessions immediately (review item
+    /// 6): the admin snapshot inside the session row is not authoritative and
+    /// disabled does not wait for the TTL —— the dispatch session slot reads
+    /// back the UserRow (locally-applied view).
     #[tokio::test]
     async fn demote_and_disable_take_effect_on_next_request() {
         let st = state().await;
@@ -1310,42 +1385,60 @@ mod tests {
             body: vec![],
         };
 
-        // 基线：admin 会话可用。
+        // Baseline: the admin session works.
         let resp = st.dispatch(get("/api/users"), remote()).await;
         assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
 
-        // 降权（set_admin=false）：旧会话下一次请求即 403（不等 8h TTL）。
+        // Demotion (set_admin=false): the old session gets 403 on its next
+        // request (no waiting for the 8h TTL).
         st.core.net.set_user_admin("boss", false).await.unwrap();
         let resp = st.dispatch(get("/api/users"), remote()).await;
-        assert_eq!(resp.status, 403, "降权后旧会话即刻 403");
+        assert_eq!(
+            resp.status, 403,
+            "old session 403 immediately after demotion"
+        );
         assert_eq!(code_of(&resp), "forbidden");
-        // /api/me 仍可达（登录档），且 admin 回显以注册表为准（false）。
+        // /api/me still reachable (login tier), and the admin echo follows the
+        // registry (false).
         let resp = st.dispatch(get("/api/me"), remote()).await;
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-        assert_eq!(body["admin"], false, "me.admin 以回读 UserRow 为准");
-        // 恢复 admin。
+        assert_eq!(
+            body["admin"], false,
+            "me.admin follows the read-back UserRow"
+        );
+        // Restore admin.
         st.core.net.set_user_admin("boss", true).await.unwrap();
         assert_eq!(st.dispatch(get("/api/users"), remote()).await.status, 200);
 
-        // 禁用：任何登录档端点 401 user_disabled（先于角色判定——admin 端点同码）。
+        // Disable: any login-tier endpoint returns 401 user_disabled (ahead of
+        // the role check —— same code on admin endpoints).
         st.core.net.set_user_disabled("boss", true).await.unwrap();
         let resp = st.dispatch(get("/api/me"), remote()).await;
-        assert_eq!(resp.status, 401, "禁用后旧会话即刻 401");
+        assert_eq!(
+            resp.status, 401,
+            "old session 401 immediately after disable"
+        );
         assert_eq!(code_of(&resp), "user_disabled");
         let resp = st.dispatch(get("/api/users"), remote()).await;
-        assert_eq!(resp.status, 401, "禁用对 admin 端点同路径拒绝");
+        assert_eq!(
+            resp.status, 401,
+            "disable rejects admin endpoints on the same path"
+        );
         assert_eq!(code_of(&resp), "user_disabled");
-        // enable 恢复。
+        // enable restores.
         st.core.net.set_user_disabled("boss", false).await.unwrap();
         assert_eq!(st.dispatch(get("/api/users"), remote()).await.status, 200);
     }
 
-    /// u64 标识的字符串序列化往返（🔴 UI 评审项 1：ID 精度丢失）：
-    /// `servers[].node_id`（ServerId 前 8B 派生，必然 >2^53——JSON number 经 JS
-    /// double 解析会丢低位）必须以**字符串**形态下发且值与 `node_id_of` 十进制
-    /// 全值一致；peers 服务器行的 `owner`（同源的纯数字 String）同样无损往返。
-    /// epoch/时间戳等小量级 u64 计数器不在该面（<2^53，保持 number）。
+    /// String round-trip serialization of u64 identifiers (UI review item 1:
+    /// ID precision loss): `servers[].node_id` (derived from the first 8B of
+    /// ServerId, necessarily >2^53 —— a JSON number parsed as a JS double
+    /// would lose the low bits) must be delivered as a **string** whose value
+    /// matches `node_id_of`'s full decimal form; the peers server row's
+    /// `owner` (a same-source pure-digit String) round-trips losslessly too.
+    /// Small-magnitude u64 counters like epoch/timestamps are not on this
+    /// surface (<2^53, stay numbers).
     #[tokio::test]
     async fn u64_ids_serialize_as_json_strings() {
         let st = state().await;
@@ -1364,18 +1457,28 @@ mod tests {
             body: vec![],
         };
 
-        // dashboard/summary：node_id 是 JSON string，且十进制全值无损。
+        // dashboard/summary: node_id is a JSON string, lossless in full
+        // decimal.
         let resp = st.dispatch(get("/api/dashboard/summary"), remote()).await;
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         let want = flock_sync::node::node_id_of(&st.core.identity.server_id).to_string();
         let node_id = &body["servers"][0]["node_id"];
-        assert!(node_id.is_string(), "node_id 须为字符串（实际 {node_id}）");
-        assert_eq!(node_id.as_str().unwrap(), want, "node_id 十进制全值无损");
-        // 小量级计数器（epoch）保持 number——精度面按「标识 vs 计数」划界。
+        assert!(
+            node_id.is_string(),
+            "node_id must be a string (got {node_id})"
+        );
+        assert_eq!(
+            node_id.as_str().unwrap(),
+            want,
+            "node_id full decimal lossless"
+        );
+        // Small-magnitude counters (epoch) stay numbers —— the precision
+        // surface is bounded by "identifier vs counter".
         assert!(body["cluster"]["epoch"].is_u64());
 
-        // peers：服务器行 owner 为纯数字 String（前端按数字串分组/截断展示）。
+        // peers: the server row's owner is a pure-digit String (the frontend
+        // renders digit strings grouped/truncated).
         let resp = st.dispatch(get("/api/peers"), remote()).await;
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
@@ -1384,24 +1487,28 @@ mod tests {
             .unwrap()
             .iter()
             .find(|p| p["kind"] == "server")
-            .expect("单服形态必有服务器自发行");
+            .expect("single-server form always has a server self-row");
         let owner = server_row["owner"].as_str().unwrap();
         assert!(
             owner.chars().all(|c| c.is_ascii_digit()),
-            "服务器行 owner 为 node_id 十进制字符串（实际 {owner}）"
+            "server row owner is the node_id decimal string (got {owner})"
         );
-        assert_eq!(owner, &want, "owner 与 summary.node_id 同源全值一致");
+        assert_eq!(owner, &want, "owner matches summary.node_id at full value");
     }
 
-    /// 审计 stderr 行注入向量被拒（🟡 评审项 4）：user 含 \n/\r/NUL/超长（>64B）⇒
-    /// 四个公共认证端点 400 bad_request（第二层清洗在 access.rs 单测）；恰 64B 的
-    /// 合法 user 过形状关——login-begin（真 ke1）⇒ 200、其余 ⇒ 401（非 400，
-    /// 证明拒绝确因 user 形状而非后续业务档）。
+    /// Audit stderr line-injection vectors rejected (review item 4): a user
+    /// containing \n/\r/NUL / overlong (>64B) ⇒ the four public auth endpoints
+    /// return 400 bad_request (the second sanitization layer is in the
+    /// access.rs unit tests); an exactly-64B valid user passes the shape gate
+    /// —— login-begin (real ke1) ⇒ 200, the others ⇒ 401 (not 400, proving
+    /// the rejection is truly due to the user's shape rather than a later
+    /// business tier).
     #[tokio::test]
     async fn auth_endpoints_reject_control_char_and_overlong_user() {
         let st = state().await;
         let inject = "evil\n2026-01-01 user=root action=peer.revoke";
-        // 真 ke1（64B user 走 dummy 同形路径 ⇒ 200——形状关的放行证据）。
+        // Real ke1 (a 64B user takes the dummy same-shape path ⇒ 200 ——
+        // evidence the shape gate passed).
         let user64 = "u".repeat(64);
         let (_, ke1) = flock_protocol::pake::login_start(
             &mut flock_protocol::rand::rngs::OsRng,
@@ -1414,12 +1521,12 @@ mod tests {
             (
                 "/api/login-finish",
                 json!({"ke3_b64": "AAAA"}),
-                401, // 无在途 begin ⇒ login_failed
+                401, // no in-flight begin ⇒ login_failed
             ),
             (
                 "/api/pw-begin",
                 json!({"token": "00".repeat(16), "m1_b64": "AAAA"}),
-                401, // 未知用户同 bad_token（不枚举）
+                401, // unknown user same bad_token (no enumeration)
             ),
             (
                 "/api/pw-commit",
@@ -1427,30 +1534,32 @@ mod tests {
                 401, // NoSuchUser ⇒ bad_token
             ),
         ] {
-            // \n / \r / NUL 注入向量 ⇒ 400。
+            // \n / \r / NUL injection vectors ⇒ 400.
             for bad in [inject, "evil\rx", "u\u{0}x"] {
                 let resp = st
                     .dispatch(post_req(path, &user_body(&extra, bad)), remote())
                     .await;
-                assert_eq!(resp.status, 400, "{path} 拒 {bad:?}");
+                assert_eq!(resp.status, 400, "{path} rejects {bad:?}");
                 assert_eq!(code_of(&resp), "bad_request");
             }
-            // > 64B ⇒ 400（四端点对齐 login-begin 的长度上限）。
+            // > 64B ⇒ 400 (all four endpoints aligned to login-begin's length
+            // cap).
             let resp = st
                 .dispatch(
                     post_req(path, &user_body(&extra, &"u".repeat(65))),
                     remote(),
                 )
                 .await;
-            assert_eq!(resp.status, 400, "{path} 拒 65B user");
-            // 恰 64B ⇒ 过形状关（业务档接管——非 400）。
+            assert_eq!(resp.status, 400, "{path} rejects 65B user");
+            // Exactly 64B ⇒ passes the shape gate (the business tier takes
+            // over —— not 400).
             let resp = st
                 .dispatch(post_req(path, &user_body(&extra, &user64)), remote())
                 .await;
             assert_eq!(
                 resp.status,
                 pass_status,
-                "{path} 64B user 过形状关: {}",
+                "{path} 64B user passes the shape gate: {}",
                 String::from_utf8_lossy(&resp.body)
             );
         }

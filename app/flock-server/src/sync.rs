@@ -1,19 +1,27 @@
-//! 多主运行装配（feature `multi-primary`；docs/design.md §2.2/§3.11/§6.2 M5 批次）。
+//! Multi-primary runtime assembly (feature `multi-primary`; docs/design.md
+//! §2.2/§3.11/§6.2 M5 batch).
 //!
-//! 单服形态见 [`crate::server::run`]；本模块把 §3.10 的 [`flock_sync::SyncNode`] 接到
-//! **真实进程/容器部署**：
+//! The single-server form is [`crate::server::run`]; this module wires the
+//! §3.10 [`flock_sync::SyncNode`] into **real process/container deployments**:
 //!
-//! 1. **入群捆绑**：`state_dir/bundle.bin`（`enroll` 子命令产物；缺失 ⇒ 等待——容器
-//!    编排里 init-cluster → 分发 → enroll 先于起服完成，等待语义让 `compose up`
-//!    一次全起不崩循环）；
-//! 2. **TCP 织物**：[`flock_sync::TcpFabric`] 绑 `sync.raft_bind`（§6.2 srvmesh 内联
-//!    网），对端表来自 `sync.raft_peers`；
-//! 3. **装配**：`SyncNodeBuilder`（voters = 根签目录全体节点）→ `ServerCore::open_sync`
-//!    （等 Bootstrap+SetOprf 在本节点 apply——运维侧 `cluster-bootstrap` 提交，等待
-//!    窗口 600s 覆盖编排序）；
-//! 4. **服务器自身 peer 面**：开 tun（`cfg.vip`）→ `set_local_peer`（dst=自身 VIP 的
-//!    包注入内核）+ 内核回程读泵（`route_outbound` 回 mesh，§2.2 判定序）；
-//! 5. 监听/admin 与单服 [`crate::server::run`] 同构（Direct 缺省 / Frp 托管）。
+//! 1. **Enrollment bundle**: `state_dir/bundle.bin` (the `enroll`
+//!    subcommand's product; missing ⇒ wait —— in container orchestration,
+//!    init-cluster → distribute → enroll completes before startup, and the
+//!    wait semantics let `compose up` start everything at once without
+//!    crash-looping);
+//! 2. **TCP fabric**: [`flock_sync::TcpFabric`] bound to `sync.raft_bind`
+//!    (the §6.2 srvmesh inline network), the peer table from
+//!    `sync.raft_peers`;
+//! 3. **Assembly**: `SyncNodeBuilder` (voters = all nodes of the root-signed
+//!    directory) → `ServerCore::open_sync` (waits for Bootstrap+SetOprf to
+//!    apply on this node —— submitted operations-side by
+//!    `cluster-bootstrap`; the 600s wait window covers the layout order);
+//! 4. **The server's own peer surface**: open the tun (`cfg.vip`) →
+//!    `set_local_peer` (packets with dst = own VIP injected into the
+//!    kernel) + the kernel return-path read pump (`route_outbound` back
+//!    into the mesh, the §2.2 decision order);
+//! 5. Listener/admin is isomorphic to the single-server
+//!    [`crate::server::run`] (Direct default / Frp managed).
 
 use std::sync::Arc;
 
@@ -24,13 +32,16 @@ use tokio::task::JoinHandle;
 use crate::config::{ListenerMode, ServerConfig};
 use crate::server::{run, ServerCore};
 
-/// 捆绑等待窗口（编排序：init-cluster → enroll 可能在 up 之后数十秒）。
+/// Bundle wait window (layout order: init-cluster → enroll may be tens of
+/// seconds after up).
 const BUNDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
-/// Bootstrap/SetOprf 等待窗口（open_sync 内 15s × 重试覆盖运维侧 cluster-bootstrap）。
+/// Bootstrap/SetOprf wait window (15s retries inside open_sync cover the
+/// operations-side cluster-bootstrap).
 const CLUSTER_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// raft 形态起服（`server.toml [sync] mode = "raft"`；§3.11 M5 批次接入）。
-/// 返回形态与 [`crate::server::run`] 同构。
+/// Start the server in raft form (`server.toml [sync] mode = "raft"`; the
+/// §3.11 M5 batch hookup). The returned shape is isomorphic to
+/// [`crate::server::run`].
 pub async fn run_raft(
     cfg: ServerConfig,
     mode: ListenerMode,
@@ -46,16 +57,17 @@ pub async fn run_raft(
         .sync
         .as_ref()
         .filter(|s| s.mode == "raft")
-        .ok_or("run_raft 需要 [sync] mode = \"raft\"")?;
+        .ok_or("run_raft requires [sync] mode = \"raft\"")?;
     let bundle_path = sync
         .bundle
         .clone()
         .unwrap_or_else(|| cfg.state_dir.join("bundle.bin"));
 
-    // 1. 等入群捆绑（enroll 产物）。
+    // 1. Wait for the enrollment bundle (the enroll product).
     let bytes = wait_bundle(&bundle_path).await?;
 
-    // 2. TCP 织物（srvmesh 直接互连；对端表 = sync.raft_peers）。
+    // 2. TCP fabric (direct srvmesh interconnect; peer table =
+    //    sync.raft_peers).
     let mut peers = std::collections::BTreeMap::new();
     for entry in &sync.raft_peers {
         let (id, addr) = flock_sync::tcp::parse_peer_entry(entry)?;
@@ -72,7 +84,9 @@ pub async fn run_raft(
             .unwrap_or_default()
     );
 
-    // 3. 装配 SyncNode（voters = 根签目录全体；同配置多节点并发 initialize 安全）。
+    // 3. Assemble the SyncNode (voters = the whole root-signed directory;
+    //    concurrent initialize from multiple nodes with the same config is
+    //    safe).
     let bundle = verify_bundle(&bytes)?;
     let ident = Arc::new(bundle.identity()?);
     let directory = bundle.directory()?;
@@ -95,8 +109,10 @@ pub async fn run_raft(
         .map_err(|e| format!("sync node: {e}"))?,
     );
 
-    // 优雅停机（A7/A5 的 docker stop = SIGTERM）：先 Raft shutdown（停复制/清队在途
-    // 写）再退出——redb 提交本身是事务持久的，此举进一步收敛在途写窗口。
+    // Graceful shutdown (A7/A5's docker stop = SIGTERM): Raft shutdown first
+    // (stop replication, drain in-flight writes) then exit —— redb commits
+    // are already transactionally durable; this further narrows the
+    // in-flight write window.
     {
         let n = node.clone();
         tokio::spawn(async move {
@@ -114,42 +130,52 @@ pub async fn run_raft(
             {
                 let _ = tokio::signal::ctrl_c().await;
             }
-            eprintln!("flock-server: 信号退出——Raft 优雅停机");
+            eprintln!("flock-server: signal exit - Raft graceful shutdown");
             let _ = n.shutdown().await;
             std::process::exit(0);
         });
     }
 
-    // 4. 集群引导端点（**先于**就绪等待绑定，§4-1 编排序）：Bootstrap/SetOprf 的根签
-    //    提交通道——admin 端点(9444)随 ServerCore 在 Bootstrap apply 后才起，而提交
-    //    本身必须先能进来（鸡蛋序解法：专用通道直达 node.write）。端口 = admin + 1。
+    // 4. Cluster bootstrap endpoint (bound **before** the ready wait, the
+    //    §4-1 layout order): the submission channel for root-signed
+    //    Bootstrap/SetOprf —— the admin endpoint (9444) starts with
+    //    ServerCore only after Bootstrap applies, yet the submission itself
+    //    must be able to arrive first (the chicken-and-egg solution: a
+    //    dedicated channel straight to node.write). Port = admin + 1.
     let boot_bind = bootstrap_bind_of(cfg.admin_bind);
     serve_bootstrap_ep(node.clone(), boot_bind)
         .await
         .map_err(|e| format!("bootstrap endpoint bind {boot_bind}: {e}"))?;
-    eprintln!("flock-server: cluster bootstrap endpoint on {boot_bind}（根签提交直达 Raft）");
+    eprintln!("flock-server: cluster bootstrap endpoint on {boot_bind} (root-signed submissions straight to Raft)");
 
-    // 5. ServerCore（等 Bootstrap+SetOprf apply；运维侧 cluster-bootstrap 先行/后行皆可）。
+    // 5. ServerCore (waits for Bootstrap+SetOprf to apply; the operations-side
+    //    cluster-bootstrap may come before or after).
     let core = wait_cluster_ready(cfg.clone(), ident, node.clone()).await?;
 
-    // 6. 服务器自身 peer 面：tun + 本机投递/回程（§2.2）。
+    // 6. The server's own peer surface: tun + local delivery/return path
+    //    (§2.2).
     wire_local_peer(&core, &node).await;
 
-    // 7. 监听 + admin（与单服 run 同构）。router 预置 ⇒ run() 不再二次开同名 tun。
+    // 7. Listener + admin (isomorphic to the single-server run). The router
+    //    is pre-set ⇒ run() does not open a same-named tun a second time.
     core.set_router(crate::dataplane::PeerRouter::none());
     run(core, mode).await
 }
 
-/// admin 端口 +1（集群引导专用通道缺省位；9444 → 9445）。
+/// Admin port + 1 (the default slot of the dedicated cluster-bootstrap
+/// channel; 9444 → 9445).
 fn bootstrap_bind_of(admin: std::net::SocketAddr) -> std::net::SocketAddr {
     let mut a = admin;
     a.set_port(admin.port() + 1);
     a
 }
 
-/// 集群引导端点：只接受 [`crate::admin::AdminRequest::SignedWrite`]（Bootstrap/SetOprf/
-/// RecordInvite——签名验证在状态机内）与 `Stats`，直达 `SyncNode::write`。进程生命周期
-/// 常驻（与 admin 并存；CLI `cluster-bootstrap`/`cluster-invite` 在 admin 未起时回退到它）。
+/// Cluster bootstrap endpoint: accepts only
+/// [`crate::admin::AdminRequest::SignedWrite`] (Bootstrap/SetOprf/
+/// RecordInvite —— signature verification inside the state machine) and
+/// `Stats`, going straight to `SyncNode::write`. Lives for the process
+/// lifetime (coexisting with admin; the CLI `cluster-bootstrap`/
+/// `cluster-invite` fall back to it while admin is not up).
 async fn serve_bootstrap_ep(
     node: Arc<flock_sync::SyncNode>,
     bind: std::net::SocketAddr,
@@ -172,7 +198,8 @@ async fn handle_bootstrap_conn(
     node: &Arc<flock_sync::SyncNode>,
     io: &mut tokio::net::TcpStream,
 ) -> std::io::Result<()> {
-    // 帧协议与 admin.rs 相同（[u32 LE len][postcard AdminRequest]）。
+    // Same framing protocol as admin.rs ([u32 LE len][postcard
+    // AdminRequest]).
     let mut hdr = [0u8; 4];
     io.read_exact(&mut hdr).await?;
     let len = u32::from_le_bytes(hdr) as usize;
@@ -191,7 +218,8 @@ async fn handle_bootstrap_conn(
             Err(e) => crate::admin::AdminResponse::Err { msg: e.to_string() },
         },
         crate::admin::AdminRequest::Stats => {
-            // 就绪前面：leader/epoch（本机视图）——编排查活用。
+            // Pre-ready surface: leader/epoch (local view) —— for layout
+            // liveness probing.
             let mut lines = Vec::new();
             lines.push(format!("node_id={}", node.id()));
             let leader = node
@@ -204,7 +232,7 @@ async fn handle_bootstrap_conn(
             crate::admin::AdminResponse::StatsText { lines }
         }
         other => crate::admin::AdminResponse::Err {
-            msg: format!("bootstrap endpoint 不受理该请求（{other:?} 面）"),
+            msg: format!("bootstrap endpoint does not accept this request ({other:?} surface)"),
         },
     };
     let out = postcard::to_allocvec(&resp).map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -213,7 +241,8 @@ async fn handle_bootstrap_conn(
     io.flush().await
 }
 
-/// 等待捆绑文件出现（enroll 先于/后于起服皆可）。
+/// Wait for the bundle file to appear (enroll may precede or follow
+/// startup).
 async fn wait_bundle(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let deadline = std::time::Instant::now() + BUNDLE_WAIT;
     loop {
@@ -221,22 +250,25 @@ async fn wait_bundle(path: &std::path::Path) -> Result<Vec<u8>, String> {
             Ok(b) => return Ok(b),
             Err(_) if std::time::Instant::now() < deadline => {
                 eprintln!(
-                    "flock-server: 等待入群捆绑 {}（enroll 后自动继续；剩余 {:?}）",
+                    "flock-server: waiting for enrollment bundle {} (continues automatically after enroll; {:?} left)",
                     path.display(),
                     deadline.saturating_duration_since(std::time::Instant::now())
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
-            Err(e) => return Err(format!("读 {}: {e}", path.display())),
+            Err(e) => return Err(format!("read {}: {e}", path.display())),
         }
     }
 }
 
-/// ServerCore（等集群就绪：Bootstrap + 本服务器的 OPRF 封装在本节点 apply）。
+/// ServerCore (waits for cluster readiness: Bootstrap + this server's OPRF
+/// wrap applied on this node).
 ///
-/// 只重试 transient 错误（[`crate::server::SYNC_NOT_READY_PREFIX`] 起头——封装尚未
-/// 复制到位）；永久错误（评审项 2：wrap 解封失败 = 本机 hybrid 私钥与封装不匹配，
-/// 重试无意义）立即上抛。
+/// Only transient errors are retried (prefixed by
+/// [`crate::server::SYNC_NOT_READY_PREFIX`] —— the wrap has not replicated
+/// yet); permanent errors (review item 2: a wrap unsealing failure = this
+/// node's hybrid private key does not match the wrap, retrying is pointless)
+/// propagate immediately.
 async fn wait_cluster_ready(
     cfg: ServerConfig,
     ident: Arc<ServerIdentity>,
@@ -250,24 +282,27 @@ async fn wait_cluster_ready(
                 if e.starts_with(crate::server::SYNC_NOT_READY_PREFIX)
                     && std::time::Instant::now() < deadline =>
             {
-                eprintln!("flock-server: {e}——2s 后重试");
+                eprintln!("flock-server: {e} - retrying in 2s");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             Err(e) if e.starts_with(crate::server::SYNC_NOT_READY_PREFIX) => {
                 return Err(format!(
-                    "集群 600s 内未就绪（Bootstrap/本机 OPRF 封装未 apply）: {e}"
+                    "cluster not ready within 600s (Bootstrap/local OPRF wrap not applied): {e}"
                 ))
             }
-            Err(e) => return Err(e), // 永久错误（解封失败等）——立即上抛
+            Err(e) => return Err(e), // permanent error (unsealing failure etc.) - propagate now
         }
     }
 }
 
-/// 服务器自身 peer 面（§2.2）：
-/// - `set_local_peer`：dst = 自身 VIP 的入向包 → tun 写泵（A2 ping / A4 iperf）；
-/// - 回程读泵：tun 产出（ICMP 回程/本机协议栈流量）→ `SyncNode::route_outbound`。
+/// The server's own peer surface (§2.2):
+/// - `set_local_peer`: inbound packets with dst = own VIP → the tun write
+///   pump (A2 ping / A4 iperf);
+/// - return-path read pump: tun output (ICMP returns / local stack traffic)
+///   → `SyncNode::route_outbound`.
 ///
-/// 无 tun（无 NET_ADMIN 部署）⇒ 记日志跳过（控制流-only；转发面设备↔设备不受影响）。
+/// No tun (a deployment without NET_ADMIN) ⇒ log and skip (control-flow
+/// only; the device↔device forwarding surface is unaffected).
 pub async fn wire_local_peer(core: &Arc<ServerCore>, node: &Arc<flock_sync::SyncNode>) {
     let vip = core.cfg.vip;
     match crate::dataplane::PeerRouter::open_tun_session(&core.cfg.tun_name, vip).await {
@@ -281,19 +316,20 @@ pub async fn wire_local_peer(core: &Arc<ServerCore>, node: &Arc<flock_sync::Sync
                     node.route_outbound(&pkt).await;
                 }
             });
-            // 设备句柄存活持有（接口随句柄存续）。
+            // The device handle is kept alive (the interface lives with the
+            // handle).
             std::mem::forget(tun);
             eprintln!(
-                "flock-server: local peer wired vip={vip}（dst=本机 VIP 入内核 + 回程进 mesh）"
+                "flock-server: local peer wired vip={vip} (dst=local VIP into kernel + return path into mesh)"
             );
         }
         None => {
-            eprintln!("flock-server: 无 tun——本机 VIP 投递降级（跨服转发面不受影响）")
+            eprintln!("flock-server: no tun - local VIP delivery degraded (cross-server forwarding unaffected)")
         }
     }
 }
 
-/// tun 写泵 sink（ForwardPlane 本机投递接缝）。
+/// The tun write-pump sink (the ForwardPlane local-delivery seam).
 struct KernelSink(tokio::sync::mpsc::Sender<Vec<u8>>);
 
 impl flock_sync::PacketSink for KernelSink {
@@ -308,6 +344,6 @@ impl flock_sync::PacketSink for KernelSink {
 }
 
 fn verify_bundle(bytes: &[u8]) -> Result<crate::bundle::NodeBundle, String> {
-    let b = crate::bundle::NodeBundle::from_bytes(bytes).ok_or("捆绑文件解码失败")?;
+    let b = crate::bundle::NodeBundle::from_bytes(bytes).ok_or("bundle file failed to decode")?;
     b.verify().map(|_| b)
 }

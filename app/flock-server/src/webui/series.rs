@@ -1,14 +1,20 @@
-//! M8 webui 流量时间序列（docs/design.md §7-M8.5——内存环形缓冲，不进 Raft/gossip）。
+//! M8 webui traffic time series (docs/design.md §7-M8.5 —— in-memory ring
+//! buffer, never enters Raft/gossip).
 //!
-//! per-VIP `VecDeque<(unix_minute, tx_bps, rx_bps)>`，容量 `series_points`（缺省
-//! 120）× `series_interval_secs`（缺省 60）⇒ 2 小时窗。采样源（同任务单趟）：
-//! - 单服 = `TrafficMeter::stats(vip)`（服务器自身走 [`SERVER_TRAFFIC_KEY`]）；
-//! - 多主 = `LeaseTable::peer_stats(device)`（服务器自身走 `server_self_device_id`；
-//!   VIP↔Device 映射来自注册表本地快照——与名册同视图）。
+//! per-VIP `VecDeque<(unix_minute, tx_bps, rx_bps)>`, capacity
+//! `series_points` (default 120) × `series_interval_secs` (default 60) ⇒ a
+//! 2-hour window. Sampling sources (one pass of the same task):
+//! - single server = `TrafficMeter::stats(vip)` (the server itself goes
+//!   through [`SERVER_TRAFFIC_KEY`]);
+//! - multi-primary = `LeaseTable::peer_stats(device)` (the server itself goes
+//!   through `server_self_device_id`; the VIP↔Device mapping comes from the
+//!   local registry snapshot —— same view as the roster).
 //!
-//! 语义（设计定死）：仅 Active 行参与采样（行消失（吊销/过期）后**序列保留至自然
-//! 环出**）；**重启清零**（纯内存）；无样本但在册的 VIP 返回空 points（非 404——
-//! 404 判定「既无序列也不在注册表」，api.rs 承担）。
+//! Semantics (fixed by design): only Active rows are sampled (after a row
+//! disappears (revoked/expired) the **series is retained until it naturally
+//! rings out**); **restart zeroes it** (pure memory); a VIP with no samples
+//! but on record returns empty points (not 404 —— the 404 decision is
+//! "neither a series nor in the registry", carried by api.rs).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -19,16 +25,16 @@ use crate::backend::NetBackend;
 use crate::netstate::DeviceStatus;
 use crate::server::ServerCore;
 
-/// 单点。
+/// One sample point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SamplePoint {
-    /// 桶时刻（unix 秒；对齐 interval 的整桶）。
+    /// Bucket time (unix seconds; aligned to whole buckets of the interval).
     pub t: u64,
     pub tx_bps: u64,
     pub rx_bps: u64,
 }
 
-/// 环形缓冲集（per-VIP）。
+/// Ring-buffer set (per VIP).
 pub struct Series {
     points: usize,
     interval_secs: u64,
@@ -48,7 +54,7 @@ impl Series {
         self.interval_secs
     }
 
-    /// 序列快照（旧→新；§M8.4 points 数组序）。
+    /// Series snapshot (old→new; the §M8.4 points array order).
     pub async fn snapshot(&self, vip: &[u8; 4]) -> Vec<SamplePoint> {
         self.inner
             .lock()
@@ -58,7 +64,7 @@ impl Series {
             .unwrap_or_default()
     }
 
-    /// 是否已有任何样本（404 判定的第一支）。
+    /// Whether any sample exists yet (the first arm of the 404 decision).
     pub async fn knows(&self, vip: &[u8; 4]) -> bool {
         self.inner
             .lock()
@@ -67,7 +73,8 @@ impl Series {
             .is_some_and(|q| !q.is_empty())
     }
 
-    /// 采样单趟（注入时钟可测；同一桶内重复采样 = 覆盖末点——幂等）。
+    /// One sampling pass (injectable clock for tests; re-sampling within the
+    /// same bucket = overwrite the last point —— idempotent).
     pub async fn sample_once(&self, core: &ServerCore, now_unix: u64) {
         let bucket = now_unix - (now_unix % self.interval_secs);
         let mut updates: Vec<([u8; 4], u64, u64)> = Vec::new();
@@ -81,7 +88,8 @@ impl Series {
                         updates.push((row.vip, tx, rx));
                     }
                 }
-                // 服务器自身（单服形态唯一 Server 条目）。
+                // The server itself (the single Server entry in single-server
+                // form).
                 if let Some((tx, rx, _)) = core.traffic.stats(crate::dataplane::SERVER_TRAFFIC_KEY)
                 {
                     updates.push((core.cfg.vip.octets(), tx, rx));
@@ -115,7 +123,7 @@ impl Series {
         for (vip, tx, rx) in updates {
             let q = g.entry(vip).or_default();
             if q.back().is_some_and(|p| p.t == bucket) {
-                q.pop_back(); // 同桶覆盖（幂等）
+                q.pop_back(); // same-bucket overwrite (idempotent)
             }
             q.push_back(SamplePoint {
                 t: bucket,
@@ -123,12 +131,12 @@ impl Series {
                 rx_bps: rx,
             });
             while q.len() > self.points {
-                q.pop_front(); // 环出最旧
+                q.pop_front(); // ring out the oldest
             }
         }
     }
 
-    /// 采样循环（interval 周期；装配于 mod.rs）。
+    /// Sampling loop (interval period; assembled in mod.rs).
     pub async fn sampler_loop(self: Arc<Self>, core: Arc<ServerCore>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(self.interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -141,8 +149,9 @@ impl Series {
 }
 
 // ============================================================================
-// 单元测试（§M8.9：注入时钟定点采样 → 环出上限 120 → 新实例为空（重启语义）→
-// 行消失后序列保留）
+// Unit tests (§M8.9: fixed-point sampling with injected clock → ring-out cap
+// 120 → a fresh instance is empty (restart semantics) → the series is retained
+// after the row disappears)
 // ============================================================================
 
 #[cfg(test)]
@@ -179,7 +188,8 @@ mod tests {
         }
     }
 
-    /// 定点采样（注入时钟）+ 环出上限 + 桶对齐 + 同桶覆盖幂等。
+    /// Fixed-point sampling (injected clock) + ring-out cap + bucket
+    /// alignment + same-bucket overwrite idempotence.
     #[tokio::test]
     async fn sampling_ring_and_bucket_alignment() {
         let dir = tempfile::tempdir().unwrap();
@@ -188,12 +198,13 @@ mod tests {
         let row = store
             .register_device("alice", [1; 32], [1; 32], "box")
             .unwrap();
-        // 喂流量（EWMA 两折出非零）。
+        // Feed traffic (two EWMA folds produce non-zero).
         core.traffic.note_tx(&row.vip, 8192);
         core.traffic.note_rx(&row.vip, 4096);
 
         let series = Series::new(4, 60);
-        // EWMA 折叠出非零（1s 窗 × 3 折——与 control.rs 名册测试同手法）。
+        // Fold the EWMA to non-zero (1s window × 3 folds —— same technique as
+        // the roster tests in control.rs).
         let mut ms = 1_000_000u64;
         for _ in 0..3 {
             core.traffic.note_tx(&row.vip, 8192);
@@ -201,31 +212,37 @@ mod tests {
             ms += 1000;
             core.traffic.tick(ms);
         }
-        // t=130：桶 = 120（对齐 60s）。
+        // t=130: bucket = 120 (aligned to 60s).
         series.sample_once(&core, 130).await;
         let pts = series.snapshot(&row.vip).await;
         assert_eq!(pts.len(), 1);
-        assert_eq!(pts[0].t, 120, "桶对齐 interval");
+        assert_eq!(pts[0].t, 120, "bucket aligned to interval");
         assert!(pts[0].tx_bps > 0 && pts[0].rx_bps > 0);
 
-        // 同桶再采样 ⇒ 覆盖（幂等，不双记）。
+        // Re-sample in the same bucket ⇒ overwrite (idempotent, not double
+        // recorded).
         series.sample_once(&core, 175).await;
-        assert_eq!(series.snapshot(&row.vip).await.len(), 1, "同桶覆盖");
+        assert_eq!(
+            series.snapshot(&row.vip).await.len(),
+            1,
+            "same-bucket overwrite"
+        );
 
-        // 4 个桶后环出（容量 4）。
+        // After 4 buckets it rings out (capacity 4).
         for t in [180, 240, 300, 360] {
             series.sample_once(&core, t).await;
         }
         let pts = series.snapshot(&row.vip).await;
-        assert_eq!(pts.len(), 4, "环出上限");
+        assert_eq!(pts.len(), 4, "ring-out cap");
         assert_eq!(
             pts.first().unwrap().t,
             180,
-            "最旧（120）被环出——留下 180..=360"
+            "the oldest (120) rang out —— 180..=360 remain"
         );
-        assert!(pts.windows(2).all(|w| w[0].t < w[1].t), "旧→新");
+        assert!(pts.windows(2).all(|w| w[0].t < w[1].t), "old→new");
 
-        // 服务器自身 VIP 也在采样面（SERVER_TRAFFIC_KEY 源；EWMA 折叠同手法）。
+        // The server's own VIP is also on the sampling surface
+        // (SERVER_TRAFFIC_KEY source; EWMA folded the same way).
         for _ in 0..3 {
             core.traffic
                 .note_tx(crate::dataplane::SERVER_TRAFFIC_KEY, 4096);
@@ -235,10 +252,14 @@ mod tests {
         series.sample_once(&core, 370).await;
         let self_pts = series.snapshot(&core.cfg.vip.octets()).await;
         assert_eq!(self_pts.len(), 1);
-        assert!(self_pts[0].tx_bps > 0, "服务器自身走 SERVER_TRAFFIC_KEY");
+        assert!(
+            self_pts[0].tx_bps > 0,
+            "the server itself goes through SERVER_TRAFFIC_KEY"
+        );
     }
 
-    /// 行消失（吊销）后序列保留至自然环出——非 Active 行不再进采样面。
+    /// After the row disappears (revoked) the series is retained until it
+    /// naturally rings out —— non-Active rows leave the sampling surface.
     #[tokio::test]
     async fn series_retained_after_row_leaves_active() {
         let dir = tempfile::tempdir().unwrap();
@@ -252,7 +273,8 @@ mod tests {
         series.sample_once(&core, 60).await;
         assert_eq!(series.snapshot(&row.vip).await.len(), 1);
 
-        // 吊销（行保留、VIP 不回收——但退出采样面）。
+        // Revoke (the row is retained, the VIP is not recycled —— but it
+        // leaves the sampling surface).
         let id = flock_protocol::session::DeviceId(sha2::Sha256::digest([1u8; 32]).into());
         store.revoke(&id).unwrap();
         series.sample_once(&core, 120).await;
@@ -261,12 +283,17 @@ mod tests {
         assert_eq!(
             pts.len(),
             1,
-            "行消失后不再追加（保留旧点，非清空）: {pts:?}"
+            "no appends after the row disappears (old point retained, not cleared): {pts:?}"
         );
-        assert_eq!(pts[0].t, 60, "旧点保留至自然环出");
+        assert_eq!(
+            pts[0].t, 60,
+            "the old point is retained until natural ring-out"
+        );
     }
 
-    /// 新实例为空（重启清零——纯内存；注册表仍在、流量计也在 ⇒ 首拍重建）。
+    /// A fresh instance is empty (restart zeroes it —— pure memory; the
+    /// registry is still there, so is the traffic meter ⇒ rebuilt on the first
+    /// sample).
     #[tokio::test]
     async fn fresh_instance_empty_restart_semantics() {
         let dir = tempfile::tempdir().unwrap();
@@ -280,11 +307,12 @@ mod tests {
         s1.sample_once(&core, 60).await;
         assert!(!s1.snapshot(&row.vip).await.is_empty());
 
-        // 「重启」：全新 Series（曲线从零开始）。
+        // "Restart": a brand-new Series (the chart starts from zero).
         let s2 = Series::new(120, 60);
-        assert!(s2.snapshot(&row.vip).await.is_empty(), "重启清零");
+        assert!(s2.snapshot(&row.vip).await.is_empty(), "restart zeroes");
         assert!(!s2.knows(&row.vip).await);
-        // 首拍后重建（注册表 + 流量计仍在的部署形态）。
+        // Rebuilt after the first sample (the deployment shape where the
+        // registry + traffic meter survive).
         s2.sample_once(&core, 120).await;
         assert_eq!(s2.snapshot(&row.vip).await.len(), 1);
     }

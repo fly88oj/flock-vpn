@@ -1,15 +1,19 @@
-//! M8 webui HTTP e2e（docs/design.md §7-M8.9——进程内真 HTTP + 原生 pake 客户端，
-//! 协议同构、绕过 wasm）。
+//! M8 webui HTTP e2e (docs/design.md §7-M8.9 —— in-process real HTTP + a
+//! native pake client, protocol-isomorphic, bypassing wasm).
 //!
-//! 覆盖（集成清单逐字）：
-//! 1. 未登录除公共端点外全 401（枚举全部端点）+ 壳页/bootstrap 公共面；
-//! 2. 首 admin 引导（`web-admin-add` 的直写路径函数）→ bootstrap → login（anchor
-//!    验签过）→ cookie 会话 → me/users CRUD（admin/非 admin 403/cannot_demote_self）
-//!    → pw-begin/commit 令牌原子（重放拒）→ peers/summary/series/audit → logout
-//!    后原 sid 401；
-//! 3. dummy 同形（未知用户 ke2 有形）/错口令 401/禁用 401 user_disabled/限速 429；
-//! 4. 访问矩阵（loopback/VPN 段/伪造 XFF）经注入连接源地址（mod.rs 单测面，此处
-//!    以真 HTTP 的 loopback 面收口）。
+//! Coverage (the integration checklist verbatim):
+//! 1. Everything but the public endpoints 401 when not logged in (all
+//!    endpoints enumerated) + the shell page/bootstrap public surface;
+//! 2. First-admin bootstrap (the `web-admin-add` direct-write path
+//!    function) → bootstrap → login (anchor verification passes) → cookie
+//!    session → me/users CRUD (admin/non-admin 403/cannot_demote_self) →
+//!    pw-begin/commit token atomicity (replay rejected) →
+//!    peers/summary/series/audit → after logout the original sid 401s;
+//! 3. dummy same-shape (an unknown user gets a well-formed ke2)/wrong
+//!    password 401/disabled 401 user_disabled/rate limit 429;
+//! 4. access matrix (loopback/VPN segment/forged XFF) via injected
+//!    connection source addresses (the mod.rs unit-test surface; closed
+//!    here on the loopback face with real HTTP).
 
 use std::io::BufRead as _;
 use std::sync::Arc;
@@ -27,7 +31,8 @@ use flock_server::server::ServerCore;
 use flock_server::webui::{self, api::WebState};
 
 // ============================================================================
-// 载具：真 HTTP 客户端（tokio TcpStream + 手写请求——不引 reqwest）
+// Vehicle: a real HTTP client (tokio TcpStream + hand-written requests ——
+// no reqwest pulled in)
 // ============================================================================
 
 struct Resp {
@@ -53,7 +58,8 @@ impl Resp {
     }
 }
 
-/// 一条 HTTP 请求（keep-alive 语义不需要——每请求新连接，`Connection: close`）。
+/// One HTTP request (keep-alive semantics unneeded —— a new connection per
+/// request, `Connection: close`).
 async fn http(
     base: std::net::SocketAddr,
     method: &str,
@@ -133,7 +139,8 @@ async fn post(base: std::net::SocketAddr, path: &str, cookie: Option<&str>, body
 }
 
 // ============================================================================
-// 载具：服务器（WebState 注入 + web-admin-add 直写路径函数）
+// Vehicle: the server (WebState injection + the web-admin-add direct-write
+// path function)
 // ============================================================================
 
 struct TestWeb {
@@ -166,7 +173,7 @@ fn test_cfg(state_dir: std::path::PathBuf) -> ServerConfig {
 fn crate_webui_cfg() -> flock_server::config::WebUiSection {
     flock_server::config::WebUiSection {
         enabled: true,
-        port: 0, // ephemeral——serve 返回实际地址
+        port: 0, // ephemeral —— serve returns the actual address
         session_ttl_secs: 28_800,
         series_points: 120,
         series_interval_secs: 60,
@@ -190,17 +197,19 @@ async fn start_web() -> TestWeb {
     }
 }
 
-/// `web-admin-add` 的直写路径函数（CLI fallback 的同一实现面：reg_start →
-/// 本机 OPRF m2 → reg_finish → [`web_pw_commit`]；admin=true）。
+/// The direct-write path function of `web-admin-add` (the same
+/// implementation surface as the CLI fallback: reg_start → local OPRF m2 →
+/// reg_finish → [`web_pw_commit`]; admin=true).
 async fn web_admin_add_direct(core: &ServerCore, user: &str, pw: &str) {
-    // 已有口令 ⇒ panic（测试面与 CLI 同语义拒）。
+    // A password already set ⇒ panic (the test surface rejects with the
+    // same semantics as the CLI).
     assert!(
         !core
             .net
             .user_row(user)
             .await
             .is_some_and(|r| r.opaque_record.is_some()),
-        "web_admin_add_direct: {user} 已有口令"
+        "web_admin_add_direct: {user} already has a password"
     );
     let mut rng = rand::rngs::OsRng;
     let (cstate, m1) = reg_start(&mut rng, pw, user).unwrap();
@@ -212,8 +221,9 @@ async fn web_admin_add_direct(core: &ServerCore, user: &str, pw: &str) {
         .expect("web_pw_commit");
 }
 
-/// 原生 OPAQUE 登录（anchor 验签——/api/bootstrap 取 identity_pub）。
-/// Ok(cookie)：登录成功；Err(ke1_state 无用) 由调用方按需驱动失败面。
+/// Native OPAQUE login (anchor verification —— /api/bootstrap provides the
+/// identity_pub). Ok(cookie): login succeeded; Err (the ke1_state goes
+/// unused) is driven by the caller as needed for failure surfaces.
 async fn pake_login(
     base: std::net::SocketAddr,
     core: &ServerCore,
@@ -241,7 +251,8 @@ async fn pake_login(
     let bind_token: [u8; 16] = bind_token.try_into().unwrap();
     let anchor_sig = hex::decode(r.body["anchor_sig"].as_str().unwrap()).unwrap();
     let server_id = core.identity.server_id.0;
-    // anchor 验签（错集群/错服务器响应混装在此拦截）。
+    // Anchor verification (wrong-cluster/wrong-server response splicing is
+    // intercepted here).
     let ke3 = client_login_finish_anchored(
         lstate,
         pw,
@@ -269,13 +280,13 @@ async fn pake_login(
 }
 
 // ============================================================================
-// ① 未登录 401 矩阵 + 公共面
+// ① The unauthenticated 401 matrix + public surface
 // ============================================================================
 
 #[tokio::test]
 async fn unauthenticated_matrix_and_public_surface() {
     let w = start_web().await;
-    // 公共面：壳页 + bootstrap（无需会话）。
+    // Public surface: shell page + bootstrap (no session needed).
     let idx = http(w.base, "GET", "/", &[], "").await;
     assert_eq!(idx.status, 200);
     let boot = get(w.base, "/api/bootstrap", None).await;
@@ -283,8 +294,12 @@ async fn unauthenticated_matrix_and_public_surface() {
     for k in ["cluster_id", "server_id", "identity_pub", "lang"] {
         assert!(boot.body[k].is_string(), "bootstrap.{k}");
     }
-    assert_eq!(boot.body["lang"], "zh-CN");
-    // login-begin 公共（坏 ke1 ⇒ 400——不需会话即达 handler）。
+    // The lang field is the server's initial UI language hint (en default;
+    // the single-language-era zh-CN tag is superseded by the bilingual
+    // packs).
+    assert_eq!(boot.body["lang"], "en");
+    // login-begin public (bad ke1 ⇒ 400 —— reaches the handler without a
+    // session).
     let r = post(
         w.base,
         "/api/login-begin",
@@ -292,8 +307,9 @@ async fn unauthenticated_matrix_and_public_surface() {
         &json!({"user": "x", "ke1_b64": "!!!"}),
     )
     .await;
-    assert_eq!(r.status, 400, "公共端点可达（坏 ke1 ⇒ 400）");
-    // 全部受保护端点 ⇒ 401 not_logged_in（先于角色——403 面在登录后）。
+    assert_eq!(r.status, 400, "public endpoint reachable (bad ke1 ⇒ 400)");
+    // All protected endpoints ⇒ 401 not_logged_in (ahead of role —— the 403
+    // surface comes after login).
     for path in [
         "/api/me",
         "/api/peers",
@@ -321,7 +337,8 @@ async fn unauthenticated_matrix_and_public_surface() {
         assert_eq!(r.status, 401, "{path}");
         assert_eq!(r.code(), "not_logged_in", "{path}");
     }
-    // CSRF：POST 缺 X-Flock-Web ⇒ 400（对公共端点同样生效）。
+    // CSRF: a POST missing X-Flock-Web ⇒ 400 (effective on the public
+    // endpoints too).
     let r = http(
         w.base,
         "POST",
@@ -335,17 +352,19 @@ async fn unauthenticated_matrix_and_public_surface() {
 }
 
 // ============================================================================
-// ② 全链：首 admin 引导 → 登录 → CRUD → 令牌原子 → peers/summary/series/audit →
-//    logout；失败面（dummy/错口令/禁用/限速）收口
+// ② The full chain: first-admin bootstrap → login → CRUD → token
+//    atomicity → peers/summary/series/audit → logout; the failure surfaces
+//    (dummy/wrong password/disabled/rate limit) closed out
 // ============================================================================
 
 #[tokio::test]
 async fn full_chain_admin_login_crud_token_atomic_and_logout() {
     let w = start_web().await;
-    // 首 admin 引导（web-admin-add 直写路径）。
+    // First-admin bootstrap (the web-admin-add direct-write path).
     web_admin_add_direct(&w.core, "boss", "S3cret-1").await;
 
-    // dummy 同形：未知用户 login-begin 仍 200 + ke2 有形。
+    // dummy same-shape: an unknown user's login-begin still gets 200 + a
+    // well-formed ke2.
     let (lstate_ghost, ke1) = login_start(&mut rand::rngs::OsRng, "whatever", "ghost").unwrap();
     let r = post(
         w.base,
@@ -354,9 +373,9 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
         &json!({"user": "ghost", "ke1_b64": ke1}),
     )
     .await;
-    assert_eq!(r.status, 200, "未知用户 ke2 同形");
+    assert_eq!(r.status, 200, "unknown user gets a same-shaped ke2");
     assert!(r.body["ke2_b64"].as_str().is_some_and(|s| !s.is_empty()));
-    // 客户端 finish 必失败（本地——dummy 记录路径）。
+    // The client finish must fail (locally —— the dummy-record path).
     assert!(flock_protocol::pake::login_finish(
         lstate_ghost,
         "whatever",
@@ -365,21 +384,23 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
     )
     .is_err());
 
-    // admin 登录（anchor 验签过）→ cookie 会话。
+    // Admin login (anchor verification passes) → cookie session.
     let (cookie, me) = pake_login(w.base, &w.core, "boss", "S3cret-1")
         .await
         .expect("login");
     assert_eq!(me["user"], "boss");
     assert_eq!(me["admin"], true);
-    // /api/me：origin 回显 loopback。
+    // /api/me: origin echoes loopback.
     let r = get(w.base, "/api/me", Some(&cookie)).await;
     assert_eq!(r.status, 200);
     assert_eq!(r.body["user"], "boss");
     assert_eq!(r.body["origin"], "loopback");
     assert!(r.body["expires_unix"].as_u64().is_some_and(|e| e > 0));
 
-    // 伪造 ke3 直发 ⇒ 401 login_failed（错口令的服务端可观测面：诚实客户端在
-    // 本地 finish 即失败、不发第三请求——OPAQUE 语义；无在途 begin 同码）。
+    // A forged ke3 sent directly ⇒ 401 login_failed (the server-observable
+    // surface of a wrong password: an honest client fails finish locally
+    // and never sends the third request —— OPAQUE semantics; no in-flight
+    // begin gets the same code).
     let r = post(
         w.base,
         "/api/login-finish",
@@ -390,7 +411,7 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
     assert_eq!(r.status, 401);
     assert_eq!(r.code(), "login_failed");
 
-    // users：创建 bob（令牌仅此一次）。
+    // users: create bob (the token shown only this once).
     let r = post(
         w.base,
         "/api/users",
@@ -401,7 +422,7 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
     assert_eq!(r.status, 200, "{}", r.body);
     let token = r.body["pw_bootstrap_token"].as_str().unwrap().to_string();
     assert_eq!(token.len(), 32, "16B hex32");
-    // 重名 ⇒ 409 user_exists；坏用户名 ⇒ 400。
+    // Duplicate name ⇒ 409 user_exists; bad username ⇒ 400.
     let r = post(
         w.base,
         "/api/users",
@@ -419,10 +440,11 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
             &json!({"username": bad}),
         )
         .await;
-        assert_eq!(r.status, 400, "坏用户名 {bad:?}");
+        assert_eq!(r.status, 400, "bad username {bad:?}");
     }
 
-    // pw-begin 令牌错 ⇒ 401 bad_token；正确 ⇒ m2；未知用户同错（不枚举）。
+    // pw-begin with a wrong token ⇒ 401 bad_token; correct ⇒ m2; unknown
+    // user same error (no enumeration).
     let (cstate, m1) = reg_start(&mut rand::rngs::OsRng, "Bob-Pw-2", "bob").unwrap();
     let r = post(
         w.base,
@@ -440,7 +462,10 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
         &json!({"user": "ghost", "token": &token, "m1_b64": m1}),
     )
     .await;
-    assert_eq!(r.status, 401, "未知用户同 bad_token（不枚举）");
+    assert_eq!(
+        r.status, 401,
+        "unknown user same bad_token (no enumeration)"
+    );
     let r = post(
         w.base,
         "/api/pw-begin",
@@ -454,8 +479,9 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
         flock_protocol::pake::reg_finish(&mut rand::rngs::OsRng, cstate, "Bob-Pw-2", "bob", &m2)
             .unwrap();
 
-    // pw-commit：原子落记录 + 消费令牌；重放 ⇒ 401 bad_token；再 begin ⇒
-    // bad_token（令牌已消费）。
+    // pw-commit: atomically persists the record + consumes the token;
+    // replay ⇒ 401 bad_token; another begin ⇒ bad_token (token already
+    // consumed).
     let r = post(
         w.base,
         "/api/pw-commit",
@@ -471,7 +497,7 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
         &json!({"user": "bob", "token": &token, "record_b64": record, "profile": 0}),
     )
     .await;
-    assert_eq!(r.status, 401, "令牌重放拒");
+    assert_eq!(r.status, 401, "token replay rejected");
     assert_eq!(r.code(), "bad_token");
     let r = post(
         w.base,
@@ -480,9 +506,9 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
         &json!({"user": "bob", "token": &token, "m1_b64": "AAAA"}),
     )
     .await;
-    assert_eq!(r.status, 401, "消费后 begin 同 bad_token");
+    assert_eq!(r.status, 401, "begin after consumption also bad_token");
 
-    // users 列表：username 升序 + has_password/devices 计数。
+    // users list: username ascending + has_password/devices counts.
     let r = get(w.base, "/api/users", Some(&cookie)).await;
     assert_eq!(r.status, 200);
     let names: Vec<&str> = r.body["users"]
@@ -491,12 +517,13 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
         .iter()
         .map(|u| u["username"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["bob", "boss"], "username 升序");
+    assert_eq!(names, ["bob", "boss"], "username ascending");
     let bob = &r.body["users"][0];
     assert_eq!(bob["has_password"], true);
     assert_eq!(bob["admin"], false);
 
-    // 禁用 ⇒ bob 登录 finish 401 user_disabled（口令证明成立后判定）；enable 恢复。
+    // Disable ⇒ bob's login finish 401 user_disabled (decided after the
+    // password proof holds); enable restores.
     let r = post(w.base, "/api/users/bob/disable", Some(&cookie), &json!({})).await;
     assert_eq!(r.status, 200);
     let r = post(w.base, "/api/users/bob/enable", Some(&cookie), &json!({})).await;
@@ -511,9 +538,9 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
     assert_eq!(r.status, 200);
     let (bob_cookie, _) = pake_login(w.base, &w.core, "bob", "Bob-Pw-2")
         .await
-        .expect("enable 后登录");
+        .expect("login after enable");
 
-    // 非 admin 403 矩阵（bob）。
+    // Non-admin 403 matrix (bob).
     for path in ["/api/users", "/api/audit"] {
         let r = get(w.base, path, Some(&bob_cookie)).await;
         assert_eq!(r.status, 403, "{path}");
@@ -534,9 +561,10 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
         &json!({"admin": true}),
     )
     .await;
-    assert_eq!(r.status, 403, "非 admin 连自封 admin 也 403");
+    assert_eq!(r.status, 403, "non-admin self-promotion also 403");
 
-    // cannot_demote_self：boss 自降 ⇒ 409（handler 层裁决）。
+    // cannot_demote_self: boss self-demotion ⇒ 409 (adjudicated at the
+    // handler layer).
     let r = post(
         w.base,
         "/api/users/boss/admin",
@@ -546,7 +574,7 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
     .await;
     assert_eq!(r.status, 409);
     assert_eq!(r.code(), "cannot_demote_self");
-    // 对他人（bob 降/升）⇒ ok。
+    // Toward others (bob demote/promote) ⇒ ok.
     let r = post(
         w.base,
         "/api/users/bob/admin",
@@ -555,7 +583,8 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
     )
     .await;
     assert_eq!(r.status, 200);
-    // reset-password：旧口令即刻失效 + 新令牌可落。
+    // reset-password: the old password stops working immediately + the new
+    // token can land.
     let r = post(
         w.base,
         "/api/users/bob/reset-password",
@@ -565,11 +594,13 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
     .await;
     assert_eq!(r.status, 200);
     let new_token = r.body["pw_bootstrap_token"].as_str().unwrap().to_string();
-    // 旧口令失效形态：记录已清 ⇒ login-begin 走 dummy ⇒ 客户端本地 finish 失败
-    //（OPAQUE 语义：错口令/无记录对客户端不可区分——同 error 面）。
+    // Old-password failure shape: the record is cleared ⇒ login-begin takes
+    // the dummy path ⇒ the client finish fails locally (OPAQUE semantics:
+    // wrong password/no record are indistinguishable to the client —— the
+    // same error surface).
     let err = pake_login(w.base, &w.core, "bob", "Bob-Pw-2")
         .await
-        .expect_err("旧口令失效（dummy ⇒ 客户端 finish 失败）");
+        .expect_err("old password invalidated (dummy ⇒ client finish fails)");
     assert!(err.contains("client finish"), "{err}");
     let (cstate2, m1b) = reg_start(&mut rand::rngs::OsRng, "Bob-Pw-3", "bob").unwrap();
     let r = post(
@@ -596,7 +627,7 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
     )
     .await;
     assert_eq!(r.status, 200);
-    // 未知用户操作 ⇒ 404。
+    // Operating on an unknown user ⇒ 404.
     let r = post(
         w.base,
         "/api/users/ghost/disable",
@@ -607,16 +638,17 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
     assert_eq!(r.status, 404);
     assert_eq!(r.code(), "not_found");
 
-    // logout：Max-Age=0 + 原 sid 立即 401。
+    // logout: Max-Age=0 + the original sid immediately 401.
     let r = post(w.base, "/api/logout", Some(&bob_cookie), &json!({})).await;
     assert_eq!(r.status, 200);
     assert!(r
         .header("set-cookie")
         .is_some_and(|c| c.contains("Max-Age=0")));
     let r = get(w.base, "/api/me", Some(&bob_cookie)).await;
-    assert_eq!(r.status, 401, "logout 后原 sid 401");
+    assert_eq!(r.status, 401, "the original sid 401s after logout");
 
-    // 审计面：含 session.login ok/error、user.create ok/denied、reset_password 行。
+    // Audit surface: contains session.login ok/error, user.create
+    // ok/denied, reset_password rows.
     let r = get(w.base, "/api/audit", Some(&cookie)).await;
     assert_eq!(r.status, 200);
     let entries = r.body["entries"].as_array().unwrap();
@@ -633,15 +665,19 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
         "user.enable",
         "session.logout",
     ] {
-        assert!(actions.contains(&want), "audit 含 {want}: {actions:?}");
+        assert!(
+            actions.contains(&want),
+            "audit contains {want}: {actions:?}"
+        );
     }
-    // 新→旧。
+    // new→old.
     let ts: Vec<u64> = entries.iter().map(|e| e["ts"].as_u64().unwrap()).collect();
     let mut sorted = ts.clone();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
-    assert_eq!(ts, sorted, "audit 新→旧");
+    assert_eq!(ts, sorted, "audit new→old");
 
-    // 限速收口（最后驱动——同 IP（127.0.0.1）桶耗尽 ⇒ 429 + retry_after_secs）。
+    // Rate-limit close-out (driven last —— the same-IP (127.0.0.1) bucket
+    // exhausting ⇒ 429 + retry_after_secs).
     let mut got_429 = None;
     for i in 0..24 {
         let r = post(
@@ -656,14 +692,16 @@ async fn full_chain_admin_login_crud_token_atomic_and_logout() {
             break;
         }
     }
-    let (_i, r) = got_429.expect("桶耗尽必达 429");
-    // 突发 10 的下界断言在 access.rs 单测（本流程已消耗部分桶额度——只断 429 形）。
+    let (_i, r) = got_429.expect("bucket exhaustion must reach 429");
+    // The burst-10 lower-bound assertion is in the access.rs unit tests
+    // (this flow has already consumed part of the bucket quota —— only the
+    // 429 shape is asserted).
     assert_eq!(r.code(), "rate_limited");
     assert!(r.body["error"]["retry_after_secs"].as_u64().is_some());
 }
 
 // ============================================================================
-// ③ peers/summary/series 数据面
+// ③ The peers/summary/series data plane
 // ============================================================================
 
 #[tokio::test]
@@ -674,7 +712,8 @@ async fn peers_summary_series_data_plane() {
         .await
         .expect("login");
 
-    // 注册两台设备（一台喂流量 + 会话在册 ⇒ online）。
+    // Register two devices (one fed traffic + a session on record ⇒
+    // online).
     let store = match &w.core.net {
         flock_server::backend::NetBackend::Single(s) => s.clone(),
         #[cfg(feature = "multi-primary")]
@@ -696,20 +735,22 @@ async fn peers_summary_series_data_plane() {
         ms += 1000;
         w.core.traffic.tick(ms);
     }
-    // 定点采样两桶（此时 row_on 仍 Active；下方 revoke 后序列保留——「行消失后
-    // 保留至自然环出」的实证）。
+    // Sample two fixed-point buckets (row_on still Active here; the series
+    // survives the revoke below —— the empirical proof of "retained after
+    // the row disappears until natural ring-out").
     w.state.series.sample_once(&w.core, 60).await;
     w.state.series.sample_once(&w.core, 120).await;
 
-    // peers：全状态 + device_id + VIP 升序（server 条目 .1 在前）。
+    // peers: all states + device_id + VIP ascending (the server entry .1
+    // first).
     let r = get(w.base, "/api/peers", Some(&cookie)).await;
     assert_eq!(r.status, 200);
     let peers = r.body["peers"].as_array().unwrap();
-    assert_eq!(peers.len(), 3, "2 设备 + 1 服务器: {peers:?}");
+    assert_eq!(peers.len(), 3, "2 devices + 1 server: {peers:?}");
     let vips: Vec<&str> = peers.iter().map(|p| p["vip"].as_str().unwrap()).collect();
     let mut sorted = vips.clone();
     sorted.sort();
-    assert_eq!(vips, sorted, "VIP 升序");
+    assert_eq!(vips, sorted, "VIP ascending");
     let p_on = peers
         .iter()
         .find(|p| p["vip"].as_str().unwrap() == "100.64.0.2")
@@ -724,8 +765,8 @@ async fn peers_summary_series_data_plane() {
     let srv = peers.iter().find(|p| p["kind"] == "server").unwrap();
     assert_eq!(srv["vip"], "100.64.0.1");
 
-    // revoke（admin）⇒ epoch + 状态 revoked；enable revoked ⇒ 409 invalid_state；
-    // kick ⇒ ok（尽力本地）。
+    // revoke (admin) ⇒ epoch + status revoked; enable revoked ⇒ 409
+    // invalid_state; kick ⇒ ok (best-effort local).
     let dev_hex = hex::encode(id_on);
     let r = post(
         w.base,
@@ -744,7 +785,10 @@ async fn peers_summary_series_data_plane() {
         .iter()
         .find(|p| p["device_id"].as_str().unwrap() == dev_hex)
         .unwrap();
-    assert_eq!(p["status"], "revoked", "全状态审计面（revoked 仍在列表）");
+    assert_eq!(
+        p["status"], "revoked",
+        "full-state audit surface (revoked still listed)"
+    );
     let r = post(
         w.base,
         &format!("/api/peers/{dev_hex}/enable"),
@@ -762,13 +806,14 @@ async fn peers_summary_series_data_plane() {
     )
     .await;
     assert_eq!(r.status, 200);
-    // 未知设备 ⇒ 404；畸形 id ⇒ 404。
+    // Unknown device ⇒ 404; malformed id ⇒ 404.
     let r = post(w.base, "/api/peers/abcd/revoke", Some(&cookie), &json!({})).await;
     assert_eq!(r.status, 404);
     let r = post(w.base, "/api/peers/zz/revoke", Some(&cookie), &json!({})).await;
     assert_eq!(r.status, 404);
 
-    // series：真 HTTP 面读回（采样已在 revoke 前注入时钟完成）。
+    // series: read back over the real HTTP face (sampling was injected at
+    // fixed clocks before the revoke).
     let vip_on = format!(
         "vip={}.{}.{}.{}",
         row_on.vip[0], row_on.vip[1], row_on.vip[2], row_on.vip[3]
@@ -782,10 +827,11 @@ async fn peers_summary_series_data_plane() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(r.body["interval_secs"], 60);
     let pts = r.body["points"].as_array().unwrap();
-    assert_eq!(pts.len(), 2, "旧→新两桶");
+    assert_eq!(pts.len(), 2, "two buckets old→new");
     assert_eq!(pts[0]["t"], 60);
     assert!(pts[0]["tx_bps"].as_u64().unwrap() > 0);
-    // 在册但无样本（row_off）⇒ 200 空 points；既无序列也不在册 ⇒ 404；坏参数 ⇒ 400。
+    // Registered but no samples (row_off) ⇒ 200 empty points; neither a
+    // series nor registered ⇒ 404; bad parameter ⇒ 400.
     let vip_off = format!(
         "vip={}.{}.{}.{}",
         row_off.vip[0], row_off.vip[1], row_off.vip[2], row_off.vip[3]
@@ -810,7 +856,7 @@ async fn peers_summary_series_data_plane() {
     let r = get(w.base, "/api/dashboard/series?vip=not-an-ip", Some(&cookie)).await;
     assert_eq!(r.status, 400);
 
-    // summary：cluster/servers/totals/self。
+    // summary: cluster/servers/totals/self.
     let r = get(w.base, "/api/dashboard/summary", Some(&cookie)).await;
     assert_eq!(r.status, 200);
     assert_eq!(r.body["cluster"]["sync_mode"], "single");
@@ -819,20 +865,20 @@ async fn peers_summary_series_data_plane() {
         hex::encode(w.core.identity.cluster_id.0)
     );
     let servers = r.body["servers"].as_array().unwrap();
-    assert_eq!(servers.len(), 1, "单服 = 本机一条");
+    assert_eq!(servers.len(), 1, "single server = one local entry");
     assert_eq!(servers[0]["leader"], true);
     assert_eq!(servers[0]["vip"], "100.64.0.1");
     let totals = &r.body["totals"];
     assert_eq!(totals["devices"], 2);
-    assert_eq!(totals["devices_active"], 1, "一台 revoked");
-    assert_eq!(totals["users"], 2, "alice（自动建户）+ boss");
+    assert_eq!(totals["devices_active"], 1, "one revoked");
+    assert_eq!(totals["users"], 2, "alice (auto-created account) + boss");
     assert_eq!(
         r.body["self"]["server_id"],
         hex::encode(w.core.identity.server_id.0)
     );
     assert!(r.body["self"]["uptime_secs"].as_u64().is_some());
 
-    // config：字段白名单。
+    // config: the field whitelist.
     let r = get(w.base, "/api/config", Some(&cookie)).await;
     assert_eq!(r.status, 200);
     for k in [
@@ -850,10 +896,10 @@ async fn peers_summary_series_data_plane() {
     let text = r.body.to_string();
     assert!(
         !text.contains("root") && !text.to_lowercase().contains("seed"),
-        "白名单外不泄密"
+        "nothing outside the whitelist leaks"
     );
 
-    // 审计含 peer.revoke/peer.kick 行。
+    // Audit contains peer.revoke/peer.kick rows.
     let r = get(w.base, "/api/audit", Some(&cookie)).await;
     let actions: Vec<&str> = r.body["entries"]
         .as_array()
@@ -866,13 +912,15 @@ async fn peers_summary_series_data_plane() {
 }
 
 // ============================================================================
-// ④ 访问矩阵（注入连接源地址——真 HTTP 面 loopback 收口 + 越界/VPN 段注入）
+// ④ Access matrix (injected connection source addresses —— the real-HTTP
+// loopback face closed out + out-of-bounds/VPN-segment injection)
 // ============================================================================
 
 #[tokio::test]
 async fn access_matrix_injected_remote_over_http_state() {
     let w = start_web().await;
-    // 真 HTTP：loopback 面可达（未登录 401——非 403）。
+    // Real HTTP: the loopback face is reachable (not logged in 401 —— not
+    // 403).
     let r = http(
         w.base,
         "GET",
@@ -881,8 +929,12 @@ async fn access_matrix_injected_remote_over_http_state() {
         "",
     )
     .await;
-    assert_eq!(r.status, 401, "loopback 可达；XFF 不参与判定");
-    // 注入源地址（dispatch 面）：VPN 段放行 / 越界 403。
+    assert_eq!(
+        r.status, 401,
+        "loopback reachable; XFF does not participate in the decision"
+    );
+    // Injected source addresses (the dispatch face): the VPN segment
+    // allowed / out-of-bounds 403.
     let mk = |_ip: &str| -> flock_server::webui::http::Request {
         flock_server::webui::http::Request {
             method: "GET".into(),
@@ -897,7 +949,7 @@ async fn access_matrix_injected_remote_over_http_state() {
             .state
             .dispatch(mk(ip), format!("{ip}:40000").parse().unwrap())
             .await;
-        assert_eq!(resp.status, 401, "{ip} 放行（会话层 401）");
+        assert_eq!(resp.status, 401, "{ip} allowed (session-layer 401)");
     }
     for ip in ["192.168.1.5", "8.8.8.8", "100.128.0.1"] {
         let resp = w
@@ -908,7 +960,8 @@ async fn access_matrix_injected_remote_over_http_state() {
     }
 }
 
-// 载具占位（BufRead 引入于 stdin 语义说明处不需要——保留给未来驱动器扩展）。
+// Vehicle placeholder (BufRead's stdin semantics are not needed —— kept for
+// future driver extensions).
 #[allow(dead_code)]
 fn _stdin_linesunused() {
     let _ = std::io::stdin().lock().lines();

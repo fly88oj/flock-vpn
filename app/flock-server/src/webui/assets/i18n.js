@@ -1,11 +1,275 @@
-// i18n.js —— M8 Web UI 文案字典（§M8.1：中文先行，v1 单语 zh-CN；全部文案集中
-// 本文件单字典对象——后补英文只加文件，API 不随语言变化）。
+// i18n.js —— M8 Web UI copy dictionaries (multi-language packs; §M8.1).
 //
-// 约定：模板一律经 window.t(key) 取文案（键缺失回落显示键名——开发期可辨）；
-// 带参文案用 {name} 占位、t(key, {name: value}) 替换。
+// Two packs with strictly identical key sets: `en` (default) and `zh`
+// (Simplified Chinese —— the only place Chinese is allowed in this project).
+// All UI copy lives in this single file; adding another language means adding
+// one pack here, with no API changes.
+//
+// Conventions: templates always fetch copy via window.t(key) (a missing key
+// falls back to displaying the key itself —— recognizable during development);
+// parameterized copy uses {name} placeholders, replaced via t(key, {name: value}).
+//
+// Language selection order:
+//  1. localStorage("flock.lang") —— the explicit user choice made via the Lang
+//     switcher (login page / settings); always wins once set;
+//  2. the /api/bootstrap `lang` field —— server-side initial hint, applied by
+//     app.js as soon as bootstrap arrives (only when no choice is stored);
+//  3. navigator.language (initial guess before bootstrap resolves);
+//  4. "en" (default fallback).
 (function () {
   'use strict';
 
+  var EN = {
+    // —— General ——
+    'app.name': 'Flock Admin Console',
+    'app.loading': 'Loading…',
+    'app.retry': 'Retry',
+    'app.empty': 'No data yet',
+    'app.error': 'Failed to load',
+    'app.logout': 'Sign out',
+    'app.copy': 'Copy',
+    'app.copied': 'Copied',
+    'app.copy.full': 'Click to copy the full ID',
+    'app.confirm': 'Confirm',
+    'app.cancel': 'Cancel',
+    'app.close': 'Close',
+    'app.admin': 'Admin',
+    'app.user': 'User',
+    'app.server': 'Server',
+    'app.device': 'Device',
+    'app.online': 'Online',
+    'app.offline': 'Offline',
+    'app.yes': 'Yes',
+    'app.no': 'No',
+    'app.refresh': 'Refresh',
+    'app.noperm.title': 'No permission',
+    'app.noperm.body': 'Your account does not have access to this page (administrator role required).',
+    'app.language': 'Language',
+
+    // —— Navigation ——
+    'nav.dashboard': 'Dashboard',
+    'nav.peers': 'Devices',
+    'nav.users': 'Accounts',
+    'nav.audit': 'Audit',
+    'nav.settings': 'Settings',
+    'nav.menu': 'Menu',
+    'nav.session.expire': 'Session expires in {time}',
+    'nav.session.expired': 'Session expired',
+    'nav.origin.loopback': 'Local login',
+    'nav.origin.vpn': 'VPN login',
+
+    // —— Language names (switcher options) ——
+    'lang.en': 'English',
+    'lang.zh': 'Chinese',
+
+    // —— Login page ——
+    'login.title': 'Sign in to Flock Admin Console',
+    'login.subtitle': 'Sign in with an administrator account; new users should set a password via a bootstrap token first.',
+    'login.bootstrap.cluster': 'Cluster',
+    'login.bootstrap.server': 'Server',
+    'login.username': 'Username',
+    'login.username.ph': 'Username',
+    'login.password': 'Password',
+    'login.password.ph': 'Password',
+    'login.submit': 'Sign in',
+    'login.busy': 'Verifying…',
+    'login.bootstrap.unreachable': 'Cannot reach the admin interface (/api/bootstrap unreachable)',
+    'login.setpw': 'First sign-in / password reset?',
+    'login.setpw.go': 'Go to set password',
+    'err.login_failed': 'Incorrect username or password.',
+    'err.user_disabled': 'This account has been disabled; contact an administrator.',
+    'err.rate_limited': 'Too many attempts; retry in {secs} seconds.',
+    'err.anchor': 'Server identity verification failed (you may be connected to the wrong server); access it via the correct local or VPN address.',
+    'err.pake': 'The authentication protocol failed; please retry.',
+    'err.no_entropy': 'Random entropy is not ready; refresh the page and retry.',
+    'err.wasm': 'The authentication module (wasm) failed to load; refresh the page and retry.',
+    'err.network': 'Network error; check the connection and retry.',
+    'err.bad_request': 'Invalid request.',
+    'err.forbidden': 'You do not have permission to perform this operation.',
+    'err.not_found': 'Target not found.',
+    'err.internal': 'Internal server error; please retry later.',
+    'err.user_exists': 'Username already exists.',
+    'err.password_exists': 'A password is already set (ask an administrator to issue a new bootstrap token to reset it).',
+    'err.invalid_state': 'This operation is not allowed in the current state (terminal devices cannot be enabled).',
+    'err.cannot_demote_self': 'You cannot remove your own administrator role.',
+    'err.bad_token': 'The bootstrap token is invalid or already used.',
+
+    // —— Set-password page ——
+    'setpw.title': 'Set password',
+    'setpw.subtitle': 'Set a new password with the one-time bootstrap token delivered by an administrator (first-time setup and reset share this page).',
+    'setpw.username': 'Username',
+    'setpw.token': 'Bootstrap token',
+    'setpw.token.ph': '32-character hexadecimal token',
+    'setpw.newpass': 'New password',
+    'setpw.newpass2': 'Confirm new password',
+    'setpw.submit': 'Set password',
+    'setpw.busy': 'Setting…',
+    'setpw.mismatch': 'The two passwords do not match.',
+    'setpw.empty': 'Please fill in all fields.',
+    'setpw.done': 'Password set; you can sign in now.',
+    'setpw.go.login': 'Go to sign in',
+
+    // —— Dashboard ——
+    'dash.cluster': 'Cluster',
+    'dash.subtitle': 'Cluster {cluster} · live status and traffic (60s polling)',
+    // One of the three cluster-card segments (round2 review item 8): cluster
+    // identity (first 8 hex chars, full value in the title tooltip)
+    'dash.cluster.id': 'Cluster ID',
+    'dash.cluster.epoch': 'Epoch',
+    'dash.cluster.mode': 'Sync mode',
+    'dash.servers': 'Servers',
+    'dash.servers.leader': 'Leader',
+    'dash.servers.follower': 'Follower',
+    'dash.servers.node': 'Node {id}',
+    'dash.totals': 'Totals',
+    'dash.totals.devices': 'Devices',
+    'dash.totals.devices_active': 'Active devices',
+    'dash.totals.devices_online': 'Online devices',
+    'dash.totals.users': 'Accounts',
+    'dash.totals.tx': 'Total TX rate',
+    'dash.totals.rx': 'Total RX rate',
+    'dash.self': 'This server',
+    'dash.self.uptime': 'Up {dur}',
+    'dash.self.server_id': 'Server ID',
+    'dash.chart': 'Device traffic',
+    'dash.chart.select': 'Select device (VIP)',
+    'dash.chart.time': 'Time',
+    'dash.chart.tx': 'TX',
+    'dash.chart.rx': 'RX',
+    'dash.chart.empty': 'No traffic samples for this device yet (the chart restarts after a server restart).',
+    'dash.chart.hint': 'Sampled every minute, last 2 hours.',
+
+    // —— Devices page ——
+    'peers.title': 'Devices',
+    'peers.subtitle': 'All devices and servers, ascending by VIP.',
+    'peers.col.vip': 'VIP',
+    'peers.col.hostname': 'Hostname',
+    'peers.col.owner': 'Account',
+    'peers.col.kind': 'Kind',
+    // Status column, three shapes (round2 review item 5): header "Status/Online";
+    // the hover legend explains the decoupled semantics dot = online state,
+    // text = lifecycle status
+    'peers.col.status': 'Status/Online',
+    'peers.col.status.legend': 'Dot = online state; text = lifecycle status',
+    'peers.col.lastseen': 'Last active',
+    'peers.col.traffic': 'Traffic (↑TX / ↓RX)',
+    'peers.col.actions': 'Actions',
+    'peers.lastseen.never': 'Never',
+    'peers.hostname.unreported': 'Not reported',
+    'peers.empty': 'No registered devices yet; devices appear here after completing enrollment.',
+    'peers.status.active': 'Active',
+    'peers.status.disabled': 'Disabled',
+    'peers.status.revoked': 'Revoked',
+    'peers.status.expired': 'Expired',
+    'peers.act.revoke': 'Revoke',
+    'peers.act.disable': 'Disable',
+    'peers.act.enable': 'Enable',
+    'peers.act.kick': 'Kick',
+    'peers.act.terminal': 'Terminal-state devices cannot be revoked or re-enabled',
+    'peers.confirm.revoke.title': 'Revoke device',
+    'peers.confirm.revoke.body': 'Revocation moves the device into a terminal state with no recovery (the epoch advances and online sessions drop immediately). Revoke {vip} ({host})?',
+    'peers.confirm.disable.title': 'Disable device',
+    'peers.confirm.disable.body': 'While disabled the device cannot connect; it can be re-enabled at any time. Disable {vip} ({host})?',
+    'peers.confirm.enable.title': 'Enable device',
+    'peers.confirm.enable.body': 'Allow {vip} ({host}) to connect again?',
+    'peers.confirm.kick.title': 'Kick device',
+    'peers.confirm.kick.body': 'Best-effort disconnect of the sessions on this server (not a ban: the device may reconnect automatically; use disable/revoke to cut it off for good). Kick {vip} ({host})?',
+    'peers.result.ok': 'Operation successful.',
+    'peers.result.epoch': 'Operation successful (epoch {epoch}).',
+
+    // —— Accounts page ——
+    'users.title': 'Accounts',
+    'users.subtitle': 'Accounts, roles and password bootstrap (one-time tokens are shown only at issuance).',
+    'users.create.title': 'Create account',
+    'users.create.name': 'Username',
+    'users.create.name.ph': '1–32 chars: letters/digits/_.-',
+    'users.create.submit': 'Create & issue token',
+    'users.col.username': 'Username',
+    'users.col.role': 'Role',
+    'users.col.disabled': 'Status',
+    'users.col.password': 'Password',
+    'users.col.devices': 'Devices',
+    'users.col.actions': 'Actions',
+    'users.disabled.yes': 'Disabled',
+    'users.disabled.no': 'Active',
+    'users.password.set': 'Set',
+    'users.password.none': 'Not set',
+    'users.empty': 'No accounts yet; create an account and hand the bootstrap token to the user.',
+    'users.act.disable': 'Disable',
+    'users.act.enable': 'Enable',
+    'users.act.disabled.disabled': 'A disabled account cannot be disabled again; enable it first',
+    'users.act.resetpw': 'Reset password',
+    'users.act.setadmin': 'Make admin',
+    'users.act.unsetadmin': 'Remove admin',
+    // Self-row guard (round2 review item 4): tooltip for the greyed-out
+    // remove-admin / disable buttons
+    'users.act.self.blocked': 'Cannot perform this on the current signed-in account',
+    'users.confirm.disable.title': 'Disable account',
+    'users.confirm.disable.body': 'While disabled, {user} cannot sign in via Web or the control plane (existing sessions are not revoked retroactively). Disable?',
+    'users.confirm.setadmin.title': 'Change administrator role',
+    'users.confirm.setadmin.body': 'Change the role of {user} to {role}?',
+    'users.role.admin': 'Administrator',
+    'users.role.plain': 'Regular user',
+    'users.token.title.create': 'Account created',
+    'users.token.title.reset': 'Password reset',
+    'users.token.body': 'One-time bootstrap token (shown only this once):',
+    'users.token.hint': 'Deliver it to {user} out of band: have them open the "Set password" page and enter this token with a new password to activate; on reset the old password stops working immediately.',
+    'users.token.go': 'Open the set-password page on this machine',
+    'users.me': '(signed in)',
+
+    // —— Audit page ——
+    'audit.title': 'Audit',
+    'audit.subtitle': 'Latest 200 administrative operations (new→old; no passwords/tokens/ticket bytes are recorded).',
+    'audit.col.time': 'Time',
+    'audit.col.user': 'Operator',
+    'audit.col.action': 'Action',
+    'audit.col.target': 'Target',
+    'audit.col.origin': 'Origin',
+    'audit.col.result': 'Result',
+    'audit.empty': 'No audit records yet; administrative operations will appear here.',
+    'audit.action.session.login': 'Sign-in',
+    'audit.action.session.logout': 'Sign-out',
+    'audit.action.user.create': 'Create account',
+    'audit.action.user.disable': 'Disable account',
+    'audit.action.user.enable': 'Enable account',
+    'audit.action.user.reset_password': 'Reset password',
+    'audit.action.user.set_admin': 'Change role',
+    'audit.action.peer.revoke': 'Revoke device',
+    'audit.action.peer.disable': 'Disable device',
+    'audit.action.peer.enable': 'Enable device',
+    'audit.action.peer.kick': 'Kick device',
+    'audit.result.ok': 'OK',
+    'audit.result.denied': 'Denied',
+    'audit.result.error': 'Error',
+
+    // —— Settings page ——
+    'settings.title': 'Settings',
+    'settings.subtitle': 'Read-only summary of the running configuration (field whitelist —— no keys, no root material).',
+    'settings.listen_mode': 'Listen mode',
+    'settings.advertise_endpoint': 'Advertised endpoint',
+    'settings.sync_mode': 'Sync mode',
+    'settings.ticket_ttl_secs': 'Ticket TTL (seconds)',
+    'settings.peer_retention_days': 'Device retention (days)',
+    'settings.max_sessions': 'Session limit',
+    'settings.webui.port': 'Web port',
+    'settings.webui.session_ttl_secs': 'Session TTL (seconds)',
+    'settings.mode.direct': 'Direct',
+    'settings.mode.frp': 'Relay (frp)',
+    'settings.sync.single': 'Single server',
+    'settings.sync.raft': 'Multi-primary Raft',
+
+    // —— Units / formatting ——
+    'fmt.seconds': '{n}s',
+    'fmt.minutes': '{n}m',
+    'fmt.hours': '{n}h',
+    'fmt.days': '{n}d',
+    'fmt.ago.now': 'just now',
+    'fmt.ago': '{dur} ago',
+  };
+
+  // —— zh-CN pack —— the ONLY place Simplified Chinese is allowed in this
+  // project; its key set must stay strictly identical to the en pack's
+  // (asserted by the webui asset tests).
   var ZH_CN = {
     // —— 通用 ——
     'app.name': 'Flock 管理控制台',
@@ -31,6 +295,7 @@
     'app.refresh': '刷新',
     'app.noperm.title': '无权限',
     'app.noperm.body': '当前账户没有访问该页面的权限（需要管理员角色）。',
+    'app.language': '语言',
 
     // —— 导航 ——
     'nav.dashboard': '仪表盘',
@@ -43,6 +308,10 @@
     'nav.session.expired': '会话已过期',
     'nav.origin.loopback': '本机登录',
     'nav.origin.vpn': 'VPN 登录',
+
+    // —— 语言名（切换控件选项）——
+    'lang.en': 'English',
+    'lang.zh': '中文',
 
     // —— 登录页 ——
     'login.title': '登录 Flock 管理控制台',
@@ -246,14 +515,58 @@
     'fmt.ago': '{dur}前',
   };
 
-  window.FLOCK_I18N = ZH_CN;
+  var PACKS = { en: EN, zh: ZH_CN };
+  var STORAGE_KEY = 'flock.lang';
+
+  // BCP-47-ish tag → pack id ('' when unsupported): zh / zh-CN / zh_TW → 'zh';
+  // en / en-US → 'en'.
+  function normalize(tag) {
+    var s = String(tag || '').toLowerCase();
+    if (s === 'zh' || s.indexOf('zh-') === 0 || s.indexOf('zh_') === 0) { return 'zh'; }
+    if (s === 'en' || s.indexOf('en-') === 0 || s.indexOf('en_') === 0) { return 'en'; }
+    return '';
+  }
+
+  // Stored explicit choice ('' when absent or storage unavailable).
+  function storedLang() {
+    try { return normalize(window.localStorage.getItem(STORAGE_KEY)); } catch (e) { return ''; }
+  }
+
+  // Initial pick before bootstrap arrives: stored choice → browser locale → 'en'.
+  var lang = storedLang()
+    || normalize(navigator.language || (navigator.languages && navigator.languages[0]) || '')
+    || 'en';
+
+  window.FLOCK_I18N = PACKS;
+  window.FLOCK_LANG = function () { return lang; };
+
   window.t = function (key, params) {
-    var s = ZH_CN[key] || key;
+    var s = (PACKS[lang] && PACKS[lang][key]) || EN[key] || key;
     if (params) {
       Object.keys(params).forEach(function (k) {
         s = s.split('{' + k + '}').join(String(params[k]));
       });
     }
     return s;
+  };
+
+  // Explicit switch (Lang control): activate the pack and persist the choice.
+  // Returns the active language ('' when the requested tag is unsupported).
+  window.FLOCK_SET_LANG = function (tag) {
+    var n = normalize(tag);
+    if (!n) { return ''; }
+    if (n !== lang) { lang = n; }
+    try { window.localStorage.setItem(STORAGE_KEY, n); } catch (e) { /* storage unavailable —— session-only */ }
+    return lang;
+  };
+
+  // Bootstrap `lang` field —— the server's initial hint. Applies only while no
+  // explicit choice is stored (a user pick always wins). Returns the active
+  // language after applying the hint.
+  window.FLOCK_APPLY_BOOTSTRAP_LANG = function (tag) {
+    if (storedLang()) { return lang; }
+    var n = normalize(tag);
+    if (n) { lang = n; }
+    return lang;
   };
 })();

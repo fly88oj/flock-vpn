@@ -1,15 +1,23 @@
-//! 多主装配集成测试（docs/design.md §2.2/§3.11 M4 批次；feature `multi-primary`）。
+//! Multi-primary assembly integration tests (docs/design.md §2.2/§3.11 M4
+//! batch; feature `multi-primary`).
 //!
-//! 进程内 3 节点内存集群（`flock_sync::testutil::MemoryFabric`，RTT 2×5ms）：
+//! In-process 3-node in-memory cluster (`flock_sync::testutil::
+//! MemoryFabric`, RTT 2×5ms):
 //!
-//! 1. **全链控制面**：redeem（Raft 提交）→ 1-RTT 首连（**两级读目录**：respond 注入
-//!    `SyncNode::device_directory`）→ OPAQUE 登录（anchor + **Raft 内共享 OPRF**）→
-//!    票据 = **Raft 密钥根**（`TicketWire::Sync`）→ key-bind → SR-SIG1 TicketRenew；
-//! 2. **跨服转发面**：双客户端经两台服务器互 ping——server-A 的包通道 → ForwardEnvelope
-//!    （FRWD 经互连 E2E 会话）→ server-B 投递（§2.2 判定序：第 0 步源 VIP 校验 →
-//!    租约定位 → 跨服转发）；
-//! 3. **吊销传播界（A6 ≤5s）**：在 server-B 侧提交 revoke → 另一台服务器（A）的新握手
-//!    被拒 ≤5s，且 A 的既有会话被 apply 回调杀掉（§2.2 (a)(b)(c)）。
+//! 1. **Full control plane**: redeem (Raft commit) → 1-RTT first
+//!    connection (the **two-level-read directory**: respond injects
+//!    `SyncNode::device_directory`) → OPAQUE login (anchor + **the
+//!    Raft-shared OPRF**) → ticket = **the Raft key root**
+//!    (`TicketWire::Sync`) → key-bind → SR-SIG1 TicketRenew;
+//! 2. **Cross-server forwarding plane**: two clients ping each other
+//!    through two servers —— server-A's packet channel → ForwardEnvelope
+//!    (FRWD over the interconnect E2E session) → server-B delivery (the
+//!    §2.2 decision order: step-0 source VIP check → lease location →
+//!    cross-server forwarding);
+//! 3. **Revocation propagation bound (A6 ≤5s)**: revoke submitted on the
+//!    server-B side → the other server's (A's) new handshake rejected
+//!    within ≤5s, and A's existing session killed by the apply callback
+//!    (§2.2 (a)(b)(c)).
 
 #![cfg(feature = "multi-primary")]
 
@@ -33,9 +41,11 @@ use flock_sync::proto::{NodeId, SyncRequest};
 use flock_sync::testutil::MemoryFabric;
 use flock_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
 
-/// RTT = 2×5ms（内存织物；§7-M4 的 100ms 校准档属 flock-sync 自身测试）。
+/// RTT = 2×5ms (the in-memory fabric; the 100ms calibration tier of §7-M4
+/// belongs to flock-sync's own tests).
 const FABRIC_DELAY: Duration = Duration::from_millis(5);
-/// A6 时序预算（§2.2：健康集群吊销传播 ≤5s）。
+/// The A6 timing budget (§2.2: revocation propagation ≤5s in a healthy
+/// cluster).
 const A6_BUDGET: Duration = Duration::from_secs(5);
 
 fn sid(n: NodeId) -> ServerId {
@@ -43,7 +53,7 @@ fn sid(n: NodeId) -> ServerId {
 }
 
 // ============================================================================
-// 装配：3 节点集群 + 双服务器栈
+// Assembly: a 3-node cluster + the dual server stacks
 // ============================================================================
 
 struct Node3 {
@@ -52,23 +62,28 @@ struct Node3 {
     nodes: Vec<Arc<SyncNode>>,
     idents: Vec<Arc<flock_protocol::session::ServerIdentity>>,
     directory: flock_protocol::trust::ClusterDirectory,
-    #[allow(dead_code)] // 保留观察面（apply 钩子记录器）
+    #[allow(dead_code)] // the observation surface kept (apply hook recorders)
     recorders: Vec<Arc<HookRecorder>>,
     _tmp: tempfile::TempDir,
 }
 
 async fn build_cluster() -> Node3 {
     let c3 = build_cluster_bare().await;
-    // OPRF 逐服务器封装（评审项 2）：ServerKeys 根签登记各服务器混合公钥 → 每台
-    // envelope v2 seal 一份 Rewrap——状态机只存 wraps，不再明文 SetOprf（§2.4 跨
-    // 节点登录语义不变）。
+    // Per-server OPRF sealing (review item 2): ServerKeys root-signed
+    // registers every server's hybrid public key → one envelope v2-sealed
+    // Rewrap per server —— the state machine stores only wraps, no more
+    // plaintext SetOprf (the §2.4 cross-node login semantics unchanged).
     let oprf_b64 = server_setup_new(&mut rand::rngs::OsRng);
     let leader = wait_leader(&c3.nodes).await;
     submit_wrapped_oprf(&leader, &c3.root, &c3.idents, &oprf_b64).await;
-    // 密封存储不可读出明文（线格式断言）：全网明文 OPRF 字段为空；状态摘要只有
-    // wraps（3 台各一份）。
+    // The sealed store is unreadable as plaintext (wire-format assertion):
+    // the network-wide plaintext OPRF field is empty; the state summary has
+    // only wraps (one per each of the 3 servers).
     for n in &c3.nodes {
-        assert!(n.oprf_b64().is_none(), "明文 OPRF 不得入 Raft 状态");
+        assert!(
+            n.oprf_b64().is_none(),
+            "the plaintext OPRF must not enter Raft state"
+        );
     }
     let view = c3.nodes[0]
         .read_linearizable(flock_sync::proto::ReadQuery::State)
@@ -77,12 +92,13 @@ async fn build_cluster() -> Node3 {
     let flock_sync::proto::ReadView::State(v) = view else {
         panic!("state view shape: {view:?}")
     };
-    assert_eq!(v.wraps.len(), 3, "每台服务器一份封装（rewrap）");
+    assert_eq!(v.wraps.len(), 3, "one seal (rewrap) per server");
     c3
 }
 
-/// 3 节点集群装配到 Bootstrap 为止（OPRF 封装提交由调用方决定子集——评审项 2 的
-/// 「无 wrap 服务器失败 / rewrap 后可解封」用例）。
+/// Assemble the 3-node cluster up to Bootstrap (the OPRF wrap submission's
+/// subset is the caller's decision —— the review-item-2 cases of "no wrap
+/// ⇒ the server fails / after rewrap it can unseal").
 async fn build_cluster_bare() -> Node3 {
     let root = ed25519_dalek::SigningKey::from_bytes(&rand::random::<[u8; 32]>());
     let cluster_id = flock_protocol::session::ClusterId(rand::random());
@@ -124,7 +140,7 @@ async fn build_cluster_bare() -> Node3 {
         recorders.push(rec);
     }
 
-    // Bootstrap（票据根进 Raft，§4）。
+    // Bootstrap (the ticket root enters Raft, §4).
     let leader = wait_leader(&nodes).await;
     let ticket_root: [u8; 32] = rand::random();
     let boot = leader
@@ -151,9 +167,11 @@ async fn build_cluster_bare() -> Node3 {
     }
 }
 
-/// ServerKeys + 逐服务器 Rewrap 提交（build_cluster 与 rewrap 补交测试共用）。
-/// 断言：状态摘要只含 wraps（3 台各一份）且全网明文 oprf 字段为空（评审项 2 的
-/// 「密封存储不可读出明文」在线格式断言）。
+/// ServerKeys + per-server Rewrap submission (shared by build_cluster and
+/// the rewrap-top-up test). Asserts: the state summary contains only wraps
+/// (one per each of the 3 servers) and the network-wide plaintext oprf
+/// field is empty (review item 2's "the sealed store is unreadable as
+/// plaintext" wire-format assertion).
 async fn submit_wrapped_oprf(
     leader: &Arc<SyncNode>,
     root: &ed25519_dalek::SigningKey,
@@ -213,13 +231,14 @@ async fn wait_leader(nodes: &[Arc<SyncNode>]) -> Arc<SyncNode> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("15s 内未选出 leader");
+    panic!("no leader elected within 15s");
 }
 
-/// 服务器栈（respond/控制流/转发面）挂到 raft 节点。
+/// A server stack (respond/control flow/forwarding plane) hung onto a raft
+/// node.
 struct SyncServer {
     core: Arc<ServerCore>,
-    #[allow(dead_code)] // endpoint 经 pin_for 消费
+    #[allow(dead_code)] // endpoint consumed via pin_for
     endpoint: String,
 }
 
@@ -229,8 +248,10 @@ async fn serve_on(c3: &Node3, idx: usize, extra_endpoints: Vec<String>) -> SyncS
     std::mem::forget(tmp);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = l.local_addr().unwrap().to_string();
-    // VIP = 本机 node_id 的确定性推导值（server_vip_of——open_sync 的一致性断言要求；
-    // 旧配置全部硬编码 .1 对 node 2/3 是「登记 VIP ≠ 实配 VIP」的错位形态）。
+    // VIP = this node's deterministically derived value (server_vip_of ——
+    // required by open_sync's consistency assertion; the old configs
+    // hard-coding .1 for nodes 2/3 were the "registered VIP ≠ actually
+    // configured VIP" misaligned shape).
     let node_id = flock_sync::node::node_id_of(&c3.idents[idx].server_id);
     let vip =
         std::net::Ipv4Addr::from(flock_sync::proto::server_vip_of(node_id).expect("node 1..=10"));
@@ -242,7 +263,8 @@ async fn serve_on(c3: &Node3, idx: usize, extra_endpoints: Vec<String>) -> SyncS
     SyncServer { core, endpoint }
 }
 
-/// serve_on / open_sync 直测共用的 ServerConfig（装配经 open_sync，不走配置文件路径）。
+/// The ServerConfig shared by serve_on / the direct open_sync tests
+/// (assembly goes through open_sync, not the config-file path).
 fn sync_server_cfg(
     state_dir: std::path::PathBuf,
     advertise_endpoint: String,
@@ -271,9 +293,12 @@ fn sync_server_cfg(
     }
 }
 
-/// 客户端 pin：以根签目录条目为身份锚，**拨号地址换成 TCP 监听口**（目录内
-/// `node-N.test:9443` 是互连织物端点；接入端点与本测试拨号口同机不同位——
-/// I1 签名锚是 identity_pub，端点串不进签名面）。
+/// The client pin: the root-signed directory entry as the identity anchor,
+/// **with the dial address swapped for the TCP listen port** (the
+/// directory's `node-N.test:9443` is the interconnect fabric endpoint; the
+/// access endpoint and this test's dial port share the machine but not the
+/// position —— I1's signature anchor is identity_pub, the endpoint string
+/// never enters the signed surface).
 fn pin_for(c3: &Node3, server_idx: usize, dial: &str) -> ServerPin {
     let mut entry = c3.directory.servers[server_idx].clone();
     entry.relay_endpoint = dial.to_string();
@@ -290,11 +315,12 @@ async fn connect(device: &DeviceStaticKeys, pin: &ServerPin) -> Tunnel {
         .expect("tcp");
     initiate(io, device, pin, TunnelConfig::default())
         .await
-        .expect("1-RTT initiate（两级读目录放行）")
+        .expect("1-RTT initiate (the two-level-read directory passes it)")
 }
 
 // ============================================================================
-// 客户端控制流驱动（复用 server crate 的协议面；仅本测试所需子集）
+// The client control-flow driver (reusing the server crate's protocol
+// surface; only the subset this test needs)
 // ============================================================================
 
 mod cli {
@@ -321,7 +347,8 @@ mod cli {
             recv_ctrl_msg(&mut self.stream).await.expect("recv")
         }
 
-        /// 设置口令（PwBegin/PwCommit——复制形态 SetPassword）。
+        /// Set the password (PwBegin/PwCommit —— the replication-form
+        /// SetPassword).
         pub async fn set_password(&mut self, user: &str, pw: &str) -> CtrlResponse {
             let mut rng = rand::rngs::OsRng;
             let (state, m1) = flock_protocol::pake::reg_start(&mut rng, pw, user).unwrap();
@@ -343,7 +370,7 @@ mod cli {
             .await
         }
 
-        /// OPAQUE 登录（anchor 验签）→ (票据, bind_token)。
+        /// OPAQUE login (anchor verification) → (ticket, bind_token).
         pub async fn login(
             &mut self,
             user: &str,
@@ -386,7 +413,8 @@ mod cli {
             }
         }
 
-        /// key-bind（设备公钥 + SR-SIG1 公钥；票据 + bind_token 一次性 + 设备签名）。
+        /// key-bind (device public keys + the SR-SIG1 public key; ticket +
+        /// one-time bind_token + device signature).
         pub async fn key_bind(
             &mut self,
             ticket: &TicketWire,
@@ -435,7 +463,7 @@ mod cli {
         }
     }
 
-    /// SR-SIG1 授权头（§1.3.2 七字段）。
+    /// The SR-SIG1 authorization header (the §1.3.2 seven fields).
     fn sr_auth(user: &str, key: &UserKey) -> flock_server::control::SrAuth {
         let now = flock_protocol::trust::now_unix() as i64;
         let nonce = sr_sig::nonce_hex();
@@ -454,16 +482,17 @@ mod cli {
 }
 
 // ============================================================================
-// IP/ICMP 构造（数据面载荷）
+// IP/ICMP construction (data-plane payloads)
 // ============================================================================
 
-/// IPv4 + ICMP echo（type=8/0；校验和填 0——转发面只校验源/目标地址字段）。
+/// IPv4 + ICMP echo (type=8/0; checksum left 0 —— the forwarding plane only
+/// validates the source/destination address fields).
 fn icmp_echo(src: [u8; 4], dst: [u8; 4], echo_type: u8, id: u16, seq: u16) -> Vec<u8> {
     let total_len = 20u16 + 8 + 8;
     let mut p = vec![0u8; total_len as usize];
     p[0] = 0x45; // IPv4 IHL=5
     p[2..4].copy_from_slice(&total_len.to_be_bytes());
-    p[4..6].copy_from_slice(&id.to_be_bytes()); // identification 复用
+    p[4..6].copy_from_slice(&id.to_be_bytes()); // identification reused
     p[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
     p[8] = 64; // TTL
     p[9] = 1; // ICMP
@@ -483,18 +512,20 @@ fn pkt_src_dst(pkt: &[u8]) -> ([u8; 4], [u8; 4]) {
 }
 
 // ============================================================================
-// 主测试
+// The main tests
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_cluster_forward_and_revocation() {
     let c3 = build_cluster().await;
 
-    // —— 双服务器栈（server-1 / server-2；server-3 只跑 Raft 仲裁）——
+    // —— The dual server stacks (server-1 / server-2; server-3 only runs
+    //    Raft arbitration) ——
     let s1 = serve_on(&c3, 0, vec![]).await;
     let s2 = serve_on(&c3, 1, vec![]).await;
 
-    // —— 开户（Raft 提交：redeem 在 server-2 侧发起，server-1 侧可读）——
+    // —— Account creation (Raft commit: redeem initiated on the server-2
+    //    side, readable on the server-1 side) ——
     let invite_id: [u8; 16] = rand::random();
     let expiry = flock_protocol::trust::now_unix() + 3600;
     c3.nodes[0]
@@ -504,7 +535,8 @@ async fn three_node_cluster_forward_and_revocation() {
         })
         .await
         .expect("record invite");
-    // 邀请文件 = 根密钥签发（运维侧；§1.3.3f 邀请生成 = 根密钥语境）。
+    // The invite file = root-key issuance (the operations side; §1.3.3f
+    // invite generation = the root-key context).
     let invite = InviteFile::issue(
         &c3.root,
         c3.cluster_id,
@@ -532,14 +564,15 @@ async fn three_node_cluster_forward_and_revocation() {
             now_unix: flock_protocol::trust::now_unix(),
         })
         .await
-        .expect("redeem A（经 server-2，Raft 提交）");
+        .expect("redeem A (via server-2, Raft commit)");
     assert_eq!(out_a.device_id, vip_of(&dev_a));
-    // server-1 侧兑换 B（同一 Raft 状态——任意节点等价）。
+    // Redeem B on the server-1 side (the same Raft state —— any node is
+    // equivalent).
     let out_b = s1
         .core
         .net
         .redeem_invite(RedeemRequest {
-            invite_bytes: &invite_bytes, // 同 invite 二次兑换必拒（下方断言）
+            invite_bytes: &invite_bytes, // a second redemption of the same invite must be rejected (assertion below)
             username: "mp-b",
             device_x25519: dev_b.x25519_public().to_bytes(),
             device_ed25519: *dev_b.ed25519_public().as_bytes(),
@@ -551,9 +584,9 @@ async fn three_node_cluster_forward_and_revocation() {
         .await;
     assert!(
         matches!(out_b, Err(flock_server::netstate::RedeemError::AlreadyUsed)),
-        "同 invite_id 二次兑换拒（Raft 状态机内查重）：{out_b:?}"
+        "a second redemption of the same invite_id rejected (dedup inside the Raft state machine): {out_b:?}"
     );
-    // B 的独立邀请。
+    // B's own invite.
     let invite2_id: [u8; 16] = rand::random();
     c3.nodes[1]
         .write(SyncRequest::RecordInvite {
@@ -584,12 +617,13 @@ async fn three_node_cluster_forward_and_revocation() {
             now_unix: flock_protocol::trust::now_unix(),
         })
         .await
-        .expect("redeem B（经 server-1）");
+        .expect("redeem B (via server-1)");
     let vip_a = out_a.vip;
     let vip_b = out_b.vip;
     assert_ne!(vip_a, vip_b);
 
-    // —— 1-RTT 首连（respond 注入两级读目录；经不同服务器）——
+    // —— 1-RTT first connections (respond injects the two-level-read
+    //    directory; through different servers) ——
     let pin1 = pin_for(&c3, 0, &s1.endpoint);
     let pin2 = pin_for(&c3, 1, &s2.endpoint);
     let ta = connect(&dev_a, &pin1).await;
@@ -597,23 +631,24 @@ async fn three_node_cluster_forward_and_revocation() {
     let mut ca = cli::Ctrl::open(ta).await;
     let cb = cli::Ctrl::open(tb).await;
 
-    // —— 控制面（Raft 复制：口令/票据/绑定）——
+    // —— The control plane (Raft replication: password/ticket/binding) ——
     assert!(
         matches!(
             ca.set_password("mp-a", "pw").await,
             flock_server::control::CtrlResponse::Ok
         ),
-        "口令设置（SetPassword 复制；共享 OPRF）"
+        "password set (SetPassword replicated; shared OPRF)"
     );
     let (ticket_a, bind_a) = ca
         .login("mp-a", "pw", &pin1)
         .await
-        .expect("登录（共享 OPRF + Raft 票据根）");
+        .expect("login (shared OPRF + the Raft ticket root)");
     assert!(
         matches!(ticket_a, TicketWire::Sync(_)),
-        "多主形态票据 = Raft 密钥根签发（TicketWire::Sync）"
+        "the multi-primary form's ticket = issued by the Raft key root (TicketWire::Sync)"
     );
-    // key-bind：登记设备 B'（本测试不必再连）+ SR-SIG1 公钥（供 TicketRenew 验签）。
+    // key-bind: register device B' (this test need not connect it again) +
+    // the SR-SIG1 public key (for TicketRenew verification).
     let sr_key = UserKey::generate();
     let dev_aux = DeviceStaticKeys::generate();
     match ca
@@ -630,7 +665,8 @@ async fn three_node_cluster_forward_and_revocation() {
         flock_server::control::CtrlResponse::KeyBound { .. } => {}
         other => panic!("key bind: {other:?}"),
     }
-    // SR-SIG1 状态变更（Sync 票据 + nonce 记账；在 server-1 上验证）。
+    // The SR-SIG1 state change (Sync ticket + nonce accounting; verified on
+    // server-1).
     match ca
         .ticket_renew(Some(ticket_a.clone()), "mp-a", &sr_key)
         .await
@@ -638,13 +674,14 @@ async fn three_node_cluster_forward_and_revocation() {
         flock_server::control::CtrlResponse::TicketRenewed { ticket } => {
             assert!(
                 matches!(ticket, TicketWire::Sync(_)),
-                "换发票据仍为 Raft 根"
+                "the renewed ticket is still Raft-rooted"
             );
         }
-        other => panic!("ticket renew（SR-SIG1 + Sync 票据）: {other:?}"),
+        other => panic!("ticket renew (SR-SIG1 + Sync ticket): {other:?}"),
     }
 
-    // —— 数据面：双客户端经两台服务器互 ping（ForwardEnvelope 路径）——
+    // —— Data plane: two clients ping each other through two servers (the
+    //    ForwardEnvelope path) ——
     let mut cha = ca
         .tunnel
         .open_packet_channel()
@@ -656,34 +693,42 @@ async fn three_node_cluster_forward_and_revocation() {
         .await
         .expect("B packet channel");
 
-    // 注：mux 的 SYN 惰性随首数据帧 flush（M3 dataplane 测试同注记）——双向各先发一包，
-    // 使两侧服务器的包通道都物化 + attach_session，再断言跨服路径。
+    // Note: the mux's SYN flushes lazily with the first data frame (same
+    // note as the M3 dataplane tests) —— send one packet each way first so
+    // both servers' packet channels materialize + attach_session, then
+    // assert the cross-server path.
     let fwd1_before = c3.nodes[0].forward().stats().forwarded;
     let fwd2_before = c3.nodes[1].forward().stats().forwarded;
 
-    // 惰性 SYN 的物化序：B 先发一包（物化 B 侧通道 + n2 attach；此刻 A 侧通道未物化
-    // ⇒ n2 按真实容错语义 NOT_HERE→locate→仍无会话→丢+ICMP——这是「目标空闲」的
-    // 诚实行为，不作断言），随后 A 发一包（物化 A 侧 + n1 attach），此后双向断言。
+    // Lazy-SYN materialization order: B sends one packet first
+    // (materializing B's channel + the n2 attach; at this moment A's
+    // channel is unmaterialized ⇒ n2, per the real fault-tolerance
+    // semantics, does NOT_HERE→locate→still no session→drop+ICMP —— the
+    // honest behavior for an "idle destination", not asserted), then A
+    // sends one packet (materializing A's side + the n1 attach); the
+    // bidirectional assertions follow.
     let warmup = icmp_echo(vip_b, vip_a, 8, 0xb000, 0);
-    chb.send(&warmup).await.expect("B 物化包（warmup）");
-    tokio::time::sleep(Duration::from_millis(400)).await; // attach + 租约扩散
+    chb.send(&warmup)
+        .await
+        .expect("B materialization packet (warmup)");
+    tokio::time::sleep(Duration::from_millis(400)).await; // attach + lease diffusion
 
-    // A → B（server-1 → server-2 的 FRWD）。
+    // A → B (server-1 → server-2 FRWD).
     let req_ab = icmp_echo(vip_a, vip_b, 8, 0xa001, 1);
-    cha.send(&req_ab).await.expect("A 发 echo request");
+    cha.send(&req_ab).await.expect("A sends echo request");
     let got_ab = tokio::time::timeout(A6_BUDGET, chb.recv())
         .await
-        .expect("B 5s 内收到 A 的请求")
+        .expect("B receives A's request within 5s")
         .expect("recv");
     assert_eq!(
         pkt_src_dst(&got_ab),
         (vip_a, vip_b),
-        "A→B 源/目标 VIP 经转发保持"
+        "A→B source/destination VIPs preserved across forwarding"
     );
 
-    // B → A（server-2 → server-1 的 FRWD）。
+    // B → A (server-2 → server-1 FRWD).
     let req_ba = icmp_echo(vip_b, vip_a, 8, 0xb001, 1);
-    chb.send(&req_ba).await.expect("B 发 echo request");
+    chb.send(&req_ba).await.expect("B sends echo request");
     let got_ba = tokio::time::timeout(A6_BUDGET, cha.recv()).await;
     let got_ba = match got_ba {
         Ok(r) => r.expect("recv"),
@@ -698,47 +743,49 @@ async fn three_node_cluster_forward_and_revocation() {
                 c3.nodes[0].lease().observe(&a_dev),
                 c3.nodes[1].lease().observe(&a_dev),
             );
-            panic!("A 5s 内未收到 B 的请求（B→A FRWD 失败）");
+            panic!("A did not receive B's request within 5s (B→A FRWD failed)");
         }
     };
     assert_eq!(
         pkt_src_dst(&got_ba),
         (vip_b, vip_a),
-        "B→A 源/目标 VIP 经转发保持"
+        "B→A source/destination VIPs preserved across forwarding"
     );
 
-    // 双向 FRWD 计数均递增（§2.2 第 3 步跨服转发的实证）。
+    // Both directional FRWD counts incremented (the empirical proof of the
+    // §2.2 step-3 cross-server forwarding).
     let f1 = c3.nodes[0].forward().stats();
     let f2 = c3.nodes[1].forward().stats();
     assert!(
         f1.forwarded > fwd1_before,
-        "server-1 跨服转发计数递增（→{}）",
+        "server-1's cross-server forwarding count incremented (→{})",
         f1.forwarded
     );
     assert!(
         f2.forwarded > fwd2_before,
-        "server-2 跨服转发计数递增（→{}）",
+        "server-2's cross-server forwarding count incremented (→{})",
         f2.forwarded
     );
 
-    // 两级读目录已实际服务握手（缓存命中或线性一致读非零）。
+    // The two-level-read directory has actually served handshakes (cache
+    // hits or linearizable reads non-zero).
     let ds1 = c3.nodes[0].dir().stats();
     assert!(
         ds1.cache_hits + ds1.linearizable_reads > 0,
-        "SyncDirectory 服务过 respond 查询（cache={} linear={}）",
+        "SyncDirectory served respond queries (cache={} linear={})",
         ds1.cache_hits,
         ds1.linearizable_reads
     );
 
-    // —— 吊销传播界（A6 ≤5s；§2.2 apply 回调）——
+    // —— Revocation propagation bound (A6 ≤5s; the §2.2 apply callback) ——
     let t0 = Instant::now();
     s2.core
         .net
         .revoke(&DeviceId(vip_of(&dev_a)))
         .await
-        .expect("revoke 经 server-2 提交（Raft）");
+        .expect("revoke submitted via server-2 (Raft)");
 
-    // 另一台服务器（server-1）的新握手 ≤5s 被拒。
+    // The other server's (server-1's) new handshake rejected within ≤5s.
     let mut rejected_at: Option<Duration> = None;
     while t0.elapsed() < A6_BUDGET {
         let io = tokio::net::TcpStream::connect(&pin1.entry.relay_endpoint)
@@ -753,33 +800,36 @@ async fn three_node_cluster_forward_and_revocation() {
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    let dt = rejected_at.expect("5s 内另一台服务器必须拒新握手（A6）");
-    assert!(dt <= A6_BUDGET, "拒新握手耗时 {dt:?} ≤ 5s");
+    let dt = rejected_at.expect("the other server must reject new handshakes within 5s (A6)");
+    assert!(dt <= A6_BUDGET, "new-handshake rejection took {dt:?} ≤ 5s");
 
-    // 既有会话被杀（apply 回调 → SyncHooks → LiveSessions.kill）。
+    // The existing session is killed (apply callback → SyncHooks →
+    // LiveSessions.kill).
     let deadline = Instant::now() + A6_BUDGET;
     while c3.nodes[0].local_epoch() == 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
         c3.nodes[0].local_epoch() >= 1,
-        "revocation_epoch 已推进（apply）"
+        "the revocation_epoch has advanced (applied)"
     );
     assert_eq!(
         s1.core.sessions.online(&vip_of(&dev_a)),
         0,
-        "server-1 上 A 的会话被杀"
+        "A's session on server-1 is killed"
     );
 
-    // 对照：未吊销的 B 仍可连（拒绝与吊销因果绑定）。
+    // Control: the unrevoked B can still connect (the rejection is causally
+    // tied to the revocation).
     let io = tokio::net::TcpStream::connect(&pin2.entry.relay_endpoint)
         .await
         .unwrap();
     initiate(io, &dev_b, &pin2, TunnelConfig::default())
         .await
-        .expect("B 仍可接入（对照）");
+        .expect("B can still connect (control)");
 
-    // 钉扎链路完整性（TOFU 面与本测试共用的根信任链）。
+    // Pin-chain integrity (the root trust chain shared by the TOFU surface
+    // and this test).
     let pins_dir = tempfile::tempdir().unwrap();
     let mut pins = PinStore::new();
     pins.pin(&c3.cluster_id, &c3.root.verifying_key());
@@ -793,19 +843,23 @@ async fn three_node_cluster_forward_and_revocation() {
 }
 
 // ============================================================================
-// 评审项 2：OPRF 逐服务器封装的就绪语义（无 wrap 明确失败 / rewrap 后新服务器可解封）
+// Review item 2: the readiness semantics of per-server OPRF sealing (no
+// wrap ⇒ explicit failure / after rewrap the new server can unseal)
 // ============================================================================
 
-/// ① 只给节点 1/2 封装：节点 3 的 `open_sync` 在短窗内明确失败（错误点名「OPRF 封装」，
-///    属 transient 类——sync.rs 的就绪重试只认该类）；
-/// ② 补交节点 3 的 rewrap 后：`open_sync` 成功（本机 hybrid sk 解封进内存——OPAQUE
-///    可用，core.oprf 即解封产物）。
+/// ① Seal only for nodes 1/2: node 3's `open_sync` fails explicitly within
+///    a short window (the error names "OPRF wrap", of the transient class
+///    —— sync.rs's ready retry recognizes only that class);
+/// ② After topping up node 3's rewrap: `open_sync` succeeds (the local
+///    hybrid sk unseals into memory —— OPAQUE available, core.oprf being
+///    the unsealed product).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
     let c3 = build_cluster_bare().await;
     let oprf_b64 = server_setup_new(&mut rand::rngs::OsRng);
     let leader = wait_leader(&c3.nodes).await;
-    // 只封装节点 1/2（idents[0]/[1]——node 1/2；节点 3 无 wrap）。
+    // Seal only nodes 1/2 (idents[0]/[1] —— nodes 1/2; node 3 without a
+    // wrap).
     submit_wrapped_oprf(&leader, &c3.root, &c3.idents[..2], &oprf_b64).await;
 
     let tmp = tempfile::tempdir().expect("tmp");
@@ -818,7 +872,8 @@ async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
         std::net::Ipv4Addr::from(flock_sync::proto::server_vip_of(3).expect("node 3")),
     );
 
-    // ① 无对应 wrap 的服务器：短窗（300ms）后明确失败——错误点名 OPRF 封装缺失。
+    // ① A server without a matching wrap: explicit failure after a short
+    //    window (300ms) —— the error names the missing OPRF wrap.
     let err = match ServerCore::open_sync_with_wait(
         cfg.clone(),
         c3.idents[2].clone(),
@@ -828,17 +883,17 @@ async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
     .await
     {
         Err(e) => e,
-        Ok(_) => panic!("节点 3 无 wrap ⇒ open_sync 必须明确失败"),
+        Ok(_) => panic!("node 3 without a wrap ⇒ open_sync must fail explicitly"),
     };
     assert!(
-        err.contains("OPRF 封装"),
-        "错误需点名 OPRF 封装缺失（可诊断）: {err}"
+        err.contains("OPRF wrap"),
+        "the error must name the missing OPRF wrap (diagnosable): {err}"
     );
     assert!(
         err.starts_with(flock_server::server::SYNC_NOT_READY_PREFIX),
-        "未达封装属 transient（就绪重试语义）: {err}"
+        "no wrap yet is transient (the ready-retry semantics): {err}"
     );
-    // 对照：有 wrap 的节点 1 同窗成功。
+    // Control: node 1, which has a wrap, succeeds within the same window.
     let tmp1 = tempfile::tempdir().expect("tmp");
     let cfg1 = sync_server_cfg(
         tmp1.path().to_path_buf(),
@@ -854,11 +909,13 @@ async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
         Duration::from_secs(5),
     )
     .await
-    .expect("节点 1 有 wrap ⇒ open_sync 成功");
+    .expect("node 1 has a wrap ⇒ open_sync succeeds");
 
-    // ② rewrap 后新服务器可解封：新服务器准入 = ServerKeys 全量重登（根签，含节点 3
-    // 的混合公钥——状态机 server_keys 是整体替换语义）→ 补交节点 3 的封装（根签
-    // Rewrap）→ open_sync 成功。
+    // ② After rewrap the new server can unseal: new-server admission = a
+    // full ServerKeys re-registration (root-signed, including node 3's
+    // hybrid public key —— the state machine's server_keys has
+    // whole-replacement semantics) → topping up node 3's seal (root-signed
+    // Rewrap) → open_sync succeeds.
     let node3_id = flock_sync::node::node_id_of(&c3.idents[2].server_id);
     let entries: Vec<flock_sync::proto::ServerKeyEntry> = c3
         .idents
@@ -905,29 +962,36 @@ async fn oprf_wrap_missing_server_fails_then_rewrap_enables() {
         Duration::from_secs(5),
     )
     .await
-    .expect("rewrap 补交后节点 3 可解封（OPAQUE 可用）");
-    // 解封语义闭环：登录路径用的就是这个 OPRF（PwBegin/Login 的服务端 setup）。
+    .expect("after the rewrap top-up, node 3 can unseal (OPAQUE available)");
+    // Unsealing semantic loop closure: the login path uses exactly this
+    // OPRF (the server-side setup of PwBegin/Login).
     let _ = &core.oprf;
 }
 
 // ============================================================================
-// M7（§7-M7.6）：双客户端跨服时 roster 在任一服务器装配一致（含 ewma 非零）
+// M7 (§7-M7.6): with two clients cross-server, the roster assembles
+// identically on either server (including non-zero ewma)
 // ============================================================================
 
-/// 断言面：
-/// - **结构字段严格相等**（vip/hostname/owner/kind/online）——注册表快照与租约域
-///   视图在两台服务器上一致；
-/// - **ewma/last_seen 容差比较**（非零 + 双侧差 < 15s）——两服务器的本地视图来自
-///   不同时刻的反熵快照（5s 周期），逐字节相等不可实现也不必要（如实声明）；
-/// - 假流量泵（A→B 持续 ~2s）：A 的 tx 与 B 的 rx 在**两台服务器**的名册里都非零
-///   （持有者折叠 + gossip 传播）。
+/// Assertion surface:
+/// - **structural fields strictly equal** (vip/hostname/owner/kind/online)
+///   —— the registry snapshot and the lease-domain view agree across the
+///   two servers;
+/// - **ewma/last_seen compared with tolerance** (non-zero + both-side
+///   difference < 15s) —— the two servers' local views come from
+///   anti-entropy snapshots at different moments (5s period); byte
+///   equality is neither achievable nor necessary (declared as-is);
+/// - a fake traffic pump (A→B sustained ~2s): A's tx and B's rx non-zero
+///   in the rosters of **both servers** (holder folding + gossip
+///   propagation).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn roster_consistent_across_servers_with_traffic_pump() {
     let c3 = build_cluster().await;
     let s1 = serve_on(&c3, 0, vec![]).await;
     let s2 = serve_on(&c3, 1, vec![]).await;
 
-    // 开户（hostname 经 redeem 上报——字段链路实证）。
+    // Account creation (hostname reported through redeem —— empirical proof
+    // of the field's chain).
     let inv_a = m7_invite(&c3, rand::random()).await;
     let dev_a = DeviceStaticKeys::generate();
     let out_a = s1
@@ -963,7 +1027,7 @@ async fn roster_consistent_across_servers_with_traffic_pump() {
         .await
         .expect("redeem B");
 
-    // 接入（A→server-1、B→server-2）+ 包通道。
+    // Connect (A→server-1, B→server-2) + packet channels.
     let pin1 = pin_for(&c3, 0, &s1.endpoint);
     let pin2 = pin_for(&c3, 1, &s2.endpoint);
     let ta = connect(&dev_a, &pin1).await;
@@ -981,14 +1045,15 @@ async fn roster_consistent_across_servers_with_traffic_pump() {
         .await
         .expect("B packet channel");
 
-    // 通道物化（惰性 SYN：双向各先发一包）。
+    // Channel materialization (lazy SYN: one packet each way first).
     let warm_b = icmp_echo(out_b.vip, out_a.vip, 8, 0xb000, 0);
     chb.send(&warm_b).await.expect("B warmup");
     let warm_a = icmp_echo(out_a.vip, out_b.vip, 8, 0xa000, 0);
     cha.send(&warm_a).await.expect("A warmup");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    // 假流量泵：A→B 持续 ~2s（每 20ms 一包 1200B ⇒ ~60KB/s 量级——EWMA 非零充分）。
+    // The fake traffic pump: A→B sustained ~2s (one 1200B packet per 20ms
+    // ⇒ on the order of ~60KB/s —— enough for non-zero EWMA).
     let pump = icmp_echo(out_a.vip, out_b.vip, 8, 0xa001, 1);
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut sent = 0u64;
@@ -999,16 +1064,18 @@ async fn roster_consistent_across_servers_with_traffic_pump() {
         sent += 1;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(sent > 10, "泵出 {sent} 包");
+    assert!(sent > 10, "pumped {sent} packets");
 
-    // 等反熵（5s）+ 折叠窗（1s）传播：ewma 经持有者折叠 → publish/反熵到对端。
+    // Wait for anti-entropy (5s) + the folding window (1s) to propagate:
+    // the ewma goes through holder folding → publish/anti-entropy to the
+    // peer.
     tokio::time::sleep(Duration::from_secs(7)).await;
 
-    // 双侧装配。
+    // Assemble on both sides.
     let r1 = flock_server::control::assemble_roster(&s1.core).await;
     let r2 = flock_server::control::assemble_roster(&s2.core).await;
 
-    // 结构字段严格相等。
+    // Structural fields strictly equal.
     let shape = |r: &[flock_server::control::PeerInfo]| {
         r.iter()
             .map(|p| (p.vip, p.hostname.clone(), p.owner.clone(), p.kind, p.online))
@@ -1017,50 +1084,52 @@ async fn roster_consistent_across_servers_with_traffic_pump() {
     assert_eq!(
         shape(&r1),
         shape(&r2),
-        "任一服务器装配一致（结构字段严格相等）"
+        "either server assembles identically (structural fields strictly equal)"
     );
-    // 3 Server + 2 Device。
+    // 3 Servers + 2 Devices.
     assert_eq!(r1.len(), 5, "{r1:?}");
     assert_eq!(
         r1.iter()
             .filter(|p| p.kind == flock_server::control::PeerKind::Server)
             .count(),
         3,
-        "三台服务器各自在册"
+        "all three servers on record"
     );
     let devices: Vec<_> = r1
         .iter()
         .filter(|p| p.kind == flock_server::control::PeerKind::Device)
         .collect();
-    assert!(devices.iter().all(|p| p.online), "双客户端在线");
+    assert!(devices.iter().all(|p| p.online), "both clients online");
 
-    // ewma 非零（双侧）：A 的 tx（接入侧计）、B 的 rx（收端计）。
+    // ewma non-zero (both sides): A's tx (counted on the access side), B's
+    // rx (counted on the receiving side).
     for (roster, tag) in [(&r1, "s1"), (&r2, "s2")] {
-        let a = roster.iter().find(|p| p.vip == out_a.vip).expect("A 条目");
+        let a = roster.iter().find(|p| p.vip == out_a.vip).expect("A entry");
         assert!(
             a.tx_bps > 0,
-            "{tag}: A 的 tx ewma 非零（持有者折叠 + 传播）: {}",
+            "{tag}: A's tx ewma non-zero (holder folding + propagation): {}",
             a.tx_bps
         );
-        let b = roster.iter().find(|p| p.vip == out_b.vip).expect("B 条目");
+        let b = roster.iter().find(|p| p.vip == out_b.vip).expect("B entry");
         assert!(
             b.rx_bps > 0,
-            "{tag}: B 的 rx ewma 非零（收端计数 + 传播）: {}",
+            "{tag}: B's rx ewma non-zero (receiving-side counting + propagation): {}",
             b.rx_bps
         );
         assert!(a.last_seen_unix > 0 && b.last_seen_unix > 0);
     }
-    // last_seen 容差（< 15s）：两视图来自不同反熵时刻。
+    // last_seen tolerance (< 15s): the two views come from different
+    // anti-entropy moments.
     let ls = |r: &[flock_server::control::PeerInfo], vip: [u8; 4]| {
         r.iter().find(|p| p.vip == vip).unwrap().last_seen_unix
     };
     for vip in [out_a.vip, out_b.vip] {
         assert!(
             ls(&r1, vip).abs_diff(ls(&r2, vip)) < 15,
-            "last_seen 双侧差 < 15s（反熵快照时差容差）"
+            "last_seen both-side difference < 15s (tolerance for anti-entropy snapshot time skew)"
         );
     }
-    // hostname 经 redeem 上报进名册。
+    // hostname reported through redeem reaches the roster.
     assert!(r1
         .iter()
         .any(|p| p.vip == out_a.vip && p.hostname == "roster-a-pad"));
@@ -1070,11 +1139,14 @@ async fn roster_consistent_across_servers_with_traffic_pump() {
 }
 
 // ============================================================================
-// server_vip_of 一致性（多主形态）：open_sync 的 VIP 断言
+// server_vip_of consistency (the multi-primary form): open_sync's VIP
+// assertion
 // ============================================================================
 
-/// node 1 的确定性服务器 VIP = 100.64.0.1：配置错位（.9）⇒ 拒起且错误**给出期望值**、
-/// 属永久错误（非 SYNC_NOT_READY 前缀——就绪重试循环不吞它）；匹配值可起。
+/// Node 1's deterministic server VIP = 100.64.0.1: a misaligned config (.9)
+/// ⇒ refuses to start and the error **names the expected value** and is a
+/// permanent error (not the SYNC_NOT_READY prefix —— the ready-retry loop
+//  does not swallow it); the matching value starts fine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_sync_rejects_vip_mismatch_with_expected_value() {
     let c3 = build_cluster().await;
@@ -1082,8 +1154,9 @@ async fn open_sync_rejects_vip_mismatch_with_expected_value() {
     let state_dir = tmp.path().to_path_buf();
     std::mem::forget(tmp);
 
-    // 错配（node 1 应为 .1，配了 .9）：明确失败 + 期望值 + 永久错误（短窗内立即返回，
-    // 不等 wrap）。
+    // Misaligned (node 1 should be .1, configured .9): explicit failure +
+    // the expected value + a permanent error (returned immediately within a
+    // short window, not waiting for the wrap).
     let mut cfg = sync_server_cfg(
         state_dir.clone(),
         "node-1.test:9443".into(),
@@ -1100,22 +1173,23 @@ async fn open_sync_rejects_vip_mismatch_with_expected_value() {
     .await
     {
         Err(e) => e,
-        Ok(_) => panic!("vip 错配必须拒起"),
+        Ok(_) => panic!("a vip mismatch must refuse to start"),
     };
     assert!(
         err.contains("100.64.0.1"),
-        "错误给出期望值（确定性推导）: {err}"
+        "the error gives the expected value (deterministic derivation): {err}"
     );
     assert!(
         !err.starts_with(flock_server::server::SYNC_NOT_READY_PREFIX),
-        "配置错误是永久错误（不被就绪重试吞掉）: {err}"
+        "a configuration error is permanent (not swallowed by the ready retry): {err}"
     );
     assert!(
         t0.elapsed() < std::time::Duration::from_secs(2),
-        "断言先于 wrap 等待（立即拒）"
+        "the assertion precedes the wrap wait (immediate rejection)"
     );
 
-    // 匹配（.1 = server_vip_of(node 1)）⇒ 正常起（wraps 已在 build_cluster 落库）。
+    // Matching (.1 = server_vip_of(node 1)) ⇒ starts normally (the wraps
+    // were already persisted by build_cluster).
     cfg.vip = "100.64.0.1".parse().unwrap();
     ServerCore::open_sync_with_wait(
         cfg,
@@ -1124,25 +1198,34 @@ async fn open_sync_rejects_vip_mismatch_with_expected_value() {
         std::time::Duration::from_secs(5),
     )
     .await
-    .expect("推导值匹配 ⇒ 可起");
+    .expect("the derived value matches ⇒ startable");
 }
 
 // ============================================================================
-// M7（§7-M7.5）：回收器——registered_at 锚 + 租约视图就绪闸门（多主形态）
+// M7 (§7-M7.5): the reaper —— the registered_at anchor + the lease
+// view-ready gate (the multi-primary form)
 // ============================================================================
 
-/// 断言面（单节点 raft 集群 = 无对端 ⇒ 永无远端租约事件——闸门两态可精确驱动）：
-/// - **闸门关**（租约表无远端事件）：即使 dev_idle 的 registered_at 锚已超窗（40d >
-///   30d 保留期）也**不回收**——重启后「反熵回填 ≤5s 与回收首拍赛跑」窗口内，远端
-///   托管设备的租约行缺失，误终态化会殃及全网（含在线设备——邀请已消费即砖死）；
-/// - **闸门开**（注入一条远端 gossip = 反熵回填完成）：从未在线且锚超窗的 dev_idle
-///   被回收；有租约观测的 dev_online（registered_at 同为 40d 前、last_seen = 当前）
-///   不动——观测值优先于陈旧锚。
+/// Assertion surface (a single-node raft cluster = no peers ⇒ never any
+/// remote lease events —— the gate's two states can be driven precisely):
+/// - **gate closed** (no remote events in the lease table): even with
+///   dev_idle's registered_at anchor past the window (40d > the 30d
+///   retention period), it is **not reaped** —— inside the post-restart
+///   "anti-entropy backfill ≤5s racing the reaper's first pass" window,
+///   remotely-hosted devices' lease rows are missing, and terminalizing
+///   them by mistake would harm the whole network (including online
+///   devices —— invite consumed = bricked);
+/// - **gate open** (injecting one remote gossip = anti-entropy backfill
+///   complete): dev_idle (never online and anchor past the window) is
+///   reaped; dev_online with a lease observation (registered_at likewise
+///   40d ago, last_seen = now) untouched —— the observation takes priority
+///   over the stale anchor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reaper_anchor_and_lease_gate_multi_primary() {
     use flock_sync::lease::GossipMsg;
 
-    // 单节点集群装配（root 签身份 + 自签目录 + 内存织物仅本机）。
+    // Single-node cluster assembly (root-signed identity + self-signed
+    // directory + an in-memory fabric with only this node).
     let root = ed25519_dalek::SigningKey::from_bytes(&rand::random::<[u8; 32]>());
     let cluster_id = flock_protocol::session::ClusterId(rand::random());
     let ident = Arc::new(flock_protocol::session::ServerIdentity::enroll(
@@ -1173,7 +1256,8 @@ async fn reaper_anchor_and_lease_gate_multi_primary() {
         .await
         .expect("node build"),
     );
-    // Bootstrap + ServerKeys + 本机 Rewrap（open_sync 就绪前置）。
+    // Bootstrap + ServerKeys + the local Rewrap (open_sync's readiness
+    // precondition).
     let leader = wait_leader(std::slice::from_ref(&node)).await;
     let oprf_b64 = server_setup_new(&mut rand::rngs::OsRng);
     submit_wrapped_oprf(&leader, &root, std::slice::from_ref(&ident), &oprf_b64).await;
@@ -1190,8 +1274,9 @@ async fn reaper_anchor_and_lease_gate_multi_primary() {
         .await
         .expect("open_sync");
 
-    // 两台设备：registered_at 同为 40 天前（提交方注入——apply 确定性）；dev_online
-    // 另有本机租约观测（publish ⇒ last_seen = 当前）。
+    // Two devices: registered_at likewise 40 days ago (injected by the
+    // submitting side —— apply is deterministic); dev_online additionally
+    // has a local lease observation (publish ⇒ last_seen = now).
     let now = flock_protocol::trust::now_unix();
     let t_old = now.saturating_sub(40 * 86_400);
     let vk_of = |seed: u8| {
@@ -1227,10 +1312,17 @@ async fn reaper_anchor_and_lease_gate_multi_primary() {
     };
     let day = 86_400u64;
 
-    // ① 闸门关（表有行但自启动起零远端事件）：锚超窗的 dev_idle 也不回收。
-    assert!(!node.lease().reaper_view_ready(), "单节点无对端 ⇒ 闸门关");
+    // ① Gate closed (the table has rows but zero remote events since
+    //    startup): even the anchor-past-window dev_idle is not reaped.
+    assert!(
+        !node.lease().reaper_view_ready(),
+        "single node without peers ⇒ the gate is closed"
+    );
     let expired = flock_server::server::reap_once(&core, 30, now + day).await;
-    assert!(expired.is_empty(), "视图未就绪 ⇒ 跳过整趟: {expired:?}");
+    assert!(
+        expired.is_empty(),
+        "view not ready ⇒ the whole pass skipped: {expired:?}"
+    );
     assert_eq!(
         row_status(&dev_idle),
         flock_sync::proto::DeviceStatus::Active
@@ -1240,13 +1332,18 @@ async fn reaper_anchor_and_lease_gate_multi_primary() {
         flock_sync::proto::DeviceStatus::Active
     );
 
-    // ② 闸门开（注入一条远端 gossip = 反熵回填完成）：dev_idle（从未在线且锚 41d >
-    // 30d）回收；dev_online（观测 1d < 30d）不动。
+    // ② Gate open (injecting one remote gossip = anti-entropy backfill
+    //    complete): dev_idle (never online and anchor 41d > 30d) reaped;
+    //    dev_online (observation 1d < 30d) untouched.
     node.lease()
         .merge_remote(GossipMsg::Anti { entries: vec![] });
     assert!(node.lease().reaper_view_ready());
     let expired = flock_server::server::reap_once(&core, 30, now + day).await;
-    assert_eq!(expired, vec![dev_idle], "仅锚超窗且从未在线者回收");
+    assert_eq!(
+        expired,
+        vec![dev_idle],
+        "only the never-online anchor-past-window one is reaped"
+    );
     assert_eq!(
         row_status(&dev_idle),
         flock_sync::proto::DeviceStatus::Expired
@@ -1254,14 +1351,15 @@ async fn reaper_anchor_and_lease_gate_multi_primary() {
     assert_eq!(
         row_status(&dev_online),
         flock_sync::proto::DeviceStatus::Active,
-        "租约观测（1d）优先于陈旧锚（41d）"
+        "the lease observation (1d) takes priority over the stale anchor (41d)"
     );
-    // 幂等：同窗再跑 ⇒ 空趟。
+    // Idempotent: another pass in the same window ⇒ an empty pass.
     let expired = flock_server::server::reap_once(&core, 30, now + day).await;
-    assert!(expired.is_empty(), "幂等");
+    assert!(expired.is_empty(), "idempotent");
 }
 
-/// M7 roster 测试的邀请 fixture（登记 + 根签签发）。
+/// The invite fixture of the M7 roster tests (registration + root-signed
+/// issuance).
 async fn m7_invite(c3: &Node3, id: [u8; 16]) -> InviteFile {
     let expiry = flock_protocol::trust::now_unix() + 3600;
     c3.nodes[0]
@@ -1282,22 +1380,27 @@ async fn m7_invite(c3: &Node3, id: [u8; 16]) -> InviteFile {
 }
 
 // ============================================================================
-// M8 webui（多主形态）：dashboard/series 的远端服务器 VIP 注册表判定
+// M8 webui (the multi-primary form): the registry verdict for remote
+// server VIPs in dashboard/series
 // ============================================================================
 
-/// 🟢 评审项 7（series vip_in_registry 含远端服务器 VIP）：Series 重启清零 ⇒
-/// 重启后首样本前 knows()=false——远端服务器 VIP 的 series 查询须命中注册表支
-///（server_keys 本地视图）返回空 points，而非 404；不在任何注册表面的 VIP 仍 404。
+/// Green review item 7 (series vip_in_registry includes remote server
+/// VIPs): Series resets on restart ⇒ before the first sample after a
+/// restart knows()=false —— a series query for a remote server VIP must
+/// hit the registry arm (the server_keys local view) and return empty
+/// points rather than 404; a VIP on no registry surface still 404s.
 #[tokio::test]
 async fn webui_series_remote_server_vip_known_before_first_sample() {
     let c3 = build_cluster().await;
-    // 节点 0 的 ServerCore（Sync backend；server_keys 已在 build_cluster 根签登记）。
+    // Node 0's ServerCore (Sync backend; server_keys already root-signed
+    // and registered by build_cluster).
     let server_a = serve_on(&c3, 0, vec![]).await;
     let state = std::sync::Arc::new(flock_server::webui::api::WebState::new(
         server_a.core.clone(),
     ));
 
-    // 登录档会话（dispatch 回读 UserRow——评审项 6 语义；直接经会话表签发）。
+    // A login-tier session (dispatch reads back the UserRow —— review item
+    // 6 semantics; issued directly through the session table).
     server_a
         .core
         .net
@@ -1316,13 +1419,14 @@ async fn webui_series_remote_server_vip_known_before_first_sample() {
         .sessions
         .issue("probe", true, Origin::Loopback, now, 3600);
 
-    // 远端服务器（节点 2）VIP = server_vip_of 的确定性推导。
+    // The remote (node 2) server's VIP = server_vip_of's deterministic
+    // derivation.
     let node2 = flock_sync::node::node_id_of(&c3.idents[2].server_id);
     let vip2 = flock_sync::proto::server_vip_of(node2).expect("node 1..=10");
     let vip_str = format!("{}.{}.{}.{}", vip2[0], vip2[1], vip2[2], vip2[3]);
     let remote: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
 
-    // DBG：server_keys 本地视图与判定输入。
+    // DBG: the server_keys local view and the decision inputs.
     let mk_req = |query: String| flock_server::webui::http::Request {
         method: "GET".into(),
         path: "/api/dashboard/series".into(),
@@ -1330,20 +1434,24 @@ async fn webui_series_remote_server_vip_known_before_first_sample() {
         headers: vec![("Cookie".into(), format!("flock_session={sid}"))],
         body: vec![],
     };
-    // 远端服务器 VIP：无样本（新 Series——重启语义）但在册 ⇒ 200 空 points。
+    // The remote server VIP: no samples (a fresh Series —— the restart
+    // semantics) but on record ⇒ 200 empty points.
     let resp = state
         .dispatch(mk_req(format!("vip={vip_str}")), remote)
         .await;
-    assert_eq!(resp.status, 200, "远端服务器 VIP 命中注册表支（非 404）");
+    assert_eq!(
+        resp.status, 200,
+        "the remote server VIP hits the registry arm (not 404)"
+    );
     let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
     assert_eq!(
         body["points"].as_array().map(Vec::len),
         Some(0),
-        "重启后首样本前空 points"
+        "empty points before the first sample after restart"
     );
-    // 不在任何注册表面的 VIP ⇒ 404。
+    // A VIP on no registry surface ⇒ 404.
     let resp = state
         .dispatch(mk_req("vip=100.64.0.99".into()), remote)
         .await;
-    assert_eq!(resp.status, 404, "未登记 VIP 仍 404");
+    assert_eq!(resp.status, 404, "an unregistered VIP still 404s");
 }

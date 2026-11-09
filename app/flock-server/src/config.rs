@@ -1,12 +1,19 @@
-//! server.toml 解析与 [`ListenerMode`] 接缝（docs/design.md §2.1/§3.11）。
+//! server.toml parsing and the [`ListenerMode`] seam (docs/design.md
+//! §2.1/§3.11).
 //!
-//! **接入层与 frp 解耦（用户硬约束，最高优先级）**：`listener.mode` 二选一——
-//! - `direct`（**缺省**）：直接监听 `bind`，零 frp 逻辑——本模块到运行时的 Direct 代码路径
-//!   不触碰 flock-frpc（不实例化 Supervisor、不生成配置、不启动子进程）；
-//! - `frp`：本地监听 `bind` + `flock-frpc` Supervisor 托管中转（§3.9/§5）。
+//! **Access layer decoupled from frp (a user hard constraint, top
+//! priority)**: `listener.mode` is one of two choices ——
+//! - `direct` (**default**): listen directly on `bind`, zero frp logic ——
+//!   the Direct code path from this module to runtime never touches
+//!   flock-frpc (no Supervisor instantiation, no config generation, no
+//!   subprocess launch);
+//! - `frp`: local listen on `bind` + `flock-frpc` Supervisor-managed relay
+//!   (§3.9/§5).
 //!
-//! 解耦纪律落在类型上：config 层只定义自有类型 [`FrpPlan`]（String/PathBuf/SocketAddr，
-//! 无 flock-frpc 类型）；RelaySpec/FrpcBinaries 的构造全部隔离在 `frp.rs`（仅 Frp 分支引用）。
+//! The decoupling discipline lands on types: the config layer defines only
+//! its own [`FrpPlan`] type (String/PathBuf/SocketAddr, no flock-frpc
+//! types); RelaySpec/FrpcBinaries construction is isolated in `frp.rs`
+//! (referenced only by the Frp branch).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,129 +22,164 @@ use serde::Deserialize;
 
 use crate::ticket::TICKET_TTL_SECS;
 
-/// frp 模式的装配计划（config 层自有类型；flock-frpc 类型不出现在此层）。
+/// The frp-mode assembly plan (a config-layer own type; no flock-frpc types
+/// appear at this layer).
 #[derive(Debug, Clone)]
 pub struct FrpPlan {
-    /// 中继规格（config 层自有形态；`frp.rs` 据此构造 flock-frpc 的 `RelaySpec`）。
+    /// Relay spec (config-layer own shape; `frp.rs` builds flock-frpc's
+    /// `RelaySpec` from it).
     pub relay: FrpRelayPlan,
-    /// frpc 二进制路径（对应 `relay` 栈代；R9 版本矩阵锁在 flock-frpc 内执行）。
+    /// frpc binary path (matching the `relay` stack generation; the R9
+    /// version matrix lock is enforced inside flock-frpc).
     pub frpc_bin: PathBuf,
-    /// Supervisor run 目录基点（托管配置/日志落点）。
+    /// Supervisor run-directory base (managed config/log drop point).
     pub run_base: PathBuf,
 }
 
-/// `[frp]` 的中继栈代（评审项 14：ChmlFrp 装配层接线——config 层自有形态，
-/// 不引用 flock-frpc 类型）。
+/// The `[frp]` relay stack generation (review item 14: ChmlFrp
+/// assembly-layer wiring —— config-layer own shape, no flock-frpc types
+/// referenced).
 #[derive(Debug, Clone)]
 pub enum FrpRelayPlan {
-    /// 原版 frpc（v0.71.1 定版）：TOML（v0.71.1 方言）**内嵌全文**——启动时写出到
-    /// state 目录再以 `RelaySpec::Original{toml}` 注册（走真实产品路径，兼容不破）。
+    /// Original frpc (pinned v0.71.1): the **full embedded text** of the
+    /// TOML (v0.71.1 dialect) —— written out to the state directory at
+    /// startup and registered as `RelaySpec::Original{toml}` (the real
+    /// product path, compatibility unbroken).
     Original { toml: String },
-    /// ChmlFrp 节点（`ChmlFrp-0.51.2_251023` 定版）。缺省 [`ChmlFrpMode::ConfigFile`]
-    /// 语义：面板「隧道管理→配置文件」导出的 frpc.ini 路径（字节级透传，仅注入
-    /// admin 探测字段）；`user_token_auto` 显式 opt-in 才走 `-u/-p` 自举（R20 风险
-    /// 见 [`UserTokenAuto`] 文档）。
+    /// ChmlFrp node (pinned `ChmlFrp-0.51.2_251023`). Default
+    /// [`ChmlFrpMode::ConfigFile`] semantics: the path of the frpc.ini
+    /// exported by the panel's "tunnel management → config file" (passed
+    /// through byte-for-byte, injecting only the admin probe fields); only
+    /// an explicit `user_token_auto` opt-in takes the `-u/-p` bootstrap (the
+    /// R20 risk is documented on [`UserTokenAuto`]).
     ChmlFrp {
         ini: Option<PathBuf>,
         user_token_auto: Option<UserTokenAuto>,
     },
 }
 
-/// `[frp] mode = "chmlfrp"` 的 `user_token_auto` opt-in（评审项 14）。
+/// The `user_token_auto` opt-in of `[frp] mode = "chmlfrp"` (review item
+/// 14).
 ///
-/// **R20 风险（opt-in 前必读）**：面板 usertoken 是全权凭据，自举走
-/// InsecureSkipVerify 的 HTTPS 拉取（中间人可截获全权 token）、token 进入子进程
-/// 命令行（同机 `ps` 可读）、拉取配置对托管层不透明（探活只剩进程状态面）——
-/// 组织/多用户机器不要启用；缺省 ConfigFile 模式无这些暴露。
+/// **R20 risk (must read before opting in)**: the panel usertoken is an
+/// all-powerful credential; the bootstrap pulls it over
+/// InsecureSkipVerify HTTPS (a man-in-the-middle can capture the
+/// all-powerful token), the token lands in the subprocess command line
+/// (readable via `ps` on the same machine), and the pulled config is opaque
+/// to the management layer (liveness probing is left with only the process
+/// state surface) —— do not enable on organizational/multi-user machines;
+/// the default ConfigFile mode has none of these exposures.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserTokenAuto {
-    /// 面板 usertoken（**凭据**：面板全权；勿入日志/版本库）。
+    /// Panel usertoken (**a credential**: full panel authority; keep out of
+    /// logs/repositories).
     pub usertoken: String,
-    /// 隧道数字 ID（面板「隧道管理」可见）。
+    /// Numeric tunnel ID (visible in the panel's "tunnel management").
     pub tunnel_id: u64,
 }
 
-/// 接入端点形态（§3.11 接缝枚字的 config 层形态；运行时句柄见 `server::RunningListener`）。
+/// Access endpoint shape (the config-layer form of the §3.11 seam enum; the
+/// runtime handle is `server::RunningListener`).
 #[derive(Debug, Clone)]
 pub enum ListenerMode {
-    /// 直接监听（**缺省**）——零 frp 逻辑（§2.1 硬约束）。
+    /// Direct listen (**default**) —— zero frp logic (the §2.1 hard
+    /// constraint).
     Direct { bind: SocketAddr },
-    /// 本地监听 + flock-frpc 托管中转。
+    /// Local listen + flock-frpc-managed relay.
     Frp { bind: SocketAddr, plan: FrpPlan },
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
-    /// 状态目录（redb + 集群身份材料 + frp 托管落点）。
+    /// State directory (redb + cluster identity material + frp managed drop
+    /// points).
     pub state_dir: PathBuf,
-    /// 本地监听地址（两形态共用；direct 缺省 0.0.0.0:9443）。
+    /// Local listen address (shared by both forms; direct defaults to
+    /// 0.0.0.0:9443).
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
-    /// `direct`（缺省）| `frp`。
+    /// `direct` (default) | `frp`.
     #[serde(default = "default_mode")]
     pub mode: String,
-    /// 目录内本服务器的**客户端可见端点**（直连地址或中转用户口；host:port 字符串，
-    /// 与 ServerEntry.relay_endpoint 同构）。
+    /// This server's **client-visible endpoint** inside the directory (a
+    /// direct address or a relay user port; host:port string, isomorphic to
+    /// ServerEntry.relay_endpoint).
     pub advertise_endpoint: String,
-    /// 追加端点（同一服务器经其他暴露口；单服 M2 的「换端点仍 1-RTT」模拟，§7-M2）。
+    /// Additional endpoints (the same server via other exposure openings;
+    /// the single-server M2 simulation of "still 1-RTT after switching
+    /// endpoints", §7-M2).
     #[serde(default)]
     pub extra_endpoints: Vec<String>,
-    /// 目录版本（根签 ClusterDirectory 的 dir_version；变更 = 手动递增 + 重签）。
+    /// Directory version (the root-signed ClusterDirectory's dir_version;
+    /// a change = manual increment + re-signing).
     #[serde(default = "default_dir_version")]
     pub dir_version: u64,
-    /// 票据 TTL 秒（缺省 60 = §2.2 硬顶；部署可调小以便过期路径验收）。
+    /// Ticket TTL seconds (default 60 = the §2.2 hard cap; deployments may
+    /// lower it to exercise the expiry path).
     #[serde(default = "default_ticket_ttl")]
     pub ticket_ttl_secs: u64,
-    /// admin loopback 端点（邀请签发/兑换/注册表管理的进程内单写者入口；CLI 子命令走它）。
+    /// Admin loopback endpoint (the in-process single-writer entry for
+    /// invite minting/redemption/registry management; CLI subcommands go
+    /// through it).
     #[serde(default = "default_admin_bind")]
     pub admin_bind: SocketAddr,
-    /// 并发会话上限（评审项 7；accept 后即占用一个许可，超限的入连被礼貌关闭并
-    /// 计数。缺省 1024）。
+    /// Concurrent session cap (review item 7; a permit is taken right after
+    /// accept; inbound connections over the cap are politely closed and
+    /// counted. Default 1024).
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
-    /// M7（§7-M7.2/§7-M7.5）：离线设备保留期（天）。超过 ⇒ 回收器置 Expired + VIP
-    /// 归还分配池（行保留审计、名册排除）。缺省 30；**0 = 永不过期**（兼容旧行为）。
-    /// u64 天然 ≥0（「校验 ≥0」由类型承担——负值在解析层即不可表达）。
+    /// M7 (§7-M7.2/§7-M7.5): offline device retention period (days). Beyond
+    /// it ⇒ the reaper sets Expired + the VIP returns to the allocation pool
+    /// (row retained for audit, excluded from the roster). Default 30;
+    /// **0 = never expire** (compatible with the old behavior). u64 is
+    /// naturally ≥0 (the "validate ≥0" is carried by the type —— negative
+    /// values are unexpressible at the parsing layer).
     #[serde(default = "default_peer_retention_days")]
     pub peer_retention_days: u64,
-    /// TUN 接口名（M3 数据面，§2.2/§3.12；缺省 "tun0"）。
+    /// TUN interface name (M3 data plane, §2.2/§3.12; default "tun0").
     #[serde(default = "default_tun_name")]
     pub tun_name: String,
-    /// 本机 tun VIP（§2.2 服务端自身也是 peer；缺省 100.64.0.1。多主形态每台服务器
-    /// 各配一个——§6.2：server-a/b/c = .1/.2/.3；设备 VIP 由 Raft 从 .11 起分配，
-    /// 与服务器段不撞）。
+    /// This node's tun VIP (§2.2 the server itself is also a peer; default
+    /// 100.64.0.1. In multi-primary form each server gets its own —— §6.2:
+    /// server-a/b/c = .1/.2/.3; device VIPs are assigned by Raft from .11,
+    /// never colliding with the server segment).
     #[serde(default = "default_vip")]
     pub vip: std::net::Ipv4Addr,
-    /// 仅 mode = "frp" 时读取。
+    /// Read only when mode = "frp".
     pub frp: Option<FrpSection>,
-    /// 多主同步（§2.2/§3.11 M4 批次；缺省 None = 单服形态——m2/m2-direct 部署不变）。
+    /// Multi-primary sync (§2.2/§3.11 M4 batch; default None =
+    /// single-server form —— m2/m2-direct deployments unchanged).
     #[serde(default)]
     pub sync: Option<SyncSection>,
-    /// M8 Web UI 管理面（§7-M8.2；缺省 enabled=true/port=9800——双绑定
-    /// 127.0.0.1:port + cfg.vip:port，**不暴露任何 bind 字段**）。
+    /// M8 Web UI admin surface (§7-M8.2; default enabled=true/port=9800 ——
+    /// dual bind 127.0.0.1:port + cfg.vip:port, **no bind field is exposed
+    /// at all**).
     #[serde(default)]
     pub webui: WebUiSection,
 }
 
-/// `[webui]` 配置节（§7-M8.2 定死；**显式白名单键集**——`deny_unknown_fields` 使
-/// `bind` 等误配键在解析层即拒，结构上排除 0.0.0.0 误配）。
+/// The `[webui]` config section (fixed by §7-M8.2; **an explicit
+/// whitelisted key set** —— `deny_unknown_fields` rejects misconfigured keys
+/// like `bind` at the parsing layer, structurally ruling out 0.0.0.0
+/// mistakes).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebUiSection {
-    /// false = 不装配 webui。
+    /// false = do not assemble the webui.
     #[serde(default = "default_webui_enabled")]
     pub enabled: bool,
-    /// 双绑定端口（127.0.0.1:port + cfg.vip:port）；校验 1..=65535 且不与
-    /// bind/admin_bind/admin_bind+1/raft_bind 冲突（拒起服）。
+    /// Dual-bind port (127.0.0.1:port + cfg.vip:port); validated 1..=65535
+    /// and not conflicting with bind/admin_bind/admin_bind+1/raft_bind
+    /// (refuses to start).
     #[serde(default = "default_webui_port")]
     pub port: u16,
-    /// 会话 TTL 秒（缺省 8h；校验 60..=86400）。
+    /// Session TTL seconds (default 8h; validated 60..=86400).
     #[serde(default = "default_webui_session_ttl")]
     pub session_ttl_secs: u64,
-    /// 流量环形缓冲点数（§M8.5；缺省 120）。
+    /// Traffic ring-buffer point count (§M8.5; default 120).
     #[serde(default = "default_webui_series_points")]
     pub series_points: usize,
-    /// 采样间隔秒（缺省 60）。
+    /// Sampling interval seconds (default 60).
     #[serde(default = "default_webui_series_interval")]
     pub series_interval_secs: u64,
 }
@@ -170,43 +212,51 @@ fn default_webui_series_interval() -> u64 {
     60
 }
 
-/// `[sync]` 配置节。
+/// The `[sync]` config section.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SyncSection {
-    /// `single`（缺省）| `raft`。
+    /// `single` (default) | `raft`.
     #[serde(default = "default_sync_mode")]
     pub mode: String,
-    /// raft 形态：节点捆绑文件（init-cluster 产物；根公钥 + 入群凭证 + 根签目录）。
-    /// 缺省 = state_dir/bundle.bin（`enroll` 子命令落点）。
+    /// Raft form: the node bundle file (an init-cluster product; root public
+    /// key + enrollment credential + root-signed directory). Default =
+    /// state_dir/bundle.bin (the `enroll` subcommand's drop point).
     pub bundle: Option<PathBuf>,
-    /// raft 形态：服务器互连织物监听地址（§6.2 srvmesh 内联网；缺省 0.0.0.0:9500）。
+    /// Raft form: the server-interconnect fabric listen address (§6.2
+    /// srvmesh inline network; default 0.0.0.0:9500).
     #[serde(default = "default_raft_bind")]
     pub raft_bind: SocketAddr,
-    /// raft 形态：对端拨号表 `"节点号=host:port"`（§6.2 srvmesh；例 "1=raft-1:9500"）。
+    /// Raft form: the peer dial table `"node-number=host:port"` (§6.2
+    /// srvmesh; e.g. "1=raft-1:9500").
     #[serde(default)]
     pub raft_peers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FrpSection {
-    /// 中继栈代：`original`（缺省）| `chmlfrp`（评审项 14：ChmlFrp 面板节点）。
+    /// Relay stack generation: `original` (default) | `chmlfrp` (review
+    /// item 14: ChmlFrp panel node).
     #[serde(default = "default_frp_flavor")]
     pub flavor: String,
-    /// 原版 frpc TOML 全文（内嵌注册，§7-M2「server 内嵌 frpc」；flavor=original 必填）。
+    /// Full original-frpc TOML text (embedded registration, §7-M2 "server
+    /// embeds frpc"; required for flavor=original).
     #[serde(default)]
     pub original_toml: String,
-    /// ChmlFrp：面板导出的 frpc.ini 路径（flavor=chmlfrp 的缺省 ConfigFile 模式必填）。
+    /// ChmlFrp: the path of the panel-exported frpc.ini (required by the
+    /// default ConfigFile mode of flavor=chmlfrp).
     #[serde(default)]
     pub chmlfrp_ini: Option<PathBuf>,
-    /// ChmlFrp `UserTokenAuto` 显式 opt-in（R20 风险见 [`UserTokenAuto`]；给此项则
-    /// 覆盖 ConfigFile 模式，`chmlfrp_ini` 可省）。
+    /// ChmlFrp `UserTokenAuto` explicit opt-in (the R20 risk is documented
+    /// on [`UserTokenAuto`]); when present it overrides the ConfigFile mode
+    /// and `chmlfrp_ini` may be omitted.
     #[serde(default)]
     pub user_token_auto: Option<UserTokenAuto>,
-    /// frpc 二进制路径（缺省 /usr/local/bin/frpc——deploy 镜像内位置；chmlfrp 栈代
-    /// 应指向 ChmlFrp 定版 frpc 二进制）。
+    /// frpc binary path (default /usr/local/bin/frpc —— the location inside
+    /// the deploy images; the chmlfrp generation should point at the
+    /// ChmlFrp-pinned frpc binary).
     #[serde(default = "default_frpc_bin")]
     pub frpc_bin: PathBuf,
-    /// run 目录基点（缺省 state_dir/frpc-run）。
+    /// Run-directory base (default state_dir/frpc-run).
     pub run_base: Option<PathBuf>,
 }
 
@@ -250,7 +300,8 @@ fn default_raft_bind() -> SocketAddr {
     "0.0.0.0:9500".parse().expect("const addr")
 }
 
-/// loopback 判定：127.0.0.0/8 全段（IPv4 回环是整段 A 类）或 ::1。
+/// Loopback verdict: the whole 127.0.0.0/8 (the IPv4 loopback is an entire
+/// class-A block) or ::1.
 fn is_loopback(a: &SocketAddr) -> bool {
     match a {
         SocketAddr::V4(v4) => v4.ip().is_loopback(),
@@ -259,7 +310,8 @@ fn is_loopback(a: &SocketAddr) -> bool {
 }
 
 impl ServerConfig {
-    /// 解析 server.toml（解析后即做加载校验——评审项 3/4：非法配置拒绝起服）。
+    /// Parse server.toml (load validation runs right after parsing —— review
+    /// items 3/4: invalid configs refuse to start).
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let text =
             std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -269,46 +321,52 @@ impl ServerConfig {
         Ok(cfg)
     }
 
-    /// 加载校验（评审项 3/4）：不合法配置在此拒绝（拒绝起服），而非带病运行。
+    /// Load validation (review items 3/4): invalid configs are rejected here
+    /// (refuse to start) rather than running sick.
     pub fn validate(&self) -> Result<(), String> {
-        // 评审项 3：admin 端点（及其 +1 派生的集群引导端点）必须 loopback——
-        // 它是无认证的进程内单写者入口（§3.11「127.0.0.1 绑定 = 认证边界」）。
-        // 需要远程运维的意图应走 SSH 隧道/反向代理（在错误信息中说明），而非放宽绑定。
+        // Review item 3: the admin endpoint (and its +1-derived cluster
+        // bootstrap endpoint) must be loopback —— it is the unauthenticated
+        // in-process single-writer entry (§3.11 "the 127.0.0.1 bind = the
+        // authentication boundary"). Remote-operations intent should go
+        // through an SSH tunnel/reverse proxy (stated in the error message),
+        // not a widened bind.
         if !is_loopback(&self.admin_bind) {
             return Err(format!(
-                "admin_bind {} 非 loopback：admin/集群引导端点是无认证的本机管理入口，\
-                 绑定到非回环地址即对全网开放——拒绝起服。远程运维请走 SSH 隧道\
-                 （ssh -L 9444:127.0.0.1:9444 …）或带认证的反向代理。",
+                "admin_bind {} is not loopback: the admin/cluster-bootstrap endpoints are unauthenticated local management entry points, and binding them to a non-loopback address opens them to the whole network - refusing to start. For remote operations use an SSH tunnel (ssh -L 9444:127.0.0.1:9444 ...) or an authenticated reverse proxy.",
                 self.admin_bind
             ));
         }
-        // 评审项 4：票据 TTL 不得超过 flock-sync 的 TICKET_TTL_SECS(60s) 硬顶
-        // （§2.2 跨服重放窗 = min(±300s, TTL)——调大即放大重放面）。部署可调小
-        // （过期路径验收用），不可调大。
+        // Review item 4: the ticket TTL must not exceed flock-sync's
+        // TICKET_TTL_SECS(60s) hard cap (§2.2 cross-server replay window =
+        // min(±300s, TTL) —— raising it widens the replay surface).
+        // Deployments may lower it (for expiry-path acceptance), never raise
+        // it.
         if self.ticket_ttl_secs > crate::ticket::TICKET_TTL_SECS {
             return Err(format!(
-                "ticket_ttl_secs {} 超过硬顶 {}（§2.2 票据 TTL 60s 硬顶：调大放大跨服\
-                 重放窗；只可调小）",
+                "ticket_ttl_secs {} exceeds the hard cap {} (the §2.2 ticket TTL 60s hard cap: raising it widens the cross-server replay window; it can only be lowered)",
                 self.ticket_ttl_secs,
                 crate::ticket::TICKET_TTL_SECS
             ));
         }
-        // M8（§M8.2）：[webui] 校验——端口与 TTL 档位 + 与既有监听面冲突拒起服。
+        // M8 (§M8.2): [webui] validation —— port and TTL tiers + conflicts
+        // with existing listening surfaces refuse to start.
         if self.webui.enabled {
             if self.webui.port == 0 {
-                return Err("[webui] port 为 0（1..=65535）".into());
+                return Err("[webui] port is 0 (1..=65535)".into());
             }
             if !(60..=86_400).contains(&self.webui.session_ttl_secs) {
                 return Err(format!(
-                    "[webui] session_ttl_secs {} 超出档位 60..=86400（缺省 8h）",
+                    "[webui] session_ttl_secs {} out of range 60..=86400 (default 8h)",
                     self.webui.session_ttl_secs
                 ));
             }
             if self.webui.series_points == 0 || self.webui.series_interval_secs == 0 {
-                return Err("[webui] series_points/series_interval_secs 须 ≥ 1".into());
+                return Err("[webui] series_points/series_interval_secs must be ≥ 1".into());
             }
-            // 端口冲突面：bind / admin_bind / admin_bind+1（集群引导端点）/ raft_bind。
-            // （webui 自身的双绑定 127.0.0.1:port 与 vip:port 同 port——不参与自冲突。）
+            // Port-conflict surface: bind / admin_bind / admin_bind+1 (the
+            // cluster bootstrap endpoint) / raft_bind. (The webui's own dual
+            // bind 127.0.0.1:port and vip:port share one port —— not part of
+            // self-conflict.)
             let webui_port = self.webui.port;
             let mut conflicts: Vec<(u16, &str)> = Vec::new();
             if self.bind.port() != 0 && self.bind.port() == webui_port {
@@ -318,12 +376,13 @@ impl ServerConfig {
                 if self.admin_bind.port() == webui_port {
                     conflicts.push((self.admin_bind.port(), "admin_bind"));
                 }
-                // admin_bind+1（集群引导端点）：u16 加法经 checked_add——65535+1
-                // 溢出（debug 构建直接 panic / release 回绕为 0）不存在可冲突的
-                // +1 端点（🟢 评审项 7）。
+                // admin_bind+1 (the cluster bootstrap endpoint): u16 addition
+                // via checked_add —— 65535+1 overflow (a direct panic in
+                // debug / wraps to 0 in release) means no +1 endpoint exists
+                // to conflict with (green review item 7).
                 if let Some(boot) = self.admin_bind.port().checked_add(1) {
                     if boot == webui_port {
-                        conflicts.push((boot, "admin_bind+1（集群引导端点）"));
+                        conflicts.push((boot, "admin_bind+1 (cluster bootstrap endpoint)"));
                     }
                 }
             }
@@ -334,15 +393,15 @@ impl ServerConfig {
             }
             if let Some((port, face)) = conflicts.first() {
                 return Err(format!(
-                    "[webui] port {webui_port} 与 {face}（:{port}）冲突——webui 双绑定\
-                     （127.0.0.1:{webui_port} + vip:{webui_port}）需独立端口，拒绝起服",
+                    "[webui] port {webui_port} conflicts with {face} (:{port}) - the webui dual bind (127.0.0.1:{webui_port} + vip:{webui_port}) needs a dedicated port; refusing to start",
                 ));
             }
         }
         Ok(())
     }
 
-    /// 解析为 ListenerMode（缺省 direct；frp 需 `[frp]` 段）。
+    /// Resolve into a ListenerMode (default direct; frp requires an `[frp]`
+    /// section).
     pub fn listener_mode(&self) -> Result<ListenerMode, String> {
         match self.mode.as_str() {
             "" | "direct" => Ok(ListenerMode::Direct { bind: self.bind }),
@@ -350,14 +409,17 @@ impl ServerConfig {
                 let frp = self
                     .frp
                     .as_ref()
-                    .ok_or("listener.mode = \"frp\" 需要 [frp] 段")?;
-                // 评审项 14：[frp].flavor 分派（original 缺省 / chmlfrp），config 层
-                // 校验必填项后产出 FrpRelayPlan；RelaySpec 构造在 frp.rs（类型隔离）。
+                    .ok_or("listener.mode = \"frp\" requires an [frp] section")?;
+                // Review item 14: the [frp].flavor dispatch (original default
+                // / chmlfrp); the config layer validates required fields then
+                // produces a FrpRelayPlan; RelaySpec construction stays in
+                // frp.rs (type isolation).
                 let relay = match frp.flavor.as_str() {
                     "" | "original" => {
                         if frp.original_toml.trim().is_empty() {
                             return Err(
-                                "[frp] flavor = \"original\" 需要 original_toml 内嵌全文".into()
+                                "[frp] flavor = \"original\" requires the full original_toml text"
+                                    .into(),
                             );
                         }
                         FrpRelayPlan::Original {
@@ -367,10 +429,10 @@ impl ServerConfig {
                     "chmlfrp" => match (&frp.user_token_auto, &frp.chmlfrp_ini) {
                         (Some(uta), _) => {
                             if uta.usertoken.trim().is_empty() {
-                                return Err("[frp] user_token_auto.usertoken 为空".into());
+                                return Err("[frp] user_token_auto.usertoken is empty".into());
                             }
                             if uta.tunnel_id == 0 {
-                                return Err("[frp] user_token_auto.tunnel_id 为 0".into());
+                                return Err("[frp] user_token_auto.tunnel_id is 0".into());
                             }
                             FrpRelayPlan::ChmlFrp {
                                 ini: frp.chmlfrp_ini.clone(),
@@ -381,15 +443,17 @@ impl ServerConfig {
                             ini: Some(ini.clone()),
                             user_token_auto: None,
                         },
-                        (None, None) => {
-                            return Err("[frp] flavor = \"chmlfrp\" 需要 chmlfrp_ini（面板导出的 \
-                                 frpc.ini 路径；缺省 ConfigFile 模式）或显式 \
+                        (None, None) => return Err(
+                            "[frp] flavor = \"chmlfrp\" requires chmlfrp_ini (the panel-exported \
+                                 frpc.ini path; default ConfigFile mode) or an explicit \
                                  [frp.user_token_auto] opt-in"
-                                .into())
-                        }
+                                .into(),
+                        ),
                     },
                     other => {
-                        return Err(format!("[frp] flavor 未知：{other:?}（original|chmlfrp）"))
+                        return Err(format!(
+                            "[frp] unknown flavor: {other:?} (original|chmlfrp)"
+                        ))
                     }
                 };
                 Ok(ListenerMode::Frp {
@@ -404,7 +468,7 @@ impl ServerConfig {
                     },
                 })
             }
-            other => Err(format!("listener.mode 未知：{other:?}（direct|frp）")),
+            other => Err(format!("unknown listener.mode: {other:?} (direct|frp)")),
         }
     }
 }
@@ -428,7 +492,10 @@ mod tests {
         ));
         assert_eq!(cfg.ticket_ttl_secs, 60);
         assert_eq!(cfg.mode, "direct");
-        assert_eq!(cfg.max_sessions, 1024, "并发会话上限缺省 1024（评审项 7）");
+        assert_eq!(
+            cfg.max_sessions, 1024,
+            "concurrent session cap default 1024 (review item 7)"
+        );
 
         let cfg2: ServerConfig = toml::from_str(
             r#"
@@ -438,7 +505,10 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert!(cfg2.listener_mode().is_err(), "frp 无 [frp] 段 ⇒ 拒");
+        assert!(
+            cfg2.listener_mode().is_err(),
+            "frp without an [frp] section ⇒ rejected"
+        );
 
         let cfg3: ServerConfig = toml::from_str(
             r#"
@@ -458,13 +528,14 @@ serverPort = 7000
         };
         match &plan.relay {
             FrpRelayPlan::Original { toml } => assert!(toml.contains("serverAddr")),
-            other => panic!("缺省 flavor = original: {other:?}"),
+            other => panic!("default flavor = original: {other:?}"),
         }
         assert_eq!(plan.run_base, PathBuf::from("/tmp/s/frpc-run"));
     }
 
-    /// 评审项 3：admin/集群引导端点必须 loopback——非 loopback 拒绝起服且错误说明
-    /// SSH 隧道/反代替代；127.0.0.0/8 全段与 ::1 放行。
+    /// Review item 3: the admin/cluster-bootstrap endpoints must be loopback
+    /// —— non-loopback refuses to start and the error explains the SSH
+    /// tunnel/reverse-proxy alternative; the whole 127.0.0.0/8 and ::1 pass.
     #[test]
     fn admin_bind_must_be_loopback() {
         fn cfg_with_admin(admin: &str) -> ServerConfig {
@@ -473,13 +544,14 @@ serverPort = 7000
             );
             toml::from_str(&text).unwrap()
         }
-        // loopback 全段放行（127.x.y.z 与 ::1）。
+        // The whole loopback block passes (127.x.y.z and ::1).
         for ok in ["127.0.0.1:9444", "127.3.2.1:9444", "[::1]:9444"] {
             let cfg = cfg_with_admin(ok);
             cfg.validate()
-                .unwrap_or_else(|e| panic!("{ok} 应放行: {e}"));
+                .unwrap_or_else(|e| panic!("{ok} should pass: {e}"));
         }
-        // 非 loopback 拒绝——错误必须说明远程运维走 SSH 隧道/反代。
+        // Non-loopback rejected —— the error must explain that remote
+        // operations go through an SSH tunnel/reverse proxy.
         for bad in [
             "0.0.0.0:9444",
             "10.1.2.3:9444",
@@ -487,16 +559,17 @@ serverPort = 7000
             "[fe80::1]:9444",
         ] {
             let err = cfg_with_admin(bad).validate().unwrap_err();
-            assert!(err.contains("loopback"), "{bad} 拒: {err}");
+            assert!(err.contains("loopback"), "{bad} rejected: {err}");
             assert!(
-                err.contains("SSH") || err.contains("反代") || err.contains("反向代理"),
-                "错误需说明替代通道: {err}"
+                err.contains("SSH") || err.contains("reverse proxy"),
+                "the error must state the alternative channel: {err}"
             );
         }
     }
 
-    /// 评审项 4：ticket_ttl_secs ≤ TICKET_TTL_SECS(60s)——超出拒绝起服；调小放行
-    /// （语义保留可调小：过期路径验收部署用）。
+    /// Review item 4: ticket_ttl_secs ≤ TICKET_TTL_SECS(60s) —— beyond it
+    /// refuses to start; lowering passes (the lowerable semantics are kept:
+    /// for expiry-path acceptance deployments).
     #[test]
     fn ticket_ttl_upper_bound_enforced() {
         fn cfg_with_ttl(ttl: u64) -> ServerConfig {
@@ -505,18 +578,22 @@ serverPort = 7000
             );
             toml::from_str(&text).unwrap()
         }
-        assert!(cfg_with_ttl(60).validate().is_ok(), "恰为硬顶 ⇒ 放行");
+        assert!(
+            cfg_with_ttl(60).validate().is_ok(),
+            "exactly the hard cap ⇒ passes"
+        );
         assert!(
             cfg_with_ttl(6).validate().is_ok(),
-            "调小 ⇒ 放行（冒烟部署）"
+            "lowered ⇒ passes (smoke deployments)"
         );
         let err = cfg_with_ttl(61).validate().unwrap_err();
-        assert!(err.contains("60"), "错误点名硬顶: {err}");
-        assert!(err.contains("只可调小"), "{err}");
+        assert!(err.contains("60"), "the error names the hard cap: {err}");
+        assert!(err.contains("only be lowered"), "{err}");
     }
 
     // ------------------------------------------------------------------
-    // M8（§M8.2/W7）：[webui] 节——缺省值/档位校验/端口冲突拒起服/键集白名单
+    // M8 (§M8.2/W7): the [webui] section —— defaults / tier validation /
+    // port conflicts refusing to start / key-set whitelist
     // ------------------------------------------------------------------
 
     fn cfg_with_webui(webui: &str) -> ServerConfig {
@@ -528,7 +605,7 @@ advertise_endpoint = \"127.0.0.1:9443\"
         toml::from_str(&text).unwrap()
     }
 
-    /// 缺省：enabled=true/port=9800/TTL 8h/series 120×60。
+    /// Defaults: enabled=true/port=9800/TTL 8h/series 120×60.
     #[test]
     fn webui_section_defaults() {
         let cfg = cfg_with_webui("");
@@ -538,7 +615,7 @@ advertise_endpoint = \"127.0.0.1:9443\"
         assert_eq!(cfg.webui.series_points, 120);
         assert_eq!(cfg.webui.series_interval_secs, 60);
         assert!(cfg.validate().is_ok());
-        // 显式覆盖往返。
+        // Explicit override round trip.
         let cfg = cfg_with_webui(
             "[webui]
 enabled = false
@@ -551,10 +628,13 @@ series_interval_secs = 30
         assert!(!cfg.webui.enabled);
         assert_eq!(cfg.webui.port, 9900);
         assert_eq!(cfg.webui.session_ttl_secs, 3600);
-        assert!(cfg.validate().is_ok(), "enabled=false 不做端口冲突面");
+        assert!(
+            cfg.validate().is_ok(),
+            "enabled=false skips the port-conflict surface"
+        );
     }
 
-    /// TTL 档位（60..=86400）与 port 0 拒。
+    /// TTL tier (60..=86400) and port 0 rejected.
     #[test]
     fn webui_range_validation() {
         assert!(cfg_with_webui(
@@ -591,8 +671,9 @@ port = 0
         assert!(err.contains("port"), "{err}");
     }
 
-    /// 端口冲突拒起服（W7）：与 bind / admin_bind / admin_bind+1 / raft_bind 撞 ⇒
-    /// 错误点名冲突面；不冲突放行。
+    /// Port conflicts refuse to start (W7): colliding with bind /
+    /// admin_bind / admin_bind+1 / raft_bind ⇒ the error names the
+    /// conflicting surface; no conflict passes.
     #[test]
     fn webui_port_conflicts_reject() {
         let mk = |extra: &str, webui_port: u16| {
@@ -606,16 +687,19 @@ port = {webui_port}
             );
             toml::from_str::<ServerConfig>(&text).unwrap()
         };
-        // 与 bind（9443）撞。
+        // Collides with bind (9443).
         let err = mk("", 9443).validate().unwrap_err();
-        assert!(err.contains("bind") && err.contains("拒绝起服"), "{err}");
-        // 与 admin_bind（9444）撞。
+        assert!(
+            err.contains("bind") && err.contains("refusing to start"),
+            "{err}"
+        );
+        // Collides with admin_bind (9444).
         let err = mk("", 9444).validate().unwrap_err();
         assert!(err.contains("admin_bind"), "{err}");
-        // 与 admin_bind+1（9445 集群引导端点）撞。
+        // Collides with admin_bind+1 (9445, the cluster bootstrap endpoint).
         let err = mk("", 9445).validate().unwrap_err();
-        assert!(err.contains("集群引导端点"), "{err}");
-        // 与 raft_bind 撞。
+        assert!(err.contains("cluster bootstrap endpoint"), "{err}");
+        // Collides with raft_bind.
         let err = mk(
             "[sync]
 mode = \"raft\"
@@ -625,9 +709,10 @@ mode = \"raft\"
         .validate()
         .unwrap_err();
         assert!(err.contains("raft_bind"), "{err}");
-        // 独立端口放行（bind 0.0.0.0:9443 / admin 9444 / raft 缺省 9500 都不撞 9800）。
+        // A dedicated port passes (bind 0.0.0.0:9443 / admin 9444 / raft
+        // default 9500 all miss 9800).
         assert!(mk("", 9800).validate().is_ok());
-        // bind 端口 0（测试 ephemeral 形态）不参与冲突面。
+        // bind port 0 (the test ephemeral form) joins no conflict surface.
         let text = "state_dir = \"/tmp/s\"
 advertise_endpoint = \"x\"
 bind = \"127.0.0.1:0\"
@@ -639,8 +724,10 @@ port = 9800
         assert!(cfg.validate().is_ok());
     }
 
-    /// admin_bind=65535 的 +1 派生经 checked_add（🟢 评审项 7）：u16 溢出不 panic
-    ///（debug 构建旧实现 `65535 + 1` 直接 overflow panic）、不误判 0 端口冲突。
+    /// The +1 derivation at admin_bind=65535 goes through checked_add
+    /// (green review item 7): the u16 overflow neither panics (the old
+    /// implementation overflow-panicked on `65535 + 1` in debug builds) nor
+    /// misreports a port-0 conflict.
     #[test]
     fn webui_port_conflict_admin_bind_65535_no_overflow_panic() {
         let text = "state_dir = \"/tmp/s\"
@@ -652,12 +739,14 @@ port = 9800
         let cfg: ServerConfig = toml::from_str(text).unwrap();
         assert!(
             cfg.validate().is_ok(),
-            "65535+1 溢出即无集群引导端口可冲突——放行且不 panic"
+            "65535+1 overflow means no cluster-bootstrap port to conflict with - passes without panicking"
         );
     }
 
-    /// 键集白名单（W7 结构防误配）：[webui] 出现 bind 等未知键 ⇒ 解析层即拒
-    ///（deny_unknown_fields——0.0.0.0 误配在结构上不可能，而非靠校验拦截）。
+    /// Key-set whitelist (W7 structural misconfiguration defense): unknown
+    /// keys like bind in [webui] ⇒ rejected at the parsing layer
+    /// (deny_unknown_fields —— a 0.0.0.0 mistake is structurally impossible,
+    /// not caught by validation).
     #[test]
     fn webui_unknown_keys_rejected_at_parse() {
         let err = toml::from_str::<ServerConfig>(
@@ -668,7 +757,10 @@ bind = \"0.0.0.0:9800\"
 ",
         )
         .unwrap_err();
-        assert!(err.to_string().contains("bind"), "未知键点名: {err}");
+        assert!(
+            err.to_string().contains("bind"),
+            "the unknown key is named: {err}"
+        );
         assert!(
             toml::from_str::<ServerConfig>(
                 "state_dir = \"/tmp/s\"
@@ -678,7 +770,7 @@ listen = \"0.0.0.0\"
 "
             )
             .is_err(),
-            "任何白名单外键拒"
+            "any key outside the whitelist rejected"
         );
     }
 }

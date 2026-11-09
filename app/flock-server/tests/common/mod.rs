@@ -1,11 +1,17 @@
-//! in-process 测试装配（`tests/control_flow.rs` 全链与 `tests/listener_mode.rs` 共用）。
+//! In-process test assembly (shared by the `tests/control_flow.rs` full
+//! chain and `tests/listener_mode.rs`).
 //!
-//! - [`TestServer`]：双监听（主端点 + 第二暴露口 = 「换端点仍 1-RTT」模拟，§7-M2），
-//!   `ServerCore::serve_listener` 直挂（`run()` 的装配分派由 `tests/listener_mode.rs` 覆盖）；
-//!   管理面（邀请签发/兑换/注册）直接调 `ServerCore`/`NetState`——admin TCP 端点的
-//!   进程外路径由 `tests/smoke.rs` 经容器内 CLI 覆盖。
-//! - [`CtrlClient`]：控制流客户端驱动（首条 yamux 流，postcard 帧）——OPAQUE 注册/登录
-//!   （anchor 验签）/key-bind（设备签名）/SR-SIG1/DirPull 逐步封装，测试按需断言中间产物。
+//! - [`TestServer`]: dual listeners (primary endpoint + a second exposure
+//!   opening = the "still 1-RTT after switching endpoints" simulation,
+//!   §7-M2), `ServerCore::serve_listener` hung directly (the assembly
+//!   dispatch of `run()` is covered by `tests/listener_mode.rs`); the
+//!   management surface (invite minting/redemption/registration) calls
+//!   `ServerCore`/`NetState` directly —— the out-of-process admin TCP
+//!   endpoint path is covered by `tests/smoke.rs` via the in-container CLI.
+//! - [`CtrlClient`]: the control-flow client driver (the first yamux
+//!   stream, postcard frames) —— OPAQUE registration/login (anchor
+//!   verification)/key-bind (device signature)/SR-SIG1/DirPull wrapped step
+//!   by step; tests assert intermediate products as needed.
 
 #![allow(dead_code)]
 
@@ -35,7 +41,7 @@ pub fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
 }
 
-/// 已连上隧道的控制流客户端。
+/// A control-flow client already connected to a tunnel.
 pub struct CtrlClient {
     pub tunnel: Tunnel,
     stream: flock_protocol::mux::Stream,
@@ -92,8 +98,10 @@ impl CtrlClient {
         .unwrap()
     }
 
-    /// OPAQUE 登录（anchor：客户端以钉扎身份验服务端签名）。
-    /// 成功返回 (票据, bind_token)；业务错误以字符串携带（负路径断言用）。
+    /// OPAQUE login (anchor: the client verifies the server's signature
+    /// against the pinned identity). Success returns (ticket, bind_token);
+    /// business errors are carried as strings (for negative-path
+    /// assertions).
     pub async fn login_anchored(
         &mut self,
         user: &str,
@@ -142,7 +150,8 @@ impl CtrlClient {
         }
     }
 
-    /// key-bind：登记设备 B 静态公钥 + 用户 SR-SIG1 公钥（设备签名 = 占有证明）。
+    /// key-bind: register device B's static public keys + the user's
+    /// SR-SIG1 public key (the device signature = proof of possession).
     pub async fn key_bind(
         &mut self,
         ticket: &TicketWire,
@@ -175,7 +184,8 @@ impl CtrlClient {
         .unwrap()
     }
 
-    /// SR-SIG1 授权头构造（canonical 七字段，§1.3.2 线上格式不变）。
+    /// SR-SIG1 authorization-header construction (the canonical seven
+    /// fields, §1.3.2 wire format unchanged).
     pub fn sr_auth(
         user: &str,
         key: &UserKey,
@@ -263,7 +273,8 @@ impl CtrlClient {
     }
 }
 
-/// 已钉扎 1-RTT 连接（邀请文件或钉扎目录条目）。
+/// An already-pinned 1-RTT connection (an invite file or a pinned directory
+/// entry).
 pub async fn connect(device: &DeviceStaticKeys, pin: &ServerPin) -> Tunnel {
     let io = tokio::net::TcpStream::connect(&pin.entry.relay_endpoint)
         .await
@@ -273,7 +284,8 @@ pub async fn connect(device: &DeviceStaticKeys, pin: &ServerPin) -> Tunnel {
         .expect("1-RTT initiate")
 }
 
-/// 由邀请文件构造目标端点 pin（idx = 目录条目序号）。
+/// Build the target endpoint pin from an invite file (idx = the directory
+/// entry index).
 pub fn pin_from_invite(invite: &InviteFile, idx: usize) -> ServerPin {
     ServerPin {
         cluster_id: invite.directory.cluster_id,
@@ -282,7 +294,8 @@ pub fn pin_from_invite(invite: &InviteFile, idx: usize) -> ServerPin {
     }
 }
 
-/// 由根签目录 + 钉扎根公钥构造目标端点 pin（dir_pull 之后的换端点路径）。
+/// Build the target endpoint pin from a root-signed directory + the pinned
+/// root public key (the endpoint-switching path after dir_pull).
 pub fn pin_with_root(
     dir: &ClusterDirectory,
     idx: usize,
@@ -296,7 +309,7 @@ pub fn pin_with_root(
 }
 
 // ============================================================================
-// TestServer（in-process 双端点）
+// TestServer (in-process, dual endpoints)
 // ============================================================================
 
 pub struct TestServer {
@@ -308,11 +321,13 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    /// `ticket_ttl_secs` 注入（过期票据路径验收用小 TTL；正式缺省 60 = §2.2 硬顶）。
+    /// `ticket_ttl_secs` injected (a small TTL for exercising the
+    /// expired-ticket path; the formal default 60 = the §2.2 hard cap).
     pub async fn start(ticket_ttl_secs: u64) -> TestServer {
         let dir = tempfile::tempdir().expect("tmp");
         let state_dir = dir.path().to_path_buf();
-        // 保持 tempdir 存活至进程结束（泄露目录优于早拆状态库）。
+        // Keep the tempdir alive until process end (leaking the directory
+        // beats tearing down the state store early).
         std::mem::forget(dir);
         let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -340,7 +355,7 @@ impl TestServer {
             },
         };
         let (core, created) = ServerCore::open_or_init(cfg).expect("core");
-        assert!(created, "全新状态库");
+        assert!(created, "a fresh state store");
         let tasks = vec![
             tokio::spawn(core.clone().serve_listener(l1)),
             tokio::spawn(core.clone().serve_listener(l2)),
@@ -354,12 +369,14 @@ impl TestServer {
         }
     }
 
-    /// 管理面签发邀请（单服形态：根密钥在库）。
+    /// Management-surface invite minting (single-server form: the root key
+    /// is in-store).
     pub async fn mint_invite(&self, ttl_secs: u64) -> Vec<u8> {
         self.core.mint_invite(ttl_secs).await.expect("mint")
     }
 
-    /// 管理面注册设备（TOFU 流程的服务器侧预置）。
+    /// Management-surface device registration (the server-side
+    /// pre-provisioning of the TOFU flow).
     pub async fn device_add(&self, user: &str, device: &DeviceStaticKeys) -> [u8; 4] {
         self.core
             .net
@@ -374,7 +391,8 @@ impl TestServer {
             .vip
     }
 
-    /// 管理面兑换邀请（开户：建用户/设备 + VIP）。
+    /// Management-surface invite redemption (account creation: user/device
+    /// + VIP).
     pub async fn redeem(&self, invite: &[u8], user: &str, device: &DeviceStaticKeys) -> [u8; 4] {
         self.core
             .net

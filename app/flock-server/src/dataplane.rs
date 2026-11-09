@@ -1,26 +1,39 @@
-//! 服务器侧数据面（docs/design.md §2.2/§3.11，M3「数据面打通」的服务端半边）。
+//! Server-side data plane (docs/design.md §2.2/§3.11, the server half of
+//! the M3 "data plane hookup").
 //!
-//! 服务端自身也是 peer：tun（VIP [`SERVER_VIP`] = 100.64.0.1，MTU 1280）+ 路由
-//! （`100.64.0.0/16` 指向 tun + rp_filter=1，与客户端同一 [`route`] 适配器）。
-//! 会话内分派：**首条 yamux 流 = 控制流**（M2 语义不变），余流按 [`PacketChannel`]
-//! 进数据面。每条包通道：
+//! The server itself is also a peer: tun (VIP [`SERVER_VIP`] = 100.64.0.1,
+//! MTU 1280) + routing (`100.64.0.0/16` pointing at the tun + rp_filter=1,
+//! the same [`route`] adapter as the client). In-session dispatch: **the
+//! first yamux stream = the control flow** (M2 semantics unchanged), the
+//! remaining streams enter the data plane as [`PacketChannel`]s. Each
+//! packet channel:
 //!
-//! 1. **第 0 步源 VIP 绑定校验**（§2.2/R22）：包源地址必须等于该会话设备的注册 VIP；
-//!    失配 ⇒ 丢包 + 计数（rp_filter 只作用于内核入向，用户态流必须应用层过滤）；
-//! 2. 经 tun 写泵注入内核（dst = 服务器 VIP 的包由本机协议栈应答——A2 ping 路径）；
-//! 3. 内核回程（tun 读泵）按目标 VIP 路由到对应会话的包通道（单服形态的租约表对应物；
-//!    跨服 ForwardEnvelope 转发面属 M4 `flock-sync`，§2.2 第 3 步）。
+//! 1. **step-0 source VIP binding check** (§2.2/R22): a packet's source
+//!    address must equal the session device's registered VIP; mismatch ⇒
+//!    drop + count (rp_filter only acts on kernel inbound; user-space
+//!    streams must filter at the application layer);
+//! 2. injected into the kernel via the tun write pump (packets with dst =
+//!    the server VIP are answered by the local stack —— the A2 ping path);
+//! 3. kernel return path (the tun read pump) routed by destination VIP to
+//!    the corresponding session's packet channel (the single-server
+//!    counterpart of the lease table; the cross-server ForwardEnvelope
+//!    forwarding surface belongs to M4 `flock-sync`, §2.2 step 3).
 //!
-//! 无 tun 环境（宿主单测、无 NET_ADMIN 的部署）：[`PeerRouter::open`] 记日志并降级
-//! 「控制流-only」——包通道优雅 FIN，客户端观察通道 EOF（M2 行为保持）。
+//! Environments without tun (host unit tests, deployments without
+//! NET_ADMIN): [`PeerRouter::open`] logs and degrades to
+//! "control-flow-only" —— packet channels FIN gracefully, the client
+//! observes channel EOF (M2 behavior preserved).
 //!
-//! # 取消安全与会话登记（关键不变量）
+//! # Cancellation safety and session registration (key invariant)
 //!
-//! - 入站帧化同客户端契约（见 `flock_client::dataplane` 模块文档）：select! 内
-//!   直接 await 帧化 recv 会丢帧——本侧以 `poll_fn` + 单次 `poll_read` + 持久
-//!   [`FrameBuf`] 驱动；
-//! - 同 VIP 重注册（设备重连，§2.4 漫游模型）：[`SessionIndex`] 以**代际**守卫——
-//!   旧会话退出只注销自己的登记，不得删除新会话的（否则该设备下行黑洞）。
+//! - Inbound framing follows the client contract (see the
+//!   `flock_client::dataplane` module docs): awaiting the framing recv
+//!   directly inside select! loses frames —— this side drives with
+//!   `poll_fn` + a single `poll_read` + a persistent [`FrameBuf`];
+//! - Re-registration of the same VIP (device reconnect, the §2.4 roaming
+//!   model): [`SessionIndex`] guards with **generations** —— an old
+//!   session's exit unregisters only its own registration and must never
+//!   delete the new session's (otherwise the device's downlink blackholes).
 
 use std::net::Ipv4Addr;
 use std::pin::pin;
@@ -39,31 +52,45 @@ use flock_client::tun::TunIo;
 #[cfg(target_os = "linux")]
 use flock_client::tun::TunSpec;
 
-/// 服务器自身 VIP（§2.2「服务端自身也是 peer，VIP 100.64.0.1」；netstate 分配从 .2 起）。
+/// The server's own VIP (§2.2 "the server itself is also a peer, VIP
+/// 100.64.0.1"; netstate allocation starts at .2).
 pub const SERVER_VIP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
 
-/// M7：单服形态流量计里「服务器自身」条目的键（设备条目以 VIP 4B 为键）。
+/// M7: the key of the "server itself" entry in the single-server traffic
+/// meter (device entries are keyed by the 4-byte VIP).
 pub const SERVER_TRAFFIC_KEY: &[u8] = b"flock-server-self";
 
-// 数据通道**不设**空闲超时（评审项 8 分层修正——M5 e2e 回归根因）。
+// Data channels set **no** idle timeout (the review-item 8 layered
+// correction —— the M5 e2e regression's root cause).
 //
-// 会话层 PING/PONG 走记录层（整条连接），不产生 yamux 流帧：一条健康但无业务流量
-// 的数据通道**必然**长期零帧。若在本层按「3×keepalive 无流帧」关闭通道，空闲客户端
-// 每 30s 被拆一次数据通道，而客户端把数据通道 EOF 视为会话终止（connector::supervise
-// 整链重连 + 端点轮换），引发「lease evicted (device moved)」风暴——e2e 实测 30 次
-// idle-close / 35 次驱逐，钉死端点拓扑全毁（A2/A6/A7/A10/A11/A14 连锁 FAIL）。
+// Session-layer PING/PONG travels on the record layer (the whole
+// connection), producing no yamux stream frames: a healthy data channel
+// with no business traffic **necessarily** stays at zero frames for long
+// stretches. If this layer closed channels on "3×keepalive without stream
+// frames", an idle client would have its data channel torn down every 30s,
+// and the client treats data-channel EOF as session termination
+// (connector::supervise reconnects the whole chain + endpoint rotation),
+// triggering a "lease evicted (device moved)" storm —— the e2e run measured
+// 30 idle-closes / 35 evictions, wrecking the pinned endpoint topology
+// (A2/A6/A7/A10/A11/A14 chained FAIL).
 //
-// 死链检测的所有权在正确的层：记录层 3×keepalive 无入站记录 ⇒ DeadLink 拆整条会话
-// （A9 语义，含 yamux 通道 FIN）；对端整机死机/NAT 过期由接受连接时设置的 TCP
-// keepalive（评审项 8）让内核报错拆链；半开握手由 respond 外包握手预算拦截。通道
-// 循环对这三条终止路径都经 EOF/错误自然退出，无需也不应再有第二把空闲刀。
+// Dead-link detection belongs to the correct layer: the record layer tears
+// the whole session on 3×keepalive without inbound records (A9 semantics,
+// including yamux channel FINs); a peer machine dying outright / NAT expiry
+// is handled by the TCP keepalive set at connection acceptance (review item
+// 8) letting the kernel error out the link; half-open handshakes are
+// intercepted by the respond-side handshake budget. The channel loop exits
+// naturally via EOF/error on all three termination paths —— a second idle
+// scythe is neither needed nor appropriate.
 
-/// 源 VIP 校验失配累计（断言/告警面；§2.2「丢包 + 计数」）。
+/// Cumulative source VIP validation mismatches (assertion/alert surface;
+/// §2.2 "drop + count").
 pub fn src_vip_mismatches() -> u64 {
     SRC_MISMATCH.load(Ordering::Relaxed)
 }
 
-/// 因 per-session 源 VIP 失配达限被拆的会话通道数（评审项 10 的 admin stats 面）。
+/// Session channels torn down for hitting the per-session source VIP
+/// mismatch limit (the review-item 10 admin stats surface).
 pub fn src_vip_mismatch_kills() -> u64 {
     SRC_MISMATCH_KILLS.load(Ordering::Relaxed)
 }
@@ -71,19 +98,23 @@ pub fn src_vip_mismatch_kills() -> u64 {
 static SRC_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static SRC_MISMATCH_KILLS: AtomicU64 = AtomicU64::new(0);
 
-/// per-session 源 VIP 失配上限（评审项 10）：达限即拆该会话通道（客户端观察通道
-/// EOF → 退避重连；持续伪造源的会话不再永久存活于「丢包+计数」的静默兜底）。
+/// Per-session source VIP mismatch cap (review item 10): reaching it tears
+/// down that session's channel (the client observes channel EOF →
+/// backoff-reconnects; a session persistently forging its source no longer
+/// lives forever under the silent "drop + count" backstop).
 const SRC_MISMATCH_SESSION_LIMIT: u32 = 100;
 
-/// 每会话源 VIP 失配计数器（serve_stream 内联使用；拆出便于上限语义单测）。
+/// Per-session source VIP mismatch counter (used inline in serve_stream;
+/// split out so the cap semantics are unit-testable).
 #[derive(Default)]
 struct SrcMismatchCounter {
     count: u32,
 }
 
 impl SrcMismatchCounter {
-    /// 记一次失配（全局计数同步累加）。返回 true ⇒ 达 [`SRC_MISMATCH_SESSION_LIMIT`]，
-    /// 调用方应拆会话通道。
+    /// Record one mismatch (the global counter accumulates in step). Returns
+    /// true ⇒ [`SRC_MISMATCH_SESSION_LIMIT`] reached; the caller should tear
+    /// down the session channel.
     fn on_mismatch(&mut self) -> bool {
         self.count += 1;
         SRC_MISMATCH.fetch_add(1, Ordering::Relaxed);
@@ -96,7 +127,8 @@ impl SrcMismatchCounter {
     }
 }
 
-/// IPv4 包源/目标地址（版本/IHL 校验后取 12..16 / 16..20）。非 IPv4/太短 ⇒ None。
+/// IPv4 packet source/destination addresses (taken from 12..16 / 16..20
+/// after version/IHL validation). Not IPv4 / too short ⇒ None.
 fn ipv4_src_dst(pkt: &[u8]) -> Option<([u8; 4], [u8; 4])> {
     if pkt.len() < 20 || pkt[0] >> 4 != 4 {
         return None;
@@ -106,13 +138,16 @@ fn ipv4_src_dst(pkt: &[u8]) -> Option<([u8; 4], [u8; 4])> {
     Some((src, dst))
 }
 
-/// 目标 VIP → 会话出站通道索引（**代际守卫**）。
+/// Destination VIP → session outbound channel index (**generation
+/// guard**).
 ///
-/// 同 VIP 重注册（设备断线重连）以 insert 覆盖旧通道——旧会话循环随其发送端被
-/// drop 而退出，退出时只允许注销**自己那一代**（[`SessionIndex::unregister`] 带
-/// 代次比对）：否则旧退出会把新会话的登记一并删除，该设备下行从此黑洞（直到
-/// 客户端再一次重连）。
-/// VIP →（出站通道，登记代次）。
+/// Re-registration of the same VIP (device disconnect-reconnect) overwrites
+/// the old channel via insert —— the old session loop exits as its sender is
+/// dropped, and on exit it may unregister **only its own generation**
+/// ([`SessionIndex::unregister`] compares the generation): otherwise the
+/// old exit would delete the new session's registration too, blackholing
+/// that device's downlink (until the client reconnects again).
+/// VIP → (outbound channel, registration generation).
 type SessionMap = std::collections::HashMap<[u8; 4], (mpsc::Sender<Vec<u8>>, u64)>;
 
 struct SessionIndex {
@@ -128,7 +163,8 @@ impl SessionIndex {
         }
     }
 
-    /// 登记（同 VIP 覆盖旧通道），返回本代代次（注销凭证）。
+    /// Register (same VIP overwrites the old channel), returning this
+    /// generation (the unregister credential).
     fn register(&self, vip: [u8; 4], tx: mpsc::Sender<Vec<u8>>) -> u64 {
         let gen = self.next_gen.fetch_add(1, Ordering::Relaxed) + 1;
         self.map
@@ -138,10 +174,13 @@ impl SessionIndex {
         gen
     }
 
-    /// 当前登记的出站通道（内核回程路由用）。调用面 = Linux 编译面的
-    /// `with_kernel_router_task` + 测试档（`outbound_sender`/SessionIndex 单测）——
-    /// 非 Linux 的非测试编译面无调用方，cfg 到位即免 allow（dead_code 按平台面
-    /// 独立分析，Windows 开发机看不到 Linux 调用点）。
+    /// The currently registered outbound channel (for kernel return-path
+    /// routing). Call surface = the Linux compilation face's
+    /// `with_kernel_router_task` + the test profile (`outbound_sender` /
+    /// SessionIndex unit tests) —— the non-Linux non-test compilation face
+    /// has no caller, and the cfg alone avoids needing allow (dead_code is
+    /// analyzed per platform face; a Windows dev machine never sees the
+    /// Linux call sites).
     #[cfg(any(test, target_os = "linux"))]
     fn get(&self, vip: &[u8; 4]) -> Option<mpsc::Sender<Vec<u8>>> {
         self.map
@@ -151,7 +190,9 @@ impl SessionIndex {
             .map(|(tx, _)| tx.clone())
     }
 
-    /// 注销**仅当**当前登记仍是 `gen` 这一代（同 VIP 已被新会话覆盖 ⇒ 不动新登记）。
+    /// Unregister **only if** the current registration is still generation
+    /// `gen` (the same VIP already overwritten by a new session ⇒ leave the
+    /// new registration alone).
     fn unregister(&self, vip: &[u8; 4], gen: u64) {
         let mut g = self.map.lock().expect("router poisoned");
         if g.get(vip).map(|(_, cur)| *cur == gen).unwrap_or(false) {
@@ -160,41 +201,54 @@ impl SessionIndex {
     }
 }
 
-/// 单服数据面路由器（VIP → 会话包通道）。
+/// The single-server data-plane router (VIP → session packet channel).
 pub struct PeerRouter {
-    /// TUN 设备句柄（**存活持有**：接口与路由随句柄存续——不被读取即其全部用途，
-    /// 纯 RAII 语义；Linux 真实装配路径写入 Some，非 Linux 降级路径恒 None，任何
-    /// 平台的编译面都不存在读取点）。allow(dead_code) 须无条件覆盖全部平台：
-    /// dead_code 恰在 Linux 编译面触发（有写入无读取），该 unix 编译面 Windows
-    /// 开发机不可见。
+    /// TUN device handle (**held alive**: the interface and routes live with
+    /// the handle —— never being read is its entire purpose, pure RAII
+    /// semantics; the real Linux assembly path writes Some, the non-Linux
+    /// degraded path is always None, and no platform's compilation face has
+    /// a read point). allow(dead_code) must cover all platforms
+    /// unconditionally: dead_code triggers precisely on the Linux
+    /// compilation face (written but never read), a unix face invisible to a
+    /// Windows dev machine.
     #[allow(dead_code)]
     tun: Option<Arc<TunIo>>,
-    /// 目标 VIP → 该会话出站通道（内核回程 → 对端；代际守卫见 [`SessionIndex`]）。
+    /// Destination VIP → that session's outbound channel (kernel return path
+    /// → peer; the generation guard is on [`SessionIndex`]).
     sessions: SessionIndex,
-    /// 内核注入通道（tun 写泵；无 tun ⇒ None = 控制流-only 降级）。
+    /// Kernel injection channel (the tun write pump; no tun ⇒ None =
+    /// control-flow-only degradation).
     kernel_tx: Option<mpsc::Sender<Vec<u8>>>,
-    /// M7：per-VIP 流量计（EWMA/last_seen——名册单服形态数据源；计数点同 §7-M7.3
-    /// 单点原则：入站（源校验通过）= 该设备 tx，出站下发 = 该设备 rx；dst = 服务器
-    /// VIP 的入站 = 服务器 rx，内核回程路由 = 服务器 tx）。
+    /// M7: per-VIP traffic meter (EWMA/last_seen —— the roster's
+    /// single-server data source; counting points per the §7-M7.3
+    /// single-point principle: inbound (source check passed) = that device's
+    /// tx, outbound delivery = that device's rx; inbound with dst = the
+    /// server VIP = server rx, kernel return-path routing = server tx).
     traffic: Mutex<Option<Arc<flock_sync::lease::TrafficMeter>>>,
-    /// 本机服务器 VIP（M7：入站 dst 判服务器 rx 用；测试装配缺省 None）。
+    /// This node's server VIP (M7: for deciding inbound-dst server rx; test
+    /// assembly defaults to None).
     server_vip: Option<Ipv4Addr>,
 }
 
 impl PeerRouter {
-    /// 打开 tun + 路由并装配路由器；任一步失败记日志并降级控制流-only
-    /// （M2 宿主测试/无 NET_ADMIN 部署路径）。async：路由配置走 rtnetlink/tokio。
+    /// Open the tun + routes and assemble the router; any step's failure
+    /// logs and degrades to control-flow-only (the M2 host-test /
+    /// no-NET_ADMIN deployment path). async: route configuration goes
+    /// through rtnetlink/tokio.
     ///
-    /// `vip` = 本机 tun VIP（单服缺省 [`SERVER_VIP`]；多主形态每台各配，§6.2）。
+    /// `vip` = this node's tun VIP (single-server default [`SERVER_VIP`];
+    /// in multi-primary form each node gets its own, §6.2).
     ///
-    /// 非 Linux 平台不装配真设备（Windows wintun 运行路径按 §7-M3 留待 M5 真机手工
-    /// 验证——宿主 `cargo test` 不得触碰宿主驱动；macOS 未验证同 §7-M3）。
+    /// Non-Linux platforms assemble no real device (the Windows wintun
+    /// runtime path is left for the M5 real-machine manual checklist per
+    /// §7-M3 —— host `cargo test` must never touch host drivers; macOS is
+    /// unverified, same §7-M3).
     pub async fn open(tun_name: &str, vip: Ipv4Addr) -> Arc<Self> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (tun_name, vip);
             eprintln!(
-                "flock-server: 数据面仅 Linux 装配（Windows 真机 M5 手工清单/macOS 未验证）——控制流-only 模式"
+                "flock-server: data plane assembles on Linux only (Windows real-machine M5 manual checklist / macOS unverified) - control-flow-only mode"
             );
             Self::none()
         }
@@ -224,12 +278,16 @@ impl PeerRouter {
         }
     }
 
-    /// 多主形态的 tun 装配（§2.2「服务端自身也是 peer」+ §6.2 M5 批次）：开 tun + 路由
-    /// 后**不**起单服内核路由任务——会话面由 flock-sync 转发面承担
-    /// （[`crate::sync::wire_local_peer`]：dst=自身 VIP 注入内核；内核回程读泵 →
-    /// `SyncNode::route_outbound`）。
+    /// The multi-primary form's tun assembly (§2.2 "the server itself is
+    /// also a peer" + the §6.2 M5 batch): opens the tun + routes but does
+    /// **not** start the single-server kernel routing task —— the session
+    /// surface is carried by the flock-sync forwarding plane
+    /// ([`crate::sync::wire_local_peer`]: dst = own VIP injected into the
+    /// kernel; the kernel return-path read pump →
+    /// `SyncNode::route_outbound`).
     ///
-    /// 返回 `(tun 句柄, 会话)`；失败 ⇒ None（控制流-only 降级，同单服语义）。
+    /// Returns `(tun handle, session)`; failure ⇒ None
+    /// (control-flow-only degradation, same semantics as single-server).
     pub async fn open_tun_session(
         tun_name: &str,
         vip: Ipv4Addr,
@@ -237,7 +295,7 @@ impl PeerRouter {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (tun_name, vip);
-            eprintln!("flock-server: 数据面仅 Linux 装配——多主形态控制流-only 模式");
+            eprintln!("flock-server: data plane assembles on Linux only - multi-primary form control-flow-only mode");
             None
         }
         #[cfg(target_os = "linux")]
@@ -252,7 +310,8 @@ impl PeerRouter {
         }
     }
 
-    /// M7：注入流量计（run() 装配期；serve_stream/内核路由任务据此计数）。
+    /// M7: inject the traffic meter (at run() assembly time;
+    /// serve_stream/kernel routing task count through it).
     pub fn set_traffic_meter(&self, meter: Arc<flock_sync::lease::TrafficMeter>) {
         *self.traffic.lock().expect("router traffic") = Some(meter);
     }
@@ -261,9 +320,11 @@ impl PeerRouter {
         self.traffic.lock().expect("router traffic").clone()
     }
 
-    /// 内核回程路由任务：tun 读泵产出 → 按目标 VIP 分发到会话出站通道
-    /// （无对应会话 ⇒ 丢弃——M4 前不做 ICMP unreachable/跨服转发，§2.2 容错策略）。
-    /// M7：内核回程 = 服务器自身 tx（计数点，§7-M7.3）。
+    /// Kernel return-path routing task: tun read-pump output → dispatched by
+    /// destination VIP to the session outbound channels (no matching session
+    /// ⇒ dropped —— no ICMP unreachable/cross-server forwarding before M4,
+    /// the §2.2 fault-tolerance strategy). M7: the kernel return path = the
+    /// server's own tx (counting point, §7-M7.3).
     #[cfg(target_os = "linux")]
     fn with_kernel_router_task(
         self: PeerRouter,
@@ -273,7 +334,9 @@ impl PeerRouter {
         let arc = Arc::new(self);
         let router = arc.clone();
         tokio::spawn(async move {
-            //（TunSession 整体移入：rx 供路由；tx 存续使写泵常驻——服务端数据面不拆。）
+            // (The TunSession moves in whole: rx for routing; tx's survival
+            // keeps the write pump resident —— the server data plane never
+            // tears down.)
             while let Some(pkt) = sess.rx.recv().await {
                 let Some((src, dst)) = ipv4_src_dst(&pkt) else {
                     continue;
@@ -291,7 +354,7 @@ impl PeerRouter {
         arc
     }
 
-    /// 显式无数据面（测试装配）。
+    /// Explicitly no data plane (test assembly).
     pub fn none() -> Arc<Self> {
         Arc::new(PeerRouter {
             tun: None,
@@ -302,7 +365,8 @@ impl PeerRouter {
         })
     }
 
-    /// 测试装配：注入内核通道（无真 tun；宿主集成测试驱动 serve_stream 用）。
+    /// Test assembly: inject a kernel channel (no real tun; drives
+    /// serve_stream in host integration tests).
     #[cfg(test)]
     pub(crate) fn with_kernel_tx(kernel_tx: mpsc::Sender<Vec<u8>>) -> Arc<Self> {
         Arc::new(PeerRouter {
@@ -314,30 +378,39 @@ impl PeerRouter {
         })
     }
 
-    /// 当前登记的出站通道（测试直驱用——非测试面内核回程走
-    /// [`SessionIndex::get`]（with_kernel_router_task 内联），本方法无生产调用方，
-    /// Linux 编译面曾以 cfg_attr allow 掩盖其 unused，实为纯测试档）。
+    /// The currently registered outbound channel (for direct test driving
+    /// —— on the non-test surface the kernel return path goes through
+    /// [`SessionIndex::get`] (inlined in with_kernel_router_task); this
+    /// method has no production caller, and the Linux compilation face once
+    /// masked its unused-ness with a cfg_attr allow —— in truth a pure test
+    /// profile).
     #[cfg(test)]
     fn outbound_sender(&self, vip: &[u8; 4]) -> Option<mpsc::Sender<Vec<u8>>> {
         self.sessions.get(vip)
     }
 
-    /// 数据面是否在位（部署诊断/断言）。
+    /// Whether the data plane is in place (deployment diagnostics/
+    /// assertions).
     pub fn is_up(&self) -> bool {
         self.kernel_tx.is_some()
     }
 
-    /// 会话包通道服务：登记出站通道（目标 VIP，代际守卫）+ 入站第 0 步源 VIP 校验
-    /// + 内核注入 + 出站回程下发。
+    /// Serve a session packet channel: register the outbound channel
+    /// (destination VIP, generation guard) + inbound step-0 source VIP
+    /// check + kernel injection + outbound return-path delivery.
     ///
-    /// 返回 = 通道结束（EOF/错误/内核通道拆/被新会话取代——同 VIP 重注册覆盖发送端
-    /// ⇒ 本侧 out_rx 收 None）。
+    /// Return = channel end (EOF/error/kernel channel torn down/superseded
+    /// by a new session —— same-VIP re-registration overwrites the sender ⇒
+    /// this side's out_rx receives None).
     ///
-    /// 取消安全结构见模块文档（入站 poll_fn + 单次 poll_read + 持久 FrameBuf 帧化，
-    /// 不用 select! 直接 await 帧化 recv；出站整帧写在分支体内完成）。
+    /// The cancellation-safety structure is in the module docs (inbound
+    /// poll_fn + single poll_read + persistent FrameBuf framing, no direct
+    /// await of the framing recv inside select!; outbound whole-frame writes
+    /// complete inside the branch bodies).
     pub async fn serve_stream(self: &Arc<Self>, vip: [u8; 4], stream: Stream) {
         let Some(kernel_tx) = self.kernel_tx.clone() else {
-            // 无数据面降级：优雅 FIN（客户端观察通道 EOF，控制流不受影响）。
+            // No data plane degraded: graceful FIN (the client observes
+            // channel EOF, the control flow is unaffected).
             let mut ch = PacketChannel::from_stream(stream);
             let _ = ch.finish().await;
             return;
@@ -349,12 +422,15 @@ impl PeerRouter {
         let mut frames = FrameBuf::new();
         let mut chunk = vec![0u8; READ_CHUNK];
         'tunnel: loop {
-            // 已缓冲完整帧：第 0 步源 VIP 校验（§2.2）→ 内核注入 / 失配丢+计数。
+            // Buffered complete frames: step-0 source VIP check (§2.2) →
+            // kernel injection / mismatch drop + count.
             while let Some(pkt) = frames.take_frame() {
                 match ipv4_src_dst(&pkt) {
                     Some((src, dst)) if src == vip => {
-                        // M7 计数点（§7-M7.3 单点原则）：入站收进 mesh = 该设备 tx；
-                        // dst = 服务器自身 VIP ⇒ 服务器 rx（本机单点计）。
+                        // M7 counting points (the §7-M7.3 single-point
+                        // principle): inbound entering the mesh = that
+                        // device's tx; dst = the server's own VIP ⇒ server rx
+                        // (the local single counting point).
                         if let Some(m) = self.traffic_of() {
                             m.note_tx(&vip, pkt.len() as u64);
                             if Some(dst) == self.server_vip.map(|v| v.octets()) {
@@ -362,16 +438,18 @@ impl PeerRouter {
                             }
                         }
                         if kernel_tx.send(pkt).await.is_err() {
-                            self.sessions.unregister(&vip, gen); // tun 写泵已拆
+                            self.sessions.unregister(&vip, gen); // the tun write pump is gone
                             return;
                         }
                     }
-                    // 失配/非 IPv4：丢包 + 计数（R22：不静默放行）。评审项 10：per-session
-                    // 失配计数 ≥100 即拆该会话通道（持续源伪造不再仅靠计数告警兜底）。
+                    // Mismatch/non-IPv4: drop + count (R22: no silent pass).
+                    // Review item 10: per-session mismatch count ≥100 tears
+                    // down that session's channel (persistent source forgery
+                    // no longer rides on counting alerts alone).
                     _ => {
                         if src_mismatch.on_mismatch() {
                             eprintln!(
-                                "flock-server: 源 VIP 失配 {} 次 ≥ {}——拆会话通道 vip={vip:?}",
+                                "flock-server: source VIP mismatch {} times >= {} - tearing down session channel vip={vip:?}",
                                 src_mismatch.count, SRC_MISMATCH_SESSION_LIMIT
                             );
                             break 'tunnel;
@@ -379,9 +457,12 @@ impl PeerRouter {
                     }
                 }
             }
-            // 单步等待（无跨 poll 状态：out_rx.poll_recv + 单次 poll_read）。不设空闲
-            // 超时——死链所有权在记录层 DeadLink/TCP keepalive（见 STREAM 注记块）；
-            // 空闲但健康的通道（无业务流量）必须长存，否则空闲客户端被周期性拆链。
+            // Single-step wait (no cross-poll state: out_rx.poll_recv + a
+            // single poll_read). No idle timeout —— dead-link ownership
+            // lives with the record-layer DeadLink/TCP keepalive (see the
+            // STREAM note block); an idle-but-healthy channel (no business
+            // traffic) must live forever, otherwise idle clients get
+            // periodically torn down.
             let step = std::future::poll_fn(|cx| {
                 match out_rx.poll_recv(cx) {
                     Poll::Ready(out) => return Poll::Ready(Step::Outbound(out)),
@@ -397,33 +478,39 @@ impl PeerRouter {
             .await;
             match step {
                 Step::Outbound(Some(pkt)) => {
-                    // M7 计数点：出站下发成功前计数（投递面——写失败即通道拆，该包
-                    // 未送达；EWMA 语义按「计入即发送」足够精确，失败路径罕见）。
+                    // M7 counting point: counted before successful outbound
+                    // delivery (the delivery surface —— a write failure means
+                    // the channel is torn down and the packet was not
+                    // delivered; for EWMA semantics "counted = sent" is
+                    // precise enough, the failure path being rare).
                     if let Some(m) = self.traffic_of() {
                         m.note_rx(&vip, pkt.len() as u64);
                     }
                     if send_packet(&mut stream, &pkt).await.is_err() {
-                        break; // 通道拆（客户端会话结束）
+                        break; // channel torn down (client session ended)
                     }
                 }
-                Step::Outbound(None) => break, // 被 newer 代覆盖（同 VIP 重注册）
+                Step::Outbound(None) => break, // overwritten by a newer generation (same-VIP re-registration)
                 Step::InBytes(n) => frames.extend(&chunk[..n]),
-                Step::InErr => break, // 通道 EOF/错误
+                Step::InErr => break, // channel EOF/error
                 Step::InEof => {
                     if frames.has_partial() {
-                        break; // 半帧截断违约，按通道错误收场
+                        break; // partial-frame truncation violation, end as a channel error
                     }
-                    break; // 对端 FIN：通道自然结束
+                    break; // peer FIN: the channel ends naturally
                 }
             }
         }
-        // 代际守卫注销：同 VIP 已被新会话覆盖时不删新登记（bug 修复点——此前无条件
-        // remove 会把新会话的出站通道一并删除，该设备下行黑洞）。
+        // Generation-guarded unregister: when the same VIP has already been
+        // overwritten by a new session, do not delete the new registration
+        // (the bug-fix point —— the previous unconditional remove deleted
+        // the new session's outbound channel too, blackholing that device's
+        // downlink).
         self.sessions.unregister(&vip, gen);
     }
 }
 
-/// poll_fn 单步产物（无跨 poll 状态）。
+/// The poll_fn single-step product (no cross-poll state).
 enum Step {
     Outbound(Option<Vec<u8>>),
     InBytes(usize),
@@ -431,8 +518,9 @@ enum Step {
     InEof,
 }
 
-/// Linux：开 tun + 配路由（`100.64.0.0/16 → tun + 本机 VIP + rp_filter=1`）。
-/// 失败记日志并返回 Err（调用方降级控制流-only）。
+/// Linux: open the tun + configure routes (`100.64.0.0/16 → tun + the
+/// local VIP + rp_filter=1`). Failure logs and returns Err (the caller
+/// degrades to control-flow-only).
 #[cfg(target_os = "linux")]
 async fn open_tun_with_route(tun_name: &str, vip: Ipv4Addr) -> Result<TunIo, ()> {
     let spec = TunSpec {
@@ -453,14 +541,16 @@ async fn open_tun_with_route(tun_name: &str, vip: Ipv4Addr) -> Result<TunIo, ()>
                     Ok(tun)
                 }
                 Err(e) => {
-                    eprintln!("flock-server: 路由配置失败（控制流-only 模式）: {e}");
+                    eprintln!(
+                        "flock-server: route configuration failed (control-flow-only mode): {e}"
+                    );
                     Err(())
                 }
             }
         }
         Err(e) => {
             eprintln!(
-                "flock-server: tun 打开失败（控制流-only 模式；容器需 --cap-add NET_ADMIN --device /dev/net/tun）: {e}"
+                "flock-server: tun open failed (control-flow-only mode; containers need --cap-add NET_ADMIN --device /dev/net/tun): {e}"
             );
             Err(())
         }
@@ -468,10 +558,12 @@ async fn open_tun_with_route(tun_name: &str, vip: Ipv4Addr) -> Result<TunIo, ()>
 }
 
 // ============================================================================
-// 多主转发面（feature `multi-primary`；§2.2 判定序 + §3.10 ForwardPlane）
+// Multi-primary forwarding plane (feature `multi-primary`; the §2.2
+// decision order + §3.10 ForwardPlane)
 // ============================================================================
 
-/// 本地会话投递 sink：ForwardPlane 的本机投递 → 会话出站通道（写泵下发到对端）。
+/// Local session delivery sink: the ForwardPlane's local delivery → the
+/// session outbound channel (written out to the peer by the pump).
 #[cfg(feature = "multi-primary")]
 struct ChannelSink(mpsc::Sender<Vec<u8>>);
 
@@ -487,14 +579,19 @@ impl flock_sync::PacketSink for ChannelSink {
     }
 }
 
-/// 多主形态的会话包通道服务（与 [`PeerRouter::serve_stream`] 同构的取消安全结构）。
+/// The multi-primary form's session packet channel service (the same
+/// cancellation-safe structure as [`PeerRouter::serve_stream`]).
 ///
-/// - 入站：帧化读出 → [`flock_sync::SyncNode::ingest_packet`]（内部完成 §2.2 判定序：
-///   **第 0 步源 VIP 绑定校验** → 租约定位 → 本机投递 / ForwardEnvelope 跨服转发 /
-///   NOT_HERE → 一次性 location_query → 仍失败丢包+尽力 ICMP）；
-/// - 出站：ForwardPlane 本机投递（sink → out_rx）→ 整帧下发；
-/// - 生命周期：attach/detach_session（租约域登记）+ 代际语义由 ForwardPlane 的
-///   sessions 表承担（同设备新流覆盖旧 sink）。
+/// - Inbound: framing read out →
+///   [`flock_sync::SyncNode::ingest_packet`] (completes the §2.2 decision
+///   order internally: **step-0 source VIP binding check** → lease location
+///   → local delivery / ForwardEnvelope cross-server forwarding / NOT_HERE
+///   → one-shot location_query → still failing, drop + best-effort ICMP);
+/// - Outbound: the ForwardPlane's local delivery (sink → out_rx) →
+///   whole-frame delivery;
+/// - Lifecycle: attach/detach_session (lease-domain registration) + the
+///   generation semantics carried by the ForwardPlane's sessions table (a
+///   new stream for the same device overwrites the old sink).
 #[cfg(feature = "multi-primary")]
 pub async fn serve_stream_sync(node: Arc<flock_sync::SyncNode>, device: [u8; 32], stream: Stream) {
     let mut stream = stream;
@@ -503,12 +600,15 @@ pub async fn serve_stream_sync(node: Arc<flock_sync::SyncNode>, device: [u8; 32]
     let mut frames = FrameBuf::new();
     let mut chunk = vec![0u8; READ_CHUNK];
     loop {
-        // 已缓冲完整帧 → 转发面（判定序在 ForwardPlane::ingest 内）。
+        // Buffered complete frames → the forwarding plane (the decision
+        // order is inside ForwardPlane::ingest).
         while let Some(pkt) = frames.take_frame() {
             let _ = node.ingest_packet(&device, &pkt).await;
         }
-        // 单步等待（无跨 poll 状态）。不设空闲超时——死链所有权在记录层 DeadLink/
-        // TCP keepalive（见 STREAM 注记块）；空闲但健康的通道必须长存（同 serve_stream）。
+        // Single-step wait (no cross-poll state). No idle timeout ——
+        // dead-link ownership lives with the record-layer DeadLink/TCP
+        // keepalive (see the STREAM note block); an idle-but-healthy channel
+        // must live forever (same as serve_stream).
         let step = std::future::poll_fn(|cx| {
             match out_rx.poll_recv(cx) {
                 Poll::Ready(out) => return Poll::Ready(Step::Outbound(out)),
@@ -538,17 +638,22 @@ pub async fn serve_stream_sync(node: Arc<flock_sync::SyncNode>, device: [u8; 32]
 }
 
 // ============================================================================
-// 单元测试（宿主：纯函数面；tun/路由真路径由 deploy/m3_assert.sh 容器实跑）
+// Unit tests (host: the pure-function surface; the real tun/route paths are
+// exercised in containers by deploy/m3_assert.sh)
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// SRC_MISMATCH/SRC_MISMATCH_KILLS 是进程级静态——触达它们的服务端 e2e 测试
-    /// 间以此锁串行（否则并行测试互踩彼此的精确计数断言）。tokio Mutex（LazyLock
-    /// 物化——new 非 const）：异步测试持锁跨 await 点（测试全程互斥；std Mutex
-    /// 跨 await 持有属 clippy 禁形），同步单元测试经 try_lock/阻塞获取同锁串行。
+    /// SRC_MISMATCH/SRC_MISMATCH_KILLS are process-level statics —— the
+    /// server e2e tests that touch them serialize through this lock
+    /// (otherwise parallel tests trample each other's exact-count
+    /// assertions). tokio Mutex (LazyLock materialization —— new is not
+    /// const): async tests hold the lock across await points (mutual
+    /// exclusion for the whole test; holding a std Mutex across an await is
+    /// a clippy-forbidden shape), synchronous unit tests serialize through
+    /// try_lock/blocking acquisition of the same lock.
     static MISMATCH_COUNTER_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -561,20 +666,23 @@ mod tests {
         let (src, dst) = ipv4_src_dst(&pkt).unwrap();
         assert_eq!(src, [100, 64, 0, 2]);
         assert_eq!(dst, [100, 64, 0, 1]);
-        assert!(ipv4_src_dst(&pkt[..19]).is_none(), "太短 ⇒ None");
-        pkt[0] = 0x65; // 版本 6
-        assert!(ipv4_src_dst(&pkt).is_none(), "非 IPv4 ⇒ None");
+        assert!(ipv4_src_dst(&pkt[..19]).is_none(), "too short ⇒ None");
+        pkt[0] = 0x65; // version 6
+        assert!(ipv4_src_dst(&pkt).is_none(), "not IPv4 ⇒ None");
     }
 
     #[test]
     fn none_router_reports_down() {
-        // 降级路径标志位（FIN 语义的端到端行为由 m3 容器反向覆盖：有 tun ⇒ is_up）。
+        // Degraded-path flag (the end-to-end behavior of the FIN semantics
+        // is reverse-covered by the m3 container: with tun ⇒ is_up).
         let router = PeerRouter::none();
         assert!(!router.is_up());
     }
 
-    /// 评审项 10：per-session 源 VIP 失配上限——前 99 次仅丢包+全局计数，第
-    /// [`SRC_MISMATCH_SESSION_LIMIT`] 次返回拆链信号并累计 kills。
+    /// Review item 10: the per-session source VIP mismatch cap —— the first
+    /// 99 occurrences only drop + count globally; the
+    /// [`SRC_MISMATCH_SESSION_LIMIT`]th returns the teardown signal and
+    /// accumulates kills.
     #[test]
     fn src_mismatch_counter_kills_at_limit() {
         let _g = futures::executor::block_on(MISMATCH_COUNTER_LOCK.lock());
@@ -582,24 +690,31 @@ mod tests {
         let kills_before = src_vip_mismatch_kills();
         let mut c = SrcMismatchCounter::default();
         for i in 1..SRC_MISMATCH_SESSION_LIMIT {
-            assert!(!c.on_mismatch(), "第 {i} 次不拆");
+            assert!(!c.on_mismatch(), "occurrence {i} does not tear down");
         }
-        assert_eq!(src_vip_mismatch_kills(), kills_before, "未达限不计数拆链");
+        assert_eq!(
+            src_vip_mismatch_kills(),
+            kills_before,
+            "no kill counted before the limit"
+        );
         assert!(
             c.on_mismatch(),
-            "第 {} 次达限 ⇒ 拆",
+            "occurrence {} reaches the limit ⇒ tear down",
             SRC_MISMATCH_SESSION_LIMIT
         );
         assert_eq!(
             src_vip_mismatches(),
             mism_before + SRC_MISMATCH_SESSION_LIMIT as u64,
-            "全局失配计数逐次累加"
+            "the global mismatch count accumulates per occurrence"
         );
-        assert_eq!(src_vip_mismatch_kills(), kills_before + 1, "拆链计数 +1");
+        assert_eq!(src_vip_mismatch_kills(), kills_before + 1, "kill count +1");
     }
 
-    /// 回归（bug：serve_stream 退出无条件 remove）：同 VIP 重注册后，旧代会话退出
-    /// 只注销自己——新登记必须存活（否则该设备下行黑洞到下一次重连）。
+    /// Regression (bug: serve_stream exit did an unconditional remove):
+    /// after same-VIP re-registration, the old generation's exit
+    /// unregisters only itself —— the new registration must survive
+    /// (otherwise that device's downlink blackholes until the next
+    /// reconnect).
     #[test]
     fn session_index_old_generation_exit_keeps_new_registration() {
         let idx = SessionIndex::new();
@@ -607,20 +722,24 @@ mod tests {
         let (tx_a, rx_a) = mpsc::channel::<Vec<u8>>(4);
         let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(4);
         let gen_a = idx.register(vip, tx_a);
-        let gen_b = idx.register(vip, tx_b); // 设备重连：覆盖 A 的发送端
+        let gen_b = idx.register(vip, tx_b); // device reconnect: overwrites A's sender
         assert_ne!(gen_a, gen_b);
         assert_eq!(
             idx.map.lock().unwrap().len(),
             1,
-            "同 VIP 单登记（新覆盖旧）"
+            "a single registration per VIP (new overwrites old)"
         );
-        // A 的发送端被覆盖 ⇒ drop ⇒ A 的 out_rx 将观察到 None（旧循环退出路径）。
-        drop(rx_a); //（接收端随旧会话任务结束）
-                    // 旧代注销：不得删除 B 的登记。
+        // A's sender overwritten ⇒ dropped ⇒ A's out_rx will observe None
+        // (the old loop's exit path).
+        drop(rx_a); // (the receiving end goes with the old session task's end)
+                    // Old-generation unregister: must not delete B's registration.
         idx.unregister(&vip, gen_a);
-        assert!(idx.get(&vip).is_some(), "旧代退出不得删除新登记");
-        // 新代通道可用。
-        let cur = idx.get(&vip).expect("B 在册");
+        assert!(
+            idx.get(&vip).is_some(),
+            "an old generation's exit must not delete the new registration"
+        );
+        // The new generation's channel works.
+        let cur = idx.get(&vip).expect("B registered");
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -628,17 +747,22 @@ mod tests {
             cur.send(vec![1, 2, 3]).await.unwrap();
             assert_eq!(rx_b.recv().await.unwrap(), vec![1, 2, 3]);
         });
-        // 新代注销后清空。
+        // Cleared after the new generation unregisters.
         idx.unregister(&vip, gen_b);
         assert!(idx.get(&vip).is_none());
         assert_eq!(idx.map.lock().unwrap().len(), 0);
     }
 
-    /// serve_stream 端到端（宿主，真会话/记录层/复用器 + 注入内核通道）：
-    /// ① 入站：合法 src VIP 包进内核、失配包丢+计数（§2.2 第 0 步）；
-    /// ② 出站：内核回程 → 包通道下发；
-    /// ③ 重注册竞态（回归 bug：退出无条件 remove）：同 VIP 新流接管后，旧流退出
-    ///    不得删除新登记——新流下行必须照常（旧代码下该设备下行黑洞）。
+    /// serve_stream end-to-end (host, real session/record layer/muxer +
+    /// injected kernel channel):
+    /// ① inbound: packets with a legal src VIP enter the kernel, mismatched
+    ///    packets are dropped + counted (§2.2 step 0);
+    /// ② outbound: kernel return path → packet-channel delivery;
+    /// ③ re-registration race (regression bug: unconditional remove on
+    ///    exit): after a new stream takes over the same VIP, the old
+    ///    stream's exit must not delete the new registration —— the new
+    ///    stream's downlink must work as usual (under the old code that
+    ///    device's downlink blackholed).
     #[tokio::test]
     async fn serve_stream_inbound_check_outbound_and_reregistration_race() {
         let _g = MISMATCH_COUNTER_LOCK.lock().await;
@@ -649,7 +773,8 @@ mod tests {
         use flock_protocol::trust::ClusterDirectory;
         use std::time::Duration;
 
-        // respond 侧材料 + 已注册设备（与客户端测试 harness 同构）。
+        // Respond-side material + a registered device (isomorphic to the
+        // client test harness).
         let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
         let identity = ServerIdentity::enroll(&root, ClusterId([7; 16]), ServerId([1; 16]), "t:1");
         let directory =
@@ -696,7 +821,8 @@ mod tests {
         };
         let mism_before = src_vip_mismatches();
 
-        // 控制占位 + 通道 1（惰性 SYN：首数据帧触发服务端 accept 产出流）。
+        // Control placeholder + channel 1 (lazy SYN: the first data frame
+        // triggers the server accept producing the stream).
         let _hold = tunnel
             .open_stream(flock_protocol::mux::Prio::Control)
             .await
@@ -709,31 +835,44 @@ mod tests {
             .unwrap();
         let r1 = router.clone();
         let t1 = tokio::spawn(async move { r1.serve_stream(vip, s1).await });
-        // ① 合法 src VIP ⇒ 进内核。
+        // ① Legal src VIP ⇒ enters the kernel.
         let got = tokio::time::timeout(Duration::from_secs(5), kernel_rx.recv())
             .await
             .expect("kernel recv")
             .unwrap();
-        assert_eq!(got, ip_pkt(vip, 1), "合法 src VIP 包注入内核");
-        // ① 失配 src ⇒ 丢 + 计数（不进内核）。
+        assert_eq!(
+            got,
+            ip_pkt(vip, 1),
+            "a legal-src-VIP packet is injected into the kernel"
+        );
+        // ① Mismatched src ⇒ dropped + counted (never enters the kernel).
         ch1.send(&ip_pkt([9, 9, 9, 9], 2)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(src_vip_mismatches(), mism_before + 1, "失配包丢+计数");
-        assert!(kernel_rx.try_recv().is_err(), "失配包不进内核");
-        // ② 出站：当前登记（代 1）下发。
+        assert_eq!(
+            src_vip_mismatches(),
+            mism_before + 1,
+            "mismatched packet dropped + counted"
+        );
+        assert!(
+            kernel_rx.try_recv().is_err(),
+            "mismatched packets never enter the kernel"
+        );
+        // ② Outbound: the current registration (generation 1) delivers.
         router
             .outbound_sender(&vip)
-            .expect("登记存在")
+            .expect("registration exists")
             .send(ip_pkt(vip, 3))
             .await
             .unwrap();
         let down = tokio::time::timeout(Duration::from_secs(5), ch1.recv())
             .await
-            .expect("ch1 下行")
+            .expect("ch1 downlink")
             .unwrap();
         assert_eq!(down, ip_pkt(vip, 3));
 
-        // ③ 同 VIP 重注册：通道 2 接管（覆盖代 1 发送端 ⇒ t1 退出并注销旧代）。
+        // ③ Same-VIP re-registration: channel 2 takes over (overwrites
+        // generation 1's sender ⇒ t1 exits and unregisters the old
+        // generation).
         let mut ch2 = tunnel.open_packet_channel().await.unwrap();
         ch2.send(&ip_pkt(vip, 4)).await.unwrap();
         let s2 = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
@@ -746,17 +885,24 @@ mod tests {
             .await
             .expect("kernel recv ch2")
             .unwrap();
-        assert_eq!(got, ip_pkt(vip, 4), "新通道入站照常");
-        // 等 t1 退出（其发送端被覆盖 → out_rx None → unregister(旧代)）。
+        assert_eq!(
+            got,
+            ip_pkt(vip, 4),
+            "the new channel's inbound works as usual"
+        );
+        // Wait for t1's exit (its sender overwritten → out_rx None →
+        // unregister(old generation)).
         let _ = tokio::time::timeout(Duration::from_secs(5), t1).await;
-        // 关键断言：新登记未被旧退出删除；新通道下行照常（旧代码在此黑洞）。
+        // Key assertion: the new registration was not deleted by the old
+        // exit; the new channel's downlink works as usual (the old code
+        // blackholed here).
         let sender2 = router
             .outbound_sender(&vip)
-            .expect("新登记存活（旧退出不得删除）");
+            .expect("the new registration survives (the old exit must not delete it)");
         sender2.send(ip_pkt(vip, 5)).await.unwrap();
         let down2 = tokio::time::timeout(Duration::from_secs(5), ch2.recv())
             .await
-            .expect("ch2 下行（重注册后不被黑洞）")
+            .expect("ch2 downlink (not blackholed after re-registration)")
             .unwrap();
         assert_eq!(down2, ip_pkt(vip, 5));
 
@@ -764,8 +910,11 @@ mod tests {
         drop(srv);
     }
 
-    /// 评审项 10：per-session 源 VIP 失配达限（100）⇒ 拆会话通道（客户端观察通道
-    /// EOF）+ kills 计数递增——持续伪造源的会话不再永久存活于「丢包+计数」兜底。
+    /// Review item 10: per-session source VIP mismatches reaching the limit
+    /// (100) ⇒ the session channel is torn down (the client observes channel
+    /// EOF) + the kills counter increments —— a session persistently forging
+    /// its source no longer lives forever under the "drop + count"
+    /// backstop.
     #[tokio::test]
     async fn serve_stream_killed_after_100_src_vip_mismatches() {
         let _g = MISMATCH_COUNTER_LOCK.lock().await;
@@ -813,8 +962,9 @@ mod tests {
         let vip = [100u8, 64, 0, 2];
         let kills_before = src_vip_mismatch_kills();
 
-        // 控制占位 + 数据通道物化（惰性 SYN：首帧触发服务端 accept）。物化用**合法**
-        // src VIP 包（不进失配计数）。
+        // Control placeholder + data channel materialization (lazy SYN: the
+        // first frame triggers the server accept). Materialized with a
+        // **legal** src VIP packet (entering no mismatch count).
         let _hold = tunnel
             .open_stream(flock_protocol::mux::Prio::Control)
             .await
@@ -835,27 +985,34 @@ mod tests {
         let r = router.clone();
         let task = tokio::spawn(async move { r.serve_stream(vip, s).await });
 
-        // 连发 100 个失配包：第 100 个达限 ⇒ 服务端拆通道（客户端 recv 观察 EOF/错误；
-        // 拆链后残余 send 报 WriteZero 即停止发送——拆链本身即是目标）。
+        // Send 100 mismatched packets in a row: the 100th reaches the limit
+        // ⇒ the server tears down the channel (the client's recv observes
+        // EOF/error; after teardown the residual sends report WriteZero and
+        // stop —— the teardown itself is the goal).
         let bad = ip_pkt([9, 9, 9, 9], 2);
         for _ in 0..SRC_MISMATCH_SESSION_LIMIT {
             if ch.send(&bad).await.is_err() {
-                break; // 通道已被服务端拆除（早于发满 100 个——计数在服务端侧已先行）
+                break; // the channel was already torn down by the server
+                       // (before all 100 were sent —— the count had already
+                       // raced ahead on the server side)
             }
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let closed = tokio::time::timeout_at(deadline.into(), async {
             loop {
                 if ch.recv().await.is_err() {
-                    break true; // 通道关闭（EOF/错误）= 服务端拆链的客户端观察
+                    break true; // channel closed (EOF/error) = the client's observation of the server-side teardown
                 }
             }
         })
         .await
         .unwrap_or(false);
-        assert!(closed, "失配达限后客户端通道必须观察到关闭");
+        assert!(
+            closed,
+            "the client channel must observe closure after the mismatch limit"
+        );
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-        assert_eq!(src_vip_mismatch_kills(), kills_before + 1, "拆链计数 +1");
+        assert_eq!(src_vip_mismatch_kills(), kills_before + 1, "kill count +1");
         drop(srv);
     }
 }

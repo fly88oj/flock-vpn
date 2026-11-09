@@ -1,30 +1,36 @@
 /* ============================================================================
-   Flock Web UI 设计系统（§M8.6：自写深色主题，现代 SaaS Dashboard 的克制感）
+   Flock Web UI design system (§M8.6: hand-written dark theme, the restraint
+   of a modern SaaS dashboard)
    ----------------------------------------------------------------------------
-   断点系统（三档全功能——任何视口无横向滚动、无功能缺失）：
-     桌面   ≥1200px  固定侧栏 + 12 列自适应网格 + 完整数据表
-     平板   768–1199px 顶栏+汉堡抽屉导航；2 列卡片网格；紧凑表格（低优先列收起）
-     手机   <768px    抽屉导航；单列卡片；数据表降级为卡片列表
-              （VIP/状态/操作完整保留——data-label 展开行）
-   触控目标：pointer:coarse 与 <768px 下交互件 ≥44px。
-   零 webfont：系统字体栈。
+   Breakpoint system (three tiers, full functionality —— no horizontal
+   scrolling and no feature loss at any viewport):
+     Desktop  ≥1200px   fixed sidebar + 12-column adaptive grid + full tables
+     Tablet   768–1199px topbar + hamburger drawer nav; 2-column card grid;
+               compact tables (low-priority columns collapsed)
+     Mobile   <768px     drawer nav; single-column cards; data tables degrade
+               to card lists (VIP/status/actions fully retained —— rows
+               expanded via data-label)
+   Touch targets: interactive elements ≥44px under pointer:coarse and <768px.
+   Zero webfonts: system font stack.
    ========================================================================== */
 
 /* —— Design tokens —— */
 :root {
   color-scheme: dark;
 
-  /* 色板（深色） */
+  /* Palette (dark) */
   --bg: #0b0e14;
   --surface: #12161f;
   --surface-2: #171c28;
   --surface-3: #1d2332;
-  /* 卡片边框/行分隔线提一档（🟡 UI 评审项 16：#303747 ≈ 4% 白） */
+  /* Card borders / row separators one tier brighter (UI review item 16:
+     #303747 ≈ 4% white) */
   --border: #303747;
   --border-strong: #3a4356;
   --fg: #e8ecf4;
   --muted: #8a94a8;
-  /* L4 辅助文字可读性下限（🟡 UI 评审项 16）：#8a93a1 档（配 ≥12px 字号） */
+  /* Readability floor for L4 auxiliary text (UI review item 16): #8a93a1 tier
+     (paired with ≥12px font size) */
   --faint: #8a93a1;
   --accent: #4f8cff;
   --accent-hover: #6ba1ff;
@@ -37,42 +43,45 @@
   --danger-dim: rgba(224, 86, 91, 0.14);
   --info: #58a6c9;
 
-  /* 间距（4px 阶） */
+  /* Spacing (4px scale) */
   --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
   --sp-5: 20px; --sp-6: 24px; --sp-8: 32px; --sp-10: 40px;
 
-  /* 圆角 */
+  /* Radii */
   --r-sm: 6px; --r-md: 10px; --r-lg: 14px; --r-full: 999px;
 
-  /* 阴影 */
+  /* Shadows */
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35), 0 2px 8px rgba(0, 0, 0, 0.22);
   --shadow-2: 0 8px 32px rgba(0, 0, 0, 0.55);
-  /* 遮罩浓度单点 token（🟡 UI 评审项 14：模态/抽屉 scrim 统一） */
+  /* Single-point scrim opacity token (UI review item 14: unified modal/drawer
+     scrim) */
   --overlay: rgba(4, 6, 10, 0.68);
 
-  /* 字号阶 */
+  /* Font-size scale */
   --fs-xs: 12px; --fs-sm: 13px; --fs-md: 14px; --fs-lg: 16px;
   --fs-xl: 20px; --fs-2xl: 26px;
 
-  /* 布局 */
+  /* Layout */
   --sidebar-w: 232px;
   --topbar-h: 56px;
-  /* 内容区水平 padding（页头标题与卡片左缘共用同一变量——🟡 UI 评审项 8） */
+  /* Content-area horizontal padding (page-head titles and card left edges
+     share the variable —— UI review item 8) */
   --pad-content: var(--sp-6);
 
-  /* 品牌渐变（🟡 UI 评审项 9：与 accent 蓝系统一——单点定义，去紫） */
+  /* Brand gradient (UI review item 9: unified with the accent-blue system ——
+     single-point definition, purple removed) */
   --brand-grad: linear-gradient(135deg, #3f74e0, #6ba1ff);
 
-  /* 系统字体栈（零 webfont） */
+  /* System font stack (zero webfonts) */
   --font: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
           "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, Menlo, monospace;
 }
 
-/* —— 基础 —— */
+/* —— Base —— */
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
-html, body { max-width: 100%; overflow-x: clip; } /* 任何视口无横向滚动 */
+html, body { max-width: 100%; overflow-x: clip; } /* no horizontal scrolling at any viewport */
 body {
   margin: 0;
   background: var(--bg);
@@ -89,7 +98,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 ::selection { background: var(--accent-dim); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 
-/* —— 按钮 —— */
+/* —— Buttons —— */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: var(--sp-2);
   min-height: 36px; padding: 6px 14px;
@@ -112,26 +121,29 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .btn-success:hover { background: var(--success-dim); }
 .btn-ghost { background: transparent; color: var(--muted); }
 .btn-ghost:hover { background: var(--surface-2); color: var(--fg); }
-/* 描边中性按钮（页头「刷新」等——按钮化而非文字链，🟡 UI 评审项 3）。
-   刷新按钮三档统一（round2 评审项 3）：一律 .btn 基准（桌面/平板 36px、
-   手机档 44px 触控规则）——不再桌面 30px / 手机 44px 参差。 */
+/* Outlined neutral button (page-head "Refresh" etc. —— buttonized rather than
+   a text link, UI review item 3).
+   Refresh button uniform across the three tiers (round2 review item 3):
+   always the .btn baseline (36px desktop/tablet, 44px touch rule on mobile)
+   —— no more 30px desktop vs 44px mobile mismatch. */
 .btn-outline { background: transparent; color: var(--muted); border-color: var(--border-strong); }
 .btn-outline:hover { color: var(--fg); border-color: var(--accent); background: var(--surface-2); }
 .btn-sm { min-height: 30px; padding: 4px 10px; font-size: var(--fs-xs); }
 .btn-block { width: 100%; }
 .btn .spin { width: 14px; height: 14px; }
-/* 占位禁用形（终态行「吊销」置灰——操作列不锯齿，🔴 UI 评审项 5） */
+/* Placeholder-disabled form (the greyed-out "Revoke" on terminal rows —— keeps
+   the action column from ragged resizing, UI review item 5) */
 .btn.is-placeholder { opacity: 0.35; border-style: dashed; cursor: not-allowed; }
 .btn.is-placeholder:hover { background: transparent; }
 
-/* 触控目标 ≥44px（粗指针设备 / 手机档） */
+/* Touch targets ≥44px (coarse-pointer devices / mobile tier) */
 @media (pointer: coarse) {
   .btn { min-height: 44px; }
   .btn-sm { min-height: 44px; }
 }
 .nav-link, .icon-btn { -webkit-tap-highlight-color: transparent; }
 
-/* —— 输入 —— */
+/* —— Inputs —— */
 .field { display: flex; flex-direction: column; gap: var(--sp-1); margin-bottom: var(--sp-4); }
 .field > label { font-size: var(--fs-xs); color: var(--muted); font-weight: 550; }
 .input, select.input {
@@ -144,17 +156,19 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
 .input:disabled { opacity: 0.6; }
 .input.mono { font-family: var(--font-mono); letter-spacing: 0.4px; }
-/* 输入框错误态红边（🟡 UI 评审项 7） */
+/* Input error state: red border (UI review item 7) */
 .input.input-error { border-color: var(--danger); }
 .input.input-error:focus { border-color: var(--danger); box-shadow: 0 0 0 3px var(--danger-dim); }
 .field-error { color: var(--danger); font-size: var(--fs-xs); min-height: 1em; }
-/* 认证表单错误区（🟡 UI 评审项 7 + round2 评审项 9）：固定一行高 + 紧凑上下距
-   （8/12）——错误出现/消失不跳动，也不把口令框与登录按钮的默认间距撑大。 */
+/* Auth-form error slot (UI review item 7 + round2 review item 9): fixed
+   one-line height + compact vertical margins (8/12) —— no jumping when the
+   error appears/disappears, and the default gap between password field and
+   sign-in button is not stretched. */
 .field-error-fixed { min-height: 20px; margin: 8px 0 12px; }
 .field-hint { color: var(--faint); font-size: var(--fs-xs); }
 @media (pointer: coarse) { .input { min-height: 44px; } }
 
-/* —— 卡片 —— */
+/* —— Cards —— */
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -166,9 +180,9 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .card-sub { color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--sp-4); }
 .kicker { font-size: var(--fs-xs); color: var(--faint); text-transform: uppercase; letter-spacing: 1.2px; font-weight: 600; }
 
-/* —— 统计卡 —— */
+/* —— Stat cards —— */
 .stat-grid { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
-/* 平板 3+3、手机 2×3（🟡 UI 评审项 11：消除 4+2 断裂行） */
+/* Tablet 3+3, mobile 2×3 (UI review item 11: eliminates the 4+2 broken row) */
 @media (max-width: 1199.98px) and (min-width: 768px) {
   .stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
@@ -180,13 +194,13 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .stat .stat-value { font-size: var(--fs-xl); font-weight: 650; font-variant-numeric: tabular-nums; }
 .stat .stat-value small { font-size: var(--fs-xs); color: var(--faint); font-weight: 500; margin-left: 4px; }
 
-/* —— 表格 —— */
+/* —— Tables —— */
 .table-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--shadow-1); overflow: hidden; }
 .table-scroll { width: 100%; }
 .table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 .table th {
   text-align: left; padding: 10px var(--sp-4);
-  /* 表头对比度 ≥#9aa4b2（🟡 UI 评审项 16） */
+  /* Header contrast ≥#9aa4b2 (UI review item 16) */
   font-size: var(--fs-xs); font-weight: 600; color: #9aa4b2;
   border-bottom: 1px solid var(--border);
   background: var(--surface-2); white-space: nowrap;
@@ -195,40 +209,44 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .table tbody tr:last-child td { border-bottom: none; }
 .table tbody tr:hover { background: rgba(255, 255, 255, 0.025); }
 .table .num { font-variant-numeric: tabular-nums; }
-/* 数值列右对齐（🟡 UI 评审项 6） */
+/* Numeric columns right-aligned (UI review item 6) */
 .table .th-num { text-align: right; }
 .table td.td-num { text-align: right; }
-/* 流量两行 ↑/↓（🟡 UI 评审项 6）：右对齐 + 等宽（mono + tabular-nums） */
+/* Traffic as two ↑/↓ rows (UI review item 6): right-aligned + monospaced
+   (mono + tabular-nums) */
 .traffic-pair { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 1px; white-space: nowrap; }
 .traffic-pair .tp-row { display: inline-flex; align-items: baseline; gap: 6px; }
 .traffic-pair .tp-arrow { color: var(--muted); font-size: var(--fs-xs); }
 .traffic-pair .tp-v { font-variant-numeric: tabular-nums; }
 .table .ellipsis { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* 行操作（🟡 UI 评审项 3）：描边小按钮 ≥36px 视觉高度，::after 外扩命中区至
-   ≥44px；组间距 ≥12px；高危动作经 .acts-sep 竖分隔线与普通动作分区。 */
+/* Row actions (UI review item 3): outlined small buttons ≥36px visual height,
+   ::after expands the hit area to ≥44px; group spacing ≥12px; high-risk
+   actions are separated from ordinary ones by the .acts-sep divider. */
 .table .row-actions { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
 .row-actions .btn-sm { min-height: 36px; padding: 5px 12px; position: relative; }
 .row-actions .btn-sm::after { content: ""; position: absolute; inset: -4px -3px; }
 .acts-sep { width: 1px; align-self: stretch; min-height: 20px; background: var(--border-strong); margin: 0 2px; }
 .actions-none { color: var(--faint); padding: 0 6px; }
 
-/* —— 可复制标识芯片（node_id 等 >2^53 u64 标识：字符串往返，截断展示 +
-      title 全值 4 位分组 + 点击复制；🔴 UI 评审项 1）—— */
+/* —— Copyable ID chips (node_id and other >2^53 u64 identifiers: string
+      round-trip, truncated display + full 4-digit-grouped value in the title
+      + click to copy; UI review item 1) —— */
 .id-chip {
   display: inline-flex; align-items: center;
   min-height: 28px; padding: 0 2px; margin: -4px 0;
   border: none; border-radius: var(--r-sm); background: transparent;
   color: var(--fg); font: inherit; font-weight: 650; cursor: copy;
   text-decoration: underline dotted rgba(138, 148, 168, 0.55);
-  text-underline-offset: 2px; /* round2 评审项 9：虚线下沿贴近正文基线 */
+  text-underline-offset: 2px; /* round2 review item 9: dotted underline hugs the text baseline */
 }
 .id-chip:hover { color: var(--accent); }
 .id-chip.mono { font-variant-numeric: tabular-nums; letter-spacing: 0.3px; }
 @media (pointer: coarse) { .id-chip { min-height: 44px; padding: 0 10px; } }
 
-/* —— 徽标 / 状态点 ——
-   形状规则（🟡 UI 评审项 10 固化）：徽标一律胶囊（--r-full）——类型徽标
-   （服务器/设备）与状态徽标同形，仅以配色区分语义；无第二种徽标形状。 */
+/* —— Badges / status dots ——
+   Shape rule (fixed by UI review item 10): badges are always pills (--r-full)
+   —— kind badges (server/device) and status badges share one shape, semantics
+   distinguished by color alone; there is no second badge shape. */
 .badge {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 2px 10px; border-radius: var(--r-full);
@@ -239,17 +257,19 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .badge-danger { background: var(--danger-dim); color: var(--danger); }
 .badge-muted { background: rgba(138, 148, 168, 0.14); color: var(--muted); }
 .badge-accent { background: var(--accent-dim); color: var(--accent); }
-/* 口令徽标「未设置」（round2 评审项 6）：琥珀描边胶囊（透明底+琥珀框/字）——
-   与「已设置」灰底胶囊拉开语义距离（待引导 vs 就绪）。 */
+/* Password badge "Not set" (round2 review item 6): amber-outlined pill
+   (transparent background + amber border/text) —— semantically distant from
+   the "Set" grey pill (needs bootstrap vs ready). */
 .badge-outline-warn { background: transparent; color: var(--warn); border: 1px solid var(--warn); }
-/* 角色徽标语义分离（🟡 UI 评审项 10）：管理员=中性紫，与 leader 的蓝
-   （--accent）区分；琥珀（badge-warn）仅用于警示操作，拒绝/错误一律红。 */
+/* Role-badge semantic separation (UI review item 10): admin = neutral violet,
+   distinct from leader's blue (--accent); amber (badge-warn) is reserved for
+   warning-tier operations; denied/error are always red. */
 .badge-admin { background: rgba(157, 140, 255, 0.16); color: #b4a5ff; }
 .badge-info { background: rgba(88, 166, 201, 0.14); color: var(--info); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
 .dot-on { background: var(--success); box-shadow: 0 0 0 3px var(--success-dim); }
 
-/* —— 模态 —— */
+/* —— Modal —— */
 .modal-overlay {
   position: fixed; inset: 0; z-index: 60;
   background: var(--overlay);
@@ -265,13 +285,15 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   animation: pop-in 0.16s ease;
 }
 .modal h3 { font-size: var(--fs-lg); margin-bottom: var(--sp-3); }
-/* 模态标题行（round2 评审项 9）：警示图标与标题文字同行居中 */
+/* Modal title row (round2 review item 9): warning icon and title text on one
+   line, centered */
 .modal-title { display: flex; align-items: center; gap: var(--sp-2); }
 .modal-title-ico { display: inline-flex; flex: none; }
 .modal-title-ico.ico-danger { color: var(--danger); }
 .modal-title-ico.ico-warn { color: var(--warn); }
 .modal p { color: var(--muted); font-size: var(--fs-sm); margin: 0 0 var(--sp-5); overflow-wrap: anywhere; }
-/* 模态动作行（🟡 UI 评审项 14）：两按钮等高 40px、底边对齐 */
+/* Modal action row (UI review item 14): two buttons of equal 40px height,
+   bottom-aligned */
 .modal-actions { display: flex; gap: var(--sp-3); align-items: center; justify-content: flex-end; flex-wrap: wrap; }
 .modal-actions .btn { min-height: 40px; }
 .token-box {
@@ -281,14 +303,16 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   font-family: var(--font-mono); font-size: var(--fs-sm);
   overflow-wrap: anywhere; user-select: all;
 }
-/* 一次性令牌安全提示（🟡 UI 评审项 15）：琥珀 ⓘ 单条（安全+交付指引合并） */
+/* One-time-token security notice (UI review item 15): a single amber ⓘ line
+   (security + delivery guidance merged) */
 .token-notice {
   display: flex; align-items: flex-start; gap: var(--sp-2);
   margin: var(--sp-3) 0 var(--sp-5); padding: 10px var(--sp-3);
   background: var(--warn-dim); color: var(--warn);
   border-radius: var(--r-md); font-size: var(--fs-xs); line-height: 1.6;
-  /* 中文词内不断行（round2 评审项 9：「新口令」等词组保持完整）；
-     overflow-wrap:anywhere 仍兜底超长 latin 串（用户名/令牌）。 */
+  /* No mid-word breaks (round2 review item 9: phrases like "new password"
+     stay intact); overflow-wrap:anywhere still backstops overlong Latin runs
+     (usernames/tokens). */
   word-break: keep-all; overflow-wrap: anywhere;
 }
 .token-notice-ico { flex: none; font-weight: 700; }
@@ -314,14 +338,14 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .toast-info { border-left: 3px solid var(--accent); }
 @keyframes slide-in { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: none; } }
 
-/* —— 三态（空/加载/错误） —— */
+/* —— Three states (empty / loading / error) —— */
 .state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--sp-2); padding: var(--sp-10) var(--sp-4); color: var(--muted); }
 .state .icon { font-size: 26px; opacity: 0.6; }
 .state .state-hint { font-size: var(--fs-xs); color: var(--faint); }
-/* 空数据态（🟡 UI 评审项 18）：图标 + 一句中文引导 */
+/* Empty state (UI review item 18): icon + one guiding sentence */
 .state-empty .state-ico { opacity: 0.55; margin-bottom: var(--sp-1); }
 .state-empty span { font-size: var(--fs-sm); }
-/* 弱化文本工具类（未上报主机名等——🟡 UI 评审项 15） */
+/* Subdued-text utility class (unreported hostnames etc. —— UI review item 15) */
 .muted { color: var(--faint); }
 .spinner {
   width: 22px; height: 22px; border-radius: 50%;
@@ -332,7 +356,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .btn:not(.btn-primary) .spin { border-color: var(--border-strong); border-top-color: var(--accent); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* —— 布局骨架：侧栏（≥1200）/ 顶栏+抽屉（<1200） —— */
+/* —— Layout skeleton: sidebar (≥1200) / topbar + drawer (<1200) —— */
 .shell { min-height: 100vh; }
 .main { display: flex; flex-direction: column; min-width: 0; }
 
@@ -349,7 +373,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   display: inline-flex; align-items: center; justify-content: center;
   color: #fff; font-size: 14px; font-weight: 800;
 }
-/* 中小视口顶栏 24px 品牌方块（🟡 UI 评审项 9） */
+/* 24px brand tile for small/medium-viewport topbar (UI review item 9) */
 .brand-mark-sm { width: 24px; height: 24px; font-size: 12px; border-radius: 7px; }
 .nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-link {
@@ -363,14 +387,17 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .nav-link .ico { width: 18px; text-align: center; opacity: 0.9; }
 .sidebar-foot { margin-top: auto; padding: var(--sp-3); border-top: 1px solid var(--border); font-size: var(--fs-xs); color: var(--faint); display: flex; flex-direction: column; gap: var(--sp-1); }
 .sidebar-foot .who { color: var(--muted); display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
-/* 「退出登录」触控目标 ≥44px（🟡 UI 评审项 13） */
+/* "Sign out" touch target ≥44px (UI review item 13) */
 .sidebar-foot .btn { min-height: 44px; margin-top: var(--sp-2); }
 
 .content { flex: 1; padding: var(--sp-6) var(--pad-content); max-width: 1320px; width: 100%; margin: 0 auto; min-width: 0; }
-/* 区块纵向节奏（🟡 UI 评审项 8）：dashboard 区块间距统一 24px（4/8 阶） */
+/* Section vertical rhythm (UI review item 8): dashboard section spacing
+   uniformly 24px (4/8 scale) */
 .stack > * + * { margin-top: var(--sp-6); }
-/* 页头（round2 评审项 9）：基线对齐——右缘刷新按钮的文字基线与左侧首行（H1
-   标题）基线对齐（flex baseline 取各 item 首行文本基线）。 */
+/* Page head (round2 review item 9): baseline alignment —— the right-edge
+   refresh button's text baseline aligns with the left side's first-line (H1
+   title) baseline (flex baseline takes each item's first-line text
+   baseline). */
 .page-head { margin-bottom: var(--sp-5); display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap; }
 .page-head h1 { font-size: var(--fs-2xl); }
 .page-head .page-sub { color: var(--muted); font-size: var(--fs-sm); margin-top: 2px; }
@@ -390,31 +417,41 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .icon-btn:hover { background: var(--surface-2); }
 .drawer-scrim { position: fixed; inset: 0; z-index: 55; background: var(--overlay); animation: fade-in 0.14s ease; }
 
-/* 平板窄档（<1024）：表格低优先列收起（最后活跃/口令列——信息密度让位于可读性） */
+/* Narrow tablet (<1024): collapse low-priority table columns (last-active /
+   password —— information density yields to readability) */
 @media (max-width: 1023.98px) {
   .hide-narrow { display: none; }
 }
 
-/* 平板（<1200）：侧栏转顶栏+抽屉（开态投影 + 右侧圆角——🟡 UI 评审项 13） */
+/* Tablet (<1200): sidebar becomes topbar + drawer (open-state shadow + right
+   rounding —— UI review item 13) */
 @media (max-width: 1199.98px) {
   .sidebar {
     transform: translateX(-100%); transition: transform 0.2s ease; box-shadow: none;
-    /* 右缘 12px 圆角（🔴 round2 评审项 2：核验确认缺失——显式 12px，不用 token） */
+    /* Right edge 12px rounding (round2 review item 2: audit confirmed missing
+       —— explicit 12px, not a token) */
     border-radius: 0 12px 12px 0;
-    /* 抽屉层级（🔴 round2 评审项 2 的真缺陷修复）：面板 56 必须高于遮罩 55——
-       旧值 50 < 55 时 0.68 黑遮罩盖在抽屉之上，整个面板内容被压暗成
-       「全黑不可见」（仅最亮的品牌行可辨）。模态 60 / Toast 80 仍在其上。 */
+    /* Drawer stacking (the real defect fix in round2 review item 2): the panel
+       at 56 must sit above the scrim at 55 —— with the old 50 < 55 the 0.68
+       black scrim covered the drawer and the whole panel content was dimmed
+       to "all-black invisible" (only the brightest brand row discernible).
+       Modal 60 / Toast 80 still sit above it. */
     z-index: 56;
   }
-  /* 静止开态：内容完全可见——显式 opacity:1 加固 transition 结束态（无
-     opacity 过渡面，防任何隐式继承/覆写把内容层置于半透明）。 */
+  /* Resting open state: content fully visible —— the explicit opacity:1
+     hardens the transition's end state (no opacity transition surface;
+     guards against any implicit inheritance/override leaving the content
+     layer semi-transparent). */
   .sidebar.open {
     transform: none; opacity: 1;
-    /* 更明显的开态投影（🔴 round2 评审项 2）：右向 12px 扩散 40px——
-       抽屉与遮罩面的层次可辨（原 shadow-2 四向弥散在深色主题下不可读）。 */
+    /* More visible open-state shadow (round2 review item 2): rightward 12px
+       spread over 40px —— drawer and scrim layers become distinguishable
+       (the original shadow-2's omnidirectional diffusion was unreadable on a
+       dark theme). */
     box-shadow: 12px 0 40px rgba(0, 0, 0, 0.55);
   }
-  /* 顶栏 58 > 抽屉 56：开态顶栏（汉堡→X）仍可点——关闭路径不因抽屉铺满而断 */
+  /* Topbar 58 > drawer 56: the open-state topbar (hamburger → X) stays
+     clickable —— the close path is not cut by the drawer filling the screen */
   .topbar { display: flex; z-index: 58; }
   .content { --pad-content: var(--sp-4); padding: var(--sp-5) var(--pad-content); }
 }
@@ -423,27 +460,32 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   .drawer-scrim { display: none !important; }
 }
 
-/* —— 网格 —— */
+/* —— Grids —— */
 .grid { display: grid; gap: var(--sp-4); }
 .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid-cards { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
-/* dashboard 顶部两列（round2 评审项 8）：桌面（≥1200）集群卡 | 服务器区等高
-   并排——单服务器卡满右列，消除 1/3 宽断裂；<1200 块级默认单列堆叠。 */
+/* Dashboard top two columns (round2 review item 8): desktop (≥1200) cluster
+   card | servers area side by side, equal height —— the single-server card
+   fills the right column, removing the 1/3-width gap; <1200 falls back to
+   single-column stacking via block defaults. */
 @media (min-width: 1200px) {
   .dash-top { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: var(--sp-4); align-items: stretch; }
   .dash-top > * { min-width: 0; }
 }
-/* 集群卡三段等距三列（round2 评审项 8）：标识 / 纪元 / 同步模式 */
+/* Cluster card: three equal segments (round2 review item 8): ID / epoch /
+   sync mode */
 .kv-cols { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-4); margin-top: var(--sp-3); }
 .kv-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .kv-cell .k { color: var(--muted); font-size: var(--fs-xs); }
 .kv-cell .v { font-weight: 600; overflow-wrap: anywhere; }
 @media (max-width: 767.98px) { .kv-cols { gap: var(--sp-3); } }
-/* 服务器卡（🟡 UI 评审项 11）：桌面与集群卡 2 列对称；平板/手机单卡全宽 */
+/* Server cards (UI review item 11): two symmetric columns with the cluster
+   card on desktop; full-width single cards on tablet/mobile */
 .servers-grid { display: grid; gap: var(--sp-4); grid-template-columns: repeat(auto-fill, minmax(min(100%, 460px), 1fr)); }
 .kv { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-2) var(--sp-6); }
-/* settings 卡内边距平衡（round2 评审项 9）：首/末行自身 padding 归零——
-   卡顶/卡底留白收敛为纯 card padding（20px），上下对称。 */
+/* Settings-card padding balance (round2 review item 9): the first/last rows
+   zero their own padding —— the card top/bottom whitespace converges to pure
+   card padding (20px), symmetric. */
 .kv > .kv-row:first-child { padding-top: 0; }
 .kv > .kv-row:last-child { padding-bottom: 0; }
 .kv-row { display: flex; justify-content: space-between; gap: var(--sp-4); padding: var(--sp-2) 0; border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
@@ -451,7 +493,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .kv-row .k { color: var(--muted); flex: none; }
 .kv-row .v { text-align: right; overflow-wrap: anywhere; }
 
-/* —— 登录/设置口令（三档居中形态） —— */
+/* —— Login / set password (centered form across the three tiers) —— */
 .auth-wrap { min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center; padding: var(--sp-5) var(--sp-4); }
 .auth-card { width: min(92vw, 400px); }
 .auth-card .brand-lg { display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-5); justify-content: center; }
@@ -460,14 +502,15 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .auth-sub { color: var(--muted); font-size: var(--fs-sm); text-align: center; margin: 0 0 var(--sp-6); }
 .auth-foot { margin-top: var(--sp-5); text-align: center; font-size: var(--fs-xs); color: var(--faint); }
 .auth-alt { margin-top: var(--sp-4); text-align: center; font-size: var(--fs-sm); }
-/* 认证页切换链接：触控区 ≥44px（🟡 UI 评审项 3——文字链不做「裸点击面」） */
+/* Auth-page switch links: touch area ≥44px (UI review item 3 —— no "bare
+   click surface" for text links) */
 .auth-alt .auth-link {
   display: inline-flex; align-items: center; justify-content: center;
   min-height: 44px; padding: 6px 14px; margin: 0 -6px;
   border-radius: var(--r-md); font-weight: 550;
 }
 
-/* —— 图表 —— */
+/* —— Chart —— */
 .chart-box { position: relative; width: 100%; min-height: 220px; }
 .chart-tooltip {
   position: absolute; z-index: 10; display: none; pointer-events: none;
@@ -479,16 +522,20 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .chart-toolbar { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-4); }
 .chart-toolbar label { font-size: var(--fs-xs); color: var(--muted); }
 
-/* uPlot 深色适配（vendor/uplot.css 之上的覆写；styles.css 先于 vendor 加载，
-   覆写规则须更高优先级——.uplot 前缀/多类名抬 specificity） */
+/* uPlot dark-theme adaptation (overrides on top of vendor/uplot.css;
+   styles.css loads before vendor, so overrides need higher specificity ——
+   the .uplot prefix / multi-class names raise it) */
 .u-select { background: var(--accent-dim); }
 .u-axis { font-size: var(--fs-xs); }
-/* 悬停指示线：1px 实线（覆写 vendor 的 1px dashed #607D8B——🟡 UI 评审项 12） */
+/* Hover indicator lines: 1px solid (overrides vendor's 1px dashed #607D8B ——
+   UI review item 12) */
 .uplot .u-hz .u-cursor-x,
 .uplot .u-vt .u-cursor-y { border-right: 1px solid rgba(255, 255, 255, 0.25); }
 
-/* 双系列图例（🔴 round2 评审项 1）：uPlot 内建图例关闭后的 DOM 自绘面——
-   桌面/手机一致呈现；色片为线形色条（与曲线同色，app.js CHART_*_COLOR 单点）。 */
+/* Two-series legend (round2 review item 1): the hand-drawn DOM surface after
+   uPlot's built-in legend is off —— identical on desktop and mobile; swatches
+   are line-shaped color bars (same color as the lines, single-point
+   definition in app.js CHART_*_COLOR). */
 .chart-legend {
   display: flex; align-items: center; gap: var(--sp-5); flex-wrap: wrap;
   margin-top: var(--sp-2); font-size: var(--fs-xs); color: var(--muted);
@@ -497,14 +544,14 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
 .chart-legend .lg-sw { width: 14px; height: 3px; border-radius: 2px; flex: none; }
 .chart-legend .lg-item b { font-weight: 600; color: var(--fg); font-variant-numeric: tabular-nums; }
 
-/* —— 手机档（<768）：表格降级为卡片列表；单列网格 —— */
+/* —— Mobile tier (<768): tables degrade to card lists; single-column grids —— */
 @media (max-width: 767.98px) {
   .content { --pad-content: var(--sp-3); padding: var(--sp-4) var(--pad-content) calc(var(--sp-8) + env(safe-area-inset-bottom, 0px)); }
   .grid-2 { grid-template-columns: minmax(0, 1fr); }
   .page-head h1 { font-size: var(--fs-xl); }
   .card { padding: var(--sp-4); }
 
-  /* 数据表 → 卡片列表（VIP/状态/操作完整保留） */
+  /* Data table → card list (VIP/status/actions fully retained) */
   .table-card { border: none; background: transparent; box-shadow: none; overflow: visible; }
   .table-scroll { overflow: visible; }
   .table, .table tbody, .table tr, .table td { display: block; width: 100%; }
@@ -518,14 +565,15 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   .table td {
     border-bottom: none; padding: 7px 0;
     display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3);
-    min-height: 44px; /* 触控行目标 */
+    min-height: 44px; /* touch row target */
   }
   .table td::before {
     content: attr(data-label);
     color: var(--muted); font-size: var(--fs-xs); flex: none; font-weight: 550;
   }
-  /* VIP 行升格为卡片标题行（🟡 UI 评审项 2）：不渲染 ::before 标签，值以
-     「VIP」胶囊前缀自述（表头列名即 VIP——proper noun 保留原文）。 */
+  /* The VIP row is promoted to the card title row (UI review item 2): no
+     ::before label rendered; the value self-describes with a "VIP" pill
+     prefix (the column name is VIP —— a proper noun kept as-is). */
   .table td.cell-vip::before { content: none; }
   .table td.cell-vip { padding-top: 10px; padding-bottom: 4px; }
   .table td.cell-vip .v-vip { font-weight: 650; font-size: var(--fs-md); font-variant-numeric: tabular-nums; }
@@ -534,7 +582,9 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
     letter-spacing: 0.8px; margin-right: 8px; padding: 2px 8px;
     border: 1px solid var(--border-strong); border-radius: var(--r-full);
   }
-  /* 手机档行内按钮本体已 ≥44px——关闭桌面档 ::after 命中外扩（防相邻命中区重叠） */
+  /* Mobile-tier inline button bodies are already ≥44px —— disable the
+     desktop-tier ::after hit expansion (prevents adjacent hit areas from
+     overlapping) */
   .row-actions .btn-sm::after { display: none; }
   .table td:last-child { padding-top: var(--sp-2); }
   .table td:last-child::before { content: none; }
@@ -547,19 +597,21 @@ code, .mono { font-family: var(--font-mono); font-size: 0.92em; }
   .chart-box { min-height: 180px; }
 }
 
-/* 平板（768–1199）行内操作按钮 ≥44px 命中（round2 评审项 3）：与手机档同一
-   触控标准——按钮本体抬到 44px（::after 外扩仍在，覆盖横向余量）；换行堆叠
-   时 row-actions 的 gap（12px）≥12px 间距要求。 */
+/* Tablet (768–1199) inline action buttons ≥44px hit area (round2 review item
+   3): the same touch standard as the mobile tier —— button bodies raised to
+   44px (::after expansion stays, covering horizontal slack); when wrapped and
+   stacked, row-actions' gap (12px) satisfies the ≥12px spacing requirement. */
 @media (max-width: 1199.98px) and (min-width: 768px) {
   .table .row-actions .btn-sm { min-height: 44px; }
 }
 
-/* 触控目标兜底（手机档与桌面窄指针一致 ≥44px 的交互件） */
+/* Touch-target backstop (mobile tier matches the desktop narrow-pointer
+   ≥44px interactive elements) */
 @media (max-width: 767.98px) {
   .btn, .btn-sm, .nav-link { min-height: 44px; }
 }
 
-/* —— 动效偏好 —— */
+/* —— Motion preference —— */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
