@@ -1,128 +1,146 @@
-# 贡献指南（CONTRIBUTING）
+# Contributing (CONTRIBUTING)
 
-欢迎为 Flock VPN 贡献。动手前请先读 [README.md](README.md) 与总体设计
-[docs/design.md](docs/design.md)（代码注释大量按 `§编号` 回链设计文档——改动行为前
-先找到对应 §节，保持设计与实现同步演进）。
+Welcome to contributing to Flock VPN. Before starting, please read [README.md](README.md) and the
+overall design [docs/design.md](docs/design.md) (code comments link back to the design doc heavily
+by `§ number` — find the corresponding §section before changing behavior, and keep design and
+implementation evolving in sync).
 
-## 环境要求
+## Environment requirements
 
-| 项 | 要求 |
+| Item | Requirement |
 |---|---|
-| Rust | **1.98.1**（仓库根 `rust-toolchain.toml` 钉死；进入仓库 rustup 自动切换） |
-| Docker Desktop | 容器 e2e / 冒烟（deploy/ 下 compose 拓扑；Linux 容器，Windows/macOS 宿主均可） |
-| 网络 | 首次构建需访问 GitHub：`flock-protocol` 以 git 依赖引入（tag `v0.1.0`）；镜像内构建同理 |
-| 平台 | 开发任选 Windows/macOS/Linux；CI 三平台矩阵把关 |
+| Rust | **1.98.1** (pinned by `rust-toolchain.toml` at the repo root; rustup auto-switches when you enter the repo) |
+| Docker Desktop | container e2e / smoke tests (the compose topologies under deploy/; Linux containers; Windows/macOS hosts both fine) |
+| Network | the first build needs GitHub access: `flock-protocol` comes in as a git dependency (tag `v0.1.0`); same for in-image builds |
+| Platform | develop on any of Windows/macOS/Linux; CI gates with a three-platform matrix |
 
-## 克隆
+## Cloning
 
 ```bash
 git clone https://github.com/fly88oj/flock-vpn.git
 cd flock-vpn
-cargo test --workspace --all-features    # 首跑即门禁自证
+cargo test --workspace --all-features    # the first run doubles as a gate self-check
 ```
 
-协议库是**独立仓库**（不再 vendored 在本仓）：
+The protocol library is a **standalone repository** (no longer vendored in this repo):
 
 ```bash
-git clone https://github.com/fly88oj/flock-protocol.git   # 仅联调/改协议时需要
+git clone https://github.com/fly88oj/flock-protocol.git   # needed only for co-debugging/protocol changes
 ```
 
-日常改主仓无需克隆协议仓——依赖经 Cargo.lock 钉到 git rev（`?tag=v0.1.0#<rev>`）。
+Day-to-day work on the main repo needs no protocol-repo clone — the dependency is pinned by
+Cargo.lock to a git rev (`?tag=v0.1.0#<rev>`).
 
-## 常用门禁命令清单
+## The usual gate commands
 
 ```bash
-cargo fmt --all -- --check                                # 格式
-cargo clippy --workspace --all-features -- -D warnings    # lint（警告即错）
-cargo test --workspace --all-features                     # 全量测试
-cargo check -p flock-client --no-default-features         # 无头档编译面（CI 同款）
+cargo fmt --all -- --check                                # format
+cargo clippy --workspace --all-features -- -D warnings    # lint (warnings are errors)
+cargo test --workspace --all-features                     # full test suite
+cargo check -p flock-client --no-default-features         # headless compile surface (same as CI)
 ```
 
-CI（[.github/workflows/ci.yml](.github/workflows/ci.yml)）跑的就是这四条：三平台
-（ubuntu-24.04 / windows-2025 / macos-14）test + check，ubuntu 追加 clippy 与 fmt。
-本地全绿再提 PR。
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs exactly these four: three-platform
+(ubuntu-24.04 / windows-2025 / macos-14) test + check, with ubuntu adding clippy and fmt. Get
+everything green locally before opening a PR.
 
-## 协议联调：[patch] 工作流
+## Protocol co-debugging: the [patch] workflow
 
-场景：改了本地 [flock-protocol](https://github.com/fly88oj/flock-protocol) 检出，想在
-主仓立即验证效果，**不等协议仓发新 tag**。
+Scenario: you changed a local [flock-protocol](https://github.com/fly88oj/flock-protocol)
+checkout and want to verify the effect in the main repo immediately, **without waiting for the
+protocol repo to cut a new tag**.
 
-做法：在主仓根的 `.cargo/config.toml` 里**临时**加一段 `[patch]`。注意：该文件本身是
-入库文件（现有内容 = wasm32 的 getrandom rustflags，须保留）——**patch 段勿提交**，
-验证完即撤除（也可放到仓库外的父目录 `.cargo/config.toml`，见下「多仓联调」）：
+How: **temporarily** add a `[patch]` section to `.cargo/config.toml` at the main repo root. Note:
+that file itself is checked in (its existing content = the getrandom rustflags for wasm32, which
+must stay) — **do not commit the patch section**; remove it once verification is done (you can
+also put it in a parent directory's `.cargo/config.toml` outside the repo; see "multi-repo
+co-debugging" below):
 
 ```toml
-# .cargo/config.toml —— 在既有 [target.wasm32-unknown-unknown] 段之外临时追加
-# （联调用完即删，勿提交！路径按你的 protocol clone 位置调整）：
+# .cargo/config.toml — temporarily append next to the existing [target.wasm32-unknown-unknown] section
+# (delete after co-debugging; do not commit! Adjust the path to your protocol clone location):
 [patch."https://github.com/fly88oj/flock-protocol.git"]
 flock-protocol = { path = "../flock-protocol" }
 ```
 
-多仓联调（主仓 + protocol + 其他消费方同机开发）可把同一 patch 放在共同父目录的
-`.cargo/config.toml`——cargo 按 cwd 向上发现配置，任意仓库内跑门禁均命中。
+For multi-repo co-debugging (main repo + protocol + other consumers developed on the same
+machine), put the same patch in the shared parent directory's `.cargo/config.toml` — cargo
+discovers configs walking up from cwd, so running the gates inside any of the repositories picks
+it up.
 
-要点：
+Key points:
 
-- patch 生效后 `cargo tree -p flock-server | head` 应显示 flock-protocol 指向本地路径；
-  验证完**删除该 patch 段并确认 `git diff .cargo/` 干净**，确保提交的代码在干净克隆
-  （纯 git 依赖）下也绿。
-- 协议改动合入协议仓并打新 tag 后，主仓升级依赖：改三处 manifest 的 `tag =`（
-  `crates/flock-sync`、`app/flock-server`、`app/flock-client`）并重新生成
-  `Cargo.lock`，核对除 `flock-protocol` 源条目外**版本零漂移**。
-- CI 不带 patch：PR 若只在本地 patch 下绿而在 CI 红，多半是协议 API 变更未同步主仓调用点。
+- With the patch active, `cargo tree -p flock-server | head` should show flock-protocol pointing
+  at the local path; after verifying, **delete the patch section and confirm `git diff .cargo/`
+  is clean**, so what you commit is also green in a clean clone (pure git dependency).
+- After a protocol change lands in the protocol repo and a new tag is cut, upgrade the main
+  repo's dependency: change `tag =` in the three manifests (`crates/flock-sync`,
+  `app/flock-server`, `app/flock-client`) and regenerate `Cargo.lock`, verifying **zero version
+  drift** except the `flock-protocol` source entry.
+- CI carries no patch: if a PR is green only under the local patch but red in CI, the protocol
+  API change was most likely not synced to the main repo's call sites.
 
-## 容器 e2e 指引
+## Container e2e guidance
 
-前置：Docker Desktop 运行中。两档（relay / direct）端口不冲突（27500/27501 vs
-9443/9444），**可并行起栈、一条命令跑全部六个冒烟**：
+Precondition: Docker Desktop running. The two profiles (relay / direct) use non-conflicting ports
+(27500/27501 vs 9443/9444), so you can **bring both stacks up in parallel and run all six smoke
+tests with one command**:
 
 ```bash
-# relay 档需 frp 二进制资产（命名构建上下文）：
+# The relay profile needs the frp binary assets (the named build context):
 mkdir -p .tmp && cd .tmp
-# 下载 frp v0.71.1 linux_amd64（github.com/fatedier/frp/releases）解压为
-#   .tmp/frp_0.71.1_linux_amd64/（内含 frps/frpc）
+# Download frp v0.71.1 linux_amd64 (github.com/fatedier/frp/releases) and extract it as
+#   .tmp/frp_0.71.1_linux_amd64/ (containing frps/frpc)
 cd ..
 
-docker compose -f deploy/m2.yml        up -d --build   # frp 中转变体
-docker compose -f deploy/m2-direct.yml up -d --build   # 直连变体（免 prepare）
+docker compose -f deploy/m2.yml        up -d --build   # frp relay variant
+docker compose -f deploy/m2-direct.yml up -d --build   # direct variant (no prepare needed)
 
-cargo test -p flock-server --test smoke -- --ignored            # 全部 6 个
-cargo test -p flock-server --test smoke -- --ignored direct     # 只跑 direct 3 个
+cargo test -p flock-server --test smoke -- --ignored            # all 6
+cargo test -p flock-server --test smoke -- --ignored direct     # only the 3 direct ones
 
 docker compose -f deploy/m2.yml        down -v
 docker compose -f deploy/m2-direct.yml down -v
 ```
 
-更重的多机/多主拓扑（e2e.yml、multinode/）见 [deploy/](deploy/) 与
-[docs/manual/](docs/manual/) 各手册；`#[ignore]` 测试均属「对容器实跑」档，不进 CI
-（理由见 ci.yml 头注）。
+For the heavier multi-machine/multi-primary topologies (e2e.yml, multinode/), see [deploy/](deploy/)
+and the manuals under [docs/manual/](docs/manual/); all `#[ignore]` tests are of the "actually
+run against containers" kind and are not in CI (rationale in the ci.yml header comment).
 
-## Commit 风格
+## Commit style
 
-**中文祈使句 + 作用域前缀**，一行说清「做了什么、为什么」；评审/修复类注明出处。例：
+**Imperative one-liner + scope prefix**, one line stating "what and why"; review/fix commits
+cite their source. (Early history used Chinese imperatives; since the repo-wide English
+migration, use English with the same shape — scope prefix, dense one-liner, source annotations
+for review/fix items.) Example shapes:
 
 ```
-build(deps): flock-protocol 切换为独立仓 git 依赖（tag v0.1.0）——……
-deploy: 六个 Dockerfile 与 build-wasm.sh 适配 git 依赖——……
-test(sync): 流量计数跨服用例前置显式化——等 C 租约 gossip 扩散到 n0 再 ingest（修并行负载下 flaky：……）
-webui(ui): round2 评审项 8 桌面 dashboard 布局——集群卡与服务器区两列并排
+build(deps): switch flock-protocol to a standalone-repo git dependency (tag v0.1.0) — …
+deploy: adapt the six Dockerfiles and build-wasm.sh to git dependencies — …
+test(sync): make the traffic-counter cross-server test explicit — wait for C's lease gossip to reach n0 before ingest (fixes flakiness under parallel load: …)
+webui(ui): round-2 review item 8 desktop dashboard layout — cluster card and server zone side by side
 ```
 
-常用作用域：`build` / `deploy` / `ci` / `docs` / `test` / 模块名（`sync`、`frpc`、
-`webui`、`client`、`server`、`protocol`…）。每个逻辑项一个独立 commit——依赖切换、
-构建面适配、文档各自成 commit，不混装。
+Common scopes: `build` / `deploy` / `ci` / `docs` / `test` / module names (`sync`, `frpc`,
+`webui`, `client`, `server`, `protocol`…). One logical item per commit — dependency switches,
+build-surface adaptations, and docs each get their own commit; do not mix them.
 
-## PR 前 checklist
+## Pre-PR checklist
 
-- [ ] `cargo fmt --all -- --check` 绿
-- [ ] `cargo clippy --workspace --all-features -- -D warnings` 绿
-- [ ] `cargo test --workspace --all-features` 绿（新增行为有对应测试）
-- [ ] `cargo check -p flock-client --no-default-features` 绿（无头档未破）
-- [ ] 涉及协议接口 → 先在 [flock-protocol](https://github.com/fly88oj/flock-protocol) 仓提交/发 tag，主仓锁文件同步且版本零漂移
-- [ ] 涉及部署/拓扑 → 容器 e2e（上节）跑过对应档
-- [ ] 涉及行为变更 → docs/design.md 对应 §节同步修订（编号被注释引用，勿裸删）
-- [ ] 临时 [patch] 已撤除——干净克隆（纯 git 依赖）下可构建
-- [ ] commit 按上节风格拆分
+- [ ] `cargo fmt --all -- --check` green
+- [ ] `cargo clippy --workspace --all-features -- -D warnings` green
+- [ ] `cargo test --workspace --all-features` green (new behavior has matching tests)
+- [ ] `cargo check -p flock-client --no-default-features` green (headless build not broken)
+- [ ] Touching protocol interfaces → commit/cut a tag in the
+      [flock-protocol](https://github.com/fly88oj/flock-protocol) repo first; the main repo's
+      lockfile is synced with zero version drift
+- [ ] Touching deployment/topology → the corresponding container e2e profile (previous section)
+      has been run
+- [ ] Touching behavior → the corresponding §section of docs/design.md is revised in sync (the
+      numbering is cited by comments; do not delete it outright)
+- [ ] Any temporary [patch] removed — buildable in a clean clone (pure git dependency)
+- [ ] Commits split per the style above
 
-安全相关（新密码学路径、认证/信任锚改动）请先读 [SECURITY.md](SECURITY.md) 与
-docs/research/crypto-2026.md，并在 PR 描述中明确威胁模型影响。
+For security-relevant work (new cryptographic paths, authentication/trust-anchor changes), please
+read [SECURITY.md](SECURITY.md) and docs/research/crypto-2026.md first, and state the threat-model
+impact in the PR description.

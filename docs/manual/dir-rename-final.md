@@ -1,24 +1,30 @@
-# 目录更名收尾步骤（ChmlVPN → FlockVPN）
+# Directory-rename closing steps (ChmlVPN → FlockVPN)
 
-2026-11-02 项目更名 Flock VPN 时，仓库目录因开发会话占用无法直接改名，过渡方案：
+When the project was renamed Flock VPN on 2026-11-02, the repository directory could not be
+renamed directly because a development session held it open; the transitional arrangement:
 
-- 真实目录仍为 `E:\Works\ChmlVPN`；
-- `E:\Works\FlockVPN` 是指向它的 **junction**（宿主机两路径等价；**Docker 挂载内 junction 不可见**，容器命令必须走 `/mnt/Works/ChmlVPN` 真实路径）；
-- `E:\Works\.cargo\config.toml` 的 patch path 与 showroom 迁移文档中的容器门禁命令因此暂用 `ChmlVPN` 路径。
+- the real directory remains `E:\Works\ChmlVPN`;
+- `E:\Works\FlockVPN` is a **junction** pointing at it (the two paths are equivalent on the host;
+  **junctions are not visible inside Docker mounts**, so container commands must use the real
+  path `/mnt/Works/ChmlVPN`);
+- the patch path in `E:\Works\.cargo\config.toml` and the container gate commands in the showroom
+  migration doc therefore temporarily use the `ChmlVPN` path.
 
-**关闭占用该目录的会话/程序后，执行以下三步完成收尾**（cmd）：
+**After closing the sessions/programs occupying the directory, run the following steps to finish**
+(cmd):
 
 ```bat
-rmdir E:\Works\FlockVPN                 :: 只删 junction，不动真实目录
-ren  E:\Works\ChmlVPN FlockVPN          :: 真实目录改名
+rmdir E:\Works\FlockVPN                 :: removes only the junction; the real directory is untouched
+ren  E:\Works\ChmlVPN FlockVPN          :: renames the real directory
 ```
 
-然后两处字符串替换 `ChmlVPN` → `FlockVPN`：
+Then replace the string `ChmlVPN` → `FlockVPN` in two places:
 
-1. `E:\Works\.cargo\config.toml`：`path = "ChmlVPN/crates/flock-protocol"` 与注释；
-2. `E:\Works\showroom\docs\flock-protocol-migration.md`：容器门禁命令中的 `/mnt/Works/ChmlVPN` 与 `../ChmlVPN` 表述。
+1. `E:\Works\.cargo\config.toml`: `path = "ChmlVPN/crates/flock-protocol"` and the comment;
+2. `E:\Works\showroom\docs\flock-protocol-migration.md`: the `/mnt/Works/ChmlVPN` and
+   `../ChmlVPN` mentions in the container gate commands.
 
-验证（任一通过即可）：
+Verification (either passing is enough):
 
 ```sh
 cd /e/Works/FlockVPN && cargo test --workspace --all-features

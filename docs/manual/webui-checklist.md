@@ -1,99 +1,104 @@
-# M8 Web UI 浏览器真机清单（M8c 截图轮）
+# M8 Web UI browser real-machine checklist (the M8c screenshot round)
 
-> §7-M8.9「浏览器目视 = 真机清单」：本文件是 M8c 评审批的浏览器目视清单骨架
-> （M8b 落盘；各项的「实测/截图」列由 M8c 填充——附件编号与结论）。访问方式：
-> `http://127.0.0.1:9800`（本机）或 `http://<VIP>:9800`（VPN 段，需已入网）。
+> §7-M8.9 "browser visual checks = the real-machine checklist": this file is the skeleton of the
+> M8c review-approval browser checklist (landed in M8b; the "tested/screenshot" column of each
+> item is filled in by M8c — attachment numbers and conclusions). How to access:
+> `http://127.0.0.1:9800` (local machine) or `http://<VIP>:9800` (VPN segment; must have joined
+> the network).
 >
-> 浏览器矩阵：Chrome / Edge / Firefox（最新稳定版）× 三档视口（桌面 ≥1200 /
-> 平板 768–1024 / 手机 360–430——DevTools 设备模拟即可）。
+> Browser matrix: Chrome / Edge / Firefox (latest stable) × three viewport tiers (desktop ≥1200 /
+> tablet 768–1024 / phone 360–430 — DevTools device emulation suffices).
 >
-> M8b 已做的自动化替代面（供 M8c 对照，不替代目视）：容器断言 W1–W7
-> （deploy/webui_assert.sh）+ 本机内嵌浏览器全链冒烟（wasm 登录/建号/设口令/
-> 三档布局 scrollWidth 核验）。
+> The automated substitute surface already done by M8b (for M8c to compare against; not a
+> replacement for visual checks): container assertions W1–W7 (deploy/webui_assert.sh) + the local
+> embedded-browser full-chain smoke (wasm login/account creation/password setting/three-tier
+> layout scrollWidth checks).
 
-## 1. 登录与认证
+## 1. Login and authentication
 
-| # | 项 | 操作 | 预期 | 实测/截图 |
+| # | Item | Action | Expected | Tested/screenshot |
 |---|---|---|---|---|
-| L1 | 登录页三档居中 | 360/768/1280 三档打开 `#/login` | 卡片水平垂直居中、无横向滚动、表单完整 | |
-| L2 | bootstrap 连接态 | 断开服务后刷新 | 「无法连接管理接口」提示（非白屏） | |
-| L3 | 集群标识展示 | 正常打开 | 「集群 xxxxxxxx · 服务器 xxxxxxxx」（前 8 位） | |
-| L4 | 正确口令登录 | wasm OPAQUE 全流程 | 进入仪表盘；侧栏显示用户名/角色/来源 | |
-| L5 | 错口令 | 输错口令提交 | 「用户名或口令错误。」；按钮 spinner 后恢复 | |
-| L6 | 禁用账户 | 管理员禁用后该账户登录 | 「该账户已被禁用，请联系管理员。」 | |
-| L7 | 429 限速 | 连续错误尝试至限速 | 「尝试过于频繁，请 N 秒后重试。」带倒计时 | |
-| L8 | anchor 拒（错服务器） | 经错误代理/端口访问 | 「服务器身份验证失败…」（wasm -3 面） | |
-| L9 | 设置口令页 | 建号令牌 + 新口令两遍 | 成功提示 → 前往登录；坏令牌「引导令牌无效或已被使用。」 | |
-| L10 | 令牌重放 | 同令牌二次设置 | 同上 bad_token 文案（一次性语义） | |
-| L11 | 登出 | 侧栏「退出登录」 | 回登录页；回退按钮不恢复会话 | |
+| L1 | Login page centered at three tiers | open `#/login` at 360/768/1280 | card centered horizontally and vertically, no horizontal scrolling, form complete | |
+| L2 | bootstrap connection state | stop the service, then refresh | "cannot reach the admin API" notice (not a blank page) | |
+| L3 | Cluster identity display | open normally | "Cluster xxxxxxxx · Server xxxxxxxx" (first 8 characters) | |
+| L4 | Login with the correct password | full wasm OPAQUE flow | enters the dashboard; sidebar shows username/role/origin | |
+| L5 | Wrong password | submit a wrong password | "Invalid username or password."; the button spinner recovers | |
+| L6 | Disabled account | admin disables the account, then that account logs in | "This account has been disabled. Contact your administrator." | |
+| L7 | 429 rate limiting | keep making wrong attempts until limited | "Too many attempts. Retry in N seconds." with a countdown | |
+| L8 | anchor rejection (wrong server) | access via a wrong proxy/port | "Server identity verification failed…" (the wasm -3 surface) | |
+| L9 | Set-password page | account-creation token + the new password twice | success notice → go to login; a bad token gives "The bootstrap token is invalid or already used." | |
+| L10 | Token replay | set the password a second time with the same token | the same bad_token copy (one-time semantics) | |
+| L11 | Logout | sidebar "log out" | back to the login page; the back button does not restore the session | |
 
-## 2. 仪表盘
+## 2. Dashboard
 
-| # | 项 | 操作 | 预期 | 实测/截图 |
+| # | Item | Action | Expected | Tested/screenshot |
 |---|---|---|---|---|
-| D1 | 集群卡 | 登录直视 | cluster_id/epoch/同步模式（single 或 raft） | |
-| D2 | 服务器卡（多主） | 双服拓扑登录 | 每台 node/VIP/endpoint/leader 徽标/epoch/在线点 | |
-| D3 | 汇总卡 | 直视 | 设备总数/active/在线/账户数/收发速率合计 | |
-| D4 | 自身信息 | 直视 | server_id（前 8 位）+ 运行时长 | |
-| D5 | 流量曲线 | 选一台设备 VIP | uPlot 双序列（发送/接收）出现并随 60s 轮询推进 | |
-| D6 | 曲线时区 | 对比系统时钟 | x 轴刻度为本地时间（非 UTC 偏移） | |
-| D7 | 曲线 tooltip | 桌面鼠标悬停 / 手机触摸 | 时间点 + 双序列速率；移动端不遮档曲线 | |
-| D8 | 曲线自适应 | 拖动窗口宽度 | 图表宽度跟随容器（resize 无错位） | |
-| D9 | 空序列态 | 服务重启后立刻查看 | 「该设备暂无流量样本…」空态文案（非空白） | |
+| D1 | Cluster card | look on login | cluster_id/epoch/sync mode (single or raft) | |
+| D2 | Server cards (multi-primary) | log in on the two-server topology | per server: node/VIP/endpoint/leader badge/epoch/online dot | |
+| D3 | Summary card | look | total devices/active/online/account count/summed tx-rx rates | |
+| D4 | Self info | look | server_id (first 8 characters) + uptime | |
+| D5 | Traffic curves | select a device VIP | the uPlot dual series (sent/received) appears and advances with the 60s polling | |
+| D6 | Curve timezone | compare with the system clock | x-axis ticks are local time (no UTC offset) | |
+| D7 | Curve tooltip | desktop hover / phone touch | time point + both series' rates; on mobile it does not cover the curve | |
+| D8 | Curve responsiveness | drag the window width | chart width follows the container (no misalignment on resize) | |
+| D9 | Empty-series state | look right after a service restart | "No traffic samples for this device yet…" empty-state copy (not a blank area) | |
 
-## 3. 设备
+## 3. Devices
 
-| # | 项 | 操作 | 预期 | 实测/截图 |
+| # | Item | Action | Expected | Tested/screenshot |
 |---|---|---|---|---|
-| P1 | 全状态表 | 直视（桌面） | VIP/主机名/账户/类型/状态/最后活跃/流量/操作 全列 | |
-| P2 | 状态徽章 | 含禁用/吊销设备时 | 正常（绿）/已禁用（黄）/已吊销（红）/已过期（灰） | |
-| P3 | 在线点 | 有在线设备 | 绿点 + 「在线」 | |
-| P4 | 吊销确认模态 | 点「吊销」 | 二次确认模态（终态警告）；Esc/取消可退 | |
-| P5 | 吊销执行 | 确认 | Toast 成功（含 epoch）；表内状态转「已吊销」 | |
-| P6 | 禁用/启用 | 依次执行 | Toast + 状态徽章切换；操作按钮随状态收放 | |
-| P7 | 强制下线 | 对在线设备 kick | 确认模态文案含「尽力断开…不封禁」语义 | |
-| P8 | 手机档卡片化 | 360–430px 视口 | 表格降级为卡片列表；VIP/状态/操作完整保留 | |
-| P9 | 触控目标 | 手机档点操作 | 按钮高度 ≥44px、无横向滚动 | |
-| P10 | 非 admin | bob 登录设备页 | 列表可见、无操作列（管理 API 403 面不触发） | |
+| P1 | Full-status table | look (desktop) | VIP/hostname/account/type/status/last active/traffic/actions — all columns | |
+| P2 | Status badges | with disabled/revoked devices present | active (green)/disabled (yellow)/revoked (red)/expired (grey) | |
+| P3 | Online dot | with online devices | green dot + "online" | |
+| P4 | Revoke confirmation modal | click "revoke" | a double-confirmation modal (terminal-state warning); Esc/cancel backs out | |
+| P5 | Revoke execution | confirm | success toast (with epoch); the in-table status turns "revoked" | |
+| P6 | Disable/enable | execute in turn | toast + status badge switches; the action buttons appear/hide per status | |
+| P7 | Force disconnect | kick an online device | the confirmation modal copy carries the "best-effort disconnect… not a ban" semantics | |
+| P8 | Phone-tier cards | 360–430px viewport | the table degrades into a card list; VIP/status/actions fully retained | |
+| P9 | Touch targets | tap actions in the phone tier | button height ≥44px, no horizontal scrolling | |
+| P10 | Non-admin | bob logs in on the devices page | list visible, no actions column (the admin-API 403 surface not triggered) | |
 
-## 4. 账号（admin）
+## 4. Accounts (admin)
 
-| # | 项 | 操作 | 预期 | 实测/截图 |
+| # | Item | Action | Expected | Tested/screenshot |
 |---|---|---|---|---|
-| U1 | 用户表 | 直视 | 用户名/角色/状态/口令/设备数/操作 | |
-| U2 | 创建账号 | 输入新用户名提交 | 令牌弹窗一次性展示（32hex）+ 复制按钮 + 引导文案 | |
-| U3 | 令牌复制 | 点「复制」 | 剪贴板为令牌全文；按钮转「已复制」 | |
-| U4 | 令牌仅一次 | 关闭弹窗后重开 | 无处再取令牌（列表无令牌列） | |
-| U5 | 引导弹窗入口 | 点「在本机打开设置口令页」 | 跳 `#/set-password` 且用户名预填 | |
-| U6 | 禁用/启用 | 依次执行 | 徽章切换；禁用后该用户 Web 登录被拒（L6 联动） | |
-| U7 | 重置口令 | 对已有口令用户 | 新令牌弹窗；旧口令即刻登录失败 | |
-| U8 | 设/撤 admin | 依次执行 | 角色徽章切换；自降被拒（cannot_demote_self 文案） | |
-| U9 | 用户名约束 | 输入 `bad user!` 提交 | 前端/服务端拒绝（合法字符集提示） | |
+| U1 | Users table | look | username/role/status/password/device count/actions | |
+| U2 | Create account | submit a new username | the token modal shown once (32hex) + a copy button + guidance copy | |
+| U3 | Token copy | click "copy" | the clipboard holds the full token; the button turns "copied" | |
+| U4 | Token exactly once | close the modal and reopen | nowhere to retrieve the token again (no token column in the table) | |
+| U5 | Guidance modal entry | click "open the set-password page on this machine" | jumps to `#/set-password` with the username prefilled | |
+| U6 | Disable/enable | execute in turn | badge switches; after disabling, that user's Web login is rejected (linked with L6) | |
+| U7 | Reset password | for a user who has a password | new-token modal; the old password fails login immediately | |
+| U8 | Grant/revoke admin | execute in turn | role badge switches; self-demotion rejected (cannot_demote_self copy) | |
+| U9 | Username constraints | enter `bad user!` and submit | rejected by the frontend/server (legal-charset hint) | |
 
-## 5. 审计与设置
+## 5. Audit and settings
 
-| # | 项 | 操作 | 预期 | 实测/截图 |
+| # | Item | Action | Expected | Tested/screenshot |
 |---|---|---|---|---|
-| A1 | 审计表 | admin 直视 | 新→旧 200 行内；时间/操作者/操作/目标/来源/结果 | |
-| A2 | 动作词表中文化 | 直视 | 11 词表均中文（登录/登出/创建账号/…/强制下线） | |
-| A3 | denied/error 行 | 触发一次 403 尝试 | 对应 denied 行在列 | |
-| A4 | 非 admin 直击 | bob 手输 `#/audit` | 「无权限」页（403 前端呈现） | |
-| A5 | 设置摘要 | 直视 | 只读键值（端点/模式/票据 TTL/保留天数/会话上限/webui 端口与 TTL）；无密钥类字段 | |
+| A1 | Audit table | admin view | within 200 rows, new→old; time/operator/action/target/origin/result | |
+| A2 | Action-vocabulary localization | view | all 11 vocabulary items localized (log in/log out/create account/…/force disconnect) | |
+| A3 | denied/error rows | trigger one 403 attempt | the corresponding denied row is listed | |
+| A4 | Non-admin direct hit | bob hand-types `#/audit` | the "no permission" page (the 403 rendered by the frontend) | |
+| A5 | Settings summary | view | read-only key-values (endpoint/mode/ticket TTL/retention days/session cap/webui port and TTL); no key-like fields | |
 
-## 6. 响应式与可访问性横切
+## 6. Responsive and accessibility cross-cutting items
 
-| # | 项 | 操作 | 预期 | 实测/截图 |
+| # | Item | Action | Expected | Tested/screenshot |
 |---|---|---|---|---|
-| R1 | 三档导航 | <1200 / <768 | 顶栏+汉堡抽屉；抽屉遮罩点击/Esc 关闭 | |
-| R2 | 无横向滚动 | 三档逐页过一遍 | 任何页面无横向滚动条（DevTools 标尺 0） | |
-| R3 | 功能完整性 | 手机档逐功能 | 全部操作可达（登录/建号/令牌/设备操作/审计），无「仅桌面」 | |
-| R4 | 深色主题一致性 | 三浏览器 | 色板/圆角/阴影一致；系统字体栈渲染正常 | |
-| R5 | 减少动效偏好 | 系统开启后刷新 | 过渡/动画近乎瞬时（prefers-reduced-motion） | |
-| R6 | 键盘可达 | Tab 遍历登录页 | 焦点环可见、Enter 提交、Esc 关模态 | |
+| R1 | Three-tier navigation | <1200 / <768 | top bar + hamburger drawer; drawer closes on overlay click/Esc | |
+| R2 | No horizontal scrolling | walk every page at the three tiers | no page has a horizontal scrollbar (DevTools ruler 0) | |
+| R3 | Functional completeness | walk every function in the phone tier | all actions reachable (login/account creation/token/device actions/audit); no "desktop only" | |
+| R4 | Dark-theme consistency | across the three browsers | palette/radius/shadows consistent; the system font stack renders normally | |
+| R5 | Reduced-motion preference | enable at the OS level and refresh | transitions/animations nearly instantaneous (prefers-reduced-motion) | |
+| R6 | Keyboard reachability | Tab through the login page | focus ring visible, Enter submits, Esc closes modals | |
 
-## 7. 性能抽样（M8c 定量项）
+## 7. Performance sampling (M8c quantitative items)
 
-- 登录按钮 → 进入仪表盘耗时（argon2 主线程 ~100ms 量级——v1 已知取舍）。
-- 仪表盘 60s 轮询的 CPU/内存抽样（120 点 uPlot 重绘无感）。
-- 首屏资源：index.html + app/i18n/styles + vendor（alpine 44.8KB / uplot 39.4KB /
-  flock_pake.js 8KB / flock_pake.wasm ~845KB——LAN/VPN 段可接受，如实记录）。
+- Time from the login button → entering the dashboard (argon2 on the main thread is on the order
+  of ~100ms — a known v1 trade-off).
+- CPU/memory sampling of the dashboard's 60s polling (the 120-point uPlot redraw is
+  imperceptible).
+- First-load resources: index.html + app/i18n/styles + vendor (alpine 44.8KB / uplot 39.4KB /
+  flock_pake.js 8KB / flock_pake.wasm ~845KB — acceptable on LAN/VPN segments; recorded as-is).
