@@ -306,11 +306,14 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
     };
     let app = NSApplication::sharedApplication(mtm);
     let past = NSDate::distantPast();
+    // SAFETY：NSDefaultRunLoopMode 是 AppKit 常量全局（不可变 NSString）——objc2 将
+    // 其暴露为 extern static，读取引用需 unsafe（惯例姿势）；只读、'static。
+    let mode = unsafe { &NSDefaultRunLoopMode };
     while !quit.load(Ordering::SeqCst) {
-        while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+        while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
             NSEventMask::Any,
             Some(&past),
-            NSDefaultRunLoopMode,
+            mode,
             true,
         ) {
             app.sendEvent(&event);
