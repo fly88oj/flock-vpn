@@ -1,956 +1,1232 @@
-# Flock VPN 总体设计
+# Flock VPN Overall Design
 
-- 设计人：总设计师（动态工作流子代理）；日期：2026-10-31
-- 输入材料（全部通读）：
-  `docs/research/verdict.md`（评估结论 + upgradeList 16 项，本设计的硬输入）、
-  `docs/research/showroom-analysis.md`、`crypto-2026.md`、`compression-2026.md`、
-  `vpn-mesh-2026.md`、`frp-compat.md`；showroom 源码（`E:\Works\showroom`，只读抽查）。
-- 设计语言：深模块 / 接口 / 接缝 / 适配器 / 深度（leverage·locality），按
-  `C:\Users\FLYING\.zcode\skills\codebase-design\SKILL.md` 的词汇表使用。
-- 证据纪律：文中每个关键论断括注来源（报告§节 / 源码 `文件:行` / 本会话执行的命令与输出）。
-  本会话亲自执行的核实见附录 B；未执行的一律写明「未验证」。
-- 硬性约束追踪：verdict §4 upgradeList 共 16 项（P0-1..P2-13、★VPN-14..16）一项不漏，
-  落位对照表见附录 A。
-
----
-
-## 0. 设计总览
-
-一句话：**Flock VPN = showroom 协议层的「升级档位化抽库」+ 长寿命隧道会话层 + 接入端点（Direct 缺省 / FRP 中转可选）+ openraft 多主多活控制面**。协议层抽成独立库 `flock-protocol`（深模块：文件信封/签名/认证/会话/复用/压缩/信任锚七个小接口藏大实现），Flock VPN 与 showroom 两项目共用；VPN 特有的 tun 适配、frpc 托管、多主同步以「接缝 + 适配器」形式落在协议库外圈的 Flock VPN workspace crate 里。
-
-**硬约束（用户令，最高优先级，覆盖任何相反表述）**：Flock VPN **不得与 frp/chmlfrp 强绑定**。frp 只服务于「服务端无公网 IP 或客户端无法直连服务端 IP」的场景；服务端可直连时**不执行任何 frp 相关逻辑**（无 frpc 子进程、无配置生成）——listener mode 缺省 = `Direct`，`Frp` 是可选适配器而非前提（§2.1/§2.2/§3.11/§5）。
-
-分层（自下而上）：
-
-```
-┌─ 客户端 app（flock-client）────────────────────────────────────┐
-│ tun(tun-rs) → PacketChannel → yamux 流 ─┐                        │
-│ 路由（rtnetlink/wintun/VpnService）      │                        │
-└──────────────────────────────────────────┼────────────────────────┘
-                                            │ 单条 TCP（密文；路径=接入端点：
-                                            │  Direct 直连 或 经 FRP 中转）
-┌─ flock-protocol（会话层）──────────────────┼───────────────────────┐
-│ SecureStream(记录层: 计数器nonce AEAD+抗重放+rekey) ← yamux 跑在加密内 │
-│ 握手: 已钉扎 1-RTT Noise-IK / TOFU 首连 2-RTT；X25519+ML-KEM-768 混合 │
-│       KEM + 服务端身份签名（邀请文件携带静态混合公钥）                  │
-└──────────────────────────────────────────┼───────────────────────┘
-                                            │ TCP 字节流（直连或中转，均透明）
-┌─ 服务端 app（flock-server）─────────────┼────────────────────────┐
-│ 监听器 ListenerMode: Direct(缺省,零 frp) │ tun + 路由 + peer 转发   │
-│   或 Frp(flock-frpc Supervisor 托管中转)  │ flock-sync: openraft+租约│
-│ 控制流: OPAQUE 登录 + 设备注册表 + 配置下发 │                        │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-走 FRP 中转时全程只见密文（frp useEncryption/useCompression 默认关，frp-compat §0.1/S20；字节透传经 T1/T2 实证，含 0x00–0xFF 全字符集与 0x16/0x17 首字节）；直连时链路上只有本协议密文。
+- Designer: chief designer (dynamic workflow subagent); date: 2026-10-31
+- Input materials (all read in full):
+  `docs/research/verdict.md` (evaluation conclusions + upgradeList of 16 items, the hard input of this design),
+  `docs/research/showroom-analysis.md`, `crypto-2026.md`, `compression-2026.md`,
+  `vpn-mesh-2026.md`, `frp-compat.md`; showroom source code (`E:\Works\showroom`, read-only spot checks).
+- Design vocabulary: deep modules / interfaces / seams / adapters / leverage (depth·locality), used per the
+  glossary of `C:\Users\FLYING\.zcode\skills\codebase-design\SKILL.md`.
+- Evidence discipline: every key claim in this document carries a source annotation (report §section /
+  source `file:line` / commands and outputs executed in this session).
+  Verifications performed first-hand in this session are in Appendix B; anything not executed is
+  explicitly marked "not verified".
+- Hard-constraint tracking: verdict §4 upgradeList has 16 items in total (P0-1..P2-13, ★VPN-14..16),
+  none omitted; the placement cross-reference table is in Appendix A.
 
 ---
 
-## 1. 共享协议库：`flock-protocol`
+## 0. Design overview
 
-### 1.1 名字与落位
+In one sentence: **Flock VPN = an "upgrade-tiered extraction into a library" of the showroom protocol
+layer + a long-lived tunnel session layer + access endpoints (Direct by default / FRP relay optional)
++ an openraft multi-primary active-active control plane**. The protocol layer is extracted into the
+standalone library `flock-protocol` (deep module: seven small interfaces — file envelope / signature /
+authentication / session / multiplexing / compression / trust anchor — hiding large implementations),
+shared by the Flock VPN and showroom projects; the VPN-specific tun adaptation, frpc supervision, and
+multi-primary sync live as "seams + adapters" in the Flock VPN workspace crates around the protocol
+library.
 
-- **crate 名**：`flock-protocol`（lib 名 `flock_protocol`）。
-- **落位**：本仓库 workspace member，`E:\Works\FlockVPN\crates\flock-protocol`。
-  workspace 布局：
+**Hard constraint (user mandate, highest priority, overrides any statement to the contrary)**: Flock VPN
+**must not be tightly bound to frp/chmlfrp**. frp serves only the "server has no public IP, or the
+client cannot reach the server IP directly" scenario; when the server is directly reachable, **no
+frp-related logic is executed** (no frpc subprocess, no config generation) — the default listener mode
+is `Direct`, and `Frp` is an optional adapter, not a prerequisite (§2.1/§2.2/§3.11/§5).
+
+Layering (bottom-up):
+
+```
+┌─ Client app (flock-client) ─────────────────────────────────────┐
+│ tun(tun-rs) → PacketChannel → yamux streams ─┐                   │
+│ routing (rtnetlink/wintun/VpnService)         │                   │
+└───────────────────────────────────────────────┼───────────────────┘
+                                                │ single TCP (ciphertext; path = access endpoint:
+                                                │   Direct connection or via FRP relay)
+┌─ flock-protocol (session layer) ────────────────┼─────────────────┐
+│ SecureStream (record layer: counter-nonce AEAD + anti-replay + rekey) ← yamux runs inside the encryption │
+│ Handshake: pinned 1-RTT Noise-IK / TOFU first-connect 2-RTT; X25519+ML-KEM-768  │
+│       hybrid KEM + server identity signature (invite file carries the static hybrid pubkey) │
+└───────────────────────────────────────────────┼─────────────────┘
+                                                │ TCP byte stream (direct or relayed, transparent either way)
+┌─ Server app (flock-server) ─────────────────────┼─────────────────┐
+│ Listener ListenerMode: Direct (default, zero frp) │ tun + routing + peer forwarding │
+│   or Frp (flock-frpc Supervisor-managed relay)    │ flock-sync: openraft + leases  │
+│ Control flow: OPAQUE login + device registry + config push │                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Over an FRP relay only ciphertext is visible end to end (frp useEncryption/useCompression off by
+default, frp-compat §0.1/S20; byte pass-through proven by T1/T2, including the full 0x00–0xFF byte
+set and 0x16/0x17 first bytes); with Direct, the only thing on the wire is this protocol's ciphertext.
+
+---
+
+## 1. Shared protocol library: `flock-protocol`
+
+### 1.1 Name and placement
+
+- **crate name**: `flock-protocol` (lib name `flock_protocol`).
+- **Placement**: workspace member of this repository, `E:\Works\FlockVPN\crates\flock-protocol`.
+  Workspace layout:
 
   ```
   E:\Works\FlockVPN\
-  ├── Cargo.toml            # workspace root（成员见下）
+  ├── Cargo.toml            # workspace root (members below)
   ├── crates/
-  │   ├── flock-protocol/    # ★ 共享协议库（Flock VPN 与 showroom 两边引用）
-  │   ├── flock-frpc/        # frpc 子进程托管双栈（Flock VPN 专用）
-  │   └── flock-sync/        # openraft 状态机 + gossip 租约（Flock VPN 专用）
+  │   ├── flock-protocol/    # ★ shared protocol library (referenced by both Flock VPN and showroom)
+  │   ├── flock-frpc/        # frpc subprocess supervision, dual stack (Flock VPN only)
+  │   └── flock-sync/        # openraft state machine + gossip leases (Flock VPN only)
   ├── app/
   │   ├── flock-server/
   │   └── flock-client/
-  ├── deploy/               # Docker compose 拓扑 + 断言脚本（§6）
+  ├── deploy/               # Docker compose topologies + assertion scripts (§6)
   └── docs/
   ```
 
-- 理由：协议库必须能被 showroom 独立引用（showroom 是另一个仓库 `E:\Works\showroom`，
-  其 workspace members = showroom-common/showroomctl/showroom，showroom/Cargo.toml:3 本次核实），
-  所以它不能是 Flock VPN app 的内部模块；同时它是本仓库的交付主体（M1 里程碑），放本仓库
-  `crates/` 是唯一同时满足「本仓库内目录」与「跨仓库可引用」的落位。
+- Rationale: the protocol library must be independently referenceable by showroom (showroom is a
+  separate repository `E:\Works\showroom`, whose workspace members = showroom-common/showroomctl/
+  showroom, showroom/Cargo.toml:3 verified in this session), so it cannot be an internal module of
+  the Flock VPN app; at the same time it is this repository's main deliverable (milestone M1), and
+  placing it in this repository's `crates/` is the only placement that satisfies both "directory in
+  this repository" and "referenceable across repositories".
 
-### 1.2 被两项目引用的方式（路径/发布策略）
+### 1.2 How the two projects reference it (path / release strategy)
 
-双轨引用，开发期零摩擦、生产期可钉版：
+Dual-track referencing: zero friction during development, pinnable versions in production:
 
-1. **Flock VPN（本仓库）**：workspace path 成员依赖 `flock-protocol = { path = "crates/flock-protocol" }`。
-2. **showroom（外部仓库）**：git 依赖钉 tag：
-   `flock-protocol = { git = "<Flock VPN 仓库 URL>", tag = "flock-protocol-v0.1.0", default-features = false, features = ["legacy", "wasm"] }`；
-   开发期在 showroom 仓库 `.cargo/config.toml` 用 `[patch."<git-url>"]` 覆盖为本地路径
-   `path = "../FlockVPN/crates/flock-protocol"`（标准 patch 工作流，showroom 不改 Cargo.toml 即可本地联调）。
-3. **发布策略**：阶段一 git+tag（够用、无发布仪式）；若 showroom CI 或第三方需要，阶段二
-   发 crates.io（许可 Apache-2.0 OR MIT，与 RustCrypto 生态一致，crypto-2026 §5）。
-   版本纪律：showroom-common 的 `pub use {ed25519_dalek, rsa}`「版本收口」语义保留
-   （showroom-analysis §2 再导出注意点）——flock-protocol 继续再导出其锁定的 dalek/x25519-dalek 等，
-   两项目不得另引版本。
+1. **Flock VPN (this repository)**: workspace path member dependency
+   `flock-protocol = { path = "crates/flock-protocol" }`.
+2. **showroom (external repository)**: git dependency pinned to a tag:
+   `flock-protocol = { git = "<Flock VPN repository URL>", tag = "flock-protocol-v0.1.0", default-features = false, features = ["legacy", "wasm"] }`;
+   during development, in the showroom repository's `.cargo/config.toml`, use `[patch."<git-url>"]`
+   to override it with the local path `path = "../FlockVPN/crates/flock-protocol"` (standard patch
+   workflow; showroom can co-debug locally without touching Cargo.toml).
+3. **Release strategy**: phase one git+tag (sufficient, no release ceremony); if showroom CI or third
+   parties need it, phase two publishes to crates.io (license Apache-2.0 OR MIT, consistent with the
+   RustCrypto ecosystem, crypto-2026 §5).
+   Version discipline: showroom-common's `pub use {ed25519_dalek, rsa}` "version funneling" semantics
+   are preserved (showroom-analysis §2 re-export caveats) — flock-protocol continues to re-export its
+   pinned dalek/x25519-dalek etc.; neither project may pull in separate versions.
 
-showroom 的迁移面（兼容保留，见 §1.3）：`showroom-common` 改为对 `flock-protocol` 的薄再导出
-（保留全部既有 pub 项签名），showroomctl/showroom 源码零改动。此迁移本身属 showroom 侧工作，
-本仓库只保证接口可替换；不在本设计交付范围（本仓库不写 showroom 代码）。
+showroom's migration surface (compatibility preserved, see §1.3): `showroom-common` becomes a thin
+re-export over `flock-protocol` (all existing pub item signatures preserved), with zero changes to
+showroomctl/showroom source. That migration itself is showroom-side work; this repository only
+guarantees the interface is swappable; it is not in this design's delivery scope (this repository
+does not write showroom code).
 
-### 1.3 API 设计：兼容面 + 升级档位
+### 1.3 API design: compatibility surface + upgrade tiers
 
-设计原则（SKILL.md）：**小接口、大实现**。每个子模块的接口是「调用方需要知道的一切」——
-包括安全前提（如信封档的一次性 k）显式写进类型名或文档契约。
+Design principle (SKILL.md): **small interface, large implementation**. Each submodule's interface is
+"everything callers need to know" — including security preconditions (such as the envelope tier's
+one-time k), made explicit in type names or documented contracts.
 
-#### 1.3.1 feature 划分
+#### 1.3.1 feature split
 
-| feature | 内容 | 默认 | 服务对象 |
+| feature | contents | default | served audience |
 |---|---|---|---|
-| （默认） | sig / pake / kem-hybrid / envelope-v2 / session / mux / compress / trust | 开 | Flock VPN 全量 |
-| `legacy` | 信封 v1（RSA-OAEP）seal/open、SR-SIG1 旧常量 | 关 | showroom 过渡 |
-| `anchor` | OPAQUE 服务端身份签名层（P0-5 的登录锚） | 关（Flock VPN 构建里开） | Flock VPN；showroom 后续跟进 |
-| `pq-sign` | ML-DSA-65 并行公钥档（ml-dsa 0.1.1，crate 自述未审计，crypto-2026 §5） | 关 | 可选 |
-| `wasm` | getrandom custom 后端桥等 showroom wasm 约束（showroom-analysis §6.3） | 关 | showroom |
+| (default) | sig / pake / kem-hybrid / envelope-v2 / session / mux / compress / trust | on | Flock VPN, full set |
+| `legacy` | envelope v1 (RSA-OAEP) seal/open, old SR-SIG1 constants | off | showroom transition |
+| `anchor` | OPAQUE server identity signature layer (the login anchor of P0-5) | off (on in Flock VPN builds) | Flock VPN; showroom to follow later |
+| `pq-sign` | ML-DSA-65 parallel public-key tier (ml-dsa 0.1.1, crate self-describes as unaudited, crypto-2026 §5) | off | optional |
+| `wasm` | getrandom custom backend bridge and other showroom wasm constraints (showroom-analysis §6.3) | off | showroom |
 
-#### 1.3.2 兼容面（保留给 showroom 的接口，签名不变）
+#### 1.3.2 Compatibility surface (interfaces preserved for showroom, signatures unchanged)
 
-以下全部来自 showroom-analysis §2 的 pub 面清单（本次抽查源码一致），原样保留：
+All of the following come from the pub-surface inventory in showroom-analysis §2 (spot-checked
+against source, consistent), preserved as-is:
 
-- `sig`：`build_canonical / sign / sign_prehashed / verify / verify_with_hash`，
-  canonical 七字段与 `SR-SIG1 <user>:<ts>:<nonce>:<sig_b64url>` 线上格式逐字节不变
-  （showroom-common/src/lib.rs:222-261 本次核实）；`SIG_WINDOW_SECS=300`（lib.rs:48）。
-- `envelope` v1（`legacy`）：`seal/open` 与 `[384B RSA-OAEP 头]||段{[12B nonce][ct+tag]}`
-  布局不变（lib.rs:376-412 本次核实），长度不变量测试保留。
-- `pake`：OPAQUE Suite（ristretto255+TripleDH+Identity KSF，opaque.rs:32-39 本次核实）、
-  全部 login/reg/server_* 函数、`SERVER_ID` 导出、rwd 外部 argon2id
-  （opaque.rs:53-70 本次核实：m=19456KiB/t=2/p=1，盐前缀 `showroom-opaque-v1`）。
-- 工具：`sha256_hex(_stream)`、`nonce_hex`（16 随机字节→32 hex，lib.rs:75-79——P2-13 文档回改按实现为准）、
-  `write_private`（0600）、`names::*`、常量 `KEY_LEN/NONCE_LEN/TAG_LEN/SEG/WRAP_LEN`。
-- 依赖代际（P1-6）：aes-gcm 0.11.1 / opaque-ke 4.0.1 / ed25519-dalek 3.0.0 /
-  rand 0.9（新代码；理由：非 wasm 的 VPN 无 0.8 兼容包袱，0.8.x 虽仍维护但 API 代差迟早要还，
-  crypto-2026 §5 rand 行）。**兼容性守门**：opaque-ke 3→4 必须过「showroom 固定向量样本互通」
-  测试（M1 硬门槛，见 §7）；OPAQUE 报文格式由 RFC 9807 固定，升级属实现代际而非协议变化
-  （crypto-2026 §4.1）。
-- 勘误落实（P2-11）：库内注释引用 RFC **9807**（opaque.rs:1 误写 9380，本次核实存在）。
+- `sig`: `build_canonical / sign / sign_prehashed / verify / verify_with_hash`; the canonical
+  seven fields and the `SR-SIG1 <user>:<ts>:<nonce>:<sig_b64url>` wire format unchanged byte for byte
+  (showroom-common/src/lib.rs:222-261 verified in this session); `SIG_WINDOW_SECS=300` (lib.rs:48).
+- `envelope` v1 (`legacy`): `seal/open` and the `[384B RSA-OAEP header]||segment{[12B nonce][ct+tag]}`
+  layout unchanged (lib.rs:376-412 verified in this session); length-invariant tests preserved.
+- `pake`: OPAQUE suite (ristretto255+TripleDH+Identity KSF, opaque.rs:32-39 verified in this
+  session), all login/reg/server_* functions, `SERVER_ID` export, external argon2id for rwd
+  (opaque.rs:53-70 verified in this session: m=19456KiB/t=2/p=1, salt prefix `showroom-opaque-v1`).
+- Utilities: `sha256_hex(_stream)`, `nonce_hex` (16 random bytes → 32 hex, lib.rs:75-79 — P2-13 doc
+  correction follows the implementation), `write_private` (0600), `names::*`, constants
+  `KEY_LEN/NONCE_LEN/TAG_LEN/SEG/WRAP_LEN`.
+- Dependency generations (P1-6): aes-gcm 0.11.1 / opaque-ke 4.0.1 / ed25519-dalek 3.0.0 / rand 0.9
+  (new code; rationale: a non-wasm VPN carries no 0.8 compatibility burden; 0.8.x is still maintained
+  but the API generation gap must be repaid sooner or later, crypto-2026 §5 rand row).
+  **Compatibility gate**: opaque-ke 3→4 must pass the "showroom fixed-vector sample interop" test
+  (hard M1 gate, see §7); the OPAQUE message format is fixed by RFC 9807, so the upgrade is an
+  implementation-generation change, not a protocol change (crypto-2026 §4.1).
+- Erratum applied (P2-11): in-library comments reference RFC **9807** (opaque.rs:1 mistakenly wrote
+  9380; existence verified in this session).
 
-#### 1.3.3 升级档位（按评估结论新增/替换）
+#### 1.3.3 Upgrade tiers (added/replaced per the evaluation conclusions)
 
-**(a) `kem` —— 混合 KEM 模块（P0-1、P0-7 PQ）**
+**(a) `kem` — hybrid KEM module (P0-1, P0-7 PQ)**
 
 ```rust
-pub struct HybridKeypair { … }          // X25519 静态 + ML-KEM-768 密钥对
-pub struct HybridPubkey { … }           // 线上 1216B = 32(X25519) + 1184(ML-KEM ek)
+pub struct HybridKeypair { … }          // X25519 static + ML-KEM-768 keypair
+pub struct HybridPubkey { … }           // wire 1216B = 32(X25519) + 1184(ML-KEM ek)
 pub struct SealedShared([u8; 32]);
 pub fn encapsulate(pk: &HybridPubkey, rng) -> (SealedShared, HybridCt); // ct 1120B = 32+1088
 pub fn decapsulate(sk: &HybridKeypair, ct: &HybridCt) -> Option<SealedShared>;
-pub fn fingerprint(pk: &HybridPubkey) -> Fingerprint;                  // 钉扎/展示用
+pub fn fingerprint(pk: &HybridPubkey) -> Fingerprint;                  // for pinning/display
 ```
 
-- 组合规则：`shared = HKDF-SHA256(x25519_ss || ml_kem_ss)`（TLS 混合思想，RFC 10024；frp-compat 无涉）。
-- 尺寸与延迟依据（verdict §3.3 复核轮实跑）：ek=1184B/ct=1088B、混合密文 1120B、混合公钥
-  1216B、encap+decap <0.1ms。实现用 ml-kem 0.3.3（纯 Rust FIPS 203）+ x25519-dalek 3.0.0；
-  **不用 liboqs**（官方明示不建议生产，crypto-2026 §5）。
-- RSA 兼容档：`legacy` feature 保留 v1 read/open；「过渡双封装」评估结论为**不提供**——
-  v1 读者按定长 384B 解析头部，任何含混合密文的新布局它都无法解析，双封装不能带来
-  「新老同解」，真正的过渡=迁移窗口内 showroom 继续写 v1、永远可读 v1（P0-1 的「可保留」
-  以此形式满足；理由与 showroom-analysis §4.1 头部布局一致）。
+- Combination rule: `shared = HKDF-SHA256(x25519_ss || ml_kem_ss)` (TLS hybrid approach, RFC 10024;
+  frp-compat not involved).
+- Size and latency basis (verdict §3.3 re-run round): ek=1184B/ct=1088B, hybrid ciphertext 1120B,
+  hybrid pubkey 1216B, encap+decap <0.1ms. Implementation uses ml-kem 0.3.3 (pure-Rust FIPS 203)
+  + x25519-dalek 3.0.0; **liboqs is not used** (officially discouraged for production,
+  crypto-2026 §5).
+- RSA compatibility tier: the `legacy` feature preserves v1 read/open; the "transitional dual
+  encapsulation" evaluation conclusion is **not to provide it** — a v1 reader parses the header by
+  fixed 384B length and cannot parse any new layout containing hybrid ciphertext, so dual
+  encapsulation cannot deliver "old and new readers both decode"; the real transition = during the
+  migration window showroom keeps writing v1, and v1 stays forever readable (P0-1's "preservable"
+  requirement is satisfied in this form; rationale consistent with the header layout in
+  showroom-analysis §4.1).
 
-**(b) `envelope` v2 —— 段序号 AAD（P0-3）+ 混合封装**
+**(b) `envelope` v2 — segment-sequence AAD (P0-3) + hybrid encapsulation**
 
 ```
-头: [1B ver=2][16B envelope_id][32B eph_x25519][1088B ml_kem_ct]   = 1137B
-段: [12B nonce][AES-256-GCM ct‖tag]，AAD = ver‖envelope_id‖seg_idx‖is_final
+header: [1B ver=2][16B envelope_id][32B eph_x25519][1088B ml_kem_ct]   = 1137B
+segment: [12B nonce][AES-256-GCM ct‖tag], AAD = ver‖envelope_id‖seg_idx‖is_final
 ```
 
-- 一次性 k 由混合 KEM 派生（每信封新临时份额 ⇒ **一次性信封获得前向保密**，verdict §3.3）。
-- 信封档保留「一次性 k + 每段随机 96-bit nonce」的**文档化前提**（每密钥消息数 = n/4MiB ≪ 2^32，
-  SP 800-38D 随机 IV 界内，verdict §3.4）；AAD 把段序号+信封 ID+结束位绑进认证，防段重排/拼接
-  （v1 缺失，本次核实 lib.rs:396-411 encrypt 调用仅 nonce+明文）。
-- `open_v1` 只读兼容（`legacy`）。zstd-19 批量档（P1-7）继续由调用方管道组合，库只加
-  `seal_v2_compress(policy)` 便捷档位。
+- The one-time k is derived from the hybrid KEM (a fresh ephemeral share per envelope ⇒ **one-time
+  envelopes gain forward secrecy**, verdict §3.3).
+- The envelope tier preserves the **documented precondition** of "one-time k + fresh random 96-bit
+  nonce per segment" (messages per key = n/4MiB ≪ 2^32, within the SP 800-38D random-IV bound,
+  verdict §3.4); AAD binds the segment sequence + envelope ID + final flag into the authentication,
+  preventing segment reordering/splicing (missing in v1; verified in this session at lib.rs:396-411,
+  the encrypt call takes only nonce+plaintext).
+- `open_v1` read-only compatibility (`legacy`). The zstd-19 bulk tier (P1-7) remains a caller-side
+  pipeline composition; the library only adds the `seal_v2_compress(policy)` convenience tier.
 
-**(c) `session` —— 隧道会话（P0-2、P1-8、P1-10 的核心承载）**
+**(c) `session` — tunnel session (the core carrier of P0-2, P1-8, P1-10)**
 
-深模块：调用方只见到 `Tunnel`，内部藏握手/记录层/抗重放/rekey/keepalive/伪造限额全套纪律。
+Deep module: callers see only `Tunnel`; inside hides the full discipline of handshake / record
+layer / anti-replay / rekey / keepalive / forgery limit and disconnect.
 
 ```rust
 pub struct TunnelConfig {
-    pub aead: AeadPreference,        // 主 AES-256-GCM(aes-gcm 0.11.1)；后备 XChaCha20-Poly1305 /
-                                     // AES-256-GCM-SIV（P1-8，协商取交集）
-    pub keepalive: Duration,         // 默认 10s（WireGuard KeepaliveTimeout，crypto-2026 §6）
-    pub rekey_after: (u64, Duration),// 默认 (2^60, 120s) 双阈值
-    pub reject_after: (u64, Duration),// 默认 (2^64−2^13−1, 180s) 硬拒绝
-    pub forge_limit: u32,            // 伪造尝试限额断链（默认 100，P0-2）
+    pub aead: AeadPreference,        // primary AES-256-GCM (aes-gcm 0.11.1); fallback XChaCha20-Poly1305 /
+                                     // AES-256-GCM-SIV (P1-8, negotiated by intersection)
+    pub keepalive: Duration,         // default 10s (WireGuard KeepaliveTimeout, crypto-2026 §6)
+    pub rekey_after: (u64, Duration),// default (2^60, 120s) dual threshold
+    pub reject_after: (u64, Duration),// default (2^64−2^13−1, 180s) hard reject
+    pub forge_limit: u32,            // forgery-attempt limit that disconnects (default 100, P0-2)
 }
 pub enum LookupVerdict { NotFound, Revoked { since_epoch: u64 }, Active(DeviceRecord) }
 pub trait DeviceDirectory: Send + Sync + 'static {
-    fn lookup(&self, id: &DeviceId) -> BoxFuture<'static, LookupVerdict>;  // 必须异步：
-        // 线性一致读经 Raft leader 是网络往返（§4）；NotFound 与 Revoked 都必须拒握手且
-        // 时序对齐（防在线探测设备枚举）。
+    fn lookup(&self, id: &DeviceId) -> BoxFuture<'static, LookupVerdict>;  // must be async:
+        // a linearizable read via the Raft leader is a network round trip (§4); both NotFound and
+        // Revoked must reject the handshake with timing aligned (to prevent online device-enumeration
+        // probing).
 }
 pub async fn initiate(io: TcpStream, device: &DeviceStaticKeys,
                       expect_server: &ServerPin, cfg: TunnelConfig) -> Result<Tunnel>;
 pub async fn respond(io: TcpStream, server: &ServerIdentity,
                      dir: impl DeviceDirectory, cfg: TunnelConfig) -> Result<Tunnel>;
 impl Tunnel {
-    pub async fn open_stream(&self, prio: Prio) -> io::Result<Stream>;     // 逻辑流（yamux 内跑）
-    pub async fn open_packet_channel(&self) -> io::Result<PacketChannel>;  // TUN 帧化（VPN-14 接口）
-    pub fn stats(&self) -> SessionStats;                                    // epoch/计数/重放拒绝
+    pub async fn open_stream(&self, prio: Prio) -> io::Result<Stream>;     // logical stream (runs inside yamux)
+    pub async fn open_packet_channel(&self) -> io::Result<PacketChannel>;  // TUN framing (VPN-14 interface)
+    pub fn stats(&self) -> SessionStats;                                    // epoch/counters/replay rejections
 }
 ```
 
-- **lookup 接缝的实现契约**（防重连风暴放大到 Raft leader，详见 §4「读与缓存」）：握手侧
-  `DeviceDirectory` 的服务端实现用「记录缓存 + 吊销纪元（revocation_epoch，随 Raft 日志
-  apply 自动推进）」两级——epoch 未变且缓存命中 ⇒ 本地答；epoch 变化或 miss ⇒ 线性一致读。
-  中转断链后的 N 客户端重连风暴在无吊销时全部命中本地缓存，不触碰 leader。
-- **握手（P1-10）双形态**——首连是否有服务器静态材料决定往返数（钉扎模型 = 集群根公钥锚定
-  全套服务器材料，§1.3.3f）：
-  - **已钉扎形态（邀请文件或既有 pin，常态 1-RTT，Noise IK 结构）**：
-    I1 = 版本+算法集+X25519 临时 + ML-KEM-768 ct(1088B，对**目标服务器**——即该端点在
-    ClusterDirectory 中对应 ServerEntry 的——**静态 ML-KEM 公钥**封装) + 以
-    HKDF(x25519(e,s_srv)‖mlkem_ss) 派生密钥加密的「设备静态 X25519 公钥+设备 Ed25519
-    公钥+**设备签名**」；R1 = 服务器临时 + **服务器身份密钥对 transcript 的签名（P0-5 隧道侧）**
-    + 双向密钥确认。握手后首帧即可承数据。`initiate` 的 `expect_server: &ServerPin` =
-    （cluster_root_pub + 目标端点的 ServerEntry）——切端点 = 换 ServerEntry，材料来自
-    邀请文件或 dir_pull 刷新的根签目录，**任意端点均 1-RTT**（A5/A15 的实现基础）。
-    - **签名覆盖契约（防 UKS/未知密钥共享）**：设备 Ed25519 签名的覆盖范围 = I1 **全部已发
-      字段**（含两个临时份额与算法集）+ 协议上下文（cluster_id、期望的服务器身份公钥、
-      会话用途标签）；服务器身份签名覆盖 = I1‖R1 全 transcript。M1 向量必须含「篡改上下文/
-      换服务器身份 → 验签失败」用例。
-  - **TOFU 首连引导形态（无任何集群材料，仅一次，2-RTT）**：
-    I0 = 版本+算法集+客户端 X25519 临时（此时无服务器静态公钥，无法封装/加密，明文发起）；
-    R0 = 该服务器的**入群凭证公开部分**（server_id + identity_pub + static_hybrid_pub 全量
-    + access_endpoint）+ **集群根公钥** + 服务器身份对 I0‖R0 的签名。客户端验证：入群凭证
-    = 根公钥对 ServerEntry 的签名 ⇒ 材料链可信；随后展示**集群根指纹**、用户确认后
-    **只钉扎根公钥**（cluster_id → root_pub），并即以该 ServerEntry 按 1-RTT 形态发 I1/R1。
-    其他端点/新服务器材料经控制流 `dir_pull`（根签 ClusterDirectory，dir_version 递增）
-    获取——**此后任何端点均 1-RTT，I0 不再出现**。
-    - **残余风险明示**：TOFU 不防首登在线 MITM——首连时攻击者可自签一套「根公钥+凭证链」、
-      客户端把攻击者的根钉住（SSH known_hosts 同类限制）；组织场景必须走邀请文件强路径
-      （§1.3.3f）。
-  - 按对端静态公钥索引会话 ⇒ 端点（中转入口）可换而会话语义连续（漫游模型，vpn-mesh §2 /
-    crypto-2026 §6）。重连 = **全新握手**，不做 PSK 恢复（TLS 恢复会绑定旧会话安全上下文且
-    binder 不抗字典，crypto-2026 §6）。
-- **记录层（P0-2）**：`[u32 len ≤1MiB][type][AEAD(payload)]`，nonce = 32-bit 零 ‖ 64-bit LE
-  计数器（WireGuard 形态）；每方向独立计数与密钥；**长会话禁随机 96-bit nonce**（信封档前提
-  不适用于隧道档——两档分立并各自文档化，verdict §3.4）。
-- **抗重放**：TCP 有序交付下接收侧检查计数严格递增，重复/回退即拒并计伪造；2048 滑动窗口
-  数据结构保留给未来 UDP 直连路径（crypto-2026 §2.2 明示 TCP 下窗口可缩、跨连接重放靠握手
-  新鲜性兜底——如实记录，不夸大）。
-- **rekey**：控制流上跑 REKEY_INIT/RESP（新混合 KEM，成本 <0.1ms），epoch 切换后计数器随新密钥
-  重置；`reject_after` 触发即清零密钥断链。
-- **AEAD 后备协商（P1-8）**：无 AES 硬件端 XChaCha20-Poly1305；抗误用/复制敏感场景
-  AES-256-GCM-SIV（本机最快 5.09-5.27 GB/s，verdict §0 复跑）。
+- **Implementation contract of the lookup seam** (prevents reconnect storms from amplifying into the
+  Raft leader; details in §4 "Reads and caching"): the server-side implementation of the handshake-side
+  `DeviceDirectory` uses two levels — "record cache + revocation epoch (revocation_epoch, advanced
+  automatically as the Raft log applies)" — epoch unchanged and cache hit ⇒ answer locally; epoch
+  changed or miss ⇒ linearizable read. After a relay link failure, an N-client reconnect storm hits
+  the local cache entirely when there are no revocations, never touching the leader.
+- **Handshake (P1-10), two forms** — whether the first connection has server static material decides
+  the round-trip count (pinning model = the cluster root pubkey anchors the full set of server
+  material, §1.3.3f):
+  - **Pinned form (invite file or existing pin; the norm, 1-RTT, Noise IK structure)**:
+    I1 = version + algorithm set + X25519 ephemeral + ML-KEM-768 ct (1088B, encapsulated to the
+    **target server's** — i.e. the ServerEntry this endpoint maps to in the ClusterDirectory —
+    **static ML-KEM pubkey**) + "device static X25519 pubkey + device Ed25519 pubkey + **device
+    signature**" encrypted with a key derived from HKDF(x25519(e,s_srv)‖mlkem_ss); R1 = server
+    ephemeral + **server identity key's signature over the transcript (P0-5, tunnel side)** +
+    mutual key confirmation. The first frame after the handshake can already carry data.
+    `initiate`'s `expect_server: &ServerPin` = (cluster_root_pub + the target endpoint's
+    ServerEntry) — switching endpoints = swapping the ServerEntry, with material from the invite
+    file or a root-signed directory refreshed via dir_pull, so **any endpoint is 1-RTT** (the
+    implementation basis of A5/A15).
+    - **Signature coverage contract (prevents UKS / unknown key share)**: the device Ed25519
+      signature covers = **all fields sent in I1** (including both ephemeral shares and the
+      algorithm set) + protocol context (cluster_id, expected server identity pubkey, session
+      purpose label); the server identity signature covers = I1‖R1, the full transcript. M1 vectors
+      must include "tamper with context / swap server identity → signature verification fails"
+      cases.
+  - **TOFU first-connect bootstrap form (no cluster material at all, once only, 2-RTT)**:
+    I0 = version + algorithm set + client X25519 ephemeral (at this point there is no server static
+    pubkey, so nothing can be encapsulated/encrypted; sent in the clear); R0 = that server's
+    **enrollment credential public part** (server_id + identity_pub + static_hybrid_pub in full
+    + access_endpoint) + **cluster root pubkey** + the server identity's signature over I0‖R0.
+    Client verifies: the enrollment credential = the root pubkey's signature over the ServerEntry ⇒
+    the material chain is trustworthy; it then displays the **cluster root fingerprint**, and after
+    the user confirms, **pins only the root pubkey** (cluster_id → root_pub), and immediately sends
+    I1/R1 per the 1-RTT form using that ServerEntry. Material for other endpoints / new servers is
+    obtained via the control flow `dir_pull` (root-signed ClusterDirectory, dir_version
+    monotonically increasing) — **from then on every endpoint is 1-RTT and I0 never appears again**.
+    - **Residual risk made explicit**: TOFU does not defend against an online MITM on the first
+      login — on first connection an attacker can self-sign a "root pubkey + credential chain" and
+      the client pins the attacker's root (the same class of limitation as SSH known_hosts);
+      organizational deployments must use the strong invite-file path (§1.3.3f).
+  - Sessions are indexed by the peer's static pubkey ⇒ the endpoint (relay entry) can change while
+    session semantics continue (roaming model, vpn-mesh §2 / crypto-2026 §6). Reconnect = **a
+    brand-new handshake**; no PSK resumption (TLS resumption would bind the old session's security
+    context and the binder is not dictionary-resistant, crypto-2026 §6).
+- **Record layer (P0-2)**: `[u32 len ≤1MiB][type][AEAD(payload)]`, nonce = 32-bit zero ‖ 64-bit LE
+  counter (WireGuard shape); independent counter and key per direction; **random 96-bit nonces are
+  forbidden for long sessions** (the envelope-tier precondition does not apply to the tunnel tier —
+  the two tiers are kept separate and each documented, verdict §3.4).
+- **Anti-replay**: with TCP's in-order delivery the receiver checks the counter is strictly
+  increasing; duplicate/regression is rejected and counted as forgery; the 2048 sliding-window
+  structure is retained for a future UDP direct path (crypto-2026 §2.2 explicitly notes the window
+  can shrink under TCP and cross-connection replay is backstopped by handshake freshness — recorded
+  as-is, not overstated).
+- **rekey**: REKEY_INIT/RESP runs on the control flow (fresh hybrid KEM, cost <0.1ms); after the
+  epoch switch the counter resets with the new key; when `reject_after` triggers, keys are zeroed
+  and the link dropped.
+- **AEAD fallback negotiation (P1-8)**: XChaCha20-Poly1305 on hosts without AES hardware;
+  AES-256-GCM-SIV for misuse-resistance / copy-sensitive scenarios (fastest on this machine at
+  5.09–5.27 GB/s, verdict §0 re-run).
 
-**(d) `mux` —— 复用与 EOF 语义（P1-9、VPN-16 协议侧）**
+**(d) `mux` — multiplexing and EOF semantics (P1-9, VPN-16 protocol side)**
 
-- 复用器：**rust-yamux 0.14.1**（hashicorp 规范实现，2026-09-21 活跃，vpn-mesh §4.1 表）。
-  yamux 本身 = 长度前缀帧 + 流 ID + 显式 FIN/EOF + ping keepalive + 流控背压——正是 P1-9
-  列出的全部语义，**不重造**。链路次序：TCP → SecureStream（记录层加密）→ yamux → 逻辑流。
-  yamux 在加密内 ⇒ 流数/流元数据对中转不可见。
-- **禁依赖 TCP 半关闭**（frp T3 实证：SHUT_WR 后回程 0/65536，整链即拆，frp-compat §1.5）——
-  单向结束一律 yamux FIN；keepalive 用 yamux ping（默认 10s，P1-10/VPN-16 应用层心跳，
-  兼作中转探活）。首字节任意值合规（用户口无 TLS 探测，T2 已证）。
-- 控制流（stream 0）高优先级调度；`PacketChannel` = TUN 包专用帧化
-  （`[u16 len][ip packet]`，保边界），是 VPN-14 要求的库侧接口。
+- Multiplexer: **rust-yamux 0.14.1** (the hashicorp-spec implementation, active 2026-09-21,
+  vpn-mesh §4.1 table). yamux itself = length-prefixed frames + stream IDs + explicit FIN/EOF +
+  ping keepalive + flow-control backpressure — exactly the full semantics P1-9 lists, **do not
+  reinvent**. Link order: TCP → SecureStream (record-layer encryption) → yamux → logical streams.
+  yamux runs inside the encryption ⇒ stream counts / stream metadata are invisible to the relay.
+- **TCP half-close is forbidden as a dependency** (frp T3 finding: after SHUT_WR the return path is
+  0/65536 and the whole chain tears down, frp-compat §1.5) — one-directional end is always a yamux
+  FIN; keepalive uses yamux ping (default 10s; the P1-10/VPN-16 application-layer heartbeat, which
+  doubles as relay liveness probing). Any first byte value is compliant (no TLS probing at the user
+  port, proven by T2).
+- The control flow (stream 0) is scheduled at high priority; `PacketChannel` = the TUN-packet
+  framing (`[u16 len][ip packet]`, boundary-preserving), the library-side interface VPN-14 requires.
 
-**(e) `compress` —— 压缩档位与安全化（P0-4、P1-7）**
+**(e) `compress` — compression tiers and hardening (P0-4, P1-7)**
 
 ```rust
-pub struct CompressPolicy { pub mode: Mode /* Off(默认) | Interactive | Bulk | Archive */,
+pub struct CompressPolicy { pub mode: Mode /* Off (default) | Interactive | Bulk | Archive */,
                             pub padding: PadPolicy, pub dict: DictRef }
-pub fn compress_frame(p: &Policy, bytes) -> Frame;   // 帧头: 压缩标志 + 原始长度
+pub fn compress_frame(p: &Policy, bytes) -> Frame;   // frame header: compression flag + original length
 ```
 
-- **默认关闭**；按策略/按流开启（VORACLE/CRIME/BREACH 前提在 Flock VPN 成立——FRP 中转即
-  长度观察点，compression-2026 §3.2）；开启时配输出填充（16B 倍数起步，可调桶化）。
-- 档位（compression-2026 §0/§2 实测）：`<128B` 直通（40B 反膨胀 122.5%、120B 零收益）；
-  `128B–1.5KB` zstd-1 + 字典 4–16KB（合成模板训练、dictID 握手协商、版本强制一致；
-  120B→28–30% 且更快）；`>1.5KB` zstd-1 分块 16–64KB + 5–10ms flush（64KB 块仅损 0.2pp）；
-  level 19 仅留 Archive/归档档；lz4_flex 0.14 作 CPU 受限备选；上下文复用（实测 3×）。
-- **非膨胀回退 MUST**（RFC 3173 §2.2）：试压不缩小即发明文 + 连续失败自适应停试。
-- 先压后密顺序不变（RFC 3173 §1）；压缩发生在记录层 payload 内。
+- **Off by default**; enabled per-policy / per-stream (the VORACLE/CRIME/BREACH preconditions hold
+  in Flock VPN — an FRP relay is exactly a length observation point, compression-2026 §3.2); when
+  enabled, output padding is configured (starting at 16B multiples, tunable bucketing).
+- Tiers (compression-2026 §0/§2 measured): `<128B` pass-through (40B anti-expansion 122.5%, 120B
+  zero gain); `128B–1.5KB` zstd-1 + 4–16KB dictionary (synthetic-template training, dictID handshake
+  negotiation, version strictly matched; 120B→28–30% and faster); `>1.5KB` zstd-1 in 16–64KB chunks
+  + 5–10ms flush (64KB chunks lose only 0.2pp); level 19 kept only for the Archive tier; lz4_flex
+  0.14 as the CPU-constrained fallback; context reuse (measured 3×).
+- **Non-expansion fallback is a MUST** (RFC 3173 §2.2): if a trial compression does not shrink,
+  emit plaintext, and after consecutive failures adaptively stop trying.
+- Compress-then-encrypt order unchanged (RFC 3173 §1); compression happens inside the record-layer
+  payload.
 
-**(f) `trust` —— 首登信任锚（P0-5）**
+**(f) `trust` — first-login trust anchor (P0-5)**
 
-钉扎模型定型（第三轮评审 blocking 的裁决，先说结论再给结构）：**客户端锚定「集群根公钥」，
-持全套服务器的根签接入材料（方案②）**。三种可选调和方式中——①集群共享一套服务器静态密钥：
-**否决**，与 §4「每台服务器各自 identity/static_hybrid 密钥」的准入模型冲突，且使 VPN-15
-「逐服务器独立封装/rewrap 权限点」变成假的（共享 HybridKeypair 下任一台泄露即可解全部 OPRF
-封装）；③切换端点回落 2-RTT 引导：**否决**，重连/切换是常态路径，每次 2-RTT + 重新人工确认
-不可接受；②客户端持全套材料、由单一根签名背书：**采纳**——「端点→服务器材料」映射本身被
-集群根密钥签名（防 MITM 的来源就是这份签名），单台服务器换静态密钥只需根签新条目、客户端
-控制流刷新目录即可，不触及其他端点的钉扎。
+Pinning model finalized (the ruling of the third review round's blocking item; conclusion first,
+then structure): **the client anchors the "cluster root pubkey" and holds the root-signed access
+material for the full set of servers (option ②)**. Of the three reconciliation options — ① the
+cluster shares one set of server static keys: **rejected**, it conflicts with §4's admission model
+of "each server has its own identity/static_hybrid keys" and makes VPN-15's "per-server independent
+encapsulation / rewrap permission point" fake (with a shared HybridKeypair, one server's leak
+decrypts all OPAQUE encapsulations); ③ switching endpoints falls back to the 2-RTT bootstrap:
+**rejected**, reconnect/switch is a routine path and a 2-RTT + fresh manual confirmation every time
+is unacceptable; ② the client holds the full set of material, vouched by a single root signature:
+**adopted** — the "endpoint → server material" mapping itself is signed by the cluster root key
+(the origin of MITM defense is exactly this signature); a single server rotating static keys only
+needs a root-signed new entry and a client-side directory refresh, without touching other
+endpoints' pins.
 
 ```rust
-pub struct ServerIdentity { ed: VerifyingKey /* + 可选 ml_dsa */, … } // 长期签名身份（每台各自）
-pub struct ServerEntry {                // = §4 入群凭证的「公开部分」，同一凭证两用：
-                                        //   服务器互认（§4）/ 客户端接入材料（此处）
+pub struct ServerIdentity { ed: VerifyingKey /* + optional ml_dsa */, … } // long-term signing identity (per server)
+pub struct ServerEntry {                // = the "public part" of §4's enrollment credential; one credential,
+                                        //   two uses: server mutual authentication (§4) / client access
+                                        //   material (here)
     pub server_id: ServerId,
-    pub access_endpoint: SocketAddr,    // 该服务器的**接入端点**：Direct 形态=直连地址（公网/
-                                        // 内网 host:port，零 frp），Frp 形态=中转用户口（frps
-                                        // host:port）——两种形态对客户端无感知差异，都是拨号
-                                        // 目标（第四轮更名自 relay_endpoint，语义扩大）
-    pub endpoint_form: Direct | Frp,    // 标注形态（客户端仅作展示/诊断，选路逻辑不变）
-    pub identity_pub: VerifyingKey,     // 该服务器身份 Ed25519 公钥
-    pub static_hybrid_pub: HybridPubkey,// 该服务器静态混合公钥（1216B；I1 的 ML-KEM ct 必须封装给它）
+    pub access_endpoint: SocketAddr,    // that server's **access endpoint**: Direct form = direct
+                                        //   address (public/internal host:port, zero frp), Frp form =
+                                        //   the relay user port (frps host:port) — the two forms are
+                                        //   indistinguishable to the client; both are dial targets
+                                        //   (renamed from relay_endpoint in round four; semantics widened)
+    pub endpoint_form: Direct | Frp,    // form annotation (client uses it for display/diagnostics only;
+                                        //   routing logic unchanged)
+    pub identity_pub: VerifyingKey,     // that server's identity Ed25519 pubkey
+    pub static_hybrid_pub: HybridPubkey,// that server's static hybrid pubkey (1216B; I1's ML-KEM ct
+                                        //   must be encapsulated to it)
 }
-pub struct ClusterDirectory {           // 端点列表与凭证同签一份，防「列表真、条目假」的拼接
+pub struct ClusterDirectory {           // endpoint list and credentials signed together in one document,
+                                        //   preventing "real list, fake entry" splices
     pub cluster_id: ClusterId,
     pub servers: Vec<ServerEntry>,
-    pub dir_version: u64,               // 递增；单台换钥 ⇒ 根签新目录 ⇒ 客户端 dir_pull 刷新
+    pub dir_version: u64,               // increasing; single-server key rotation ⇒ root-signed new
+                                        //   directory ⇒ client dir_pull refresh
 }
-pub struct InviteFile {                 // v3：集群目录 + 一次性消费凭据，一次根签名
+pub struct InviteFile {                 // v3: cluster directory + one-time consumption credential,
+                                        //   one root signature
     pub directory: ClusterDirectory,
-    pub cluster_root_pub: VerifyingKey, // 集群根公钥（§4 根密钥之公钥，信任锚本体）
-    pub expiry: DateTime,               // 默认 7 天（可配）
-    pub invite_id: Uuid,                // 进 Raft 状态机做单次消费（见下）
-    pub root_sig: Signature,            // 集群根密钥签名，覆盖上述全部字段
+    pub cluster_root_pub: VerifyingKey, // cluster root pubkey (the public half of §4's root key; the
+                                        //   trust anchor proper)
+    pub expiry: DateTime,               // default 7 days (configurable)
+    pub invite_id: Uuid,                // goes into the Raft state machine for single consumption (below)
+    pub root_sig: Signature,            // cluster root key signature covering all fields above
 }
-pub struct PinStore { … }               // 钉扎粒度 = (cluster_id → cluster_root_pub)
+pub struct PinStore { … }               // pin granularity = (cluster_id → cluster_root_pub)
 pub fn first_pin(cluster_id, root_pub) / verify_pinned(cluster_id, root_pub) -> Verdict;
-                                        // 变更→显式告警；服务器级材料不单独 TOFU（由根签名背书）
+                                        // change → explicit warning; server-level material gets no
+                                        // separate TOFU (vouched by the root signature)
 pub fn load_invite(path) -> Result<InviteFile>;
 ```
 
-- **落地双路径**：①**邀请文件强路径**（对标 innernet 一次性邀请，vpn-mesh §2/S15）：v3 内含
-  **全套服务器接入材料（ClusterDirectory）+ 集群根公钥**，一次根签名同签——持邀请客户端对
-  任意端点（含 A5 切换到 server-b、A15 迁移到 server-a）都直接 1-RTT，完全避开 TOFU；
-  ②TOFU 路径（个人自建）：首连 2-RTT 引导（§1.3.3c），客户端**只钉扎集群根公钥**（展示根
-  指纹、确认一次），服务器材料经入群凭证链由根验签；此后任何端点（含新服务器，经 dir_pull
-  取根签目录）均 1-RTT。服务端身份密钥另进 OPAQUE login-finish（`anchor` feature：签名覆盖
-  SERVER_ID‖user‖ke2 transcript‖bind_token）。
-- **邀请文件的一生（一次性语义，对标 innernet「邀请文件（一次性）」 vpn-mesh §2 表）**：
-  生成（管理操作，根密钥语境）→ 分发（0600 文件，按凭据对待）→ **兑换 = Raft 管理操作
-  `redeem_invite(invite_id)`：查重（used? 拒）+ 吊销检查 + expiry 检查 → 标记 used → 创建
-  用户/设备并分配 VIP**；同一 invite_id 二次兑换必拒；`revoke_invite(invite_id)`（根密钥签名
-  的管理操作）可吊销未兑换邀请。已兑换文件泄露 = 无效（used）；未兑换文件泄露 = expiry 内
-  可被抢先兑换一次（接受边界：邀请按一次性凭据管理，默认 7 天过期，写入部署文档）。
-- **开户流程（用户账号从哪来，补齐 showroom 语义的对齐）**：用户账号 = 管理员 `user-add`
-  或邀请兑换时创建；之后走 OPAQUE 注册（pw-begin/pw-commit）设置口令；设备密钥（X25519+
-  Ed25519）客户端本地生成、公钥经登录态登记（key-bind 类似物，受服务端身份签名覆盖）；
-  设备进注册表 = `(DeviceId, owner, VIP, 静态公钥集, status)`。即：**邀请文件决定「谁能
-  入网」（根签）、OPAQUE 决定「谁是谁」（账号口令）、设备密钥决定「哪台机器」**，三者分离。
-- **残余风险明示（不可静默）**：TOFU 不防首登在线 MITM（首连可被整体替身+钉扎攻击者密钥，
-  随后 bind_token 抢用接管依旧成立——SSH known_hosts 同类限制，verdict §3.9 攻击只被
-  部分关闭）；面向组织的部署文档必须把邀请文件标为推荐路径。
-- 依据：verdict §3.9（SPEC.md:285-287 已声明的 bind_token 抢用接管攻击；`SERVER_ID` 是
-  字面量非密钥，opaque.rs:42 本次核实）；RFC 9807 aPAKE 模型要求客户端持有已认证服务端身份。
+- **Two landing paths**: ① **invite-file strong path** (modeled on innernet's one-time invite,
+  vpn-mesh §2/S15): v3 contains the **full set of server access material (ClusterDirectory) + the
+  cluster root pubkey**, signed together once by the root — an invite-holding client reaches any
+  endpoint (including A5's switch to server-b and A15's migration to server-a) directly at 1-RTT,
+  fully bypassing TOFU; ② TOFU path (personal self-hosting): first connection is the 2-RTT bootstrap
+  (§1.3.3c); the client **pins only the cluster root pubkey** (displays the root fingerprint,
+  confirmed once), and server material is root-verified via the enrollment credential chain;
+  thereafter every endpoint (including new servers, via dir_pull of the root-signed directory) is
+  1-RTT. The server identity key additionally enters OPAQUE login-finish (`anchor` feature:
+  signature covers SERVER_ID‖user‖ke2 transcript‖bind_token).
+- **The life of an invite file (one-time semantics, modeled on innernet's "invite file (one-time)",
+  vpn-mesh §2 table)**: generation (admin operation, root-key context) → distribution (0600 file,
+  treated as a credential) → **redemption = Raft admin operation `redeem_invite(invite_id)`:
+  duplicate check (used? reject) + revocation check + expiry check → mark used → create the
+  user/device and assign a VIP**; a second redemption of the same invite_id must be rejected;
+  `revoke_invite(invite_id)` (a root-key-signed admin operation) can revoke an unredeemed invite. A
+  leaked redeemed file = useless (used); a leaked unredeemed file = can be redeemed once ahead of
+  the owner within expiry (accepted boundary: invites are managed as one-time credentials, default
+  7-day expiry, written into the deployment docs).
+- **Account provisioning flow (where user accounts come from, completing the alignment with
+  showroom semantics)**: a user account is created by the admin via `user-add` or on invite
+  redemption; the password is then set via OPAQUE registration (pw-begin/pw-commit); device keys
+  (X25519 + Ed25519) are generated client-side locally, with pubkeys registered through the
+  logged-in state (a key-bind analogue, covered by the server identity signature); a device enters
+  the registry = `(DeviceId, owner, VIP, static pubkey set, status)`. That is: **the invite file
+  decides "who may join the network" (root-signed), OPAQUE decides "who is who" (account password),
+  device keys decide "which machine"** — three separations.
+- **Residual risk made explicit (never silent)**: TOFU does not defend against an online MITM on the
+  first login (the first connection can be wholly impersonated, pinning the attacker's key; the
+  subsequent bind_token hijack-and-takeover still applies — the same class of limitation as SSH
+  known_hosts; verdict §3.9's attack is only partially closed); organization-facing deployment docs
+  must mark the invite file as the recommended path.
+- Basis: verdict §3.9 (the bind_token hijack takeover attack already declared at SPEC.md:285-287;
+  `SERVER_ID` is a literal, not a key, opaque.rs:42 verified in this session); the RFC 9807 aPAKE
+  model requires the client to hold an authenticated server identity.
 
-**(g) `sig` 档位（P2-12）**：SR-SIG1 线上格式不变；新增 `KeyProfile`（kid→算法分派：
-Ed25519 主档 + `pq-sign` 下 ML-DSA-65 并行公钥位）。
+**(g) `sig` tier (P2-12)**: the SR-SIG1 wire format is unchanged; adds `KeyProfile` (kid→algorithm
+dispatch: Ed25519 primary + an ML-DSA-65 parallel public-key slot under `pq-sign`).
 
-**(h) `pake` 档位（P2-11）**：argon2id 参数版本化 profile
-  （`Profile::Owasp19MiB`（showroom 兼容默认）/`Profile::Rfc9807High`（m=2GiB,t=1,p=4 高配档）），
-  profile id 进注册记录，防跨档漂移；OPAQUE 本体不变（adopt，verdict §3.1）。
+**(h) `pake` tier (P2-11)**: versioned argon2id parameter profiles
+(`Profile::Owasp19MiB` (showroom-compatible default) / `Profile::Rfc9807High` (m=2GiB,t=1,p=4 high
+tier)); the profile id goes into the registration record to prevent cross-tier drift; OPAQUE itself
+unchanged (adopt, verdict §3.1).
 
-### 1.4 原版 FRP 与 ChmlFrp 下行为一致（论证）
+### 1.4 Identical behavior under original FRP and ChmlFrp (argument)
 
-协议库只假设底层是「可靠有序、字节透明、可能整条硬断的 TCP 流」：
+The protocol library assumes only that the underlying thing is "a reliable, ordered, byte-transparent
+TCP stream that may hard-drop as a whole":
 
-1. **字节透明已证**：原版 v0.71.1 上全 256 字节值 + 1MiB 随机往返 sha256 一致、首字节 0x16/0x17
-   无干扰、无框定注入（frp-compat §1.5 T1/T2）；ChmlFrp 数据面与原版 v0.51.2 逐行一致
-   （fork diff 未涉 `pkg/msg` 与数据通路，frp-compat §2.3）⇒ 两家中转承载同一密文字节流。
-2. **不依赖中转特有行为**：禁半关闭（用 yamux FIN，R3）；不依赖多隧道（单 frp 隧道承载全部
-   会话，yamux 复用，R11——ChmlFrp 免费档 4 隧道上限下的硬要求）；应用层 10s 心跳探活
-   （数据面无空闲超时但节点重启/NAT 硬断，R5）；断链 = 全新握手重连（R6）。
-3. **两家中转的差异被隔离在 `flock-frpc`**（§5）：协议库本体不感知 frp 存在——它的接缝是
-   `TcpStream`，直连/原版中转/ChmlFrp 中转是同一接缝上的三个适配器，行为差异只剩 RTT 与
-   节点限速（ChmlFrp 8–32Mbps 服务端强制，frp-compat §2.3）。
+1. **Byte transparency proven**: on original v0.71.1, a round trip of all 256 byte values + 1MiB
+   random has matching sha256; first bytes 0x16/0x17 cause no interference; no framing injection
+   (frp-compat §1.5 T1/T2); ChmlFrp's data plane is line-for-line identical to original v0.51.2
+   (the fork diff touches neither `pkg/msg` nor the data path, frp-compat §2.3) ⇒ both relays carry
+   the same ciphertext byte stream.
+2. **No relay-specific behavior is relied on**: half-close forbidden (use yamux FIN, R3); no
+   multi-tunnel reliance (a single frp tunnel carries all sessions, yamux multiplexes, R11 — a hard
+   requirement under ChmlFrp's free tier's 4-tunnel limit); 10s application-layer heartbeat liveness
+   (the data plane has no idle timeout but node restarts / NAT hard-drops exist, R5); link loss =
+   reconnect with a brand-new handshake (R6).
+3. **The differences between the two relays are isolated inside `flock-frpc`** (§5): the protocol
+   library proper is unaware frp exists — its seam is `TcpStream`; direct / original relay / ChmlFrp
+   relay are three adapters on the same seam, and the behavioral differences reduce to RTT and node
+   rate limits (ChmlFrp's server-enforced 8–32Mbps, frp-compat §2.3).
 
 ---
 
-## 2. Flock VPN 总体架构
+## 2. Flock VPN overall architecture
 
-### 2.1 部署形态（对标 Tailscale「控制面集中、数据面分布」模型，vpn-mesh §2）
+### 2.1 Deployment form (modeled on Tailscale's "centralized control plane, distributed data plane",
+vpn-mesh §2)
 
-- **接入端点模型（硬约束落地，最高优先级）**：每台服务器暴露**一个接入端点**，形态二选一，
-  由 `server.toml` 的 `listener.mode` 配置，**`Direct` 为缺省**：
-  - `Direct`（缺省）：服务器直接监听公网/内网地址，客户端 TCP 直连——**零 frp 逻辑**
-    （无 frpc 子进程、无配置生成、不装配 flock-frpc）；
-  - `Frp(RelaySpec)`：仅当「服务端无公网 IP 或客户端无法直连服务端 IP」时选用——
-    `flock-frpc` 托管 frpc（§3.9/§5）把监听口经中转节点暴露成用户口。
-  两种形态对协议层完全同构（都是「一条 TCP 字节流」，§1.4），同一集群可按机器混布
-  （server-a 直连、server-b 经中转、server-c 直连）。服务端互连（Raft + gossip +
-  跨服转发）同理走直连或经各自接入路径，跑**服务器-服务器 profile** 的同一 E2E 会话协议
-  （双向入群凭证认证，§4 准入）。
-- **服务端 ×3 起**（Raft 奇数 voter，容 1 故障）：每台按上文二选一暴露接入端点；只有无公网
-  IP/不可直连的机器才挂 FRP 中转节点（ChmlFrp 节点或自建原版 frps）并运行 `flock-frpc`。
-- **客户端 ×N**（Windows/macOS/Linux 首发，Android/iOS 接缝预留）：`flock-client` 按
-  ClusterDirectory 中的接入端点拨号——**直连地址或中转用户口客户端无感知差异**（都是 TCP
-  拨号目标；tcp 代理形态下客户端本来就不需要 frpc，frp-compat §1.1 proxy 模型），持有
-  「接入端点列表 + 探活切换」，任意服务端接入效果一致。
-- 数据面：客户端 ↔ 服务端会话型隧道（首版 hub-and-spoke，peer 间经服务端路由；不做 P2P
-  直连，vpn-mesh §6 明示首发策略）；任何链路形态下第三方只见本协议密文。
-- 虚拟网：`100.64.0.0/10`（RFC 6598 CGNAT 段，Tailscale/NetBird 双先例，vpn-mesh §3.1），
-  内部保留 /24 若干；分配由 Raft 状态机裁决（强一致防撞）；MTU 1280（Tailscale 同款、
-  IPv6 下限，vpn-mesh §3.2）。
-  **IP 复用策略（M7 修订，取代此前「禁用不删除、IP 不复用」的一刀切表述）**：
-  - **吊销（Revoked）→ IP 永不复用**（不变；innernet 先例，安全优先，vpn-mesh §3.1）；
-    禁用（Disabled）同理：行保留、VIP 不回收。
-  - **离线超过保留期 → Expired + VIP 归还分配池**（新，M7）：回收器把「离线 > 保留期」
-    的设备经 Raft 管理操作置 Expired 并释放其 VIP 回分配池——新设备可分到该 VIP；
-    **过期记录本身保留在册**（审计可查），名册查询排除 Expired。窗口内重连同设备保持
-    同 IP（未过期不动行）。保留期 = server.toml `peer_retention_days`（缺省 30 天；
-    **0 = 永不过期**，兼容旧行为）。Expired ≠ Revoked：两者都阻断握手，但状态可区分
-    （审计/名册语义不同——Expired 是时间性淘汰，Revoked 是安全处置）。
+- **Access endpoint model (hard constraint landed, highest priority)**: every server exposes
+  **one access endpoint**, in one of two forms, configured by `server.toml`'s `listener.mode`, with
+  **`Direct` as the default**:
+  - `Direct` (default): the server listens directly on a public/internal address and clients TCP
+    dial it — **zero frp logic** (no frpc subprocess, no config generation, no flock-frpc assembly);
+  - `Frp(RelaySpec)`: chosen only when "the server has no public IP or the client cannot reach the
+    server IP directly" — `flock-frpc` supervises frpc (§3.9/§5), exposing the listen port through
+    a relay node as a user port.
+  The two forms are fully isomorphic to the protocol layer (both are "one TCP byte stream", §1.4);
+  a single cluster may mix them per machine (server-a direct, server-b via relay, server-c direct).
+  Server interconnects (Raft + gossip + cross-server forwarding) likewise go direct or via their own
+  access paths, running the same E2E session protocol with the **server-server profile** (mutual
+  enrollment-credential authentication, §4 admission).
+- **Servers ×3 minimum** (Raft odd voter count, tolerating 1 failure): each exposes one access
+  endpoint per the above; only machines without public IP / direct reachability attach to an FRP
+  relay node (a ChmlFrp node or self-hosted original frps) and run `flock-frpc`.
+- **Clients ×N** (Windows/macOS/Linux first; Android/iOS seam reserved): `flock-client` dials the
+  access endpoints in the ClusterDirectory — **a direct address or a relay user port is
+  indistinguishable to the client** (both are TCP dial targets; in the tcp proxy form the client
+  never needs frpc anyway, frp-compat §1.1 proxy model), holding "the access endpoint list + liveness
+  probing and switching"; any server gives the same access experience.
+- Data plane: client ↔ server session tunnels (first version hub-and-spoke, peers routed via the
+  server; no P2P direct connections, vpn-mesh §6 states the first-release strategy explicitly); in
+  any link form a third party sees only this protocol's ciphertext.
+- Virtual network: `100.64.0.0/10` (RFC 6598 CGNAT range; Tailscale/NetBird dual precedent,
+  vpn-mesh §3.1), with several internal /24s reserved; allocation is decided by the Raft state
+  machine (strongly consistent collision prevention); MTU 1280 (same as Tailscale, the IPv6 floor,
+  vpn-mesh §3.2).
+  **IP reuse policy (M7 revision, replacing the earlier blanket "disable without deleting, no IP
+  reuse" wording)**:
+  - **Revoked → the IP is never reused** (unchanged; innernet precedent, security first,
+    vpn-mesh §3.1); Disabled likewise: the row is kept, the VIP is not reclaimed.
+  - **Offline past the retention period → Expired + VIP returned to the allocation pool** (new,
+    M7): a reaper moves devices that are "offline > retention period" to Expired via a Raft admin
+    operation and releases their VIP back into the allocation pool — a new device may then be
+    assigned that VIP; **the expired record itself stays on the roster** (auditable), while roster
+    queries exclude Expired. Within the window, a reconnecting same device keeps the same IP (a
+    non-expired row is untouched). Retention period = server.toml `peer_retention_days` (default 30
+    days; **0 = never expire**, compatible with the old behavior). Expired ≠ Revoked: both block
+    the handshake, but the states are distinguishable (different audit/roster semantics — Expired is
+    time-based retirement, Revoked is security disposition).
 
-### 2.2 服务端（`app/flock-server`）
+### 2.2 Server (`app/flock-server`)
 
-职责链：**接入 → 认证 → 注册表 → 会话 → 转发 → 同步**。
+Responsibility chain: **access → authentication → registry → session → forwarding → sync**.
 
-- 监听器（TCP :9443）：每条入连一个 E2E 会话（`session::respond`）。暴露形态 =
-  `server.toml` 的 `listener.mode`（§3.11 ListenerMode 接缝）——**`Direct` 缺省**（直接
-  监听，零 frp 逻辑）/`Frp(RelaySpec)`（flock-frpc Supervisor 路径）；**Direct 模式的代码
-  路径不触碰 flock-frpc**（不实例化 Supervisor、不生成配置、不启动任何子进程）。
-- 控制流（yamux stream 0，postcard 编码消息）：OPAQUE 登录（`anchor` 开：身份签名 + TOFU/
-  邀请钉扎校验）→ 会话票据签发（本地短 TTL 票据，密钥根来自 Raft，VPN-15 下放）；
-  设备注册/配置拉取（网络视图：peer VIP/公钥/路由）。
-  - **票据强制契约（SR-SIG1 跨服重放面的闭合前提，必须写成接口契约）**：所有受 SR-SIG1
-    保护的**状态变更**请求必须携带有效会话票据（绑定 device + revocation_epoch），且校验
-    顺序 = 票据有效性（签名+TTL+epoch+吊销）**先于** nonce 记账；等效重放窗 =
-    min(±300s, 票据 TTL)。没有这个前提，同一签名请求发给未见过 nonce 的另一台服务器即可
-    重放（票据密钥根 Raft 共享、任何服务器都验得了，挡得住的只有「票据 TTL + epoch 失效」）。
-- 设备管理：设备 = `(DeviceId=Ed25519 指纹, owner, VIP, 静态公钥集, status, hostname,
-  expired_at)`（hostname/expired_at 为 M7 增补，§7-M7），全部进 `flock-sync` 强一致
-  状态机。
-  - **吊销传播界（数字定死，A6 据此可验证）**：吊销 = Raft 提交；每台服务器在**自己的
-    日志 apply 回调**里 (a) 推进 revocation_epoch、失效记录缓存，(b) 杀死本地该设备会话，
-    (c) 清拒其票据（票据 epoch < 当前 epoch 即拒）。即「踢会话」不需要额外广播——Raft
-    复制本身就把吊销送到每台服务器的状态机。时序预算：健康集群（中转 RTT ~100ms、心跳
-    500ms）commit→apply ≤2s + 事件余量 ≤1s + slack 2s ⇒ **A6 ≤5s 成立**；票据 TTL 60s
-    硬顶兜住跨服重放。在线租约另有事件推送（≤1s）+ 5s 反熵（§4）。
-- **数据面（含跨服务端转发——「任意服务端接入效果一致」的必要组成）**：服务端自身也是
-  peer（有 tun + VIP 100.64.0.1…）。转发判定序：
-  0. **源 VIP 绑定校验（第 0 步，先于一切转发逻辑）**：从 PacketChannel 读出的每个 IP 包，
-     其**源地址必须等于该会话设备的注册 VIP**（会话 DeviceId ↔ src VIP 绑定）；失配 ⇒
-     丢包 + 计数 + 超限告警/断会话。注意：§2.3 的 `rp_filter=1` 只作用于内核网络接口的
-     入向，对经 yamux 流上来的用户态 IP 包**不生效**——此校验是应用层的「每节点入向过滤
-     执行策略」（Tailscale/innernet 先例，vpn-mesh §2 借鉴点 3）。没有它，持有有效会话的
-     恶意设备可用任意 peer 的 VIP 作源发包（身份嫁祸/反射/未来 ACL 全绕过）。ForwardEnvelope
-     的 `src_dev` 字段同样与内层包源地址交叉校验（收端与发端各查一次）。
-  1. 目标 VIP → 设备归属：查**本地租约表**（gossip）。**设备当前位置的唯一真相源 = 租约域**
-     （每台服务器权威发布「连在我这的设备」+ 租约 TTL 30s + 事件推送 ≤1s + 5s 反熵）；
-     **NetState（Raft）只存静态注册信息**（设备/VIP/公钥/状态/邀请消费记录），**不存
-     「设备当前在哪台服务器」**——接入/切换是高频事件，实时写 Raft 会把重连风暴变成写
-     风暴（R18 只防了读风暴），不实时写则映射陈旧、回退必然再错：双源真相不可取，定死
-     单源。
-  2. 归属本机 ⇒ 直接投该会话的 PacketChannel（同服路径）。
-  3. 归属他机 ⇒ **跨服转发**：`ForwardEnvelope{ver, src_dev, dst_dev, origin_server,
-     hop=1, payload=IP 包}` 经服务器互连 E2E 会话的专用 FRWD 流发出（外层有服务器间
-     加密；内层 IP 包此时为明文——威胁模型见 §2.5）。收端：dst 在本地会话 ⇒ 投递；
-     否则回 `NOT_HERE` 给 origin（**禁止二次转发**，hop=1 防环）。
-  4. **租约未命中/陈旧的容错策略**（vpn-mesh §5.2 明示这是策略决策，此处定死）：
-     设备刚迁移到另一台服务器时，旧租约窗口内的包发往旧服务器 → 旧服务器回 NOT_HERE →
-     origin 发**一次性位置查询**（LocationQuery：问租约表里有该设备租约的服务器，或
-     fan-out ≤3 台互连服务器「谁在托管 dst？」）重定向一次；仍失败 ⇒ **丢包 + 尽力发
-     ICMP unreachable**（不广播、不缓存重试——VPN 流量丢包可由上层恢复，避免转发面状态
-     膨胀）。设备上线/迁移的事件推送（≤1s）使该窗口通常短于租约 TTL。
-  - Linux 路由配 rtnetlink（VPN-14）。
-- `flock-frpc` 托管（§5）：配置生成 + 进程守护 + 健康探测。
-- **Web UI 管理面（§7-M8）**：进程内嵌 HTTP（`127.0.0.1:port` + 本机 tun VIP:port
-  双绑定，缺省 9800，不绑 LAN/公网）——管理登录账号 + Dashboard；认证 = OPAQUE
-  （pake 复用）+ admin 角色 + HttpOnly 会话 cookie；集群中每台服务器各自内嵌，
-  数据经 Raft/租约/EWMA 天然一致（任意 VIP 均可访问）。
+- Listener (TCP :9443): one E2E session per inbound connection (`session::respond`). Exposed form =
+  `server.toml`'s `listener.mode` (§3.11 ListenerMode seam) — **`Direct` default** (direct listen,
+  zero frp logic) / `Frp(RelaySpec)` (the flock-frpc Supervisor path); **the Direct-mode code path
+  never touches flock-frpc** (no Supervisor instantiation, no config generation, no subprocesses
+  started).
+- Control flow (yamux stream 0, postcard-encoded messages): OPAQUE login (`anchor` on: identity
+  signature + TOFU/invite pinning verification) → session ticket issuance (short-TTL local ticket;
+  the ticket key root comes from Raft, delegated per VPN-15); device registration / config pull
+  (network view: peer VIPs/pubkeys/routes).
+  - **Mandatory ticket contract (the closure precondition for the SR-SIG1 cross-server replay
+    surface; must be written as an interface contract)**: all **state-changing** requests protected
+    by SR-SIG1 must carry a valid session ticket (bound to device + revocation_epoch), and the
+    validation order = ticket validity (signature + TTL + epoch + revocation) **before** nonce
+    accounting; the effective replay window = min(±300s, ticket TTL). Without this precondition,
+    the same signed request replayed to another server that has not seen the nonce would succeed
+    (the ticket key root is Raft-shared and any server can verify; the only things stopping it are
+    "ticket TTL + epoch invalidation").
+- Device management: device = `(DeviceId=Ed25519 fingerprint, owner, VIP, static pubkey set,
+  status, hostname, expired_at)` (hostname/expired_at added by M7, §7-M7), all inside the
+  `flock-sync` strongly consistent state machine.
+  - **Revocation propagation bound (numbers fixed; A6 is verifiable against this)**: revocation = a
+    Raft commit; each server, in **its own log apply callback**, (a) advances revocation_epoch and
+    invalidates the record cache, (b) kills that device's local session, (c) rejects its tickets (a
+    ticket whose epoch < current epoch is rejected). That is, "kicking sessions" needs no extra
+    broadcast — Raft replication itself delivers the revocation to every server's state machine.
+    Timing budget: healthy cluster (relay RTT ~100ms, heartbeat 500ms) commit→apply ≤2s + event
+    margin ≤1s + slack 2s ⇒ **A6's ≤5s holds**; the 60s ticket TTL hard-caps cross-server replay.
+    Online leases additionally have event push (≤1s) + 5s anti-entropy (§4).
+- **Data plane (including cross-server forwarding — a necessary component of "any server gives the
+  same access experience")**: the server itself is also a peer (has tun + VIP 100.64.0.1…).
+  Forwarding decision order:
+  0. **Source VIP binding check (step 0, ahead of all forwarding logic)**: every IP packet read
+     from the PacketChannel must have a **source address equal to the registered VIP of that
+     session's device** (session DeviceId ↔ src VIP binding); mismatch ⇒ drop + count + alert on
+     excess / drop the session. Note: §2.3's `rp_filter=1` only acts on inbound kernel-network-
+     interface traffic and **does not apply** to userspace IP packets arriving over yamux streams —
+     this check is the application-layer "per-node ingress filtering enforcement policy"
+     (Tailscale/innernet precedent, vpn-mesh §2 borrowing point 3). Without it, a malicious device
+     holding a valid session could send packets with any peer's VIP as source (identity framing /
+     reflection / future ACL total bypass). The ForwardEnvelope `src_dev` field is likewise
+     cross-checked against the inner packet's source address (checked once at the receiver and once
+     at the sender).
+  1. Destination VIP → device ownership: look up the **local lease table** (gossip). **The single
+     source of truth for a device's current location = the lease domain** (each server
+     authoritatively publishes "the devices connected to me" + lease TTL 30s + event push ≤1s + 5s
+     anti-entropy); **NetState (Raft) stores only static registration info** (device/VIP/pubkey/
+     status/invite-consumption records), **not "which server a device is currently on"** — access/
+     switching are high-frequency events; writing them to Raft in real time would turn reconnect
+     storms into write storms (R18 only guards against read storms), while not writing in real time
+     leaves the mapping stale and the fallback necessarily wrong again: two sources of truth are
+     unacceptable; one source is fixed.
+  2. Owned locally ⇒ deliver directly into that session's PacketChannel (same-server path).
+  3. Owned by another server ⇒ **cross-server forwarding**:
+     `ForwardEnvelope{ver, src_dev, dst_dev, origin_server, hop=1, payload=IP packet}` is sent on a
+     dedicated FRWD stream of the server-interconnect E2E session (the outer layer has
+     server-to-server encryption; the inner IP packet is plaintext at this point — threat model in
+     §2.5). At the receiver: if dst is in a local session ⇒ deliver; otherwise reply `NOT_HERE` to
+     the origin (**second-hop forwarding forbidden**, hop=1 prevents loops).
+  4. **Fault-tolerance policy for lease miss / staleness** (vpn-mesh §5.2 explicitly calls this a
+     policy decision; fixed here): when a device has just migrated to another server, packets within
+     the old-lease window go to the old server → the old server replies NOT_HERE → the origin sends
+     a **one-shot location query** (LocationQuery: ask the servers holding a lease for that device
+     in their lease tables, or fan out to ≤3 interconnected servers, "who is hosting dst?") and
+     redirects once; still failing ⇒ **drop the packet + best-effort ICMP unreachable** (no
+     broadcast, no cached retries — VPN packet loss is recoverable by upper layers; this avoids
+     state bloat in the forwarding plane). Device-online/migration event push (≤1s) usually makes
+     this window shorter than the lease TTL.
+  - Linux routing is configured via rtnetlink (VPN-14).
+- `flock-frpc` supervision (§5): config generation + process supervision + health probing.
+- **Web UI admin plane (§7-M8)**: in-process embedded HTTP (dual bind on `127.0.0.1:port` + the
+  local tun VIP:port, default 9800, no LAN/public binding) — admin login account + Dashboard;
+  authentication = OPAQUE (pake reuse) + admin role + HttpOnly session cookie; each server in the
+  cluster embeds its own instance, and data is naturally consistent via Raft/leases/EWMA (reachable
+  on any VIP).
 
-### 2.3 客户端（`app/flock-client`）
+### 2.3 Client (`app/flock-client`)
 
-- 接入器：接入端点列表（来自根签 ClusterDirectory 的 `access_endpoint`——直连地址或中转
-  用户口，无感知差异）→ TCP 拨号 → `session::initiate`（带 ServerPin）；断线指数退避
-  （5s 起步 + 抖动，wireguard-go RekeyTimeout 节奏，crypto-2026 §6）+ 端点轮询切换。
-- tun 数据面：`tun-rs 2.8.16`（平台矩阵最全、活跃度最高、内置 wintun/iOS fd/Android
-  establish 示例，vpn-mesh §1.2）创建 TUN（MTU 1280）；IP 包 ↔ `PacketChannel`。
-  **接缝**：`TunDevice` trait（open/read/write/close），平台适配器 = tun-rs 原生、
-  Android `VpnService` fd 传入 + `protect()`、iOS `NEPacketTunnelProvider` fd 传入
-  （vpn-mesh §1.1：两平台无 native 等价 API，fd 必须由上层框架注入——这是库必须留的缝）。
-- 路由：Linux rtnetlink 0.23.0（/16 池指向 TUN + rp_filter=1 反向路径过滤，innernet 建议，
-  vpn-mesh §3.3）；Windows 用 wintun 路由 API；Android 走 `VpnService.Builder` 路由参数。
-- TCP-over-TCP 缓解：内层单流限速与队列管理（避免多内层流放大争抢；弱网坍缩机理见
-  vpn-mesh §3.2）；P2P 直连列远期路线（自建节点 xtcp），首版不做。
+- Access: the access endpoint list (from the root-signed ClusterDirectory's `access_endpoint` —
+  a direct address or a relay user port, indistinguishable) → TCP dial → `session::initiate`
+  (with ServerPin); on disconnect, exponential backoff (starting at 5s + jitter, following
+  wireguard-go's RekeyTimeout cadence, crypto-2026 §6) + endpoint round-robin switching.
+- tun data plane: `tun-rs 2.8.16` (the fullest platform matrix, highest activity, built-in
+  wintun/iOS fd/Android establish examples, vpn-mesh §1.2) creates the TUN (MTU 1280); IP packets ↔
+  `PacketChannel`. **Seam**: the `TunDevice` trait (open/read/write/close); platform adapters =
+  tun-rs native, Android `VpnService` fd injection + `protect()`, iOS `NEPacketTunnelProvider` fd
+  injection (vpn-mesh §1.1: neither platform has a native equivalent API; the fd must be injected
+  by the upper framework — this is a seam the library must leave).
+- Routing: Linux rtnetlink 0.23.0 (/16 pool pointing to TUN + rp_filter=1 reverse-path filtering,
+  innernet recommendation, vpn-mesh §3.3); Windows uses the wintun routing API; Android goes
+  through `VpnService.Builder` routing parameters.
+- TCP-over-TCP mitigation: per-inner-stream rate limiting and queue management (avoiding
+  amplification contention across multiple inner streams; the weak-network collapse mechanism is in
+  vpn-mesh §3.2); P2P direct connections go on the long-term roadmap (self-hosted node xtcp); not
+  in the first version.
 
-### 2.4 密钥与会话生命周期
+### 2.4 Keys and session lifecycle
 
-| 阶段 | 密钥/凭据 | 生命周期 |
+| Stage | Keys / credentials | Lifecycle |
 |---|---|---|
-| 引导 | 邀请文件 v3（集群根公钥+根签 ClusterDirectory 全套服务器材料+一次性 invite_id）或 TOFU 首连 2-RTT 引导后**钉扎集群根公钥** | 根公钥变更 = 显式告警 + 人工确认；单台服务器换钥 = 根签新目录条目 + dir_pull 刷新（合法变更不告警） |
-| 登录 | OPAQUE（密码不上线）+ 服务端身份签名 | 每次登录重新执行；成功 → 会话票据（短 TTL，本地签发） |
-| 设备注册 | 设备静态密钥（X25519 会话用 + Ed25519 身份用，客户端生成永不出机） | 注册进 Raft；吊销即全网失效 |
-| 隧道会话 | 1-RTT 握手派生双向密钥（混合 KEM ⇒ 前向保密 + PQ） | rekey 双阈值 2^60 包/120s；180s/2^64−2^13−1 硬拒绝；断链重连=全新握手 |
-| 服务端身份密钥 | Ed25519（可选 ML-DSA 并行） | 长期；轮换=新密钥+老密钥并行期+客户端重钉扎流程 |
-| OPRF key | OPAQUE 服务端密钥（Raft 状态机内，加密封装到各服务器混合公钥） | 常驻（轮换使全部 pass.opaque 失效——showroom 同语义，showroom-analysis §5） |
-| 共享秘密封装 | 状态机内秘密逐服务器封装（envelope v2 到各自 HybridPubkey） | 「按服务器独立密钥/逐次重封装」权限点：新增服务器 = re-wrap（VPN-15） |
+| Bootstrap | Invite file v3 (cluster root pubkey + root-signed ClusterDirectory with the full set of server material + one-time invite_id), or after TOFU first-connect 2-RTT bootstrap, the **pinned cluster root pubkey** | Root pubkey change = explicit warning + manual confirmation; single-server key rotation = root-signed new directory entry + dir_pull refresh (legitimate changes do not warn) |
+| Login | OPAQUE (the password never goes on the wire) + server identity signature | Re-executed on every login; success → session ticket (short TTL, issued locally) |
+| Device registration | Device static keys (X25519 for sessions + Ed25519 for identity, generated on the client and never leave the machine) | Registered into Raft; revocation invalidates it network-wide |
+| Tunnel session | 1-RTT handshake derives bidirectional keys (hybrid KEM ⇒ forward secrecy + PQ) | rekey dual threshold 2^60 packets/120s; 180s/2^64−2^13−1 hard reject; reconnect after link loss = brand-new handshake |
+| Server identity key | Ed25519 (optional parallel ML-DSA) | Long-term; rotation = new key + old-key parallel period + client re-pinning flow |
+| OPRF key | OPAQUE server key (inside the Raft state machine, sealed by encryption to each server's hybrid pubkey) | Persistent (rotation invalidates all pass.opaque — same semantics as showroom, showroom-analysis §5) |
+| Shared secret sealing | In-state-machine secrets sealed per server (envelope v2 to each server's HybridPubkey) | "Per-server independent keys / per-rotation re-wrapping" permission point: adding a server = re-wrap (VPN-15) |
 
-前向保密链：握手一次性 DH/KEM 份额 → 每 120s（或 2^60 包）rekey 换新份额 → 旧密钥擦除。
-重放状态分级归属（verdict §3.6 多主多活约束）：**隧道数据面** = 会话级计数器（随会话归属
-单一服务端，无需共享）；**控制面关键一次性操作**（bind_token/票据换发）= Raft 线性一致查重
-（低频，写放大可接受）；**SR-SIG1 请求 nonce** = 本地 ±300s 窗 + **票据强制契约**（§2.2：
-状态变更请求必带有效票据、票据校验先于 nonce 记账、等效重放窗 = min(±300s, 票据 TTL 60s)）
-收窄跨服重放面（如实记录：高频请求级 nonce 非强一致，靠票据 TTL 闭合，这是工程取舍）。
+Forward-secrecy chain: handshake one-time DH/KEM share → rekey every 120s (or 2^60 packets)
+swaps in a fresh share → old keys erased.
+Replay-state ownership by tier (verdict §3.6 multi-primary active-active constraints): **tunnel
+data plane** = per-session counter (owned by the single server the session belongs to; no sharing
+needed); **control-plane critical one-time operations** (bind_token/ticket reissuance) = Raft
+linearizable duplicate check (low frequency; write amplification acceptable); **SR-SIG1 request
+nonces** = local ±300s window + the **mandatory ticket contract** (§2.2: state-changing requests
+must carry a valid ticket, ticket validation precedes nonce accounting, effective replay window =
+min(±300s, ticket TTL 60s)) narrowing the cross-server replay surface (recorded as-is:
+high-frequency per-request nonces are not strongly consistent; they are closed by ticket TTL — this
+is an engineering trade-off).
 
-### 2.5 威胁模型边界（明确声明，防止安全主张被误读为 peer 级 E2E）
+### 2.5 Threat model boundaries (explicit statement, to prevent security claims from being misread as peer-level E2E)
 
-1. **跨 peer 流量在接入服务器明文**：首版 hub-and-spoke（§2.1/§2.2）意味着客户端↔客户端
-   流量在接入服务器**解密后转发**（跨服路径在外层有服务器间加密，但每台服务器内部仍是
-   明文）。这与 Tailscale「协调服务器无法解密」（vpn-mesh §2/S18）的属性**根本不同**：
-   任一台在册服务器可观察/篡改全部经其转发的跨 peer 流量。缓解：服务器主机加固 + 准入
-   控制（§4）；**远期**：peer 间端到端 overlay 加密层（客户端-客户端内层会话，服务器退化为
-   盲转），列入路线图但不在本设计范围。
-2. **任一服务器可离线字典全部口令**：OPRF key 逐服务器封装（§2.4 表）⇒ 攻破任一台在册
-   服务器即得 OPRF key，可对全部用户口令做离线字典（OPAQUE aPAKE 模型内 OPRF key 持有者
-   即有此能力——showroom 同语义，showroom-analysis §5；argon2id 档位是唯一减速带）。
-   缓解：服务器密钥 0600/内存驻留 + 准入红线（§4：伪节点拿不到 key）；**远期**：OPRF key
-   门限化（quorum 解封）。此为接受边界，写进部署文档。
-3. **TOFU 不防首登在线 MITM**（§1.3.3f 残余风险）：个人自建可接受；组织场景强制邀请文件。
-4. **中转与链路**：FRP 中转/链路观察者只见密文与长度（长度侧信道对策见压缩档 P0-4）；
-   ChmlFrp 面板凭据通道风险见 §5/R 表（R20）。
+1. **Cross-peer traffic is plaintext on the access server**: the first-version hub-and-spoke
+   (§2.1/§2.2) means client↔client traffic is **decrypted and then forwarded** on the access server
+   (the cross-server path has server-to-server encryption on the outer layer, but inside each
+   server it is still plaintext). This is **fundamentally different** from Tailscale's "the
+   coordination server cannot decrypt" property (vpn-mesh §2/S18): any enrolled server can observe/
+   tamper with all cross-peer traffic it forwards. Mitigations: server host hardening + admission
+   control (§4); **long term**: a peer-to-peer end-to-end overlay encryption layer (client-client
+   inner session, the server degrading to a blind relay), on the roadmap but out of scope for this
+   design.
+2. **Any server can offline-dictionary all passwords**: the OPRF key is sealed per server (§2.4
+   table) ⇒ compromising any enrolled server yields the OPRF key and enables offline dictionary
+   attacks on all user passwords (within the OPAQUE aPAKE model, the OPRF key holder inherently has
+   this ability — same semantics as showroom, showroom-analysis §5; the argon2id tier is the only
+   speed bump). Mitigations: server keys 0600/memory-resident + admission red lines (§4: a fake
+   node cannot obtain the key); **long term**: OPRF key thresholding (quorum unsealing). This is an
+   accepted boundary, written into the deployment docs.
+3. **TOFU does not defend against an online MITM on first login** (§1.3.3f residual risk):
+   acceptable for personal self-hosting; organizational deployments must enforce the invite file.
+4. **Relay and link**: FRP relay / link observers see only ciphertext and lengths (length
+   side-channel countermeasures are in the compression tier P0-4); the ChmlFrp panel credential
+   channel risk is in §5/R table (R20).
 
 ---
 
-## 3. 模块划分（ModuleSpec）
+## 3. Module breakdown (ModuleSpec)
 
-每个 spec：**接口**（调用方需知的一切）· **接缝**（接口落点、谁可替换）· **实现要点**。
-深模块检验：接口方法数 ≤5、安全前提进类型/契约、删除测试（删掉则复杂度回到 N 个调用方）。
+Each spec: **interface** (everything callers need to know) · **seam** (where the interface lands,
+who can swap it) · **implementation points**. Deep-module checks: interface method count ≤5,
+security preconditions in types/contracts, the deletion test (removing it would push the complexity
+back onto N callers).
 
-### 3.1 `flock-protocol::kem`（混合 KEM 原语）
-- **接口**：`HybridKeypair/HybridPubkey/HybridCt` 三类型 + `encapsulate/decapsulate/fingerprint`
-  三函数（§1.3.3a）。
-- **接缝**：KEM 算法槽位——`trait KemGroup` 内部缝（X25519、ML-KEM-768 各一实现），未来
-  换 ML-KEM-1024/纯 PQ 不动调用方。
-- **实现要点**：ml-kem 0.3.3 + x25519-dalek 3.0.0；HKDF 合流；`legacy` 下 RSA-OAEP 只读。
+### 3.1 `flock-protocol::kem` (hybrid KEM primitive)
+- **Interface**: the three types `HybridKeypair/HybridPubkey/HybridCt` + the three functions
+  `encapsulate/decapsulate/fingerprint` (§1.3.3a).
+- **Seam**: the KEM algorithm slot — an internal `trait KemGroup` seam (one implementation each for
+  X25519 and ML-KEM-768); a future switch to ML-KEM-1024/pure-PQ touches no callers.
+- **Implementation points**: ml-kem 0.3.3 + x25519-dalek 3.0.0; HKDF confluence; under `legacy`,
+  RSA-OAEP is read-only.
 
-### 3.2 `flock-protocol::envelope`（文件信封 v1/v2）
-- **接口**：`seal_v2(recipient, plain_reader, out) -> SealInfo`、`open_v2(sk, in, out)`、
-  `open_v1_legacy(rsa_sk, in, out)`；SealInfo 含 envelope_id/段数/总长。
-- **接缝**：封装算法（头的 ver 字节分派 v1/v2）；段 AAD 构造为内部实现细节。
-- **实现要点**：v2 头 1137B（§1.3.3b）；流式恒定内存（沿用 showroom seal/open 缓冲模型，
-  showroom-analysis §4.1）；AAD=ver‖id‖seg_idx‖is_final；长度不变量测试（v1 的测试思想平移）。
+### 3.2 `flock-protocol::envelope` (file envelope v1/v2)
+- **Interface**: `seal_v2(recipient, plain_reader, out) -> SealInfo`, `open_v2(sk, in, out)`,
+  `open_v1_legacy(rsa_sk, in, out)`; SealInfo carries envelope_id/segment count/total length.
+- **Seam**: the encapsulation algorithm (the header's ver byte dispatches v1/v2); segment AAD
+  construction is an internal implementation detail.
+- **Implementation points**: v2 header 1137B (§1.3.3b); streaming with constant memory (reusing
+  showroom's seal/open buffering model, showroom-analysis §4.1); AAD = ver‖id‖seg_idx‖is_final;
+  length-invariant tests (v1's test idea carried over).
 
-### 3.3 `flock-protocol::sig`（SR-SIG1 + 密钥档案）
-- **接口**：v1 兼容五函数（§1.3.2）+ `KeyProfile::verify_dispatch(kid)`（kid→Ed25519/ML-DSA）。
-- **接缝**：kid 算法分派表——`ProfileKey` enum 扩展新算法零调用方改动。
-- **实现要点**：ed25519-dalek 3.0.0；预哈希流式签名保留；`pq-sign` off by default
-  （ml-dsa 0.1.1 未审计，crypto-2026 §5——如实标注）。
+### 3.3 `flock-protocol::sig` (SR-SIG1 + key profiles)
+- **Interface**: the five v1-compatible functions (§1.3.2) +
+  `KeyProfile::verify_dispatch(kid)` (kid→Ed25519/ML-DSA).
+- **Seam**: the kid algorithm dispatch table — extending `ProfileKey` with a new algorithm requires
+  zero caller changes.
+- **Implementation points**: ed25519-dalek 3.0.0; prehashed streaming signing preserved; `pq-sign`
+  off by default (ml-dsa 0.1.1 unaudited, crypto-2026 §5 — labeled as-is).
 
-### 3.4 `flock-protocol::pake`（OPAQUE + 身份锚）
-- **接口**：showroom 兼容函数族 + `login_finish_anchored(...) -> (SessionSeed, ServerIdentity)`
-  （`anchor` feature）；`rwd(pw, user, profile)`。
-- **接缝**：argon2 profile 参数化（版本化升级不破老记录）；锚签名层可开关（showroom 先关）。
-- **实现要点**：opaque-ke 4.0.1；固定向量互通测试（3.0.0 记录样本 → 4.0.1 可解，M1 守门）；
-  RFC 引用 9807；dummy 假记录防枚举保留。
+### 3.4 `flock-protocol::pake` (OPAQUE + identity anchor)
+- **Interface**: the showroom-compatible function family +
+  `login_finish_anchored(...) -> (SessionSeed, ServerIdentity)` (the `anchor` feature);
+  `rwd(pw, user, profile)`.
+- **Seam**: argon2 profile parameterization (versioned upgrades do not break old records); the
+  anchor signature layer is switchable (showroom keeps it off initially).
+- **Implementation points**: opaque-ke 4.0.1; fixed-vector interop tests (3.0.0 recorded samples →
+  4.0.1 can decode; the M1 gate); RFC reference 9807; the dummy fake-record anti-enumeration
+  preserved.
 
-### 3.5 `flock-protocol::session`（会话/记录层/握手）
-- **接口**：`initiate/respond(async)/Tunnel{async open_stream, async open_packet_channel, stats}`
-  （§1.3.3c）；握手双形态：已钉扎 1-RTT / TOFU 首连 2-RTT 引导。
-- **接缝**：`trait DeviceDirectory: fn lookup(&self, &DeviceId) -> BoxFuture<LookupVerdict>`
-  （异步 + 三态 NotFound/Revoked/Active——服务端把注册表/吊销查询注入协议库，多主多活的
-  权限点之一；线性一致读是网络往返，同步签名不可实现）；`AeadPreference`（算法协商档）；
-  `DeviceStaticKeys`（设备密钥注入，Android/iOS 由上层钥匙库供）。
-- **实现要点**：P0-2 全部纪律内建（计数器 nonce/双阈值 rekey/硬拒绝/伪造断链）；Noise IK
-  结构自研（不用 snow——其 CVE 史与无法插 KEM 槽位，crypto-2026 §5/§3.1）；**设备签名覆盖
-  I1 全字段 + 协议上下文（cluster_id/期望身份指纹）——防 UKS，M1 有对应失败向量**；
-  transcript 哈希链 + 测试向量（M1）；严格递增计数校验 + 窗口结构留 UDP 路径。
+### 3.5 `flock-protocol::session` (session/record layer/handshake)
+- **Interface**: `initiate/respond(async)/Tunnel{async open_stream, async open_packet_channel,
+  stats}` (§1.3.3c); handshake in two forms: pinned 1-RTT / TOFU first-connect 2-RTT bootstrap.
+- **Seam**: `trait DeviceDirectory: fn lookup(&self, &DeviceId) -> BoxFuture<LookupVerdict>`
+  (async + three states NotFound/Revoked/Active — the server injects the registry/revocation lookup
+  into the protocol library; one of the multi-primary active-active permission points; a
+  linearizable read is a network round trip, so a synchronous signature is unimplementable);
+  `AeadPreference` (algorithm negotiation tier); `DeviceStaticKeys` (device key injection; on
+  Android/iOS supplied by the upper-layer keystore).
+- **Implementation points**: all P0-2 discipline built in (counter nonce/dual-threshold rekey/hard
+  reject/forgery disconnect); the Noise IK structure is implemented in-house (snow not used — its
+  CVE history and the inability to insert a KEM slot, crypto-2026 §5/§3.1); **the device signature
+  covers all I1 fields + protocol context (cluster_id/expected identity fingerprint) — anti-UKS, M1
+  has corresponding failure vectors**; transcript hash chain + test vectors (M1); strictly
+  increasing counter checks + window structure reserved for a UDP path.
 
-### 3.6 `flock-protocol::mux`（yamux 承载与包通道）
-- **接口**：`Stream`（AsyncRead/Write + 显式 `finish()`）、`PacketChannel::send(pkt)/recv_stream()`、
-  `Prio` 调度档。
-- **接缝**：复用器实现——`trait Multiplexer` 内部缝（yamux 适配器为唯一首发实现；第二个
-  适配器出现前不外露该 trait——「一个适配器=假想缝」纪律，SKILL.md 原则）。
-- **实现要点**：rust-yamux 0.14.1 跑在 SecureStream 内；控制流 stream 0 高优先级；
-  keepalive = yamux ping 10s；FIN 表达单向结束（禁半关闭）。
+### 3.6 `flock-protocol::mux` (yamux carrier and packet channel)
+- **Interface**: `Stream` (AsyncRead/Write + explicit `finish()`),
+  `PacketChannel::send(pkt)/recv_stream()`, `Prio` scheduling tiers.
+- **Seam**: the multiplexer implementation — an internal `trait Multiplexer` seam (the yamux adapter
+  is the only first-release implementation; the trait is not exposed until a second adapter appears
+  — "one adapter = an imaginary seam" discipline, SKILL.md principle).
+- **Implementation points**: rust-yamux 0.14.1 runs inside SecureStream; control-flow stream 0 at
+  high priority; keepalive = yamux ping 10s; FIN expresses one-directional end (half-close
+  forbidden).
 
-### 3.7 `flock-protocol::compress`（压缩档位）
-- **接口**：`CompressPolicy` + `compress_frame/decompress_frame`（§1.3.3e）。
-- **接缝**：策略档位（Off/Interactive/Bulk/Archive）+ 字典版本协商（dictID 进握手扩展）。
-- **实现要点**：zstd 0.14.3（Windows/MSVC 已证可编译，compression-2026 §5）+ lz4_flex 0.14；
-  非膨胀回退 MUST；默认 Off + 填充联动。
+### 3.7 `flock-protocol::compress` (compression tiers)
+- **Interface**: `CompressPolicy` + `compress_frame/decompress_frame` (§1.3.3e).
+- **Seam**: policy tiers (Off/Interactive/Bulk/Archive) + dictionary version negotiation (dictID
+  goes into handshake extensions).
+- **Implementation points**: zstd 0.14.3 (Windows/MSVC proven compilable, compression-2026 §5) +
+  lz4_flex 0.14; non-expansion fallback MUST; default Off + padding interlock.
 
-### 3.8 `flock-protocol::trust`（TOFU/邀请）
-- **接口**：`PinStore`（钉扎粒度 = cluster_id → 集群根公钥）、`InviteFile`（v3：根签
-  ClusterDirectory 全套服务器接入材料 + 一次性 invite_id + expiry 默认 7 天，§1.3.3f）、
-  `ClusterDirectory/ServerEntry`（= §4 入群凭证公开部分；`access_endpoint` = 接入端点——
-  Direct 直连地址或 Frp 中转用户口，**客户端无感知差异**，选路/探活逻辑不分形态）、
-  `fingerprint`、集群根密钥/入群凭证类型（§4 准入用）。
-- **接缝**：钉扎存储（文件适配器首发；钥匙库适配器给移动端）；邀请文件版本（v2 单服务器
-  材料与 v1 指纹-only 均不再接受——多服务器集群下无法支撑任意端点 1-RTT）；目录刷新
-  （dir_pull，根验签 + dir_version 递增）。
-- **实现要点**：known_hosts 语义（集群根级）；指纹展示格式（8 组 hex）；根公钥变更告警
-  不可静默跳过；invite_id 单次消费语义由 flock-sync 的 Raft 状态机保证（库只做结构校验）；
-  **文档必须内嵌 TOFU 残余风险声明**（不防首登在线 MITM，组织走邀请强路径）。
+### 3.8 `flock-protocol::trust` (TOFU/invite)
+- **Interface**: `PinStore` (pin granularity = cluster_id → cluster root pubkey), `InviteFile`
+  (v3: root-signed ClusterDirectory with the full set of server access material + one-time
+  invite_id + expiry default 7 days, §1.3.3f), `ClusterDirectory/ServerEntry` (= the public part of
+  §4's enrollment credential; `access_endpoint` = the access endpoint — a Direct direct address or
+  an Frp relay user port, **indistinguishable to the client**; routing/liveness logic does not
+  branch on the form), `fingerprint`, cluster root key / enrollment credential types (for §4
+  admission).
+- **Seam**: pin storage (file adapter first; a keystore adapter for mobile); the invite file
+  version (v2 single-server material and v1 fingerprint-only are both no longer accepted — under a
+  multi-server cluster they cannot support 1-RTT at any endpoint); directory refresh (dir_pull,
+  root-verified + dir_version increasing).
+- **Implementation points**: known_hosts semantics (at the cluster-root level); fingerprint display
+  format (8 hex groups); root pubkey change warnings cannot be silently skipped; the invite_id
+  single-consumption semantics are guaranteed by flock-sync's Raft state machine (the library only
+  does structural validation); **the docs must embed the TOFU residual-risk statement** (no defense
+  against an online first-login MITM; organizations use the strong invite path).
 
-### 3.9 `crates/flock-frpc`（frpc 子进程托管，VPN-16）
-- **接口**：`Supervisor::start(spec: RelaySpec) -> ManagedRelay`；
-  `RelaySpec::ChmlFrp{mode: ChmlFrpMode} | Original{toml}`，其中
-  `ChmlFrpMode::ConfigFile(ini_path)`（**默认**：面板「隧道管理→配置文件」粘贴导出的
-  frpc.ini，走 `-c` 模式）| `ChmlFrpMode::UserTokenAuto{usertoken, tunnel_id}`（legacy
-  可选：`-u/-p` cfg API 自举）；`health() -> RelayStatus`。
-- **接缝**：frpc 变体（ChmlFrp v0.51.2 定版二进制 / 原版 v0.71.1 定版二进制）+ 配置生成器
-  （golden-file 测试，R8/R12：**不改面板生成的 proxy 参数**——CheckProxy 会拒，frp-compat §2.3）。
-- **实现要点**：进程守护（ChmlFrp frpc 三次重连失败即退出——魔改行为，frp-compat §2.3——
-  退出即拉起 + 指数退避）；健康探测（本地隧道口 + frpc admin）；版本矩阵锁（R9：ChmlFrp 节点
-  ⇔ ChmlFrp frpc、自建节点 ⇔ 同代原版 frpc，禁交叉——两代控制面互不兼容，frp-compat §1.3）；
-  **usertoken 安全档**：`-u/-p` 自举的 cfg API 是 InsecureSkipVerify 的 HTTPS
-  （frp-compat §2.2，chml/pkg/api/api.go:30-46），面板全权凭据可被中间人截获 ⇒ 默认走
-  `-c` 配置文件模式，UserTokenAuto 保留但文档标注风险（R20）。仅服务端
-  `listener.mode = Frp` 时装配（Direct 模式零 frp 逻辑，§3.11）；tcp 代理形态下客户端
-  直连用户口、自身从不需要 frpc。
+### 3.9 `crates/flock-frpc` (frpc subprocess supervision, VPN-16)
+- **Interface**: `Supervisor::start(spec: RelaySpec) -> ManagedRelay`;
+  `RelaySpec::ChmlFrp{mode: ChmlFrpMode} | Original{toml}`, where
+  `ChmlFrpMode::ConfigFile(ini_path)` (**default**: the frpc.ini pasted and exported from the
+  panel's "Tunnel Management → Config File", using `-c` mode) |
+  `ChmlFrpMode::UserTokenAuto{usertoken, tunnel_id}` (legacy option: `-u/-p` cfg-API bootstrap);
+  `health() -> RelayStatus`.
+- **Seam**: frpc variants (ChmlFrp v0.51.2 pinned binary / original v0.71.1 pinned binary) + the
+  config generator (golden-file tests, R8/R12: **do not modify the panel-generated proxy
+  parameters** — CheckProxy would reject, frp-compat §2.3).
+- **Implementation points**: process supervision (ChmlFrp frpc exits after three reconnect failures
+  — modified behavior, frp-compat §2.3 — restart on exit + exponential backoff); health probing
+  (local tunnel port + frpc admin); version matrix lock (R9: ChmlFrp node ⇔ ChmlFrp frpc,
+  self-hosted node ⇔ same-generation original frpc, cross-combination forbidden — the two
+  generations' control planes are mutually incompatible, frp-compat §1.3); **usertoken security
+  tier**: the `-u/-p` bootstrapped cfg API is InsecureSkipVerify HTTPS (frp-compat §2.2,
+  chml/pkg/api/api.go:30-46); the all-powerful panel credential can be intercepted by a MITM ⇒ the
+  `-c` config-file mode is the default, UserTokenAuto retained but risk-documented (R20). Assembled
+  only when the server's `listener.mode = Frp` (Direct mode has zero frp logic, §3.11); in the tcp
+  proxy form the client dials the user port directly and never needs frpc itself.
 
-### 3.10 `crates/flock-sync`（多主多活，VPN-15）
-- **接口**：`NetState::{register_device, revoke, allocate_ip, redeem_invite,
-  revoke_invite, config_version, server_keys, rewrap, admin_op}`（写，经 Raft 提交；
-  admin_op = add_voter/rewrap/revoke_invite，须集群根密钥签名；**NetState 不存设备当前位置
-  ——静态注册信息与邀请消费记录而已**）+ `read_linearizable(...)` + `LeaseTable::{publish,
-  observe, location_query}`（gossip：事件推送 ≤1s + 5s 反熵；租约 TTL 30s；**设备当前位置
-  的唯一真相源**；location_query = 一次性跨服位置询问，fan-out ≤3）+ `TicketIssuer::
-  issue/verify`（本地签发，TTL 60s，带 revocation_epoch）+ `Enrollment`（入群凭证验证/
-  轮换，§4）+ `Directory::serve(dir_pull)`（向客户端下发根签 ClusterDirectory，§1.3.3f）
-  + 跨服转发承载（互连会话 FRWD 流上的 ForwardEnvelope，§2.2）。
-- **接缝**：状态机存储（redb 适配器首发）；Raft 网络传输（直接 TCP / 经中转 TCP——都跑
-  **服务器-服务器 profile** 的 E2E 会话：双向入群凭证 + transcript 签名，无凭证即拒）；
-  gossip 传输（复用服务端互连会话）。
-- **实现要点**：openraft 0.9.25 稳定线（0.10 仍是 alpha，vpn-mesh §5.1）；redb 单文件嵌入
-  （纯 Rust，契合「无共享数据库」部署形态）；apply 回调推进 revocation_epoch + 杀本地会话
-  （§2.2 吊销传播界）+ **apply-lag >2s 熔断本地缓存、降级线性一致读**（§4 读与缓存）；
-  learner→快照→add_voter→rewrap 准入流水（§4）；租约冲突 = 新者胜 + 旧端踢会话
-  （vpn-mesh §5.2）；invite_id 单次消费在 Raft 内查重（§1.3.3f 邀请一生）。
-  M7 增补（§7-M7）：租约条目携带 per-device EWMA 流量与 last_seen（动态面搭租约
-  便车，不进 Raft）；注册表支持 Expired 状态与 VIP 归还分配池（§2.1 IP 复用策略
-  修订）。
+### 3.10 `crates/flock-sync` (multi-primary active-active, VPN-15)
+- **Interface**: `NetState::{register_device, revoke, allocate_ip, redeem_invite, revoke_invite,
+  config_version, server_keys, rewrap, admin_op}` (writes, committed through Raft; admin_op =
+  add_voter/rewrap/revoke_invite, must be signed by the cluster root key; **NetState does not store
+  device current location — only static registration info and invite-consumption records**) +
+  `read_linearizable(...)` + `LeaseTable::{publish, observe, location_query}` (gossip: event push
+  ≤1s + 5s anti-entropy; lease TTL 30s; **the single source of truth for device current location**;
+  location_query = a one-shot cross-server location inquiry, fan-out ≤3) + `TicketIssuer::
+  issue/verify` (issued locally, TTL 60s, carries revocation_epoch) + `Enrollment` (enrollment
+  credential verification/rotation, §4) + `Directory::serve(dir_pull)` (serves the root-signed
+  ClusterDirectory to clients, §1.3.3f) + the cross-server forwarding carrier (ForwardEnvelope on
+  the interconnect session's FRWD stream, §2.2).
+- **Seam**: the state machine store (redb adapter first); the Raft network transport (direct TCP /
+  relayed TCP — both run the E2E session with the **server-server profile**: mutual enrollment
+  credentials + transcript signatures; no credential, no connection); the gossip transport (reuses
+  the server interconnect sessions).
+- **Implementation points**: openraft 0.9.25 stable line (0.10 still alpha, vpn-mesh §5.1); redb
+  single-file embedded (pure Rust, fits the "no shared database" deployment form); the apply
+  callback advances revocation_epoch + kills local sessions (§2.2 revocation propagation bound) +
+  **apply-lag >2s circuit-breaks the local cache and degrades to linearizable reads** (§4 reads and
+  caching); the learner→snapshot→add_voter→rewrap admission pipeline (§4); lease conflict = newest
+  wins + the old end's session is kicked (vpn-mesh §5.2); invite_id single consumption is
+  duplicate-checked inside Raft (§1.3.3f the life of an invite).
+  M7 additions (§7-M7): lease entries carry per-device EWMA traffic and last_seen (the dynamic plane
+  rides the leases, not Raft); the registry supports the Expired state and VIP return to the
+  allocation pool (§2.1 IP reuse policy revision).
 
-### 3.11 `app/flock-server`（服务端装配）
-- **接口**：`flock-server --config server.toml` / `init-cluster` / `enroll` /
-  `web-admin-add`（进程入口；web-admin-add = M8 Web UI 首 admin 引导，§7-M8.3）
-  + 控制流消息协议（版本化，票据强制契约见 §2.2；含 dir_pull/开户兑换流程 §1.3.3f）
-  + Web UI HTTP API（§7-M8.4 契约逐字）。
-- **接缝**：`ListenerMode`（接入端点形态，server.toml `listener.mode`，**Direct 缺省**）：
+### 3.11 `app/flock-server` (server assembly)
+- **Interface**: `flock-server --config server.toml` / `init-cluster` / `enroll` /
+  `web-admin-add` (process entry points; web-admin-add = M8 Web UI first-admin bootstrap, §7-M8.3)
+  + the control-flow message protocol (versioned; mandatory ticket contract in §2.2; includes
+  dir_pull / the provisioning-redeem flow §1.3.3f) + the Web UI HTTP API (§7-M8.4 contract,
+  verbatim).
+- **Seam**: `ListenerMode` (access endpoint form, server.toml `listener.mode`, **Direct default**):
   ```rust
   enum ListenerMode {
-      Direct { bind: SocketAddr },                 // 直接监听公网/内网地址——零 frp 逻辑，
-                                                   // 代码路径不触碰 flock-frpc（不实例化
-                                                   // Supervisor/不生成配置/不启动子进程）
-      Frp { bind: SocketAddr, relay: RelaySpec },  // 无公网 IP/不可直连时：本地监听 +
-                                                   // flock-frpc Supervisor 托管中转（§3.9/§5）
+      Direct { bind: SocketAddr },                 // listen directly on a public/internal address — zero frp logic;
+                                                   // the code path never touches flock-frpc (no Supervisor
+                                                   // instantiation / no config generation / no subprocesses)
+      Frp { bind: SocketAddr, relay: RelaySpec },  // when there is no public IP / direct access is impossible:
+                                                   // local listen + flock-frpc Supervisor-managed relay (§3.9/§5)
   }
   ```
-  对下注入 session::respond 的 `DeviceDirectory`（= 「NetState 缓存 + epoch 两级读 + lag
-  熔断」，§4 读与缓存）；对上挂 tun 适配器、flock-sync（含 FRWD 转发面）与
-  **仅 Frp 模式下的** flock-frpc（装配期按 mode 分派，Direct 分支无 flock-frpc 类型引用）。
-- **实现要点**：tokio 运行时；每入连一会话任务；转发面 = **第 0 步源 VIP 绑定校验** →
-  租约表定位 → 本机投递或 ForwardEnvelope 跨服转发（NOT_HERE → 一次性 location_query
-  重定向 + hop=1 防环 + 失败丢包/ICMP，§2.2）；吊销在 apply 回调内本地执行（无额外广播依赖）；
-  M8：内嵌 Web UI 管理面（loopback + tun VIP 双绑定 :9800，OPAQUE 登录 + 会话 cookie，
-  自研最小 HTTP/1.1——§7-M8）。
+  Downward it injects the `DeviceDirectory` for session::respond (= "NetState cache + epoch
+  two-level read + lag circuit-break", §4 reads and caching); upward it hangs the tun adapter,
+  flock-sync (including the FRWD forwarding plane) and flock-frpc **only in Frp mode** (dispatched
+  by mode at assembly; the Direct branch has no flock-frpc type references).
+- **Implementation points**: tokio runtime; one session task per inbound connection; the forwarding
+  plane = **step-0 source VIP binding check** → lease-table location → local delivery or
+  ForwardEnvelope cross-server forwarding (NOT_HERE → one-shot location_query redirect + hop=1 loop
+  prevention + drop/ICMP on failure, §2.2); revocation executes locally inside the apply callback
+  (no extra broadcast dependency); M8: the embedded Web UI admin plane (loopback + tun VIP dual
+  bind :9800, OPAQUE login + session cookie, in-house minimal HTTP/1.1 — §7-M8).
 
-### 3.12 `app/flock-client`（客户端装配）
-- **接口**：`flock-client --config client.toml` / `flock-client invite <file>`。
-- **接缝**：`TunDevice` trait（tun-rs 适配器首发；Android/iOS fd 注入适配器接缝预留）；
-  接入端点列表（来源 = 邀请文件/钉扎目录中的根签 ClusterDirectory，可 dir_pull 刷新、
-  可探活切换——任意端点均 1-RTT，§1.3.3c/§1.3.3f）。
-- **实现要点**：路由配置（rtnetlink/wintun/VpnService 参数）；接入器退避重连；数据面
-  IP 包 ↔ PacketChannel；MTU 1280。
-
----
-
-## 4. 多主多活同步方案（择型：openraft 强一致状态机 + gossip 租约）
-
-**选择**：调研推荐的第一阶段形态——「openraft 复制状态机（设备注册表/凭证/配置版本）+
-gossip 租约（在线状态）+ 会话票据本地签发」（vpn-mesh §5.3）。
-
-**理由**（逐条对调研证据）：
-1. 数据分三类定机制（vpn-mesh §5.2）：注册表/IP 分配/吊销要**强一致**（IP 撞车=脑裂事故、
-   吊销必须全序及时）——Raft 甜区，openraft `ensure_linearizable` 恰好满足「任意服务端接入
-   效果一致」；在线状态秒级陈旧可接受——gossip 租约；网络配置是派生数据——状态机版本化。
-2. 明确不选 CRDT（吊销无全序保证）、纯 gossip（IP 分配可脑裂）、共享 DB（把多主问题转嫁给
-   数据库且要求库独立可达，与「每服务端一个中转节点、无共享内网」形态不契合；NetBird 自托管
-   HA 本就是商业版功能，同类项目里多主多活不是默认能力，vpn-mesh §2/§5.3）。
-3. openraft 是 Rust 生态最成熟的 Raft（Databend 生产使用、混沌测试进 CI、0.9.25 稳定线，
-   vpn-mesh §5.1/S35）；服务端互连跑我们自己的 E2E 会话协议 ⇒ 同步链路也有加密/认证/重连
-   语义，不另造协议。
-
-**要点**：3 voter 起（容 1 故障）；写转发 leader（多一跳中转延迟，写少场景可忽略）；
-票据密钥根在 Raft、短 TTL 票据本地签发（登录路径不依赖 leader，vpn-mesh §5.3 第二阶段
-能力直接吸收进首版）；选举/心跳超时按中转 RTT 调参（默认心跳 500ms/选举超时 1.5s，
-M4 注入 100ms RTT 校准）；重放状态分级归属见 §2.4。
-
-**读与缓存（防重连风暴打穿 leader）**：`DeviceDirectory`（§1.3.3c）的服务端实现 =
-「设备记录缓存 + revocation_epoch（随 Raft 日志 apply 自动推进，**无需额外广播即全网
-收敛**）」两级——epoch 未变且缓存命中 ⇒ 本地答；epoch 前进 ⇒ 失效缓存、下次查线性一致读。
-中转断链后的 N 客户端重连风暴在无吊销时全部命中本地缓存，leader 只承接真正的全局序变化。
-`ensure_linearizable` 保留给「必须读到最新」的少数路径（如管理员侧查询）。
-**陈旧读边界的披露与熔断（诚实声明健康前提）**：follower 落后时（分区恢复/追赶中）其本地
-epoch 是旧值且「未变」，缓存中的 Active 记录照常命中放行——**leader 已 commit 的吊销在本地
-apply 之前挡不住新握手**，窗口 = follower 日志落后时长（正常 < 心跳 500ms；分区恢复后可达
-秒级以上）。对策（熔断）：心跳/AppendEntries 携带 leader commit index，follower 自监听
-apply lag，**lag > 2s（= A6 时序预算）即停用本地缓存路径、降级线性一致读**，追平后恢复；
-叠加兜底 = 会话票据 epoch 校验（票据 TTL 60s 内必然经过一次本地 apply 点）。M4 测试含
-「follower 人为落后 5s 时吊销仍被拦截」用例。A6 的 ≤5s 因此带显式健康前提：健康集群或
-熔断生效时成立，失联且 lag>2s 的节点已被熔断降级。
-
-**服务器间信任引导与集群准入（M4 开工前提，安全关键）**：
-
-1. **集群引导**：运维运行 `flock-server init-cluster --voters 3` 生成**集群根密钥**
-   （Ed25519，离线保管，只签名不组网）与每台初始 voter 的**入群凭证（enrollment cert）**
-   = `{cluster_id, server_id, role, identity_pub, static_hybrid_pub, raft_addr, access_endpoint,
-   expiry}` 的根密钥签名。每台服务器持有：自己的身份/静态混合私钥 + 自己的入群凭证 + 集群
-   根公钥。**同一信任根两用**：入群凭证的公开部分（ServerEntry，§1.3.3f）就是客户端接入
-   材料——根密钥既做服务器互认（本节）也签客户端邀请文件/集群目录（§1.3.3f），不引入第二
-   个信任根。
-2. **互连认证**：服务器互连（Raft/gossip/跨服转发）跑 E2E 会话协议的**服务器-服务器
-   profile**——双向要求对方出示入群凭证并以凭证内身份密钥对 transcript 签名；无有效凭证
-   的对端在握手层即被拒。openraft 网络适配器只挂在该认证会话之上 ⇒ **攻击者拉起伪节点
-   既拿不到快照也进不了 Raft**（若只靠 Raft 层弱认证，伪节点可索要快照与 re-wrap——
-   rewrap 即解封 OPRF key，全网口令离线字典面被打开，此为本设计的红线）。
-3. **新节点准入（授权路径定死）**：运维用集群根密钥签发新节点入群凭证 → 新节点以
-   **learner** 加入（openraft 动态成员，joint 共识）→ 快照同步 → 运维发起 Raft 管理操作
-   `add_voter`（请求体带集群根密钥签名，状态机验签后生效）→ 提升为 voter；**secrets
-   rewrap（把 OPRF key 等逐服务器封装扩到新服务器）是另一个独立的管理操作**
-   `rewrap(server_id)`，同样要求集群根密钥签名——被入侵的单台在册服务器没有根密钥，
-   无法自授准入、无法触发 rewrap。
-4. **凭证轮换**：入群凭证带 expiry；轮换 = 根密钥签新凭证 + Raft 提交生效窗口
-   （新旧并行的最小窗口），集群根密钥泄露 = 全网重引导（文档明示为灾难恢复路径）。
+### 3.12 `app/flock-client` (client assembly)
+- **Interface**: `flock-client --config client.toml` / `flock-client invite <file>`.
+- **Seam**: the `TunDevice` trait (tun-rs adapter first; the Android/iOS fd-injection adapter seam
+  is reserved); the access endpoint list (source = the root-signed ClusterDirectory in the invite
+  file/pinned directory, refreshable via dir_pull, switchable via liveness probing — every endpoint
+  is 1-RTT, §1.3.3c/§1.3.3f).
+- **Implementation points**: routing configuration (rtnetlink/wintun/VpnService parameters);
+  access-side backoff reconnect; data plane IP packets ↔ PacketChannel; MTU 1280.
 
 ---
 
-## 5. FRP 兼容策略（择型：方案 A 子进程托管，双栈定版）——**可选适配器，非前提**
+## 4. Multi-primary active-active sync scheme (selection: openraft strongly consistent state machine + gossip leases)
 
-> **硬约束（§0）**：frp 只服务于「服务端无公网 IP 或客户端无法直连服务端 IP」的场景；
-> `listener.mode = Direct`（缺省）时**不执行任何 frp 相关逻辑**。本章全部内容仅适用于
-> 显式选择 `Frp` 形态的服务器。
+**Choice**: the first-phase form recommended by the research — "openraft replicated state machine
+(device registry/credentials/config versions) + gossip leases (online state) + locally issued
+session tickets" (vpn-mesh §5.3).
 
-**选择**：frp-compat §3 的**方案 A**——子进程托管两套定版 frpc：ChmlFrp 节点用
-`ChmlFrp-0.51.2_251023`（已有 Linux 包：`.tmp/chmlfrpc/ChmlFrp-0.51.2_251023_linux_amd64/`，
-本次核实存在），自建/原版节点用原版 frp v0.71.1（Linux 官方包本次下载并容器内执行验证：
-`frps --version` → `0.71.1`，FRPS_LINUX_OK）。
+**Rationale** (point by point against the research evidence):
+1. Three classes of data, three mechanisms (vpn-mesh §5.2): registry/IP allocation/revocation need
+   **strong consistency** (an IP collision = a split-brain incident; revocation must be totally
+   ordered and timely) — Raft's sweet spot, and openraft's `ensure_linearizable` exactly satisfies
+   "any server gives the same access experience"; online state tolerates second-level staleness —
+   gossip leases; network config is derived data — versioned in the state machine.
+2. Explicitly not chosen: CRDT (revocation has no total-order guarantee), pure gossip (IP
+   allocation can split-brain), a shared DB (pushes the multi-primary problem onto the database and
+   requires the DB to be independently reachable, which does not fit the "one relay node per
+   server, no shared internal network" form; NetBird's self-hosted HA is a commercial feature;
+   among comparable projects multi-primary active-active is not a default capability, vpn-mesh
+   §2/§5.3).
+3. openraft is the Rust ecosystem's most mature Raft (in production at Databend, chaos tests in CI,
+   the 0.9.25 stable line, vpn-mesh §5.1/S35); the server interconnect runs our own E2E session
+   protocol ⇒ the sync link also has encryption/authentication/reconnect semantics; no new
+   protocol is invented.
 
-**理由**（frp-compat §0.4/§3）：
-1. ChmlFrp 基于 v0.51.2（无控制面加密）与原版 ≥v0.53.0（强制 AES-128-CFB）**两代互不兼容**
-   （§1.3 源码级证实）⇒ A 是唯一「同时兼容两家且零协议维护成本」路径。
-2. B（Rust 原生实现）撞上 v1→v2 wire protocol 过渡期（v1 计划 v0.78.0 移除）+ 需对齐 ChmlFrp
-   魔改鉴权/CheckProxy 命名——投入产出比最差的时间点；列远期演进。
-3. C（visitor/xtcp）在 ChmlFrp 不可用（面板建不出 stcp/xtcp + CheckProxy 拒绝，§2.4）；
-   仅自建节点可作远期 P2P 加速层，主链路不走。
-4. 已知短板全有工程解：ChmlFrp frpc 三次重连退出 → 守护拉起（§3.9）；proxy 参数不可自创
-   （CheckProxy）→ golden-file 配置生成（R12）；单隧道多会话 → yamux 复用（R11）。
-5. 协议层一致性断言集：R1–R12（frp-compat §4）作为 §6 Docker 断言与 M2/M5 验收用例来源。
+**Key points**: 3 voters minimum (tolerating 1 failure); writes forwarded to the leader (one extra
+relay hop of latency, negligible for a low-write workload); the ticket key root lives in Raft, and
+short-TTL tickets are issued locally (the login path does not depend on the leader; the vpn-mesh
+§5.3 phase-two capability is absorbed directly into the first version); election/heartbeat timeouts
+tuned to the relay RTT (default heartbeat 500ms/election timeout 1.5s, calibrated in M4 with an
+injected 100ms RTT); replay-state ownership by tier is in §2.4.
+
+**Reads and caching (preventing reconnect storms from punching through the leader)**: the
+server-side implementation of `DeviceDirectory` (§1.3.3c) = two levels — "device record cache +
+revocation_epoch (advanced automatically as the Raft log applies, **converging network-wide without
+any extra broadcast**)" — epoch unchanged and cache hit ⇒ answer locally; epoch advanced ⇒
+invalidate the cache; the next lookup is a linearizable read. After a relay link failure, an
+N-client reconnect storm hits the local cache entirely when there are no revocations; the leader
+only absorbs genuine global-order changes. `ensure_linearizable` is reserved for the few paths that
+"must read the latest" (e.g. admin-side queries).
+**Disclosure of the stale-read boundary and the circuit breaker (an honest statement of the health
+precondition)**: when a follower lags (partition recovery / catching up), its local epoch is an old
+value and "unchanged", and cached Active records still hit and pass — **a revocation the leader has
+already committed cannot block a new handshake before it applies locally**; the window = how long
+the follower's log lags (normally < heartbeat 500ms; after partition recovery it can reach seconds
+or more). Countermeasure (circuit breaker): heartbeats/AppendEntries carry the leader's commit
+index; followers self-monitor their apply lag; **lag > 2s (= the A6 timing budget) disables the
+local-cache path and degrades to linearizable reads**, restored once caught up; the additional
+backstop = session-ticket epoch checks (within a ticket's TTL 60s a local apply point necessarily
+passes). M4's tests include "with a follower artificially lagged 5s, a revocation is still
+blocked". A6's ≤5s therefore carries an explicit health precondition: it holds on a healthy cluster
+or when the breaker has tripped; a partitioned node with lag>2s has already been broken and
+degraded.
+
+**Inter-server trust bootstrap and cluster admission (M4 start precondition, security-critical)**:
+
+1. **Cluster bootstrap**: the operator runs `flock-server init-cluster --voters 3` to generate the
+   **cluster root key** (Ed25519, kept offline, used only for signing, never for networking) and
+   each initial voter's **enrollment credential** = the root key's signature over
+   `{cluster_id, server_id, role, identity_pub, static_hybrid_pub, raft_addr, access_endpoint,
+   expiry}`. Each server holds: its own identity/static-hybrid private keys + its own enrollment
+   credential + the cluster root pubkey. **One trust root, two uses**: the public part of the
+   enrollment credential (ServerEntry, §1.3.3f) is exactly the client access material — the root
+   key both vouches for server mutual authentication (this section) and signs client invite files /
+   the cluster directory (§1.3.3f); no second trust root is introduced.
+2. **Interconnect authentication**: server interconnects (Raft/gossip/cross-server forwarding) run
+   the E2E session protocol's **server-server profile** — each side must present an enrollment
+   credential and sign the transcript with the credential's identity key; a peer without a valid
+   credential is rejected at the handshake layer. The openraft network adapter hangs only above
+   that authenticated session ⇒ **an attacker spinning up a fake node gets neither the snapshot nor
+   entry into Raft** (with only Raft-layer weak authentication, a fake node could demand a snapshot
+   and a re-wrap — a rewrap unseals the OPRF key, opening the network-wide offline-password-dictionary
+   surface; this is this design's red line).
+3. **New-node admission (the authorized path is fixed)**: the operator signs a new node's
+   enrollment credential with the cluster root key → the new node joins as a **learner** (openraft
+   dynamic membership, joint consensus) → snapshot sync → the operator initiates the Raft admin
+   operation `add_voter` (the request body carries the cluster root key signature; the state
+   machine verifies the signature before it takes effect) → promotion to voter; **secrets rewrap
+   (extending the per-server sealing of the OPRF key etc. to the new server) is another independent
+   admin operation** `rewrap(server_id)`, likewise requiring the cluster root key signature — a
+   compromised single enrolled server does not hold the root key and can neither self-grant
+   admission nor trigger a rewrap.
+4. **Credential rotation**: enrollment credentials carry an expiry; rotation = a root-key-signed
+   new credential + a Raft-committed activation window (the minimal window of old/new parallel
+   validity); cluster root key leakage = full-network re-bootstrap (the docs state this explicitly
+   as the disaster-recovery path).
 
 ---
 
-## 6. Docker 多机互连实测拓扑（Windows 主机 + Docker Desktop Linux 容器）
+## 5. FRP compatibility strategy (selection: option A subprocess supervision, pinned dual stack) — **an optional adapter, not a prerequisite**
 
-### 6.1 可行性核实（本会话全部实际执行，命令与输出见附录 B）
+> **Hard constraint (§0)**: frp serves only the "server has no public IP, or the client cannot
+> reach the server IP directly" scenario; when `listener.mode = Direct` (the default), **no
+> frp-related logic is executed**. Everything in this chapter applies only to servers that
+> explicitly choose the `Frp` form.
 
-| 项 | 结果 | 命令（摘要） |
+**Choice**: **option A** of frp-compat §3 — supervising two pinned frpc builds as subprocesses:
+ChmlFrp nodes use `ChmlFrp-0.51.2_251023` (the Linux package already exists:
+`.tmp/chmlfrpc/ChmlFrp-0.51.2_251023_linux_amd64/`, existence verified in this session);
+self-hosted/original nodes use original frp v0.71.1 (the Linux official package was downloaded in
+this session and executed inside a container to verify: `frps --version` → `0.71.1`,
+FRPS_LINUX_OK).
+
+**Rationale** (frp-compat §0.4/§3):
+1. ChmlFrp is based on v0.51.2 (no control-plane encryption) and original ≥v0.53.0 (mandatory
+   AES-128-CFB); **the two generations are mutually incompatible** (§1.3, confirmed at source
+   level) ⇒ A is the only path that "supports both simultaneously at zero protocol-maintenance
+   cost".
+2. B (a native Rust implementation) hits the v1→v2 wire-protocol transition (v1 is planned for
+   removal in v0.78.0) + must align with ChmlFrp's modified auth/CheckProxy naming — the worst
+   cost/benefit moment; listed as a long-term evolution.
+3. C (visitor/xtcp) is unavailable on ChmlFrp (the panel cannot create stcp/xtcp + CheckProxy
+   rejects, §2.4); only self-hosted nodes could use it as a long-term P2P acceleration layer; not
+   on the main path.
+4. Every known shortcoming has an engineering fix: ChmlFrp frpc exiting after three reconnects →
+   supervised restart (§3.9); proxy parameters cannot be hand-crafted (CheckProxy) → golden-file
+   config generation (R12); multiple sessions over one tunnel → yamux multiplexing (R11).
+5. Protocol-layer consistency assertion set: R1–R12 (frp-compat §4) as the source of §6 Docker
+   assertions and M2/M5 acceptance cases.
+
+---
+
+## 6. Docker multi-machine interconnect test topology (Windows host + Docker Desktop Linux containers)
+
+### 6.1 Feasibility verification (all actually executed in this session; commands and outputs in Appendix B)
+
+| Item | Result | Command (summary) |
 |---|---|---|
-| Docker 后端 | Docker Desktop 29.8.2 / Engine 29.8.2，**WSL2**（内核 6.18.54.1-microsoft-standard-WSL2） | `docker version` / `docker info` |
-| `/dev/net/tun` 直通 | **可行**：`--cap-add NET_ADMIN --device /dev/net/tun` 下 `ip tuntap add` + `ip addr add 100.64.0.1/32` 成功（TUN_CREATE_OK） | 见附录 B-2 |
-| `mknod` 回退 | **可行**：无 `--device` 时容器内 `mknod /dev/net/tun c 10 200` + 建设备成功（MKNOD_PATH_OK） | 附录 B-3 |
-| 原版 frps Linux 二进制 | **可行**：官方 v0.71.1 linux_amd64 下载（14,140,587B）+ 容器内 `frps --version`→`0.71.1` | 附录 B-4 |
-| ChmlFrp Linux 包 | 已在 `.tmp/chmlfrpc/ChmlFrp-0.51.2_251023_linux_amd64/`（frpc+frps+ini，本次 ls 核实） | 附录 B-5 |
-| Windows 主机工具链 | Rust 1.98.1（msvc + linux-gnu + wasm32 目标已装） | 附录 B-6 |
-| 未验证（如实声明） | 容器内 Rust 镜像构建未跑（仓库尚无代码，无事可建）；Hyper-V/Docker VMM 后端 CONFIG_TUN 未核（vpn-mesh §1.3 限制——**部署约束写死 WSL2 后端**） | — |
+| Docker backend | Docker Desktop 29.8.2 / Engine 29.8.2, **WSL2** (kernel 6.18.54.1-microsoft-standard-WSL2) | `docker version` / `docker info` |
+| `/dev/net/tun` passthrough | **Works**: with `--cap-add NET_ADMIN --device /dev/net/tun`, `ip tuntap add` + `ip addr add 100.64.0.1/32` succeeded (TUN_CREATE_OK) | see Appendix B-2 |
+| `mknod` fallback | **Works**: without `--device`, inside the container `mknod /dev/net/tun c 10 200` + device creation succeeded (MKNOD_PATH_OK) | Appendix B-3 |
+| Original frps Linux binary | **Works**: official v0.71.1 linux_amd64 download (14,140,587B) + in-container `frps --version`→`0.71.1` | Appendix B-4 |
+| ChmlFrp Linux package | already at `.tmp/chmlfrpc/ChmlFrp-0.51.2_251023_linux_amd64/` (frpc+frps+ini, verified by ls in this session) | Appendix B-5 |
+| Windows host toolchain | Rust 1.98.1 (msvc + linux-gnu + wasm32 targets installed) | Appendix B-6 |
+| Not verified (stated as-is) | in-container Rust image builds not run (the repo has no code yet; nothing to build); Hyper-V/Docker VMM backend CONFIG_TUN not checked (vpn-mesh §1.3 limitation — **the deployment constraint pins the WSL2 backend**) | — |
 
-### 6.2 拓扑（deploy/e2e.yml，三网隔离——单网段会让「模拟不可信公网」名不副实）
+### 6.2 Topology (deploy/e2e.yml, three isolated networks — a single subnet would make
+"simulating an untrusted public network" a misnomer)
 
 ```
-网络划分（关键：Frp 形态的 server-a/b 对 flockpub 不可直连，杜绝实现走直连回退骗过断言；
-server-c 故意以 Direct 形态直挂 flockpub——两种 listener mode 同拓扑共存，验证硬约束）：
-  flockpub  172.28.0.0/24  bridge，模拟不可信公网——挂 frps、frpc 边车、client、
-                          以及 Direct 形态的 server-c；密文流经它
-  srvmesh  172.29.0.0/24  internal——只挂三台 server（Raft/gossip/FRWD 互连，不出公网）
-  link-a/b 各 /30 内联网——frpc 边车 ↔ 对应 server（边车把 server:9443 经中转暴露出去）
+Network split (key point: the Frp-form server-a/b are not directly reachable on flockpub,
+ruling out an implementation cheating the assertions via a direct-connection fallback;
+server-c deliberately hangs directly on flockpub in Direct form — both listener modes coexist
+in one topology, verifying the hard constraint):
+  flockpub  172.28.0.0/24  bridge, simulates the untrusted public network — hosts frps, the frpc
+                          sidecars, clients, and Direct-form server-c; ciphertext flows over it
+  srvmesh   172.29.0.0/24  internal — hosts only the three servers (Raft/gossip/FRWD interconnect,
+                          never on the public network)
+  link-a/b  one /30 internal network each — frpc sidecar ↔ its server (the sidecar exposes
+                          server:9443 through the relay)
 
-frps-a   [flockpub]  原版 frps 0.71.1  :7000(frpc 控制) :23000(用户口A)
-frps-b   [flockpub]  原版 frps 0.71.1  :7000           :23001(用户口B)
-frpc-a   [flockpub+link-a] frpc 0.71.1 → 注册到 frps-a，转发至 server-a:9443
-frpc-b   [flockpub+link-b] frpc 0.71.1 → 注册到 frps-b，转发至 server-b:9443
+frps-a   [flockpub]  original frps 0.71.1  :7000(frpc control) :23000(user port A)
+frps-b   [flockpub]  original frps 0.71.1  :7000              :23001(user port B)
+frpc-a   [flockpub+link-a] frpc 0.71.1 → registers to frps-a, forwards to server-a:9443
+frpc-b   [flockpub+link-b] frpc 0.71.1 → registers to frps-b, forwards to server-b:9443
 server-a [link-a+srvmesh]  flock-server listener.mode=Frp   tun0 VIP 100.64.0.1
 server-b [link-b+srvmesh]  flock-server listener.mode=Frp   tun0 VIP 100.64.0.2
-server-c [flockpub+srvmesh] flock-server listener.mode=Direct（缺省）:9443 直挂公网
+server-c [flockpub+srvmesh] flock-server listener.mode=Direct (default) :9443 directly on the
+                                                                  public network
                                                                   tun0 VIP 100.64.0.3
-         （C 为 Raft 仲裁 voter：2 节点 Raft 容错为 0，故障切换断言需 3 voter——
-           对题目「服务端×2 各挂中转」的必要扩展，理由见 §4；第四轮起 C 兼任
-           Direct 形态样板：无 frpc 边车、无 frp 进程，接入端点=172.28.0.22:9443）
-client-1 [flockpub] flock-client  tun0 VIP 100.64.0.11  ——配置钉死经 frps-a:23000 接入
-client-2 [flockpub] flock-client  tun0 VIP 100.64.0.12  ——配置钉死经 frps-b:23001 接入
-client-3 [flockpub] flock-client  tun0 VIP 100.64.0.13  ——配置钉死直连 172.28.0.22:9443
-         （钉死映射是断言语义要求：A2 的 client-1↔client-2 互 ping 必然跨服（server-a↔server-b
-           的 ForwardEnvelope 路径），不能让两 client 连同一服务器绕过跨服转发面）
-（client-N 可复制；全部 flock 容器 --cap-add NET_ADMIN --device /dev/net/tun，MTU 1280）
+         (C is a Raft quorum voter: a 2-node Raft has zero fault tolerance; the failover
+           assertion needs 3 voters — a necessary extension of the brief's "×2 servers each
+           behind a relay"; rationale in §4; from round four on, C doubles as the Direct-form
+           template: no frpc sidecar, no frp process, access endpoint = 172.28.0.22:9443)
+client-1 [flockpub] flock-client  tun0 VIP 100.64.0.11  — config pinned to access via frps-a:23000
+client-2 [flockpub] flock-client  tun0 VIP 100.64.0.12  — config pinned to access via frps-b:23001
+client-3 [flockpub] flock-client  tun0 VIP 100.64.0.13  — config pinned to direct 172.28.0.22:9443
+         (the pinned mapping is an assertion-semantics requirement: A2's client-1↔client-2 mutual
+           ping must cross servers (the server-a↔server-b ForwardEnvelope path); the two clients
+           must not be allowed to defeat the cross-server forwarding plane by connecting to the
+           same server)
+(client-N can be replicated; all flock containers get --cap-add NET_ADMIN --device /dev/net/tun,
+ MTU 1280)
 ```
 
-服务端容器内：`flock-server` 监听 :9443——server-a/b 仅 link 网可达（经 frpc 边车暴露成
-frps 用户口 23000/23001）；server-c 以 Direct 形态直接监听 flockpub 地址（**容器内无 frpc
-边车、无任何 frp 进程**）。客户端拨接入端点（直连地址或中转用户口，逻辑同构，§2.1）。
-Frp 形态生产部署中 frpc 是 server 进程内子进程（§3.9），测试拓扑用独立边车容器只是组网
-需要——同一 Supervisor 代码两种部署。
-构建：Windows 主机写码与跑主机单测；Linux 二进制在容器内构建——构建镜像的 C 工具链问题
-**本会话已实测闭环**（修订轮，附录 B-9）：`rust:1-slim-bookworm` 实测自带 `/usr/bin/cc`、
-`/usr/bin/gcc`（Debian gcc 12.2.0），且在该镜像内 `cargo add zstd@0.14 && cargo build
---release` 编译 zstd-sys 2.1.2（vendored C 源）**成功**（7.67s，ZSTD_BUILD_CHECK_DONE）
-——默认 feature 含压缩模块的构建不会在 zstd-sys 处挂掉。镜像 tag 钉 digest（或 `rust:1` +
-CI 校验 `rustc --version` ≥1.98）；若追求更稳可用完整版 `rust:1-bookworm`。
-自动化基线用原版 frp ×2（ChmlFrp 真实节点需实名账号，frp-compat gaps#1——留手工清单项，
-协议字节流一致性由 §1.4 论证 + R8/R12 golden-file 覆盖配置侧）。
+Inside the server containers: `flock-server` listens on :9443 — server-a/b are reachable only on
+their link networks (exposed via the frpc sidecars as frps user ports 23000/23001); server-c, in
+Direct form, listens directly on its flockpub address (**no frpc sidecar, no frp process of any
+kind in the container**). Clients dial the access endpoint (direct address or relay user port;
+logic isomorphic, §2.1). In Frp-form production deployments frpc is a subprocess inside the server
+process (§3.9); the separate sidecar containers in the test topology are purely a networking need
+— the same Supervisor code, two deployments.
+Build: code is written and host unit tests run on the Windows host; Linux binaries are built inside
+containers — the build image's C toolchain question **was closed by an actual test in this session**
+(revision round, Appendix B-9): `rust:1-slim-bookworm` was measured to ship `/usr/bin/cc`,
+`/usr/bin/gcc` (Debian gcc 12.2.0), and inside that image `cargo add zstd@0.14 && cargo build
+--release` compiled zstd-sys 2.1.2 (vendored C source) **successfully** (7.67s,
+ZSTD_BUILD_CHECK_DONE) — a default-feature build that includes the compression module will not
+die at zstd-sys. The image tag is pinned by digest (or `rust:1` + a CI check of `rustc --version`
+≥1.98); for extra stability, use the full `rust:1-bookworm`.
+The automation baseline uses original frp ×2 (a real ChmlFrp node needs a real-name account,
+frp-compat gaps#1 — left as a manual checklist item; protocol byte-stream consistency is argued in
+§1.4 + R8/R12 golden files covering the config side).
 
-### 6.3 断言清单（deploy/e2e_assert.sh，M5 验收 = 全 PASS）
+### 6.3 Assertion checklist (deploy/e2e_assert.sh, M5 acceptance = all PASS)
 
-| # | 断言 | 通过标准 |
+| # | Assertion | Pass criteria |
 |---|---|---|
-| A1 | 字节透传 | 复用 frp-compat T1/T2 harness：经两条中转各 echo 回 1MiB 随机 + 全 256 字节值，sha256 一致（R1/R2） |
-| A2 | 隧道连通（含跨服） | client-1 `ping -c 3 100.64.0.1` 0 丢包（同服路径）；client-1↔client-2 互 ping 通——接入映射钉死 client-1→frps-a、client-2→frps-b，此互 ping **必然走跨服转发**（§2.2 ForwardEnvelope 路径） |
-| A3 | MTU | `ip link show tun0` 含 `mtu 1280`；`ping -c 2 -s 1252 -M do 100.64.0.1` 通（1252+28=1280） |
-| A4 | 吞吐基线 | iperf3 over 隧道 ≥ 100 Mbps（本地中转无 8Mbps 限速；记录数值供回归对比，R7） |
-| A5 | 中转故障切换 | `docker stop frps-a` → client-1 在 ≤30s 内切换 `frps-b:23001`（= server-b 的端点，用 ClusterDirectory 中 server-b 的 ServerEntry）完成全新握手——**1-RTT 已钉扎形态，I0 不得出现**（钉扎模型 §1.3.3f 的直接验证），VIP 不变，ping 恢复；断言依据：客户端配置只含根签目录内端点列表（R6） |
-| A6 | 多主吊销生效（参数化） | 经 server-b 吊销 client-2 → 各 server 在 Raft apply 回调内杀本地会话 + revocation_epoch 前进 → server-a 上会话被踢 + 新握手被拒 + 票据 epoch 检验失效；≤5s（预算：commit→apply ≤2s + 事件余量 ≤1s + slack 2s，§2.2；票据 TTL 60s 兜底） |
-| A7 | Raft 容错 | `docker stop server-a`（含其 frpc）→ B/C 仍有 quorum，A2/A6 全量重跑通过；重选举 ≤15s |
-| A8 | 单隧道多会话 | 100 并发 yamux 流持续 60s 无错（R11） |
-| A9 | keepalive 断链检测 | `docker network disconnect` 模拟静默死链 → 双侧 ≤3×10s 内检测并进入重连（R5） |
-| A10 | rekey 无感 | iperf3 持续负载 ≥5min，epoch 递增 ≥2 次，吞吐无 >1s 平台（P0-2） |
-| A11 | 压缩默认关 | 默认配置抓记录长度=原始+常数开销；开压缩档后非膨胀回退生效（P0-4） |
-| A12 | 抗重放（单元级注入） | 会话层注入重复/回退计数记录被拒且计入伪造限额（M1 单测在 M5 复跑入口） |
-| A13 | 无直连回退（拓扑有效性，Frp 形态服务器） | 从 client-1 容器 `timeout 2 bash -c '</dev/tcp/172.28.0.20/9443'`、`…/172.28.0.21/9443` 对 server-a/b 的 flockpub 直连失败（两台不挂 flockpub ⇒ 必须失败，否则 A1/A5 的「经中转」语义已被绕过；server-c 除外——它是 Direct 形态，本就该直达，由 A16 正面断言） |
-| A16 | Direct 形态（硬约束守门） | client-3 直连 `172.28.0.22:9443` 完成 1-RTT 握手（同一 ServerEntry 材料体系）且 ping 100.64.0.3 通；client-1/2 ↔ client-3 互 ping 通（Direct↔Frp 跨服转发同构）；server-c 容器内 `pgrep -f frp` 无任何进程、无 frpc 边车容器（Direct 模式零 frp 逻辑的运行时证明） |
-| A14 | 跨服转发面 + 源 VIP 校验 | client-1（挂 server-a）↔client-2（挂 server-b）互 ping 的抓包计数：server-a 的 FRWD 流出现 ForwardEnvelope（非零计数），且 kill srvmesh 连接后互 ping 断、本服 ping server-a 仍通（隔离跨服面故障）；另以 client-1 内 `hping3/scapy` 伪造 src=100.64.0.12（client-2 的 VIP）发包 ⇒ server-a 丢包计数递增、client-2 收不到（§2.2 第 0 步源 VIP 绑定校验） |
-| A15 | 租约陈旧容错 | 迁移 client-2 配置从 frps-b 切到 frps-a 并重启（新端点握手同样 1-RTT），旧租约窗口内 client-1→client-2 丢包 ≤ 租约 TTL(30s)+反熵(5s) 后恢复（§2.2 容错策略：NOT_HERE→location_query 重定向路径被走到，FRWD 计数可见重定向帧） |
+| A1 | Byte pass-through | reuse the frp-compat T1/T2 harness: echo 1MiB random + all 256 byte values back through each of the two relays; sha256 matches (R1/R2) |
+| A2 | Tunnel connectivity (incl. cross-server) | client-1 `ping -c 3 100.64.0.1` 0 loss (same-server path); client-1↔client-2 mutual ping works — the access mapping pins client-1→frps-a, client-2→frps-b, so this mutual ping **must traverse cross-server forwarding** (the §2.2 ForwardEnvelope path) |
+| A3 | MTU | `ip link show tun0` contains `mtu 1280`; `ping -c 2 -s 1252 -M do 100.64.0.1` works (1252+28=1280) |
+| A4 | Throughput baseline | iperf3 over the tunnel ≥ 100 Mbps (local relay without the 8Mbps cap; the number is recorded for regression comparison, R7) |
+| A5 | Relay failover | `docker stop frps-a` → client-1 switches within ≤30s to `frps-b:23001` (= server-b's endpoint, using server-b's ServerEntry from the ClusterDirectory) and completes a brand-new handshake — **1-RTT pinned form; I0 must not appear** (a direct verification of the pinning model §1.3.3f), VIP unchanged, ping recovers; assertion basis: the client config contains only the endpoint list from the root-signed directory (R6) |
+| A6 | Multi-primary revocation takes effect (parameterized) | revoke client-2 via server-b → each server kills local sessions inside its Raft apply callback + revocation_epoch advances → the session on server-a is kicked + new handshakes rejected + ticket epoch checks fail; ≤5s (budget: commit→apply ≤2s + event margin ≤1s + slack 2s, §2.2; ticket TTL 60s backstop) |
+| A7 | Raft fault tolerance | `docker stop server-a` (including its frpc) → B/C still have quorum; A2/A6 rerun in full and pass; re-election ≤15s |
+| A8 | Many sessions over one tunnel | 100 concurrent yamux streams for 60s without errors (R11) |
+| A9 | keepalive link-failure detection | `docker network disconnect` simulates a silent dead link → both sides detect within ≤3×10s and enter reconnect (R5) |
+| A10 | Seamless rekey | iperf3 sustained load ≥5min; epoch increases ≥2 times; throughput shows no >1s plateau (P0-2) |
+| A11 | Compression off by default | with default config, captured record lengths = original + constant overhead; after enabling a compression tier, non-expansion fallback works (P0-4) |
+| A12 | Anti-replay (unit-level injection) | duplicate/regressed counter records injected at the session layer are rejected and counted toward the forgery limit (M1 unit tests re-run as the M5 entry) |
+| A13 | No direct-connection fallback (topology validity, Frp-form servers) | from the client-1 container, `timeout 2 bash -c '</dev/tcp/172.28.0.20/9443'` and `…/172.28.0.21/9443` against server-a/b's flockpub addresses fail (neither is on flockpub ⇒ must fail; otherwise the "via relay" semantics of A1/A5 has been bypassed; server-c excepted — it is the Direct form and is meant to be directly reachable, asserted positively by A16) |
+| A16 | Direct form (hard-constraint gate) | client-3 directly dials `172.28.0.22:9443`, completes the 1-RTT handshake (same ServerEntry material system) and pings 100.64.0.3 successfully; client-1/2 ↔ client-3 mutual ping works (Direct↔Frp cross-server forwarding isomorphic); inside the server-c container `pgrep -f frp` finds no process, and there is no frpc sidecar container (the runtime proof of zero frp logic in Direct mode) |
+| A14 | Cross-server forwarding plane + source VIP check | packet-capture counters for client-1 (on server-a) ↔ client-2 (on server-b) mutual ping: ForwardEnvelope appears on server-a's FRWD stream (non-zero count), and after killing the srvmesh connection the mutual ping breaks while the local ping to server-a still works (isolating a cross-server-plane failure); also, from client-1, `hping3/scapy` forges packets with src=100.64.0.12 (client-2's VIP) ⇒ server-a's drop counter increases and client-2 receives nothing (§2.2 step-0 source VIP binding check) |
+| A15 | Stale-lease fault tolerance | migrate client-2's config from frps-b to frps-a and restart (the new endpoint's handshake is likewise 1-RTT); within the old-lease window client-1→client-2 packet loss recovers after ≤ lease TTL(30s)+anti-entropy(5s) (§2.2 fault-tolerance policy: the NOT_HERE→location_query redirect path is exercised, FRWD counters show redirect frames) |
 
 ---
 
-## 7. 里程碑拆分（每个有可验证完成标准）
+## 7. Milestone breakdown (each with verifiable completion criteria)
 
-### M1 协议库（crates/flock-protocol）
-范围：§1.3 全部档位 + 兼容面 + feature 矩阵；upgradeList 落位 P0-1/2/3/4/5、P1-6/7/8/9/10、
-P2-11/12/13（协议库部分）。
-完成标准（全部可跑）：
-- `cargo test -p flock-protocol --all-features` 全绿，其中必须包含：
-  - OPAQUE 向量：showroom 3.0.0 生成的注册记录/登录样本在 4.0.1 下互通（P2-11 守门）；
-  - 信封 v1 只读兼容：showroom `seal` 产物被 `open_v1_legacy` 解开且长度不变量断言通过（P0-1 兼容档）；
-  - 信封 v2 AAD：段重排/拼接/删尾用例必须失败（P0-3）；
-  - 会话纪律：重复计数拒、120s 注入时钟触发 rekey、180s 硬拒绝、伪造 N 次断链（P0-2）；
-  - **握手双形态**：已钉扎 1-RTT 全向量；TOFU 首连 2-RTT（I0→R0→I1→R1）状态机向量；
-    邀请文件 v3（含集群根公钥+全套服务器材料）→ 任意端点首连即 1-RTT；
-  - **UKS/绑定失败向量（防未知密钥共享）**：篡改协议上下文（cluster_id/期望身份指纹）或
-    替换服务器身份 → 设备签名/服务器签名验签必须失败（§1.3.3c 签名覆盖契约）；
-  - **DeviceDirectory 假实现三态**：NotFound/Revoked/Active 各自的握手行为（前两者拒、
-    时序对齐）+ 异步接口（BoxFuture）编译期断言；
-  - 混合 KEM 往返 + ml-kem 官方 KAT 复跑（P0-1）；
-  - 压缩：<128B 直通、试压不缩回退明文、dictID 协商（P0-4/P1-7）；
-  - trust：钉扎变更触发告警路径；邀请文件 v3 结构向量——根签名不匹配/目录条目被篡改/
-    dir_version 回退 → 拒载入；同一根公钥下**多端点 ServerEntry 各自可完成 1-RTT 封装**
-    （多服务器钉扎模型 §1.3.3f 的守门用例）（P0-5）。
-- `cargo bench -p flock-protocol --bench aead`：aes-gcm 0.11.1 @4MiB ≥ 4 GB/s
-  （本机旧内核基线 2.2，P1-6 的 2.3× 预期下限）。
-- `cargo clippy -p flock-protocol --all-features -- -D warnings` 通过。
+### M1 Protocol library (crates/flock-protocol)
+Scope: all tiers of §1.3 + the compatibility surface + the feature matrix; upgradeList placement
+P0-1/2/3/4/5, P1-6/7/8/9/10, P2-11/12/13 (protocol-library parts).
+Completion criteria (all runnable):
+- `cargo test -p flock-protocol --all-features` fully green, and it must include:
+  - OPAQUE vectors: registration records/login samples generated by showroom 3.0.0 interop under
+    4.0.1 (P2-11 gate);
+  - envelope v1 read-only compatibility: showroom `seal` output is opened by `open_v1_legacy` and
+    the length-invariant assertions pass (P0-1 compatibility tier);
+  - envelope v2 AAD: segment-reorder/splice/tail-truncation cases must fail (P0-3);
+  - session discipline: duplicate counter rejected, a 120s injected clock triggers rekey, 180s hard
+    reject, N forgeries disconnect (P0-2);
+  - **handshake in two forms**: pinned 1-RTT full vectors; TOFU first-connect 2-RTT
+    (I0→R0→I1→R1) state-machine vectors; invite file v3 (containing the cluster root pubkey + the
+    full set of server material) → any endpoint's first connection is already 1-RTT;
+  - **UKS/binding failure vectors (against unknown key share)**: tampering with the protocol
+    context (cluster_id/expected identity fingerprint) or swapping the server identity → the device
+    signature/server signature verification must fail (§1.3.3c signature coverage contract);
+  - **DeviceDirectory fake-implementation three states**: handshake behavior for each of
+    NotFound/Revoked/Active (the first two reject, with timing aligned) + async interface
+    (BoxFuture) compile-time assertion;
+  - hybrid KEM round trip + ml-kem official KAT re-run (P0-1);
+  - compression: <128B pass-through, trial-compression-no-shrink fallback to plaintext, dictID
+    negotiation (P0-4/P1-7);
+  - trust: the pin-change-triggers-warning path; invite file v3 structure vectors — root signature
+    mismatch / directory entry tampered / dir_version regression → refuse to load; under the same
+    root pubkey, **each of multiple endpoint ServerEntries can complete its own 1-RTT
+    encapsulation** (the gating case of the multi-server pinning model §1.3.3f) (P0-5).
+- `cargo bench -p flock-protocol --bench aead`: aes-gcm 0.11.1 @4MiB ≥ 4 GB/s
+  (this machine's old-kernel baseline 2.2; the 2.3× expected floor of P1-6).
+- `cargo clippy -p flock-protocol --all-features -- -D warnings` passes.
 
-### M2 服务端（app/flock-server + flock-frpc，单服形态）
-范围：监听器（ListenerMode：Direct 缺省 / Frp）/控制流/OPAQUE 登录+锚/设备注册（本地
-NetState 适配器：redb 单机版，接口与 flock-sync 相同）/frpc 托管双栈（仅 Frp 模式装配）/
-配置生成 golden-file。
-完成标准：
-- `docker compose -f deploy/m2.yml up -d --build`（1 frps + 1 server(Frp 模式) + 1 client
-  骨架）起稳；
-- **直连冒烟变体（硬约束守门，第四轮新增）**：`docker compose -f deploy/m2-direct.yml up
-  -d --build` 起稳——**无 frps 容器**，server 以 `listener.mode = Direct` 监听并映射到
-  宿主端口，client 直连该端口跑完与 m2.yml 完全相同的 smoke 断言集（`cargo test -p
-  flock-server --test smoke -- --ignored --direct` 或等效 env 切换端点）；并断言
-  Direct 形态 server 容器内 `pgrep -f frp` 无进程、Supervisor 未实例化（Direct 代码路径
-  零 frp 逻辑的运行时证明）；
-- `cargo test -p flock-server --test smoke -- --ignored`（对容器实跑）断言：
-  邀请文件（含静态混合公钥）→1-RTT 首连→OPAQUE 登录→key-bind（签名校验路径）→设备出现
-  在注册表→SR-SIG1 请求验签通过→吊销后握手被拒；
-  **票据强制契约测试**：无票据/过期票据/低 epoch 票据（吊销后）的状态变更请求必须被拒，
-  且票据校验先于 nonce 记账（顺序断言：错误票据 + 全新 nonce → 拒，错误票据 + 已用 nonce
-  → 拒且 nonce 不入账）；等效重放窗 = min(±300s, 60s) 验证；
-  **TOFU 首连路径测试**：无邀请时 I0→R0 引导（R0 携入群凭证链）+ 根指纹确认回调 →
-  钉扎集群根公钥落盘 → 二连为 1-RTT 且**换端点（另一台服务器）仍 1-RTT**（目录拉取生效）；
-  **开户/邀请一次性测试**：兑换 invite_id → 用户/设备创建+VIP 分配；同 invite_id 二次兑换
-  拒；revoke_invite 后拒；过期拒。
-- frpc 生成配置 golden-file 测试（ChmlFrp INI 样本 + 原版 TOML 样本逐字段一致，R8/R12）；
-  ChmlFrp frpc「退出被拉起」守护单测（假进程 3 退→3 拉）；ChmlFrp 默认 `-c` 模式断言
-  （UserTokenAuto 显式 opt-in 才启用）。
+### M2 Server (app/flock-server + flock-frpc, single-server form)
+Scope: the listener (ListenerMode: Direct default / Frp) / control flow / OPAQUE login + anchor /
+device registration (local NetState adapter: redb single-node edition, interface identical to
+flock-sync) / frpc supervision dual stack (assembled only in Frp mode) / config generation
+golden-file.
+Completion criteria:
+- `docker compose -f deploy/m2.yml up -d --build` (1 frps + 1 server (Frp mode) + 1 client
+  skeleton) comes up and stays up;
+- **direct-connection smoke variant (hard-constraint gate, added in round four)**:
+  `docker compose -f deploy/m2-direct.yml up -d --build` comes up — **no frps container**; the
+  server listens with `listener.mode = Direct` and is mapped to a host port; the client dials that
+  port directly and runs exactly the same smoke assertion set as m2.yml (`cargo test -p
+  flock-server --test smoke -- --ignored --direct` or an equivalent env switch for the endpoint);
+  and it is asserted that inside the Direct-form server container `pgrep -f frp` finds no process
+  and the Supervisor was never instantiated (the runtime proof of zero frp logic on the Direct code
+  path);
+- `cargo test -p flock-server --test smoke -- --ignored` (actually run against containers)
+  asserts: invite file (containing static hybrid pubkeys) → 1-RTT first connection → OPAQUE login
+  → key-bind (signature-verification path) → the device appears in the registry → SR-SIG1 request
+  signatures verify → after revocation the handshake is rejected;
+  **mandatory ticket contract tests**: state-changing requests with no ticket / an expired ticket /
+  a low-epoch ticket (post-revocation) must be rejected, and ticket validation precedes nonce
+  accounting (order assertion: bad ticket + brand-new nonce → reject; bad ticket + already-used
+  nonce → reject and the nonce is not recorded); effective replay window = min(±300s, 60s)
+  verified;
+  **TOFU first-connection path tests**: without an invite, I0→R0 bootstrap (R0 carries the
+  enrollment credential chain) + root-fingerprint confirmation callback → the pinned cluster root
+  pubkey is written to disk → the second connection is 1-RTT and **switching endpoints (another
+  server) is still 1-RTT** (directory pull takes effect);
+  **provisioning / invite one-time-use tests**: redeem invite_id → user/device created + VIP
+  assigned; a second redemption of the same invite_id rejected; rejected after revoke_invite;
+  rejected when expired.
+- frpc generated-config golden-file tests (ChmlFrp INI sample + original TOML sample field-for-
+  field identical, R8/R12); the ChmlFrp frpc "exit and be restarted" supervision unit test (fake
+  process exits 3 times → restarted 3 times); the ChmlFrp default `-c` mode assertion (UserTokenAuto
+  enabled only by explicit opt-in).
 
-### M3 客户端（app/flock-client，数据面打通）
-范围：tun 适配（tun-rs）/路由（rtnetlink/wintun）/接入器退避/PacketChannel 数据面。
-完成标准：
-- `docker compose -f deploy/m3.yml up -d --build`；
-- `deploy/m3_assert.sh` 全 PASS：断言 A2/A3/A4/A9（单服版）；Windows 主机上
-  `cargo test -p flock-client`（tun 单测用 mock TunDevice——主机无容器 NET_ADMIN 环境）；
-- **Windows 真机手工清单（首发平台必须有真机记录）**：开发机上以本地测试中转跑通
-  wintun 创建+路由注入+`--smoke`（wintun.dll 权限/驱动首次安装行为记录）；macOS 无设备
-  ⇒ 标注未验证（utun 依 tun-rs 平台矩阵设计）。
+### M3 Client (app/flock-client, data plane working)
+Scope: tun adaptation (tun-rs) / routing (rtnetlink/wintun) / access-side backoff / PacketChannel
+data plane.
+Completion criteria:
+- `docker compose -f deploy/m3.yml up -d --build`;
+- `deploy/m3_assert.sh` all PASS: assertions A2/A3/A4/A9 (single-server edition); on the Windows
+  host `cargo test -p flock-client` (tun unit tests use a mock TunDevice — the host has no
+  container NET_ADMIN environment);
+- **Windows real-machine manual checklist (the lead platform must have real-machine records)**:
+  on the dev machine, with a local test relay, wintun creation + route injection + `--smoke` pass
+  (wintun.dll permissions / first-time driver-install behavior recorded); macOS has no device ⇒
+  marked not verified (utun per the tun-rs platform-matrix design).
 
-### M4 多主同步（crates/flock-sync）
-范围：openraft 状态机（注册表/凭证/配置版本/票据密钥根）+ gossip 租约 + rewrap 权限点 +
-**集群准入（入群凭证/服务器-服务器 profile，§4）** + 跨服转发承载（ForwardEnvelope）。
-完成标准：
-- `cargo test -p flock-sync --test cluster`（3 节点内存集群）断言：
-  任意节点写入 → 任意节点线性一致读 ≤2s 可见（含吊销记录）；
-  kill leader → 重选举 ≤15s 且无丢提交（注入中转 RTT 100ms 模拟）；
-  同设备双服务端租约冲突 → 新者胜、旧端踢出回调触发；
-  `register→revoke→register`（IP 不复用语义）与 `server_keys→rewrap` 往返；
-  **吊销传播界**：revoke 提交后各节点 apply 回调推进 revocation_epoch + 杀本地会话
-  钩子触发 ≤2s（注入 RTT 100ms）。
-- `cargo test -p flock-sync --test admission` 断言：
-  **无入群凭证/伪造凭证的节点在服务器-服务器握手层被拒**（拿不到快照也进不了 Raft）；
-  learner 加入→快照同步→`add_voter`（根密钥签名）→提升；`rewrap` 无根密钥签名 → 状态机
-  拒绝；有根密钥签名 → 新服务器混合公钥进入封装集（OPRF key 副本数 +1 可观测）。
-- `cargo test -p flock-sync --test forward` 断言：**源 VIP 绑定校验**（会话设备发包
-  src=他人 VIP ⇒ 丢+计数；ForwardEnvelope src_dev 与内层源地址失配 ⇒ 收端拒）；本机投递/
-  NOT_HERE → 一次性 location_query 重定向/hop=1 防环（构造二次转发 → 丢弃计数）；仍失败发
-  ICMP unreachable。
-- `cargo test -p flock-sync --test cluster` 追加：**apply-lag 熔断**——人为让 follower 落后
-  5s，期间注入吊销 ⇒ 该 follower 拒用缓存（降级线性一致读）且新握手被拒（§4 陈旧读边界）。
+### M4 Multi-primary sync (crates/flock-sync)
+Scope: the openraft state machine (registry/credentials/config versions/ticket key root) + gossip
+leases + the rewrap permission point + **cluster admission (enrollment credentials/server-server
+profile, §4)** + the cross-server forwarding carrier (ForwardEnvelope).
+Completion criteria:
+- `cargo test -p flock-sync --test cluster` (3-node in-memory cluster) asserts:
+  a write on any node → a linearizable read on any node sees it within ≤2s (including revocation
+  records);
+  kill the leader → re-election ≤15s with no lost commits (an injected relay RTT of 100ms
+  simulated);
+  the same device holding leases on two servers conflicts → newest wins, the old side's
+  kick callback fires;
+  `register→revoke→register` (the no-IP-reuse semantics) and the `server_keys→rewrap` round trip;
+  **revocation propagation bound**: after a revoke commits, each node's apply callback advances
+  revocation_epoch + the kill-local-session hook fires within ≤2s (RTT 100ms injected).
+- `cargo test -p flock-sync --test admission` asserts:
+  **a node without an enrollment credential or with a forged credential is rejected at the
+  server-server handshake layer** (it gets neither the snapshot nor entry into Raft);
+  learner joins → snapshot sync → `add_voter` (root-key signature) → promotion; `rewrap` without a
+  root-key signature → the state machine rejects it; with the signature → the new server's hybrid
+  pubkey enters the sealing set (OPRF key replica count +1 observable).
+- `cargo test -p flock-sync --test forward` asserts: **source VIP binding check** (a session's
+  device sending with someone else's VIP as src ⇒ drop + count; a ForwardEnvelope whose src_dev
+  mismatches the inner source address ⇒ the receiver rejects it); local delivery / NOT_HERE →
+  one-shot location_query redirect / hop=1 loop prevention (construct a second-hop forward → drop
+  counter); on still failing, send ICMP unreachable.
+- `cargo test -p flock-sync --test cluster` additionally: **apply-lag circuit breaker** —
+  artificially lag a follower by 5s and inject a revocation during that time ⇒ that follower
+  refuses to use the cache (degrades to linearizable reads) and new handshakes are rejected (§4
+  stale-read boundary).
 
-### M5 Docker 多机实测（deploy/e2e.yml + e2e_assert.sh）
-范围：§6.2 全拓扑（三网隔离 + 接入映射钉死 + Direct/Frp 混布）+ §6.3 断言 A1–A16。
-完成标准：`docker compose -f deploy/e2e.yml up -d --build && deploy/e2e_assert.sh` 全 PASS，
-脚本输出逐项 PASS/FAIL 汇总（A5/A6/A7/A15 允许显式重试窗口内通过）。
-**桌面真机手工清单（M5 验收必填项，主机执行非容器）**：
-- Windows（开发机即真机）：`cargo run -p flock-client -- --smoke`——wintun 设备创建、
-  `route print` 断言 100.64.0.0/10 路由存在、tun0 MTU 1280、经本地测试中转 ping 通 server VIP；
-  wintun.dll 首次装驱动的管理员权限行为记录进清单。
-- macOS：无设备，列**未验证**（utun 路径按 tun-rs 平台矩阵设计，留待有设备后补；vpn-mesh
-  §1.1 的 utun 事实为设计依据）。
-- Linux 容器路径已被 A2–A15 覆盖，无需手工。
-未含项如实声明：ChmlFrp 真实节点端到端（需账号，手工清单：M5 后有账号时补 R1/R6/R7 于
-ChmlFrp 节点）；移动端（Android/iOS）真机（M3 后独立排期，接缝已在 §3.12 预留）。
+### M5 Docker multi-machine test (deploy/e2e.yml + e2e_assert.sh)
+Scope: the full §6.2 topology (three isolated networks + pinned access mapping + Direct/Frp mix) +
+§6.3 assertions A1–A16.
+Completion criteria: `docker compose -f deploy/e2e.yml up -d --build && deploy/e2e_assert.sh` all
+PASS; the script outputs a per-item PASS/FAIL summary (A5/A6/A7/A15 may pass within an explicit
+retry window).
+**Desktop real-machine manual checklist (a mandatory M5 acceptance item, run on the host, not in
+containers)**:
+- Windows (the dev machine is the real machine): `cargo run -p flock-client -- --smoke` — wintun
+  device creation, `route print` asserting the 100.64.0.0/10 route exists, tun0 MTU 1280, ping to
+  the server VIP through a local test relay; the admin-permission behavior of wintun.dll's
+  first-time driver install goes into the checklist.
+- macOS: no device; listed as **not verified** (the utun path designed per the tun-rs platform
+  matrix, to be filled in when a device is available; the utun facts in vpn-mesh §1.1 are the
+  design basis).
+- The Linux container path is covered by A2–A15; no manual step needed.
+Omissions stated as-is: ChmlFrp real-node end-to-end (needs an account; manual checklist: after M5,
+when an account exists, re-run R1/R6/R7 against a ChmlFrp node); mobile (Android/iOS) real machines
+(separately scheduled after M3; the seam is already reserved in §3.12).
 
-### M6 系统服务化 + 客户端控制面（第一阶段：daemon 侧；托盘第二阶段并行）
+### M6 System service + client control plane (phase one: daemon side; tray in a parallel phase two)
 
-需求（用户原话）：Windows/Linux/macOS 作为系统服务开机启动；主机有 GUI 则显示系统托盘
-图标（暂不弹 GUI 窗口），托盘右键菜单三项：连接状态、VPN IP、退出。第一阶段交付 daemon
-侧（服务化/IPC/安装器），托盘 UI 第二阶段开发——**IPC 契约本阶段固化为可独立编译消费的
-模块**（`flock_client::ipc`，托盘工程直接依赖）。
+Requirements (user's words): Windows/Linux/macOS auto-start as a system service at boot; if the
+machine has a GUI, show a system tray icon (no GUI window for now); the tray's right-click menu has
+three items: connection status, VPN IP, quit. Phase one delivers the daemon side (service/IPC/
+installer); the tray UI is developed in phase two — **the IPC contract is frozen in this phase as a
+module compilable and consumable standalone** (`flock_client::ipc`, directly depended on by the
+tray project).
 
-#### M6.1 双进程模型（架构定型）
+#### M6.1 Two-process model (architecture finalized)
 
-- `flock-client service`：**系统服务进程**——无任何 GUI 依赖，开机自启（Windows SCM /
-  systemd / launchd），持有全部既有 supervise/数据面逻辑（§3.12 不变），另起本地控制
-  IPC 服务端。
-- `flock-client tray`：**用户会话进程**——仅托盘 UI（第二阶段实现），经控制 IPC 查询
-  状态/触发退出，不接触密钥/tun/数据面。
-- **理由**：Windows 服务运行在 session 0，无法创建托盘（Shell 屏蔽，事实约束）；单进程
-  无法同时满足「无会话开机自启」与「会话内托盘」。Linux/macOS 服务同样跑在系统上下文
-  （systemd system unit / LaunchDaemon），与用户会话 GUI 分离——三平台同构，避免平台
-  分叉（Linux 的 user-service 形态不采用：与 Windows 服务形态不可对齐、登录前不启动）。
-- **退出语义**（「退出」托盘菜单）：停 VPN + 托盘进程退出；**服务保持已安装**（下次开机
-  自启）。daemon 侧的 Shutdown = 优雅停服：断会话（隧道 GoAway/FIN）→ 停数据面 → 拆
-  tun → 进程退出；服务管理器**不复活**（systemd 单元 `Restart=on-failure`——正常退出
-  非失败；launchd plist 不设 KeepAlive；Windows 服务恢复策略只对失败退出动作）。
+- `flock-client service`: **the system service process** — no GUI dependencies of any kind;
+  auto-starts at boot (Windows SCM / systemd / launchd); owns all the existing supervise/data-plane
+  logic (§3.12 unchanged) and additionally runs a local control-IPC server.
+- `flock-client tray`: **the user-session process** — tray UI only (implemented in phase two);
+  queries status / triggers quit over the control IPC; never touches keys/tun/the data plane.
+- **Rationale**: a Windows service runs in session 0 and cannot create a tray (blocked by the
+  shell; a factual constraint); a single process cannot satisfy both "auto-start without a session"
+  and "a tray inside the session". Linux/macOS services likewise run in the system context (a
+  systemd system unit / a LaunchDaemon), separate from the user-session GUI — the three platforms
+  are isomorphic, avoiding platform forks (Linux's user-service form is not adopted: it cannot
+  align with the Windows service form and does not start before login).
+- **Quit semantics** (the "Quit" tray menu): stop the VPN + the tray process exits; **the service
+  stays installed** (auto-starts next boot). The daemon-side Shutdown = graceful stop: drop the
+  session (tunnel GoAway/FIN) → stop the data plane → tear down tun → process exit; the service
+  manager **does not revive it** (the systemd unit `Restart=on-failure` — a normal exit is not a
+  failure; the launchd plist sets no KeepAlive; the Windows service recovery policy acts only on
+  failed exits).
 
-#### M6.2 控制 IPC（v1 契约）
+#### M6.2 Control IPC (v1 contract)
 
-**传输**（postcard over 本地传输，帧格式与 §3.11 admin 面同构：`[u32 LE len][postcard]`，
-单连接单请求-响应）：
+**Transport** (postcard over a local transport; framing isomorphic to §3.11's admin plane:
+`[u32 LE len][postcard]`, single connection, single request-response):
 
-| 平台 | 端点 | 权限 |
+| Platform | Endpoint | Permissions |
 |---|---|---|
-| Windows | 命名管道 `\\.\pipe\flock-client-control` | 显式 DACL（SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)`）：SYSTEM + Administrators + 交互用户组（IU）读写 |
-| Linux/macOS | Unix socket `/run/flock/client.sock` | 0660，目录 `/run/flock` 0755 root |
+| Windows | named pipe `\\.\pipe\flock-client-control` | explicit DACL (SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)`): SYSTEM + Administrators + interactive-users group (IU) read/write |
+| Linux/macOS | Unix socket `/run/flock/client.sock` | 0660, directory `/run/flock` 0755 root |
 
-**认证**：daemon 每次启动生成 32B 随机 token（`rand::random`），落 token 文件——Windows
-`%ProgramData%\flock\control-token`（显式 ACL：Users 读）；Linux/macOS
-`/var/lib/flock/client/control-token`（0640 root；`client.toml` 的 `control_group` 字段
-指定组则 daemon 写盘时 chgrp token 与 socket 到该组——组名单一真相源在配置而非
-install 参数，安装动作不改写用户配置；仅解析本地 /etc/group 或数字 gid，失败告警
-不阻断，缺省 root:root 即「仅 root 可控」，即装即用文档说明）。**每请求都带
-token**（Status 与 Shutdown 同一信封字段），校验先于分发，错即 `Denied`——比「仅
-Shutdown 带 token」收紧：Status 泄露端点/VIP，不放开给传输层全体可连者。
+**Authentication**: the daemon generates a 32B random token on every start (`rand::random`) and
+writes it to a token file — Windows `%ProgramData%\flock\control-token` (explicit ACL: Users
+read); Linux/macOS `/var/lib/flock/client/control-token` (0640 root; if `client.toml`'s
+`control_group` field names a group, the daemon chgrps the token and socket to that group when
+writing them out — the single source of truth for the group name is the config, not install
+parameters; installing never rewrites the user's config; only local /etc/group names or numeric
+gids are resolved; on failure warn but do not block, and the default root:root means "root-only
+control", documented as works-out-of-the-box). **Every request carries the token** (Status and
+Shutdown share the same envelope field); validation precedes dispatch; a wrong token ⇒ `Denied` —
+tighter than "only Shutdown carries the token": Status leaks endpoints/VIP and is not opened to
+everyone who can connect at the transport layer.
 
-**消息**（`flock_client::ipc`，postcard/serde，`#[derive(Clone, PartialEq)]`）：
+**Messages** (`flock_client::ipc`, postcard/serde, `#[derive(Clone, PartialEq)]`):
 
 ```rust
 pub enum CtrlReq {
@@ -960,128 +1236,159 @@ pub enum CtrlReq {
 pub enum CtrlResp {
     Status {
         state: ConnState,              // Connected | Connecting | Disconnected
-        vip: Option<String>,           // 本端 VIP（启动即解析 ⇒ Some；文案容错位）
-        endpoint: Option<String>,      // 当前/最近拨号端点
-        epoch: u64,                    // 当前会话密钥纪元（rekey 推进；断开 ⇒ 0）
-        uptime_secs: u64,              // daemon 启动至今秒数
+        vip: Option<String>,           // local VIP (resolved at startup ⇒ Some; copy-tolerance slot)
+        endpoint: Option<String>,      // current/most recent dialed endpoint
+        epoch: u64,                    // current session key epoch (advanced by rekey; 0 when down)
+        uptime_secs: u64,              // seconds since daemon start
     },
-    Ok,        // Shutdown 受理
-    Denied,    // token 错
+    Ok,        // Shutdown accepted
+    Denied,    // wrong token
 }
 ```
 
-**语义**：`Status` 无副作用幂等；`Shutdown` = §M6.1 优雅停服，回 `Ok` 后 daemon 完成拆除
-即退出（进程退出与响应写出竞速以响应先写为承诺，极端情形客户端见连接重置亦视为已受理）。
-v1 无版本协商字段——枚举加变体向后兼容（postcard varint 变体序号），跨版本策略留给 v2。
+**Semantics**: `Status` is side-effect-free and idempotent; `Shutdown` = the §M6.1 graceful stop;
+after replying `Ok` the daemon finishes teardown and exits (the process exit races with writing the
+response; the promise is response-first — in the extreme case the client seeing a connection reset
+still counts as accepted). v1 has no version-negotiation field — adding enum variants is backward
+compatible (postcard varint variant ordinals); cross-version policy is left to v2.
 
-#### M6.3 服务安装（`flock-client install` / `uninstall`）
+#### M6.3 Service installation (`flock-client install` / `uninstall`)
 
-`--user` 只装托盘自启、`--service` 只装服务、缺省两者。安装动作记录**安装时**的 `--config`
-路径进服务定义（unit/plist/服务命令行携带），卸载反向清理。
+`--user` installs only the tray autostart; `--service` only the service; the default is both. The
+install action records the **install-time** `--config` path into the service definition
+(unit/plist/service command line carries it); uninstall reverses the cleanup.
 
-- **Windows**（windows-service crate）：`SERVICE_AUTO_START` + 失败恢复策略（重启，延迟
-  5s/次封顶 3 次）；服务名 `flock-client`，二进制路径 = 当前 exe，命令行 `service --config
-  <path>`；事件日志源 `flock-client`（报告 Start/Stop/失败）。**服务安装需管理员**：非提升
-  会话给出清晰错误提示（docs/manual/windows-smoke.md 先例——真机安装列入手工清单项
-  `docs/manual/service-install.md`）。
-- **Linux**：渲染 `/etc/systemd/flock-client.service`（`WantedBy=multi-user.target`，
-  `Restart=on-failure`，`After=network-online.target` + `Wants=network-online.target`，
-  `ExecStart=<exe> service --config <path>`）→ `systemctl daemon-reload` → `systemctl
-  enable --now flock-client`。**需 root**（sudo 提示）。uninstall：`disable --now` → 删单元
-  → `daemon-reload`。容器内安装需 systemd 运行（测试阶段只验证单元渲染与命令序列，
-  enable 执行面留给真机清单）。
-- **macOS**：写 `/Library/LaunchDaemons/com.flockvpn.client.plist`（`RunAtLoad=true`、
-  **无 KeepAlive**——Shutdown 后不复活）→ `launchctl load -w`。需 root。**本机无设备 ⇒
-  标注未验证**（文件与命令照常写出，M6 手工清单留位）。
-- **托盘自启**：Windows `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 值
-  `flock-client-tray` = `<exe> tray`（HKCU 无需提权）；Linux
-  `~/.config/autostart/flock-client-tray.desktop`；macOS
-  `~/Library/LaunchAgents/com.flockvpn.client-tray.plist`（`RunAtLoad`，无 KeepAlive）。
+- **Windows** (windows-service crate): `SERVICE_AUTO_START` + a failure-recovery policy (restart,
+  5s delay each, capped at 3); service name `flock-client`, binary path = the current exe, command
+  line `service --config <path>`; event-log source `flock-client` (reports Start/Stop/failures).
+  **Service installation needs an administrator**: a non-elevated session gets a clear error
+  message (docs/manual/windows-smoke.md precedent — the real-machine install goes on the manual
+  checklist `docs/manual/service-install.md`).
+- **Linux**: renders `/etc/systemd/flock-client.service` (`WantedBy=multi-user.target`,
+  `Restart=on-failure`, `After=network-online.target` + `Wants=network-online.target`,
+  `ExecStart=<exe> service --config <path>`) → `systemctl daemon-reload` → `systemctl enable --now
+  flock-client`. **Needs root** (sudo hint). Uninstall: `disable --now` → delete the unit →
+  `daemon-reload`. Installing inside a container requires systemd to be running (in the test phase
+  only unit rendering and the command sequence are verified; the enable execution surface is left
+  to the real-machine checklist).
+- **macOS**: writes `/Library/LaunchDaemons/com.flockvpn.client.plist` (`RunAtLoad=true`,
+  **no KeepAlive** — no revival after Shutdown) → `launchctl load -w`. Needs root. **No device on
+  this machine ⇒ marked not verified** (the file and commands are written out anyway; a slot is
+  reserved on the M6 manual checklist).
+- **Tray autostart**: Windows `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value
+  `flock-client-tray` = `<exe> tray` (HKCU needs no elevation); Linux
+  `~/.config/autostart/flock-client-tray.desktop`; macOS
+  `~/Library/LaunchAgents/com.flockvpn.client-tray.plist` (`RunAtLoad`, no KeepAlive).
 
-#### M6.4 CLI 面
+#### M6.4 CLI surface
 
-现有默认运行（`--config` 裸跑）保留为**前台调试模式**（不起 IPC，日志直连 stderr）；新增
-子命令：`service`（daemon 装配：supervise + IPC 服务端 + 优雅停服，前台运行于服务管理器
-之下）、`tray`（**第二阶段已实现**：§M6.7——托盘菜单/轮询/退出，feature 门控）、
-`install`/`uninstall`（§M6.3）、`status`（直接发一次 `Status` 请求并打印——无托盘环境
-与测试的探针；token 从 token 文件读，读不到即报「daemon 未运行/无权限」）。
+The existing default run (`--config`, bare) is kept as the **foreground debug mode** (no IPC; logs
+straight to stderr); new subcommands: `service` (the daemon assembly: supervise + IPC server +
+graceful stop, running in the foreground under the service manager), `tray` (**implemented in
+phase two**: §M6.7 — tray menu/polling/quit, feature-gated), `install`/`uninstall` (§M6.3), and
+`status` (sends one `Status` request and prints — a probe for tray-less environments and tests;
+the token is read from the token file, and failure to read reports "daemon not running / no
+permission").
 
-#### M6.5 feature 门控
+#### M6.5 Feature gating
 
-`tray` feature：Windows/macOS 开发默认包含；Linux 无头服务器镜像默认不拖累托盘 GUI 依赖。
-**Cargo 限制如实声明**：cargo 无法表达按 target 差异的 default features——本阶段 `default =
-["tray"]` 对三平台一致，但 tray 门控面仅是子命令注册（零依赖差异）；第二阶段托盘 GUI 依赖
-全部按 `[target.'cfg(windows/macos)'.dependencies]` + `optional = true` 挂进 `tray`
-feature，Linux 默认构建（含 default features）不引入 GUI 依赖面，发布档以
-`--no-default-features` 显式去托盘（CI 门禁含该档）。
+`tray` feature: included in Windows/macOS dev defaults; a Linux headless server image must not
+drag in tray GUI dependencies by default. **Cargo limitation stated as-is**: cargo cannot express
+per-target default features — in this phase `default = ["tray"]` is identical across the three
+platforms, but the tray gating surface is only subcommand registration (zero dependency delta);
+in phase two all tray GUI dependencies hang under `[target.'cfg(windows/macos)'.dependencies]` +
+`optional = true` inside the `tray` feature; the Linux default build (including default features)
+pulls in no GUI dependency surface, and release builds drop the tray explicitly with
+`--no-default-features` (CI gating includes that build).
 
-#### M6.6 完成标准（第一阶段）
+#### M6.6 Completion criteria (phase one)
 
-1. `cargo test -p flock-client --all-features` 全绿（IPC 契约往返/token 拒绝/Denied/守护
-   装配与服务语义单测；传输层 mock + 平台真实回环各一组）。
-2. `cargo check -p flock-client --no-default-features`（无 tray 档）与
-   `cargo check --target x86_64-unknown-linux-gnu -p flock-client`（Linux 编译面）通过。
-3. `cargo clippy -p flock-client -- -D warnings` 通过。
-4. Windows 服务安装/启动/真机托盘自启、macOS 全链路：需管理员/真机，列
-   `docs/manual/service-install.md` 手工清单（Windows 真机项标注「待管理员会话执行」；
-   macOS 标注未验证）。
-5. 托盘工程可直接 `use flock_client::ipc::{CtrlReq, CtrlResp, ...}` 消费契约（lib 面
-   导出 + 契约单测即消费样例）。
+1. `cargo test -p flock-client --all-features` fully green (IPC contract round trips / token
+   rejection / Denied / supervision assembly and service-semantics unit tests; one set each of
+   transport-layer mocks and real platform loopback).
+2. `cargo check -p flock-client --no-default-features` (no-tray build) and
+   `cargo check --target x86_64-unknown-linux-gnu -p flock-client` (the Linux compile surface)
+   pass.
+3. `cargo clippy -p flock-client -- -D warnings` passes.
+4. Windows service install/start/real-machine tray autostart, the full macOS chain: needs
+   administrator/real machines; listed on the `docs/manual/service-install.md` manual checklist
+   (the Windows real-machine item marked "to be executed in an administrator session"; macOS
+   marked not verified).
+5. The tray project can directly `use flock_client::ipc::{CtrlReq, CtrlResp, ...}` to consume the
+   contract (lib-surface export + the contract unit tests double as consumption samples).
 
-#### M6.7 托盘进程（第二阶段实现，2026-11-06）
+#### M6.7 Tray process (implemented in phase two, 2026-11-06)
 
-- **入口**：`flock-client tray`（`tray` feature 门控；不建任何 GUI 窗口）。托盘/daemon
-  依 §M6.2 契约交互，token 自 token 文件读取；核心逻辑（文案投影/token 源/轮询拍/退出
-  裁决/图标/GUI 判定）在 `flock_client::tray` 平台无关层——**零 GUI 依赖、宿主全单测**。
-- **菜单（三项）**：「连接状态」「VPN IP」为动态只读菜单项（disabled 项——置灰只读的
-  平台惯用形态），2s 轮询 `Status` 刷新文本（「连接状态：已连接 · frps-a:23000」
-  「VPN IP：100.64.0.11」；未连接/`vip: None` 时 VPN IP 显示「—」；daemon 未运行/IPC
-  失败/`Denied` ⇒「服务未运行」并继续重试）；「退出」为动作项：对 token 发 `Shutdown`
-  ⇒ daemon 优雅停服（§M6.1：服务保持已安装、下次开机自启）⇒ 托盘进程退出；daemon 不在
-  （token 缺失/IPC 失败）⇒ **仅退托盘**；`Denied` ⇒ 不退出并提示——token 失效重载
-  （daemon 重启换 token 的恢复路径），用户重点「退出」即重试。tooltip 同步状态摘要。
-- **图标**：32×32 程序化 RGBA（圆角方底 + 雁阵前向箭头，SDF 亚像素抗锯齿）——不引入
-  image crate/PNG 资产：`tray_icon::Icon::from_rgba` 与 ksni ARGB32 均吃原始像素，PNG
-  纯中转；无二进制资产 diff，像素级可断言（角透明/中心不透明/前景像素数/确定性）。
-- **平台库与最小泵**（不引 winit/tauri/egui 全套 GUI 栈）：
-  - Windows/macOS：`tray-icon`（内建 muda 菜单，经 `tray_icon::menu` 再导出消费）。
-    Windows 用最小 Win32 消息泵（专用线程 `GetMessageW`，主线程经
-    `PostThreadMessageW` 唤醒刷新/`WM_QUIT` 收泵——官方最小示例形态；tray-icon 的
-    事件派发要求创建线程泵消息，此为硬约束）；macOS 用主线程 NSApp 事件排空循环
-    （`nextEvent/sendEvent/updateWindows` + 50ms 节律消费共享刷新；AppKit 托盘/NSMenu
-    主线程约束）。
-  - Linux：`ksni`（纯 Rust DBus StatusNotifierItem，zbus 后端 tokio 特性与既有运行时
-    同域）——**零 GTK/libappindicator 系统依赖**，与无头纪律一致；菜单每次打开按最新
-    状态重建（ksni 语义天然满足 2s 刷新），tooltip 经 `Handle::update` 主动刷新。
-- **GUI 探测与回退**：Linux 前置判定 `DISPLAY`/`WAYLAND_DISPLAY` 至少其一 + 会话 DBus
-  （`DBUS_SESSION_BUS_ADDRESS` 或 `$XDG_RUNTIME_DIR/bus`），缺任一 ⇒ 日志「未检测到
-  GUI 会话，托盘未启动」退出码 0；Windows/macOS 不预判——托盘创建失败同样优雅退出
-  （不 panic、退出码 0）。SNI 宿主晚于自启就绪不判死（`assume_sni_available` +
-  `watcher_offline` 保持等待——登录竞速容错）。
-- **feature/依赖门控（M6.5 兑现）**：`tray` feature 自 `[]` 占位填充真依赖——
-  tray-icon（win/macos target 门控 optional）、objc2/objc2-app-kit/objc2-foundation
-  （macos 泵）、ksni（linux，default-features=false + tokio 特性）；`dep:` 引用在
-  不匹配 target 上为 no-op ⇒ Linux 默认构建不出现 tray-icon/objc2 面、Windows 不出现
-  ksni 面、`--no-default-features` 三平台编译面零 GUI 依赖（门禁实测）。
-- **验证边界（如实）**：核心单测（投影全分支/token 失效重载/轮询恢复/退出顺序真传输
-  IPC mock）+ 宿主 Windows 真进程实测（mock daemon 真端点/token 落位：tray ≥10s 存活
-  无 panic、菜单刷新日志、与 `status` 两进程状态一致、对 token `Shutdown` 停 daemon 后
-  tray 转显「服务未运行」并继续重试）；**图标/菜单目视与「退出」点击**无法自动化 ⇒
-  `docs/manual/service-install.md` 托盘真机清单；真 daemon 联测需 invite 引导 + wintun
-  管理员（windows-smoke.md 先例），列同清单；macOS 全链路未验证（无设备；且
-  aarch64-apple-darwin 工具链本会话下载过慢未及编译级核验——API 面按 crate 源核对，
-  列清单待补）；Linux 桌面真机未验证（容器档覆盖编译面）。
+- **Entry point**: `flock-client tray` (gated by the `tray` feature; opens no GUI window of any
+  kind). Tray/daemon interact per the §M6.2 contract, with the token read from the token file; the
+  core logic (copy projection / token source / polling cadence / quit adjudication / icon / GUI
+  detection) lives in the platform-neutral `flock_client::tray` layer — **zero GUI dependencies,
+  fully unit-testable on the host**.
+- **Menu (three items)**: "Connection status" and "VPN IP" are dynamic read-only menu items
+  (disabled items — the platform-idiomatic greyed-out read-only form), refreshing text by polling
+  `Status` every 2s ("Connection status: connected · frps-a:23000", "VPN IP: 100.64.0.11"; when
+  disconnected/`vip: None`, VPN IP shows "—"; daemon not running / IPC failure / `Denied` ⇒
+  "service not running" with continued retrying); "Quit" is the action item: sends `Shutdown` with
+  the token ⇒ the daemon stops gracefully (§M6.1: the service stays installed and auto-starts next
+  boot) ⇒ the tray process exits; if the daemon is absent (token missing / IPC failure) ⇒ **quit
+  the tray only**; `Denied` ⇒ do not quit and show a hint — the token-stale reload path (the
+  recovery path when the daemon restarted with a fresh token); the user clicks "Quit" again to
+  retry. The tooltip mirrors the status summary.
+- **Icon**: a 32×32 programmatic RGBA (rounded-square base + a goose-formation forward arrow,
+  SDF-subpixel anti-aliased) — no image crate / no PNG asset:
+  `tray_icon::Icon::from_rgba` and ksni ARGB32 both eat raw pixels; PNG would be a pure relay; no
+  binary-asset diffs, pixel-level assertions possible (corner transparency / center opacity /
+  foreground pixel count / determinism).
+- **Platform libraries and minimal pump** (no winit/tauri/egui full GUI stack):
+  - Windows/macOS: `tray-icon` (built-in muda menus, consumed via the `tray_icon::menu`
+    re-export). Windows uses a minimal Win32 message pump (a dedicated thread `GetMessageW`; the
+    main thread wakes refresh via `PostThreadMessageW` and stops the pump with `WM_QUIT` — the
+    official minimal-example shape; tray-icon's event dispatch requires a thread that pumps
+    messages, a hard constraint); macOS uses a main-thread NSApp event-drain loop
+    (`nextEvent/sendEvent/updateWindows` + a 50ms cadence consuming the shared refresh; AppKit's
+    tray/NSMenu main-thread constraint).
+  - Linux: `ksni` (pure-Rust DBus StatusNotifierItem; the zbus tokio feature shares the existing
+    runtime domain) — **zero GTK/libappindicator system dependencies**, consistent with the
+    headless discipline; the menu is rebuilt to the latest state every time it opens (ksni
+    semantics naturally satisfy the 2s refresh); the tooltip refreshes actively via
+    `Handle::update`.
+- **GUI detection and fallback**: on Linux, first check that at least one of `DISPLAY`/
+  `WAYLAND_DISPLAY` is set + a session DBus (`DBUS_SESSION_BUS_ADDRESS` or
+  `$XDG_RUNTIME_DIR/bus`); any missing ⇒ log "no GUI session detected, tray not started" and exit
+  code 0; Windows/macOS do not pre-check — a tray-creation failure likewise exits gracefully (no
+  panic, exit code 0). An SNI host that becomes ready later than autostart is not treated as fatal
+  (`assume_sni_available` + `watcher_offline` keeps waiting — login-race tolerance).
+- **feature/dependency gating (M6.5 delivered)**: the `tray` feature filled with real dependencies
+  from its `[]` placeholder — tray-icon (win/macos target-gated optional),
+  objc2/objc2-app-kit/objc2-foundation (the macos pump), ksni (linux, default-features=false +
+  tokio feature); `dep:` references are no-ops on non-matching targets ⇒ the Linux default build
+  shows no tray-icon/objc2 surface, Windows shows no ksni surface, and `--no-default-features`
+  has a zero-GUI-dependency compile surface on all three platforms (gates verified by testing).
+- **Verification boundary (as-is)**: core unit tests (all projection branches / token-stale
+  reload / polling recovery / quit-ordering with a real-transport IPC mock) + a real Windows
+  process test on the host (mock daemon on a real endpoint / token in place: tray stays alive
+  ≥10s without panic, menu-refresh logs, state consistent with `status` in two processes, and
+  after a token `Shutdown` stops the daemon the tray shows "service not running" and keeps
+  retrying); **icon/menu visual checks and the "Quit" click** cannot be automated ⇒ the tray
+  real-machine checklist in `docs/manual/service-install.md`; a real-daemon joint test needs
+  invite bootstrap + wintun administrator (windows-smoke.md precedent), listed on the same
+  checklist; the full macOS chain unverified (no device; and the aarch64-apple-darwin toolchain
+  downloaded too slowly in this session for compile-level verification — the API surface checked
+  against crate sources, listed for later); the Linux desktop real machine unverified (the
+  container build covers the compile surface).
 
-### M7 成员名册与可观测性（服务端侧）
+### M7 Member roster and observability (server side)
 
-需求（用户原话浓缩）：CLI 要能列出各 VPN IP 的主机名、账户、在线状态、平均流量；
-主机离线不马上消失，默认保留 1 个月；窗口内重连同设备保持同 IP（到期后设备过期、
-IP 归还池子）；响应速度由客户端实测（不在本里程碑范围）。
+Requirements (condensed from the user's words): the CLI must be able to list each VPN IP's
+hostname, account, online status, and average traffic; a host going offline must not disappear
+immediately — retain it for 1 month by default; within the window, a reconnecting same device
+keeps the same IP (after expiry the device expires and the IP returns to the pool); response
+latency is measured by the client (out of scope for this milestone).
 
-#### M7.1 注册表扩展（Raft 静态面）
+#### M7.1 Registry extension (Raft static plane)
 
-`DeviceRow` 增两字段（`crates/flock-sync/src/proto.rs`，注册表行 = Raft 状态机快照
-线格式）：
+`DeviceRow` gains two fields (`crates/flock-sync/src/proto.rs`; the registry row = the Raft state
+machine's snapshot wire format):
 
 ```rust
 pub struct DeviceRow {
@@ -1089,74 +1396,90 @@ pub struct DeviceRow {
     pub device_x25519: [u8; 32],
     pub device_ed25519: [u8; 32],
     pub vip: [u8; 4],
-    pub status: DeviceStatus,      // Active | Disabled | Revoked | Expired(新)
+    pub status: DeviceStatus,      // Active | Disabled | Revoked | Expired (new)
     pub since_epoch: u64,
-    pub hostname: String,          // 新（M7）：客户端入网上报；空 ⇒ "(unknown)"；
-                                   //   re-register（同设备 key-bind 再入网）可更新
-    pub expired_at: Option<u64>,   // 新（M7）：置 Expired 的 unix 秒（审计）；非 Expired
-                                   //   恒 None
+    pub hostname: String,          // new (M7): reported by the client when joining; empty ⇒ "(unknown)";
+                                   //   re-register (the same device key-binding again) can update it
+    pub expired_at: Option<u64>,   // new (M7): unix seconds when set to Expired (for audit); always
+                                   //   None when not Expired
 }
 ```
 
-- `hostname` 来源：enroll/key-bind 路径（`DevicePubs` 增 `hostname: String` 字段，进
-  key-bind 设备签名覆盖面）；服务端先把字段与默认值打通——客户端上报为 M8 客户端
-  阶段补齐，空串落 `"(unknown)"`（长度上限 64 字节，超长截断）。
-- **快照/线格式兼容（如实声明）**：postcard 无字段标签，`DeviceRow`/`SyncRequest`
-  加字段后**旧快照与旧日志条目不可解码**——未发布窗口允许（与 proto.rs 既有
-  `L_SERVER_KEYS` 更名的同一纪律）；升级残留旧库需重建（init-cluster 重跑），不提供
-  迁移。
+- `hostname` origin: the enroll/key-bind path (`DevicePubs` gains a `hostname: String` field,
+  included in the key-bind device-signature coverage); the server wires the field and its default
+  through first — client reporting is filled in during the M8 client phase, with an empty string
+  landing as `"(unknown)"` (length cap 64 bytes, truncated beyond).
+- **Snapshot/wire-format compatibility (stated as-is)**: postcard has no field tags, so after
+  `DeviceRow`/`SyncRequest` gain fields, **old snapshots and old log entries cannot be decoded** —
+  acceptable in the pre-release window (the same discipline as the existing `L_SERVER_KEYS` rename
+  in proto.rs); upgrades with leftover old databases require a rebuild (re-running init-cluster);
+  no migration is provided.
 
-#### M7.2 IP 复用策略修订（§2.1 已同步修订）
+#### M7.2 IP reuse policy revision (§2.1 revised in sync)
 
-- **吊销 → IP 永不复用**（不变）；**离线超过保留期 → Expired + VIP 归还分配池**
-  （新设备可分到）；**过期记录保留在册**（审计），名册查询排除。
-- 实现：`SyncRequest::Expire { device, now_unix }`（Raft 写操作；`now_unix` 由提交方
-  注入，状态机确定性落 `expired_at`）。apply 语义：仅 Active/Disabled → Expired
-  （幂等：已 Expired 重放放行、不动 epoch）；推进 revocation_epoch 并触发吊销传播钩子
-  （杀残留会话/废票据——与 Revoked 同路径，仅状态语义不同）；释放 VIP 进分配池
-  （`NetStateData.vip_pool: BTreeSet<[u8; 4]>`，**优先于水位线分配**——池取最小，
-  池空回退水位线 `vip_next` 单调递增）；VIP 反查索引删除旧条目（Expired 行不进索引
-  ——释放后的 VIP 单射性由「池内 VIP 不在索引」维持）。
-- **Expired 为终态**（同 Revoked）：不可 Enable（旧 VIP 可能已属他设备，复活会破
-  单射）；同钥匙同设备身份不可复活（DeviceId = hash(ed25519) ⇒ 重注册即 DeviceExists，
-  仅走 re-register 的 hostname 更新路径）——**新设备身份（新钥匙）注册新行新 VIP**。
-  单服形态（netstate.rs StateStore）同语义：`expire()` + VIP 池表。
-- 保留期 = server.toml `peer_retention_days`（缺省 30；**0 = 永不过期**，兼容旧行为；
-  u64 天然 ≥0，解析即校验）。
+- **Revoked → the IP is never reused** (unchanged); **offline past the retention period → Expired
+  + VIP returned to the allocation pool** (a new device may get it); **the expired record stays on
+  the roster** (audit), excluded from roster queries.
+- Implementation: `SyncRequest::Expire { device, now_unix }` (a Raft write; `now_unix` is injected
+  by the submitter, and the state machine deterministically sets `expired_at`). Apply semantics:
+  only Active/Disabled → Expired (idempotent: replaying an already-Expired entry passes without
+  touching the epoch); advances revocation_epoch and triggers the revocation-propagation hooks
+  (kill residual sessions / void tickets — the same path as Revoked, only the state semantics
+  differ); releases the VIP into the allocation pool (`NetStateData.vip_pool: BTreeSet<[u8; 4]>`,
+  **takes priority over high-water-mark allocation** — take the minimum from the pool; when the
+  pool is empty fall back to the monotonically increasing watermark `vip_next`); the
+  VIP-reverse-lookup index drops the old entry (Expired rows do not enter the index — the
+  injectivity of released VIPs is maintained by "VIPs in the pool are not in the index").
+- **Expired is terminal** (like Revoked): cannot be Enabled (the old VIP may already belong to
+  another device; revival would break injectivity); the same device identity with the same keys
+  cannot be revived (DeviceId = hash(ed25519) ⇒ re-registering yields DeviceExists; only the
+  re-register hostname-update path is available) — **a new device identity (new keys) registers a
+  new row with a new VIP**. The single-server form (netstate.rs StateStore) has the same
+  semantics: `expire()` + a VIP pool table.
+- Retention period = server.toml `peer_retention_days` (default 30; **0 = never expire**,
+  compatible with the old behavior; u64 is naturally ≥0, parsing validates it).
 
-#### M7.3 动态面搭租约便车（EWMA 流量 + last_seen，不进 Raft）
+#### M7.3 The dynamic plane rides the leases (EWMA traffic + last_seen, not into Raft)
 
-- 租约条目（`flock-sync/src/lease.rs`）增：`tx_ewma/rx_ewma: u64`（bytes/s，**设备
-  视角**——tx = 设备发出、rx = 设备收到；服务器自身条目同理）与
-  `last_seen_unix: u64`。gossip `Publish`/`Anti` 消息同步携带（持有者权威值）。
-- EWMA：α = 0.2（`EWMA_ALPHA_NUM/DEN = 1/5`），**1s 更新窗口**——`LeaseTable` 内
-  per-device 字节累加器（`note_tx/note_rx`），`tick_ewma(now_ms)` 每 1s 折一次：
-  `ewma = ewma·(1−α) + (Δbytes/Δt)·α`（只折本机持有的行——远端行的值以持有者
-  publish/反熵为准，不本地覆写）。
-- **计数点（单点原则，杜绝双计）**：按「投递成功点计数」——
-  - **src 设备 tx**：由**接入服务器**（src 租约持有者）在其 ingest 通过第 0 步源
-    VIP 绑定校验后计 1 次（收进 mesh 即成功；dst 侧绝不计 src）；
-  - **dst 设备 rx**：由**投递成功的服务器**（本机 sink 投递成功 / ForwardEnvelope
-    收端本机投递成功——即 dst 的真实持有者）计 1 次；跨服 FRWD 的 origin 不计 dst，
-    Not_HERE/丢弃不计；
-  - **服务器自身条目**：dst = 本机 VIP 注内核成功 ⇒ 本机 rx；内核回程
-    `route_outbound` ⇒ 本机 tx。
-  - TTL 过期的租约行**保留**（不再删除）：`observe` 语义不变（过期 ⇒ None），但
-    行内 `last_seen_unix`/ewma 留存供名册离线设备展示（内存权衡：每行 ~60B）；
-    **离线衰减（修订）**：TTL 过期且本窗无累加的行 ewma 按窗 ×4/5 衰减、<8B/s 置 0
-    （`tick_ewma` 的衰减支路——有累加器的行由零速率折叠同数学衰减）——名册不再
-    呈现离线非零流量。
-- `last_seen_unix` 更新点：publish/续期（持有者）、本机计到该设备流量（持有者）、
-  收到对端 publish/反熵事件（远端条目以消息携带值为准）。
-- 同步通道：随**现有**租约 publish/事件（≤1s 语义；续期循环 10s 重发布携带最新
-  ewma）与反熵（5s）——不新增 gossip 消息类型。名册装配从**本地租约视图**取。
-- 单服形态：无租约表——`flock-sync` 提供同数学的 `TrafficMeter`（任意键 + EWMA +
-  last_seen，无 gossip），`PeerRouter::serve_stream` 双向计数（入站 = 该设备 tx、
-  出站 = 该设备 rx；dst = 服务器 VIP 的入站包计服务器 rx，内核回程计服务器 tx）。
+- Lease entries (`flock-sync/src/lease.rs`) gain: `tx_ewma/rx_ewma: u64` (bytes/s, **device
+  perspective** — tx = sent by the device, rx = received by the device; the server's own entry
+  likewise) and `last_seen_unix: u64`. Gossip `Publish`/`Anti` messages carry them along (the
+  holder's authoritative values).
+- EWMA: α = 0.2 (`EWMA_ALPHA_NUM/DEN = 1/5`), a **1s update window** — per-device byte
+  accumulators in `LeaseTable` (`note_tx/note_rx`); `tick_ewma(now_ms)` folds once per second:
+  `ewma = ewma·(1−α) + (Δbytes/Δt)·α` (fold only the rows this machine holds — remote rows' values
+  come from the holder's publish/anti-entropy and are never overwritten locally).
+- **Counting points (single-point principle, no double counting)**: count "at the
+  successful-delivery point" —
+  - **src device tx**: counted once by the **access server** (the src lease holder) after the step-0
+    source VIP binding check passes at ingest (entering the mesh = success; the dst side never
+    counts src);
+  - **dst device rx**: counted once by the **server that delivers successfully** (local sink
+    delivery success / ForwardEnvelope receive-side local delivery success — i.e. the dst's actual
+    holder); the origin of a cross-server FRWD does not count dst; Not_HERE/drops are not counted;
+  - **the server's own entry**: dst = the local VIP injected into the kernel successfully ⇒ local
+    rx; the kernel return path `route_outbound` ⇒ local tx.
+  - Rows whose TTL has expired are **retained** (no longer deleted): `observe` semantics are
+    unchanged (expired ⇒ None), but the row's `last_seen_unix`/ewma remain for the roster's
+    offline-device display (memory trade-off: ~60B per row);
+    **offline decay (revision)**: rows past TTL with no accumulation this window decay their ewma
+    by ×4/5 per window, set to 0 below 8B/s (the decay branch of `tick_ewma` — rows with
+    accumulators get the same mathematical decay via zero-rate folding) — the roster no longer
+    shows non-zero traffic for offline devices.
+- `last_seen_unix` update points: publish/renewal (holder), local traffic counted for that device
+  (holder), receiving a peer's publish/anti-entropy event (remote entries take the value carried
+  in the message).
+- Sync channel: rides the **existing** lease publish/events (≤1s semantics; the renewal loop
+  re-publishes every 10s carrying the latest ewma) and anti-entropy (5s) — no new gossip message
+  types. The roster assembly takes from the **local lease view**.
+- Single-server form: no lease table — `flock-sync` provides the same-math `TrafficMeter` (any key
+  + EWMA + last_seen, no gossip); `PeerRouter::serve_stream` counts both directions (inbound =
+  that device's tx, outbound = that device's rx; inbound packets with dst = the server VIP count
+  the server's rx; the kernel return path counts the server's tx).
 
-#### M7.4 名册契约（控制流新增；客户端阶段消费，逐字固化）
+#### M7.4 Roster contract (new on the control flow; consumed in the client phase, frozen verbatim)
 
-`CtrlRequest` 新增变体 + 响应 + 行类型（postcard，`flock-server/src/control.rs`）：
+`CtrlRequest` gains a variant + response + row type (postcard, `flock-server/src/control.rs`):
 
 ```rust
 CtrlRequest::PeerListPull { ticket: Option<TicketWire> }
@@ -1169,732 +1492,1025 @@ pub struct PeerInfo {
     kind: PeerKind,            // pub enum PeerKind { Device, Server }
     online: bool,
     last_seen_unix: u64,
-    tx_bps: u64,               // 设备视角 EWMA（bytes/s）
+    tx_bps: u64,               // device-perspective EWMA (bytes/s)
     rx_bps: u64,
 }
 ```
 
-- **票据保护**：登录票据必带（`ticket: None` ⇒ `TicketMissing`）；**票据校验
-  （签名+TTL+epoch+设备态）先于名册数据装配**——沿 §2.2 票据强制契约纪律（本操作
-  为只读，无 nonce 记账面；顺序有测试断言：坏票据 ⇒ `TicketBad` 且装配计数不动）。
-- **装配** = 注册表快照（**本地已 apply 视图**——两级读缓存档即可，不强制线性一致
-  读：名册是展示面，允许follower 视图的秒级陈旧）⋈ 本地租约视图（含 ewma）：
-  - 设备条目：`status == Active` 的行（Disabled/Revoked/Expired 排除——名册 = 现任
-    成员；审计走 DeviceList）；`online` = 本地租约视图 TTL 有效；`last_seen_unix`/
-    `tx_bps`/`rx_bps` 取租约行（无租约历史 ⇒ 0）。
-  - **服务器自身也进名册**（kind=Server）：多主形态取 Raft `server_keys` 本地视图
-    （`ServerKeyEntry` 增 `vip: [u8; 4]`——根签登记时随身份/混合公钥同签，canonical
-    字节随之扩展；vip 值由节点号**确定性推导**：node 1..=10 → `100.64.0.<node_id>`
-    （§6.2 服务器段 .1–.10），越界拒登——全网同推导，无第二真相源）；`owner` = 该
-    服务器的 node_id 十进制串（server_id 的承载形态），`hostname` = 根签
-    ClusterDirectory 内该服务器 `relay_endpoint`（客户端可见端点，熟悉且唯一）；
-    流量 = 本地租约视图内该服务器的自发布条目（`server_self_device_id(node_id)`
-    合成设备键——node_id 大端居前 8B + 固定标记后缀，与真实设备 id
-    （sha256(ed25519)）碰撞概率可忽略；各服务器在租约续期循环里自发布 + 内核路径
-    计数）。单服形态：本机一条 Server 条目（vip = `cfg.vip`，hostname =
-    `advertise_endpoint`，流量 = 本机 TrafficMeter）。
-  - **按 VIP 升序**排序输出。
+- **Ticket protection**: the login ticket is mandatory (`ticket: None` ⇒ `TicketMissing`);
+  **ticket validation (signature + TTL + epoch + device state) precedes roster data assembly** —
+  following the §2.2 mandatory-ticket-contract discipline (this operation is read-only with no
+  nonce-accounting surface; the order has a test assertion: a bad ticket ⇒ `TicketBad` and the
+  assembly counter does not move).
+- **Assembly** = a registry snapshot (the **locally applied view** — the two-level read-cache tier
+  suffices; a linearizable read is not required: the roster is a display surface, tolerating
+  second-level staleness of a follower view) ⋈ the local lease view (including ewma):
+  - Device entries: rows with `status == Active` (Disabled/Revoked/Expired excluded — the roster =
+    current members; audits go through DeviceList); `online` = valid TTL in the local lease view;
+    `last_seen_unix`/`tx_bps`/`rx_bps` taken from the lease row (no lease history ⇒ 0).
+  - **The servers themselves are also on the roster** (kind=Server): the multi-primary form takes
+    the Raft `server_keys` local view (`ServerKeyEntry` gains `vip: [u8; 4]` — signed at root-signed
+    registration together with the identity/hybrid pubkeys, with the canonical bytes extended
+    accordingly; the vip value is **deterministically derived** from the node number: node 1..=10 →
+    `100.64.0.<node_id>` (the §6.2 server segment .1–.10); out-of-range registration is rejected —
+    the same derivation network-wide, no second source of truth); `owner` = that server's node_id
+    in decimal string form (the carrier form of server_id); `hostname` = that server's
+    `relay_endpoint` in the root-signed ClusterDirectory (the client-visible endpoint, familiar
+    and unique); traffic = the server's self-published entry in the local lease view (the
+    `server_self_device_id(node_id)` synthetic device key — node_id big-endian in the first 8B +
+    a fixed marker suffix; collision probability with a real device id (sha256(ed25519)) is
+    negligible; each server self-publishes in its lease renewal loop and counts the kernel path).
+    Single-server form: one local Server entry (vip = `cfg.vip`, hostname =
+    `advertise_endpoint`, traffic = the local TrafficMeter).
+  - Output sorted **ascending by VIP**.
 
-#### M7.5 回收器（低频任务）
+#### M7.5 The reaper (a low-frequency task)
 
-server 内低频任务（周期 60s）：扫本地已 apply 注册表快照，把「Active 且
-`last_seen_unix` 距今 > `peer_retention_days`」的设备经 Raft 写操作置 Expired + 释放
-VIP（M7.2 路径）。`peer_retention_days = 0` ⇒ 不装配回收器。多台并发回收幂等
-（Expire 重放放行）；`last_seen_unix` = 本地租约视图（多主）/TrafficMeter（单服）；
-**无观测（0）时以 `DeviceRow.registered_at` 为起算锚**（「注册即起算」的落地——纪元 0
-起算会让 `0 <= cutoff` 恒真，重启后未及观测的在线设备被首拍整体终态化——评审修正）。
-另设**重启/视图未就绪闸门**（纵深防御，最小可靠形态）：单服 = TrafficMeter 自创建起
-零观测（空且注册表非空 ⇒ 刚重启）跳过本趟；多主 = 本地租约表空**或**自启动起未收到
-任何远端租约事件（反熵回填 ≤1 周期 5s 与回收首拍的赛跑窗；单节点 raft 集群无对端 ⇒
-闸门恒关、保留期不生效——非部署面形态，如实注明）跳过本趟。
-`registered_at` 由提交方注入（apply 无时钟——确定性），Raft 行与单服行同步落库
-（postcard/手工编解码加字段，旧快照不可解码——未发布窗口允许，§7-M7.1 纪律）。
-窗口判定函数以注入时钟取值（`reap_once(.., now_unix)` 可测）。
+A low-frequency task inside server (60s period): scan the locally applied registry snapshot and,
+via a Raft write, move devices that are "Active and `last_seen_unix` older than
+`peer_retention_days`" to Expired + release their VIP (the M7.2 path). `peer_retention_days = 0`
+⇒ the reaper is not assembled. Concurrent reaping across servers is idempotent (Expire replay
+passes); `last_seen_unix` = the local lease view (multi-primary) / TrafficMeter (single-server);
+**with no observation (0), the anchor is `DeviceRow.registered_at`** (landing "counting starts at
+registration" — counting from epoch 0 would make `0 <= cutoff` always true, and online devices
+not yet observed after a restart would be bulk-terminated on the first tick — a review
+correction). There is also a **restart / view-not-ready gate** (defense in depth, minimal reliable
+form): single-server = TrafficMeter has had zero observations since creation (empty and the
+registry non-empty ⇒ just restarted) skips this round; multi-primary = the local lease table is
+empty **or** no remote lease event has been received since startup (the race window between
+anti-entropy backfill ≤1 period 5s and the reaper's first tick; a single-node raft cluster has no
+peers ⇒ the gate stays closed and the retention period never applies — not a deployment-facing
+form, noted as-is) skips this round. `registered_at` is injected by the submitter (apply has no
+clock — determinism); the Raft row and the single-server row both persist it (postcard/manual
+codec gains a field; old snapshots cannot be decoded — acceptable in the pre-release window,
+§7-M7.1 discipline). The window-decision function takes the injected clock (`reap_once(..,
+now_unix)` is testable).
 
-#### M7.7 客户端侧（M7 第二批次：登录/票据保持/名册消费/peers CLI）
+#### M7.7 Client side (M7 second batch: login/ticket keeping/roster consumption/peers CLI)
 
-**契约上收（偿还架构债）**：`PeerInfo`/`PeerKind`、票据线格式 `TicketWire`/
-`SignedTicket`、控制面消息 `CtrlRequest`/`CtrlResponse` 与值类型、key-bind 设备签名
-canonical、hostname 规范化——上收至 **`flock-protocol::roster`**（两端同类型无第二
-真相源；`flock-server::{control,ticket}` 与 `flock-sync::proto` 以 `pub use` 再导出，
-既有引用路径不变；票据权威逻辑 TicketAuthority/NonceLedger 不搬——服务端内部面）。
-flock-protocol 门禁含 wasm32 check（roster 纯数据无平台面）。
+**Contract hoisting (repaying an architecture debt)**: `PeerInfo`/`PeerKind`, the ticket wire
+formats `TicketWire`/`SignedTicket`, the control-plane messages `CtrlRequest`/`CtrlResponse` and
+their value types, the key-bind device-signature canonical, hostname normalization — hoisted into
+**`flock-protocol::roster`** (the same types on both ends, no second source of truth;
+`flock-server::{control,ticket}` and `flock-sync::proto` re-export them via `pub use`, existing
+reference paths unchanged; the authoritative ticket logic TicketAuthority/NonceLedger does not
+move — a server-internal surface). flock-protocol gating includes a wasm32 check (roster is pure
+data with no platform surface).
 
-**凭据与登录（客户端半边）**：
+**Credentials and login (the client half)**:
 
-- `client.toml` 增 `[auth] username`（+ 可选 `credentials_file`，缺省 state 目录
-  `credentials`）；口令**单行明文**存 0600 文件（Windows 显式 DACL：SYSTEM+管理员+
-  属主，无 Users）。**静止风险如实声明**：OPAQUE（RFC 9807）保证口令不上线；本地
-  静止 = 本地信任域（属主侧明文可读——与「root 可读 /etc/shadow」同级取舍，无钥匙
-  环依赖）。
-- `flock-client login`（一次性引导）：stdin 读口令（tty 有回显——本地信任域取舍）→
-  写 0600 凭据 → 直连隧道控制流：`PwBegin/PwCommit` 设服务端口令（授权 = 会话设备
-  owner；admin 面无开户口令操作，口令设置本就走控制流）→ 登录验证 + key-bind
-  携带 hostname 入册。票据不保留（一次性命令）。
-- daemon（`service` 形态）登录保持任务：会话在位 ⇒ OPAQUE 登录（anchor 以**钉扎
-  目录内该 server 的身份公钥**验签——端点轮询换服后锚仍正确）→ key-bind（hostname
-  re-register 更新链路；`add_user_sig_key` 去重 ⇒ 周期重登不膨胀注册表）→ 票据
-  **只存内存**；重登节奏 = TTL·2/3（**相对量**——免疫两端时钟偏移；票据 TTL 内保持
-  新鲜）。凭据文件**每次登录现读**（`login` 换口令免重启 daemon）。控制流请求超时 ⇒
-  流毒化 + 主动杀会话重连（yamux 流超时后可能错位——宁可重连不带错位继续）。
+- `client.toml` gains `[auth] username` (+ optional `credentials_file`, defaulting to the state
+  directory's `credentials`); the password is stored as a **single plaintext line** in a 0600
+  file (Windows explicit DACL: SYSTEM+administrators+owner, no Users). **At-rest risk stated
+  as-is**: OPAQUE (RFC 9807) guarantees the password never goes on the wire; at rest locally =
+  the local trust domain (owner-side plaintext readable — the same class of trade-off as "root
+  can read /etc/shadow", no keystore dependency).
+- `flock-client login` (one-time bootstrap): read the password from stdin (a tty echoes — a local
+  trust-domain trade-off) → write the 0600 credential → direct-tunnel control flow:
+  `PwBegin/PwCommit` sets the server-side password (authorization = the session device's owner;
+  the admin plane has no account-password-creation operation; password setting has always gone
+  through the control flow) → login verification + key-bind carrying the hostname onto the
+  roster. The ticket is not kept (a one-shot command).
+- The daemon (`service` form) login-keep task: session in place ⇒ OPAQUE login (anchor verified
+  with **the identity pubkey of that server from the pinned directory** — the anchor stays correct
+  after endpoint rotation switches servers) → key-bind (the hostname re-register update path;
+  `add_user_sig_key` dedup ⇒ periodic re-login does not bloat the registry) → the ticket
+  **lives in memory only**; re-login cadence = TTL·2/3 (a **relative quantity** — immune to clock
+  skew between the two ends; stays fresh within the ticket TTL). The credentials file is **read
+  fresh at every login** (changing the password via `login` needs no daemon restart). Control-flow
+  request timeout ⇒ poison the stream + actively kill the session and reconnect (a yamux stream
+  after a timeout may be misaligned — better to reconnect than continue misaligned).
 
-**hostname 上报**：`client.toml hostname` 覆写，缺省 OS 主机名（hostname crate）；
-统一 `normalize_hostname`（trim/64B 截断/空串 "(unknown)"——与服务端落库同语义）。
+**Hostname reporting**: `client.toml hostname` overrides; the default is the OS hostname (the
+hostname crate); unified `normalize_hostname` (trim/64B truncate/empty string "(unknown)" — the
+same semantics as the server-side persist).
 
-**PeerListPull 消费 + IPC/CLI**：
+**PeerListPull consumption + IPC/CLI**:
 
-- daemon 缓存最近一次名册（`RosterCache`，拉取时刻 + ≤5s 新鲜窗）；IPC 增
-  `CtrlReq::Peers{token}` → daemon：缓存新鲜或持当前票据拉取 → 对 **online 且非
-  自身**条目并发 ping 探测（ICMP echo 经 tun——raw socket 发往 VIP 由路由表走
-  tun0；3 探针、2s 超时/探针、取上中位；实现 = socket2 raw ICMP 薄层：daemon 特权
-  上下文 raw 权限在位、三平台同一 API 面、校验和/回复匹配全控；raw 不可用 ⇒ 延迟列
-  降级「—」）→ `Peers{rows}`，`PeerRow = PeerInfo + latency_ms + self_flag`；
-  未登录/隧道断/未配置 ⇒ `PeersUnavailable{reason}`（CLI 转指引文案）。
-- `flock-client peers`：对齐列表格 `VIP｜主机名｜账户｜类型｜状态｜延迟(ms)｜↓流量
-  (B/s)｜↑流量(B/s)`；状态三态 = 在线 / 离线（Device）/ **服务未运行**（Server 型
-  离线——与设备离线可区分）；离线延迟列 `—`；自身行 `(self)` 标注；`--json` 机读档
-  （数组，latency null = 离线/未探测）。daemon 不在/未登录 ⇒ 明确错误与指引。
-- 实测：`deploy/m7.yml` + `m7_assert.sh`（两 client + server：名册条目/延迟/iperf3
-  流量列/JSON 解析）；Windows/macOS raw ICMP 真机 → `docs/manual/service-install.md`
-  §7 清单第 9 项。
+- The daemon caches the most recent roster (`RosterCache`, fetch time + ≤5s freshness window);
+  IPC gains `CtrlReq::Peers{token}` → the daemon: cache fresh, or fetch holding the current ticket
+  → for entries that are **online and not self**, concurrently ping-probe (ICMP echo over tun — a
+  raw socket to the VIP goes out via the routing table through tun0; 3 probes, 2s timeout per
+  probe, take the upper median; implementation = a thin socket2 raw-ICMP layer: the daemon's
+  privileged context has raw permission in place, the same API surface on all three platforms,
+  checksum/reply matching fully controlled; raw unavailable ⇒ the latency column degrades to "—")
+  → `Peers{rows}`, `PeerRow = PeerInfo + latency_ms + self_flag`; not logged in / tunnel down /
+  not configured ⇒ `PeersUnavailable{reason}` (the CLI turns it into guidance copy).
+- `flock-client peers`: an aligned table `VIP | hostname | account | type | status | latency (ms)
+  | ↓ traffic (B/s) | ↑ traffic (B/s)`; status has three states = online / offline (Device) /
+  **service not running** (Server-type offline — distinguishable from device offline); offline
+  latency column `—`; own row annotated `(self)`; `--json` machine-readable build (an array;
+  latency null = offline/not probed). Daemon absent / not logged in ⇒ a clear error and guidance.
+- Live test: `deploy/m7.yml` + `m7_assert.sh` (two clients + server: roster entries/latency/
+  iperf3 traffic columns/JSON parsing); Windows/macOS raw ICMP real machines → item 9 of §7 of
+  the `docs/manual/service-install.md` checklist.
 
-#### M7.6 完成标准
+#### M7.6 Completion criteria
 
-1. `cargo test -p flock-sync --all-features`：含 DeviceRow 往返（新字段）、Expired
-   释放后新设备拿到该 VIP、EWMA 收敛、lease gossip 带宽字段往返、快照兼容性声明
-   （旧格式不可解码 ⇒ 干净失败）。
-2. `cargo test -p flock-server --all-features`：roster 装配（在线/离线/过期三态 +
-   Server 条目）、票据先行顺序断言、回收器窗口逻辑（注入时钟）、hostname 默认值/
-   re-register 更新。
-3. `tests/multi_primary.rs` 追加：双客户端跨服时 roster 在任一服务器装配一致
-   （结构字段严格相等；ewma/last_seen 容差比较——两服务器的本地视图来自不同时刻的
-   反熵快照，逐字节相等不可实现也不必要），假流量泵使 ewma 非零。
-4. 门禁：两 crate clippy `-D warnings`、workspace check、fmt；容器 linux 档 check
-   （涉及 cfg 的仅数据面计数路径，不新增平台分支）。
+1. `cargo test -p flock-sync --all-features`: includes DeviceRow round trips (new fields), a new
+   device receiving a released Expired VIP, EWMA convergence, lease-gossip traffic-field round
+   trips, and the snapshot-compatibility statement (old formats cannot be decoded ⇒ clean
+   failure).
+2. `cargo test -p flock-server --all-features`: roster assembly (online/offline/expired three
+   states + Server entries), the ticket-first order assertion, reaper window logic (injected
+   clock), hostname defaults / re-register updates.
+3. `tests/multi_primary.rs` additionally: with two clients cross-server, the roster assembles
+   identically on either server (structural fields strictly equal; ewma/last_seen compared with
+   tolerance — the two servers' local views come from anti-entropy snapshots at different times;
+   byte-for-byte equality is neither possible nor necessary), with a fake traffic pump making ewma
+   non-zero.
+4. Gates: both crates clippy `-D warnings`, workspace check, fmt; the container linux-tier check
+   (anything involving cfg is only on the data-plane counting path; no new platform branches).
 
-### M8 服务端 Web UI（管理登录 + 现代 Dashboard）
+### M8 Server Web UI (admin login + a modern dashboard)
 
-需求（用户原话）：服务端需要有 Web UI 管理登录账号和完整现代的 Dashboard；默认仅服务端
-本机可以访问，有权限的账户从 VPN 服务端的内网 IP 访问；如果是多个服务端集群，则任意
-服务端 VPN 内网 IP 都可以访问。
+Requirements (the user's words): the server needs a Web UI with an admin login account and a
+complete, modern dashboard; by default only the server's own machine can access it, and authorized
+accounts access it via the VPN server's internal IP; in a multi-server cluster, any server's VPN
+internal IP works.
 
-#### M8.1 形态与选型定型（进程内嵌 / HTTP 框架 / 前端三案 / 资产内嵌 / i18n）
+#### M8.1 Form and selection finalized (in-process embedding / HTTP framework / three frontend
+options / asset embedding / i18n)
 
-- **形态：flock-server 进程内嵌 HTTP 服务**（webui 模块，§M8.8 文件落位），与既有
-  接入端点（:9443）、admin loopback（:9444）并列的第三个监听面。集群 = 每台 server
-  各自内嵌同一套 UI 与 API；数据面（注册表/Raft、租约/EWMA、epoch）经既有机制天然
-  一致 ⇒「任意服务端 VPN 内网 IP 都可访问」不需要任何新增同步逻辑。**会话表是
-  per-server 进程内存**（不进 Raft）：在 server-a 的 VIP 登录得到的 cookie 对
-  server-b 无效（cookie 本就按 host 域隔离）——在 b 上重新登录即可，行为写明文档。
-- **HTTP 框架：自研最小 HTTP/1.1（`webui::http`）而非 axum**。裁决理由：
-  1. 依赖树现状：Cargo.lock（364 包）不含 hyper/tower/http 任何构件；axum 最小装配
-     需引入 ~40–60 个新 crate（hyper 1.x + tower + http-body + matchit + mime…），
-     为一个仅 loopback+VIP 可达、约 20 个 JSON 端点的管理面付出整条 tower 栈，与
-     仓库既有纪律相悖（§3.6「一个适配器=假想缝」；admin.rs/session 均为自研帧协议
-     先例）。
-  2. 暴露面极小 ⇒ HTTP 子集极小：HTTP/1.1、GET/POST、keep-alive、单 cookie 解析、
-     `Content-Length` 定长体——**拒绝 Transfer-Encoding/chunked 与重复
-     Content-Length**（防请求走私的根本手法是不实现歧义特性）；请求行 ≤2KiB、头
-     ≤8KiB、体 ≤64KiB，超限 400/413 并关连接；并发上限 = 独立信号量（缺省 64）。
-  3. 解析器带畸形请求测试向量（§M8.9），拒绝路径全部有断言。
-  代价（如实声明）：无 HTTP/2、无分块上传、无 Range——管理面不需要；未来需要时
-  `webui::http` 是唯一调用方，可整体替换（缝在 handler 分发函数上）。
-- **前端选型（三案评估，择 A）**：
-  - **A（选定）**：手写 fetch + Alpine.js 3.14（vendored，~15KB gz）+ 自写现代 CSS
-    设计系统（深色主题）+ **uPlot 1.6.9**（vendored ~48KB min）画流量曲线；
-  - B（否决）：htmx 服务端渲染片段——图表与轮询仍需 JS（uPlot 不因 htmx 消失），
-    却把 HTML 拼装移进 Rust 模板面，且 wasm OPAQUE 客户端照样要浏览器 JS——两头不省；
-  - C（否决）：Vue ESM vendored——无 node 工具链即无 SFC 编译，只能以模板字符串写
-    组件（可维护性差），~34KB gz 运行时对 6 个页面的表单/列表交互属过剩。
-  图表库 uPlot vs Chart.js：流量时间序列是 uPlot 甜区（canvas、120 点每分钟重绘无感、
-  ~12KB gz vs Chart.js ~65KB gz），**定 uPlot**。
-- **资产内嵌：`include_dir`**（定死）。vs rust-embed：include_dir 零运行时依赖、
-  行为确定；rust-embed 的 debug 档 fs 回读对本资产集（<15 文件）无增量价值。
-  资产 `Cache-Control`：API `no-store`、资产 `no-cache`（单二进制升级即全量刷新，
-  无指纹文件名需求）。
-- **i18n：中文先行**（定死）。v1 单语 zh-CN；全部文案集中 `assets/i18n.js` 单字典
-  对象（后补英文只加文件，API 不随语言变化）。
-- **wasm：flock-protocol 以 wasm32 目标编译 OPAQUE 客户端函数**——不引 wasm-bindgen
-  （showroom §8.3 约束同源），沿用 showroom `wasm_shim.rs` 的 **C-ABI 垫片**手法 +
-  本仓 `wasm_bridge.rs` 已就位的 getrandom custom 后端（`.cargo/config.toml` 的
-  `getrandom_backend="custom"`）。新垫片 `crates/flock-protocol/src/webauth_shim.rs`
-  （契约 §M8.6）。构建档：`cargo build -p flock-protocol --target
-  wasm32-unknown-unknown --no-default-features --features wasm,anchor`（无 zstd ⇒
-  零 C 依赖）；产物 + 手写 JS 胶水（~120 行）一并 include_dir 内嵌进 server 二进制。
+- **Form: an HTTP service embedded in the flock-server process** (the webui module, file placement
+  in §M8.8), a third listening surface alongside the existing access endpoint (:9443) and the admin
+  loopback (:9444). A cluster = every server embeds the same UI and API; the data plane
+  (registry/Raft, leases/EWMA, epoch) is naturally consistent via existing mechanisms ⇒ "any
+  server's VPN internal IP works" needs no new sync logic. **The session table is per-server
+  process memory** (not in Raft): a cookie obtained by logging in at server-a's VIP is invalid at
+  server-b (cookies are host-scoped anyway) — just log in again on b; the behavior goes into the
+  docs.
+- **HTTP framework: an in-house minimal HTTP/1.1 (`webui::http`), not axum**. Ruling:
+  1. Dependency-tree status: Cargo.lock (364 packages) contains no hyper/tower/http artifacts
+     whatsoever; a minimal axum assembly would pull in ~40–60 new crates (hyper 1.x + tower +
+     http-body + matchit + mime…); paying for the whole tower stack for an admin plane reachable
+     only on loopback+VIP with ~20 JSON endpoints contradicts the repository's existing discipline
+     (§3.6 "one adapter = an imaginary seam"; admin.rs/session are precedents of in-house frame
+     protocols).
+  2. The exposure surface is tiny ⇒ the HTTP subset is tiny: HTTP/1.1, GET/POST, keep-alive,
+     single-cookie parsing, fixed-length bodies via `Content-Length` — **reject
+     Transfer-Encoding/chunked and duplicate Content-Length** (the fundamental way to prevent
+     request smuggling is to not implement ambiguous features); request line ≤2KiB, headers ≤8KiB,
+     body ≤64KiB, over-limit 400/413 and close the connection; the concurrency cap = an
+     independent semaphore (default 64).
+  3. The parser carries malformed-request test vectors (§M8.9); every rejection path is asserted.
+  Cost (stated as-is): no HTTP/2, no chunked uploads, no Range — the admin plane does not need
+  them; if needed later, `webui::http` has a single caller and can be replaced wholesale (the seam
+  is the handler dispatch function).
+- **Frontend selection (three options evaluated; A chosen)**:
+  - **A (chosen)**: hand-written fetch + Alpine.js 3.14 (vendored, ~15KB gz) + a hand-written
+    modern CSS design system (dark theme) + **uPlot 1.6.9** (vendored ~48KB min) for traffic
+    curves;
+  - B (rejected): htmx server-rendered fragments — charts and polling still need JS (uPlot does
+    not disappear because of htmx), yet HTML assembly moves into the Rust template surface, and
+    the wasm OPAQUE client still needs browser JS — savings nowhere;
+  - C (rejected): Vue ESM vendored — without a node toolchain there is no SFC compilation, leaving
+    components written as template strings (poor maintainability), and a ~34KB gz runtime is
+    overkill for form/list interactions across 6 pages.
+  Chart library uPlot vs Chart.js: traffic time series are uPlot's sweet spot (canvas, 120 points
+  redrawn per minute imperceptibly, ~12KB gz vs Chart.js ~65KB gz); **uPlot it is**.
+- **Asset embedding: `include_dir`** (fixed). vs rust-embed: include_dir has zero runtime
+  dependencies and deterministic behavior; rust-embed's debug-profile fs read-back adds no value
+  for this asset set (<15 files). Asset `Cache-Control`: API `no-store`, assets `no-cache` (a
+  single-binary upgrade refreshes everything; no fingerprinted filenames needed).
+- **i18n: Chinese first** (fixed). v1 is zh-CN only; all copy is centralized in a single
+  dictionary object in `assets/i18n.js` (adding English later only adds a file; the API does not
+  vary by language).
+- **wasm: flock-protocol compiles the OPAQUE client functions for the wasm32 target** — no
+  wasm-bindgen (same-origin constraint as showroom §8.3), reusing showroom `wasm_shim.rs`'s
+  **C-ABI shim** approach + this repo's already-in-place getrandom custom backend in
+  `wasm_bridge.rs` (`getrandom_backend="custom"` in `.cargo/config.toml`). The new shim
+  `crates/flock-protocol/src/webauth_shim.rs` (contract in §M8.6). Build profile: `cargo build -p
+  flock-protocol --target wasm32-unknown-unknown --no-default-features --features wasm,anchor`
+  (no zstd ⇒ zero C dependencies); the artifact + hand-written JS glue (~120 lines) are both
+  embedded into the server binary via include_dir.
 
-#### M8.2 监听、绑定与访问矩阵（断言表）
+#### M8.2 Listening, binding, and the access matrix (assertion table)
 
-- **双绑定（重试逻辑定死）**：`[webui] port`（缺省 **9800**）派生两个监听地址——
-  `127.0.0.1:9800` 与 `cfg.vip:9800`。**配置不暴露任何 bind 字段**（0.0.0.0 误配在
-  结构上不可能，而非靠校验拦截）。loopback 监听启动即绑定；**VIP 绑定由重试任务
-  补上**（周期 5s：tun 未就绪/地址未配 ⇒ 绑定失败重试；失败记日志一次、状态变化时
-  再记，永不 crash——loopback 面不受影响）。数据路径：peer → 接入服务器 E2E 会话 →
-  （跨服则 ForwardEnvelope，收端投内核 `fwd_delivered_kernel` 路径）→ 目标服务器
-  tun0 → 内核 TCP 栈 → VIP:9800 listener——与「peer ping 服务器 VIP」同路径，无需
-  新转发面。
-- **server.toml 增节（§3.11 ServerConfig 扩展）**：
+- **Dual binding (retry logic fixed)**: `[webui] port` (default **9800**) derives two listen
+  addresses — `127.0.0.1:9800` and `cfg.vip:9800`. **The config exposes no bind field at all** (a
+  0.0.0.0 misconfiguration is structurally impossible, not caught by validation). The loopback
+  listener binds at startup; **the VIP binding is added by a retry task** (5s period: tun not
+  ready / address unconfigured ⇒ bind fails and retries; failure logged once, re-logged on state
+  change, never crashes — the loopback surface is unaffected). Data path: peer → access-server E2E
+  session → (cross-server: ForwardEnvelope, the receiver injects into the kernel
+  `fwd_delivered_kernel` path) → the target server's tun0 → the kernel TCP stack → the VIP:9800
+  listener — the same path as "peer pings the server VIP"; no new forwarding plane.
+- **server.toml new section (§3.11 ServerConfig extension)**:
   ```toml
   [webui]
-  enabled = true            # 缺省；false = 不装配 webui
-  port = 9800               # 校验 1..=65535，且不与 bind/admin_bind/admin_bind+1/raft_bind 冲突（拒起服）
-  session_ttl_secs = 28800  # 缺省 8h；校验 60..=86400
-  series_points = 120       # 流量环形缓冲点数（§M8.5）
-  series_interval_secs = 60 # 采样间隔
+  enabled = true            # default; false = do not assemble webui
+  port = 9800               # validated 1..=65535 and no conflict with bind/admin_bind/admin_bind+1/raft_bind (server start refused)
+  session_ttl_secs = 28800  # default 8h; validated 60..=86400
+  series_points = 120       # traffic ring-buffer point count (§M8.5)
+  series_interval_secs = 60 # sampling interval
   ```
-- **访问矩阵（来源中间件逐请求判定，测试锚定 W-A1–W-A4）**：
+- **Access matrix (adjudicated per request by the origin middleware; tests anchored to W-A1–W-A4)**:
 
-| # | 来源（RemoteAddr） | 结果 | 机制 |
+| # | Origin (RemoteAddr) | Result | Mechanism |
 |---|---|---|---|
-| W-A1 | 127.0.0.0/8（含 ::1） | **可达**：静态页 + 登录；登录后按角色授权 | loopback 绑定 + 来源中间件放行 |
-| W-A2 | 100.64.0.0/10（经 tun VIP 入） | **可达**：同上（任一 VPN peer 可打开登录页；无角色账户登录后只读/403） | VIP 绑定 + 来源中间件放行 |
-| W-A3 | 其它（LAN/公网接口） | **不可达**（连接层） | 根本机制：未绑定任何 LAN/公网地址；纵深防御：来源中间件对越界 RemoteAddr 回 403 `forbidden_origin` |
-| W-A4 | 反向代理/LB 之后 | **不承诺** | `X-Forwarded-For` 一律忽略（客户端可伪造）；代理 IP 不在放行段即 403——不支持反代部署，文档明示 |
+| W-A1 | 127.0.0.0/8 (incl. ::1) | **Reachable**: static pages + login; post-login authorization by role | loopback binding + origin middleware allow |
+| W-A2 | 100.64.0.0/10 (arriving via the tun VIP) | **Reachable**: same as above (any VPN peer can open the login page; accounts without a role get read-only/403 after login) | VIP binding + origin middleware allow |
+| W-A3 | anything else (LAN/public interfaces) | **Unreachable** (at the connection layer) | Root mechanism: no LAN/public address is bound; defense in depth: the origin middleware returns 403 `forbidden_origin` for out-of-range RemoteAddrs |
+| W-A4 | behind a reverse proxy / LB | **Not promised** | `X-Forwarded-For` is always ignored (client-forgeable); a proxy IP not in the allowed ranges gets 403 — reverse-proxy deployments are unsupported, stated in the docs |
 
-- **远程运维既定路径**：SSH 隧道（`ssh -L 9800:127.0.0.1:9800 …`，与 admin 端点同
-  建议，§3.11 校验文案）；把 webui 放到 TLS 反代后属于未定义行为（RemoteAddr 将是
-  代理地址，触发 W-A4 拒绝）。
+- **The established path for remote administration**: an SSH tunnel (`ssh -L 9800:127.0.0.1:9800
+  …`, the same recommendation as the admin endpoint, §3.11 validation copy); putting the webui
+  behind a TLS reverse proxy is undefined behavior (the RemoteAddr would be the proxy's address,
+  triggering the W-A4 rejection).
 
-#### M8.3 认证与授权（OPAQUE 复用形态 + 会话 + 与既有授权面的裁决）
+#### M8.3 Authentication and authorization (OPAQUE reuse form + sessions + the ruling against the
+existing authorization surfaces)
 
-**登录流 = HTTP 同语义新端点（不复用控制流消息，复用 pake 原语）**——显式裁决：
-- 控制流 `LoginBegin/Finish` 的授权前提是「会话设备 owner == user」（隧道内已认证，
-  control.rs 现行实现）；Web 登录无隧道会话 ⇒ **为 HTTP 定义同语义端点**
-  `/api/login-begin|finish`，服务端调同一组 `pake::{server_login_start,
-  server_login_finish}` + 同一 OPRF（单服=本地 / 多主=Raft 封装解封后的共享 key）+
-  同一注册表口令记录。ke1/ke2/ke3 线上形态 = 同 b64 字符串（协议同构）。
-- **anchor 保留**：login-begin 响应携带 `{server_id, bind_token, anchor_sig}`（与
-  控制流同 canonical：`anchor_canonical_bytes`）；页面启动 `GET /api/bootstrap` 取
-  本服务器 `identity_pub`，wasm 内 `login_finish_anchored` 验签。语义边界（如实）：
-  浏览器没有钉扎的集群根公钥，此验证绑定「登录 transcript ↔ 本服务器身份」（防
-  错集群/错服务器响应混装），**不提供 MITM 防护**——传输完整性由信任域承担
-  （loopback / VPN 逐跳 E2E，§M8.7）。
-- **profile 约束**：Web 登录客户端恒用 `Profile::Owasp19MiB`（=default）；记录侧
-  profile ≠ 0 ⇒ login-finish 客户端本地 Err ⇒ 401 `login_failed`（与错口令同表现，
-  不泄漏原因）。系统内全部口令记录均以 default 档创建（控制流 PwBegin/CLI
-  web-admin-add 同档），不构成实际限制。
-- **防枚举**：未知用户走 pake dummy 路径（ke2 同形）；login-finish 统一 401。
+**The login flow = same-semantics new HTTP endpoints (control-flow messages are not reused; the
+pake primitives are)** — an explicit ruling:
+- The control flow's `LoginBegin/Finish` presumes "session device owner == user" (authenticated
+  inside the tunnel; the current control.rs implementation); a Web login has no tunnel session ⇒
+  **define same-semantics endpoints for HTTP**: `/api/login-begin|finish`, with the server calling
+  the same `pake::{server_login_start, server_login_finish}` + the same OPRF (single-server =
+  local / multi-primary = the shared key unsealed from Raft sealing) + the same registry password
+  records. The ke1/ke2/ke3 wire form = the same b64 strings (protocol-isomorphic).
+- **anchor kept**: the login-begin response carries `{server_id, bind_token, anchor_sig}` (the
+  same canonical as the control flow: `anchor_canonical_bytes`); the page startup fetches
+  `GET /api/bootstrap` for this server's `identity_pub`, and wasm verifies with
+  `login_finish_anchored`. Semantic boundary (as-is): the browser has no pinned cluster root
+  pubkey; this verification binds "login transcript ↔ this server's identity" (preventing
+  wrong-cluster/wrong-server response mixups) and **provides no MITM protection** — transport
+  integrity is borne by the trust domain (loopback / per-hop VPN E2E, §M8.7).
+- **Profile constraint**: the Web login client always uses `Profile::Owasp19MiB` (=default); if
+  the record-side profile ≠ 0 ⇒ login-finish errors locally on the client ⇒ 401 `login_failed`
+  (same presentation as a wrong password; no reason leaked). All password records in the system
+  are created at the default tier (the control flow PwBegin/CLI web-admin-add use the same tier),
+  so this is no practical restriction.
+- **Anti-enumeration**: unknown users go down the pake dummy path (ke2 same shape);
+  login-finish is uniformly 401.
 
-**会话（服务端内存表 + HttpOnly cookie）**：
-- SessionId = 32B 随机（`flock_protocol::rand`）hex 64 字符；表 =
-  `HashMap<sid, Session{user, admin, origin: Loopback|Vpn, iat_unix, exp_unix}>`；
-  TTL = `session_ttl_secs`（缺省 28800）；**上限 256 条**，超限按 iat 淘汰最旧
-  （断言）；惰性过期（命中即验 exp）+ 60s 周期清扫。origin 在 login-finish 时按
-  RemoteAddr 定档（loopback / VPN 段），**两类都合法、都记录**（不拒绝跨段重用
-  cookie——按需求原语义；/api/me 与审计行回显 origin）。
-- Cookie（逐字）：
-  `Set-Cookie: flock_session=<64hex>; HttpOnly; SameSite=Strict; Path=/; Max-Age=<session_ttl_secs>`；
-  logout 回 `Max-Age=0` 同名删除。**无 Secure**（无 TLS，§M8.7）。cookie 按 host 域
-  隔离 ⇒ 127.0.0.1 与 VIP、VIP-a 与 VIP-b 各自独立登录（文档写明）。
-- **角色模型**：`UserRow.admin: bool`（下文）决定角色。**未登录：除公共端点
-  （login-begin/finish、pw-begin/commit、bootstrap、静态资产）外一切 API 401
-  `not_logged_in`**；非 admin：只读端点可用（peers/dashboard/config——这些数据本就经
-  M7 名册对任何成员可见），管理端点 403 `forbidden`。逐端点角色矩阵定死于 §M8.4。
-- **降权/禁用生效 = 会话即时回收（评审修订）**：dispatch 会话档在会话表 lookup 后
-  **回读 `UserRow`**（Raft 形态用本地已 apply 视图、不必 linearizable——本机提交
-  写后回读立即可见，他机提交在本机 apply 后亚秒~秒级生效，与名册/peers 同视图档）：
-  `set_admin=false` 后旧会话**下一次请求即 403**（会话行内 admin 快照不作准，
-  `/api/me` 回显同步）；`disabled` 用户任何登录档端点**下一请求即 401
-  `user_disabled`**——均不等 TTL（旧行为的 8h 越权滞留窗口消除）。
+**Sessions (server-side in-memory table + HttpOnly cookie)**:
+- SessionId = 32B random (`flock_protocol::rand`) as 64 hex chars; table =
+  `HashMap<sid, Session{user, admin, origin: Loopback|Vpn, iat_unix, exp_unix}>`; TTL =
+  `session_ttl_secs` (default 28800); **cap of 256 entries**, oldest-by-iat evicted beyond the cap
+  (asserted); lazy expiry (exp checked on hit) + a 60s periodic sweep. origin is set at
+  login-finish by the RemoteAddr (loopback / VPN segment); **both classes are legal and both are
+  recorded** (cross-segment cookie reuse is not rejected — per the requirement's original
+  semantics; /api/me and audit rows echo origin).
+- Cookie (verbatim):
+  `Set-Cookie: flock_session=<64hex>; HttpOnly; SameSite=Strict; Path=/; Max-Age=<session_ttl_secs>`;
+  logout returns the same name with `Max-Age=0` to delete. **No Secure** (no TLS, §M8.7). Cookies
+  are host-scoped ⇒ 127.0.0.1 vs the VIP, and VIP-a vs VIP-b, are each independent logins
+  (documented).
+- **Role model**: `UserRow.admin: bool` (below) decides the role. **Not logged in: everything
+  except the public endpoints (login-begin/finish, pw-begin/commit, bootstrap, static assets) is
+  401 `not_logged_in`**; non-admin: read-only endpoints available (peers/dashboard/config — this
+  data is already visible to any member via the M7 roster), admin endpoints 403 `forbidden`. The
+  per-endpoint role matrix is fixed in §M8.4.
+- **Demotion/disable takes effect = immediate session recycling (review revision)**: dispatch, on
+  the session-tier lookup, **re-reads `UserRow`** (the Raft form uses the locally applied view; a
+  linearizable read is not required — a local commit is visible on re-read immediately, another
+  server's commit takes effect within sub-second-to-seconds after local apply, the same view tier
+  as the roster/peers): after `set_admin=false`, an old session **gets 403 on its next request**
+  (the admin snapshot inside the session row does not count; `/api/me` echoes the sync); a
+  `disabled` user gets **401 `user_disabled` on the next request at any login-tier endpoint** —
+  neither waits for the TTL (the old behavior's 8h lingering privilege window is eliminated).
 
-**Web 会话 ↔ 既有授权面的显式裁决（三条，堵住歧义）**：
-1. Web 会话**不复用、不映射**控制流 60s 票据：票据绑设备、隧道内短期凭据；web 会话
-   绑用户、HTTP 面 8h 凭据——两套凭据两套生命周期，不桥接、互不可用。
-2. Web 变更类写操作**走既有 Raft 普通写路径**（与控制流 DeviceOp 同型）：授权在
-   handler 层（会话 user 须 admin）裁决后由本服务器经 `NetBackend` 提交。**不经过
-   也不放宽 `admin_op` 根签操作**：`add_voter/rewrap/revoke_invite` 与
-   `cluster-bootstrap/cluster-invite`（根密钥语境）**不在 Web UI 暴露**，仍走 CLI +
-   root.seed（§4-3 红线不变）。
-3. 与 admin loopback（:9444，无认证本机单写者）并存分工：CLI 运维面继续走 9444；
-   `web-admin-add` 走 9444 的扩展变体（首 admin 引导，下文）。两端点都不承诺远程。
+**Web sessions ↔ the existing authorization surfaces: an explicit ruling (three items, closing
+the ambiguity)**:
+1. Web sessions **neither reuse nor map to** the control flow's 60s tickets: tickets bind devices
+   and are short-term in-tunnel credentials; web sessions bind users and are 8h credentials on
+   the HTTP surface — two credential systems, two lifecycles; no bridging, mutually unusable.
+2. Web mutating writes **go through the existing ordinary Raft write path** (the same shape as
+   the control flow's DeviceOp): authorization is adjudicated at the handler layer (the session
+   user must be admin), then committed by this server via `NetBackend`. **They neither go through
+   nor loosen `admin_op` root-signed operations**: `add_voter/rewrap/revoke_invite` and
+   `cluster-bootstrap/cluster-invite` (root-key context) **are not exposed in the Web UI**; they
+   stay CLI + root.seed (the §4-3 red line unchanged).
+3. Coexistence and division of labor with the admin loopback (:9444, unauthenticated, single
+   local writer): the CLI ops surface keeps using 9444; `web-admin-add` is a 9444 extension
+   variant (first-admin bootstrap, below). Neither endpoint promises remote access.
 
-**注册表扩展（Raft 静态面）**：`UserRow`（flock-sync/src/proto.rs；单服 netstate 同源
-再导出）增三字段——**postcard 无字段标签 ⇒ 旧快照/旧日志不可解码，未发布窗口允许**
-（§7-M7.1 同一纪律；升级残留旧库重建。单服 redb 行编码为 netstate 模块自持布局：
-三字段尾追加，pre-M8 旧行**宽容解码**为缺省值——既有单服部署升级不破库，与 flock-sync
-postcard 快照的「干净失败」是两个不同编码面）：
+**Registry extension (Raft static plane)**: `UserRow` (flock-sync/src/proto.rs; re-exported by the
+single-server netstate from the same source) gains three fields — **postcard has no field tags ⇒
+old snapshots/old logs cannot be decoded; acceptable in the pre-release window** (the same
+discipline as §7-M7.1; upgrades with leftover old databases rebuild. The single-server redb row
+encoding is the netstate module's own layout: the three fields append at the tail, and pre-M8
+old rows are **leniently decoded** to default values — existing single-server deployments upgrade
+without breaking the database; this is a different encoding surface from flock-sync's postcard
+snapshot "clean failure"):
 
 ```rust
 pub struct UserRow {
-    pub opaque_record: Option<String>,  // 既有
-    pub opaque_profile: u16,            // 既有
-    pub sr_sig_pubs: Vec<[u8; 32]>,     // 既有
-    pub admin: bool,                    // 新（M8）：Web 管理角色
-    pub disabled: bool,                 // 新（M8）：禁用 ⇒ 阻断 Web 与控制流登录
-                                        //   （Web 会话下一请求即 401 user_disabled——评审修订；
-                                        //   已建数据面/控制流会话不追溯断开，设备级断离走 disable/revoke）
-    pub pw_bootstrap: Option<[u8; 16]>, // 新（M8）：初始/重置口令一次性引导令牌（消费即置 None）
+    pub opaque_record: Option<String>,  // existing
+    pub opaque_profile: u16,            // existing
+    pub sr_sig_pubs: Vec<[u8; 32]>,     // existing
+    pub admin: bool,                    // new (M8): Web admin role
+    pub disabled: bool,                 // new (M8): disabled ⇒ blocks Web and control-flow login
+                                        //   (a Web session gets 401 user_disabled on the next
+                                        //   request — review revision; established data-plane/
+                                        //   control-flow sessions are not retroactively dropped;
+                                        //   device-level severance goes through disable/revoke)
+    pub pw_bootstrap: Option<[u8; 16]>, // new (M8): initial/reset-password one-time bootstrap token
+                                        //   (set to None once consumed)
 }
 ```
 
-`SyncRequest` **尾部追加**五个普通写（无根签要求——授权在提交方 handler/CLI 层，与
-SetPassword/AddUserSigKey 同型）+ `StateError` 尾部追加 `BadBootstrapToken`：
+`SyncRequest` **appends at the tail** five ordinary writes (no root-signature requirement —
+authorization is at the submitter's handler/CLI layer, the same shape as SetPassword/
+AddUserSigKey) + `StateError` tail-appends `BadBootstrapToken`:
 
 ```rust
-CreateUser { username: String, pw_bootstrap: [u8; 16] }      // UserExists 拒
+CreateUser { username: String, pw_bootstrap: [u8; 16] }      // UserExists rejects
 SetPasswordBootstrap { user: String, token: [u8; 16],
-                       record_b64: String, profile: u16 }    // 原子：令牌匹配 且 记录为空 ⇒ 落记录 + 清令牌
-ResetPassword { user: String, new_token: [u8; 16] }          // 清记录 + 置新令牌（管理员发起；旧口令即刻失效）
+                       record_b64: String, profile: u16 }    // atomic: token matches and the record
+                                                            // is empty ⇒ persist the record + clear
+                                                            // the token
+ResetPassword { user: String, new_token: [u8; 16] }          // clear the record + set a new token
+                                                            // (admin-initiated; the old password is
+                                                            // invalidated immediately)
 SetUserAdmin { user: String, admin: bool }
 SetUserDisabled { user: String, disabled: bool }
 ```
 
-- **禁用语义**：disabled 用户 Web login-finish 401 `user_disabled`（login-begin 对
-  未知用户/未设密码走 dummy 同形防枚举；对 disabled 用户**仍用真记录**——ke2 与
-  正常用户同形、不泄漏禁用态，诚实客户端得以完成 ke3 并在 finish 收到
-  `user_disabled`；禁用判定发生在口令证明成立之后，不泄漏额外信息）、控制流
-  `LoginBegin` 增同一判定（**唯一动到既有控制流分发的点**，测试覆盖）；已建数据面/
-  控制流会话不追溯断开（设备级处置走既有 disable/revoke）——文档写明。
-  **如实声明（评审修订）：禁用账号存在口令正确性 oracle**——finish 阶段口令正确 ⇒
-  `user_disabled`、错误 ⇒ `login_failed`（两者可区分）；该 oracle 仅在能对口令做
-  在线验证时可用，且受 §M8.3 登录退避（15min 滑窗、第 5 次起指数锁定封顶 900s）与
-  per-IP 令牌桶（10 次/min）节流——与「ke2 同形防枚举」的目标（不泄漏账号存在性/
-  禁用态于 begin 阶段）不冲突；代价换取诚实客户端的明确错误语义（否则禁用用户与
-  错口令不可区分，运维无法区分两者）。**Web 会话面**：disabled 用户已持有的 Web
-  会话在下一请求即 401 `user_disabled`（dispatch 回读 UserRow，见上「降权/禁用
-  生效 = 会话即时回收」）。
-- **口令设置流（创建/重置共用）**：管理员 `POST /api/users`（或 reset-password）⇒
-  响应一次性返回 `pw_bootstrap_token`（32hex，仅此一次，线下交付用户）⇒ 用户浏览器
-  `POST /api/pw-begin {user, token, m1_b64}`（令牌预检只读、不消费）⇒
-  `POST /api/pw-commit {user, token, record_b64, profile}`（Raft 原子消费 + 落记录）。
-  令牌 = 16B 随机一次性凭据，与 invite_id 同信任级（Raft 状态内可读、单次消费）。
+- **Disabled semantics**: a disabled user's Web login-finish gets 401 `user_disabled` (login-begin
+  goes down the dummy same-shape path for unknown users / users without a password, for
+  anti-enumeration; for disabled users **the real record is still used** — the ke2 is the same
+  shape as a normal user's, leaking no disabled state; an honest client can therefore complete
+  ke3 and receives `user_disabled` at finish; the disabled determination happens after the
+  password proof is established, leaking nothing extra), and the control flow's `LoginBegin` gains
+  the same determination (**the only touch to the existing control-flow dispatch**, test-covered);
+  established data-plane/control-flow sessions are not retroactively dropped (device-level
+  disposition goes through the existing disable/revoke) — documented. **Stated as-is (review
+  revision): a disabled account has a password-correctness oracle** — at finish, a correct
+  password ⇒ `user_disabled`, a wrong one ⇒ `login_failed` (distinguishable); that oracle is
+  usable only when online password verification is possible and is throttled by the §M8.3 login
+  backoff (15min sliding window, exponential lockout from the 5th failure, capped at 900s) and a
+  per-IP token bucket (10/min) — not in conflict with the "ke2 same-shape anti-enumeration" goal
+  (not leaking account existence / disabled state at the begin stage); the price buys honest
+  clients a clear error semantics (otherwise a disabled user and a wrong password would be
+  indistinguishable and ops could not tell them apart). **Web session surface**: a disabled
+  user's existing Web session gets 401 `user_disabled` on the next request (dispatch re-reads
+  UserRow; see "demotion/disable takes effect = immediate session recycling" above).
+- **Password-setting flow (shared by create/reset)**: admin `POST /api/users` (or
+  reset-password) ⇒ the response returns a one-time `pw_bootstrap_token` (32hex, exactly once,
+  delivered to the user out of band) ⇒ the user's browser `POST /api/pw-begin {user, token,
+  m1_b64}` (token pre-check is read-only, no consumption) ⇒ `POST /api/pw-commit {user, token,
+  record_b64, profile}` (atomic Raft consumption + record persist). The token = a 16B random
+  one-time credential, at the same trust level as an invite_id (readable inside Raft state,
+  single consumption).
 
-**首个 admin 引导（CLI 子命令，复用 credentials/OPAQUE 注册路径）**：
-`flock-server web-admin-add <用户名>`——stdin 交互读口令两遍（tty 有回显，本地信任域
-取舍，与 `flock-client login` 同语义）；进程内跑原生 OPAQUE 注册（`reg_start` →
-admin 端点 m1→m2 → `reg_finish` → 提交）。admin 端点（:9444）**尾部追加**两个变体：
-`AdminRequest::WebPwBegin { user, m1_b64 }` → m2（loopback 绑定 = 认证边界，与既有
-invite/revoke 同级信任）；`AdminRequest::WebPwCommit { user, token, record_b64,
-profile, admin: bool }`——服务在跑 ⇒ 经端点提交（多主：CreateUser（UserExists 幂等
-忽略）+ SetPasswordBootstrap + SetUserAdmin；token 由 CLI 生成随消息携带）；服务未跑
-⇒ 单服可直写状态库（Cmd::Invite 的 fallback 先例），**多主必须经在跑服务提交
-（Raft）**，否则明确报错。目标用户已存在且已有口令 ⇒ 拒绝并指引走 Web 重置。
+**First-admin bootstrap (a CLI subcommand reusing the credentials/OPAQUE registration path)**:
+`flock-server web-admin-add <username>` — reads the password twice interactively from stdin (a
+tty echoes; a local trust-domain trade-off, the same semantics as `flock-client login`); runs the
+native OPAQUE registration in-process (`reg_start` → the admin endpoint m1→m2 → `reg_finish` →
+submit). The admin endpoint (:9444) **tail-appends** two variants: `AdminRequest::WebPwBegin {
+user, m1_b64 }` → m2 (loopback binding = the authentication boundary, the same trust level as the
+existing invite/revoke); `AdminRequest::WebPwCommit { user, token, record_b64, profile, admin:
+bool }` — if the service is running ⇒ submit through the endpoint (multi-primary: CreateUser
+(UserExists idempotently ignored) + SetPasswordBootstrap + SetUserAdmin; the token is generated by
+the CLI and carried in the message); if the service is not running ⇒ the single-server form may
+write the state store directly (the Cmd::Invite fallback precedent); **multi-primary must submit
+through a running service (Raft)**, otherwise a clear error. If the target user already exists
+and already has a password ⇒ refuse and point to the Web reset flow.
 
-**登录失败退避 + 限速（进程内存，注入时钟可测）**：按用户名计失败（15min 滑窗）：
-第 5 次失败起锁定 30s，每再失败翻倍、封顶 900s；成功或窗净空即清零。另按 RemoteAddr
-令牌桶限 login-begin/pw-begin 频率（10 次/min，突发 10）——防枚举压测。429 响应带
-`retry_after_secs`。
+**Login-failure backoff + rate limiting (process memory, testable with an injected clock)**:
+failures counted per username (15min sliding window): from the 5th failure, lockout 30s, doubling
+per further failure, capped at 900s; success or an empty window clears it. Additionally a
+per-RemoteAddr token bucket rate-limits login-begin/pw-begin (10/min, burst 10) — against
+enumeration grinding. 429 responses carry `retry_after_secs`.
 
-#### M8.4 API 契约（逐字定死）
+#### M8.4 API contract (fixed verbatim)
 
-**通用约定**：
-- Base = `http://127.0.0.1:9800` 或 `http://<VIP>:9800`；API 前缀 `/api/`；资产在根
-  与 `/static/`。请求/响应体一律 `application/json; charset=utf-8`（资产/wasm 除外）。
-- **CSRF 双门槛（变更类 = 全部 POST）**：必须携带请求头 `X-Flock-Web: 1` **且**
-  `Content-Type: application/json`——浏览器跨站表单/顶级导航/fetch 均不可能同时满足
-  （无 CORS 面时自定义头必触发预检且预检无响应即失败）⇒ 与 SameSite=Strict 叠加
-  闭合 CSRF。缺头 ⇒ 400 `bad_request`（不泄漏是 CSRF 拦截）。
-- **统一错误信封（逐字）**：
+**Common conventions**:
+- Base = `http://127.0.0.1:9800` or `http://<VIP>:9800`; API prefix `/api/`; assets at the root
+  and under `/static/`. Request/response bodies are always `application/json; charset=utf-8`
+  (except assets/wasm).
+- **CSRF double gate (mutating = all POSTs)**: the request must carry the header `X-Flock-Web: 1`
+  **and** `Content-Type: application/json` — a cross-site form / top-level navigation / fetch in
+  a browser cannot satisfy both simultaneously (without a CORS surface, a custom header always
+  triggers a preflight that fails with no response) ⇒ stacked with SameSite=Strict, CSRF is
+  closed. Missing header ⇒ 400 `bad_request` (does not leak that it was a CSRF block).
+- **Unified error envelope (verbatim)**:
   ```json
-  {"error": {"code": "<code>", "message": "<白名单文案，不含路径/内部错误串>"}}
+  {"error": {"code": "<code>", "message": "<whitelisted copy, no paths/internal error strings>"}}
   ```
-  code → HTTP 映射（定死）：`bad_request` 400 / `not_logged_in` 401 / `login_failed`
-  401 / `user_disabled` 401 / `bad_token` 401 / `forbidden` 403 / `forbidden_origin`
-  403 / `not_found` 404 / `method_not_allowed` 405 / `user_exists` 409 /
-  `password_exists` 409 / `invalid_state` 409 / `cannot_demote_self` 409 /
-  `payload_too_large` 413 / `rate_limited` 429（另带 `retry_after_secs` 字段）/
-  `internal` 500。
-- 上限与走私拒绝：请求行 2KiB、头 8KiB、体 64KiB；存在 `Transfer-Encoding` 或重复
-  `Content-Length` ⇒ 400 关连接。**慢速攻击双层读超时（评审修订）**：单 read 15s
-  （半开）+ **单请求总时限 30s**（head+body 整体——逐字节滴注每 read 均在单读超时
-  内也绕不过总预算；到期关连接并计数，keep-alive 每请求重置）——否则可无限期占用
-  并发许可（64）耗尽管理面。
+  code → HTTP mapping (fixed): `bad_request` 400 / `not_logged_in` 401 / `login_failed` 401 /
+  `user_disabled` 401 / `bad_token` 401 / `forbidden` 403 / `forbidden_origin` 403 / `not_found`
+  404 / `method_not_allowed` 405 / `user_exists` 409 / `password_exists` 409 / `invalid_state`
+  409 / `cannot_demote_self` 409 / `payload_too_large` 413 / `rate_limited` 429 (also carrying a
+  `retry_after_secs` field) / `internal` 500.
+- Limits and smuggling rejection: request line 2KiB, headers 8KiB, body 64KiB; a
+  `Transfer-Encoding` or a duplicate `Content-Length` ⇒ 400 with connection close. **Slowloris
+  dual-layer read timeouts (review revision)**: 15s per read (half-open) + **a 30s total budget
+  per request** (head+body as a whole — byte-dripping that stays under each per-read timeout
+  still cannot pass the total budget; on expiry the connection closes and a counter increments;
+  keep-alive resets per request) — otherwise the 64 concurrency permits can be held open
+  indefinitely, exhausting the admin plane.
 
-**端点契约**（请求体 → 200 响应体逐字；角色列 = 会话要求；错误码列仅列业务项）：
+**Endpoint contract** (request body → 200 response body verbatim; the role column = session
+requirement; the error-code column lists business items only):
 
-| 端点 | 方法 | 角色 | 请求 → 200 响应 | 业务错误 |
+| Endpoint | Method | Role | Request → 200 response | Business errors |
 |---|---|---|---|---|
-| `/api/bootstrap` | GET | 公共 | → `{"cluster_id":"<hex32>","server_id":"<hex32>","identity_pub":"<b64-32B>","lang":"zh-CN"}` | — |
-| `/api/login-begin` | POST | 公共 | `{"user":"alice","ke1_b64":"…"}` → `{"ke2_b64":"…","bind_token":"<hex16B>","anchor_sig":"<hex64B>","server_id":"<hex32>"}`（未知用户 dummy 同形） | 400；429 |
-| `/api/login-finish` | POST | 公共 | `{"user":"alice","ke3_b64":"…"}` → `{"user":"alice","admin":true}` + Set-Cookie | 401 login_failed；401 user_disabled；429 |
-| `/api/logout` | POST | 登录 | `{}` → `{"ok":true}` + 清 cookie | 401 |
-| `/api/me` | GET | 登录 | → `{"user":"alice","admin":true,"origin":"vpn"‖"loopback","expires_unix":1760000000}` | 401 |
-| `/api/users` | GET | **admin** | → `{"users":[{"username":"bob","admin":false,"disabled":false,"has_password":true,"devices":2}]}`（username 升序） | 403 |
-| `/api/users` | POST | **admin** | `{"username":"bob"}` → `{"username":"bob","pw_bootstrap_token":"<hex32B>"}`（用户名约束 1..=32B、`[A-Za-z0-9_.-]`） | 409 user_exists；400 |
+| `/api/bootstrap` | GET | public | → `{"cluster_id":"<hex32>","server_id":"<hex32>","identity_pub":"<b64-32B>","lang":"zh-CN"}` | — |
+| `/api/login-begin` | POST | public | `{"user":"alice","ke1_b64":"…"}` → `{"ke2_b64":"…","bind_token":"<hex16B>","anchor_sig":"<hex64B>","server_id":"<hex32>"}` (unknown users dummy same shape) | 400; 429 |
+| `/api/login-finish` | POST | public | `{"user":"alice","ke3_b64":"…"}` → `{"user":"alice","admin":true}` + Set-Cookie | 401 login_failed; 401 user_disabled; 429 |
+| `/api/logout` | POST | logged in | `{}` → `{"ok":true}` + clears cookie | 401 |
+| `/api/me` | GET | logged in | → `{"user":"alice","admin":true,"origin":"vpn"‖"loopback","expires_unix":1760000000}` | 401 |
+| `/api/users` | GET | **admin** | → `{"users":[{"username":"bob","admin":false,"disabled":false,"has_password":true,"devices":2}]}` (username ascending) | 403 |
+| `/api/users` | POST | **admin** | `{"username":"bob"}` → `{"username":"bob","pw_bootstrap_token":"<hex32B>"}` (username constrained 1..=32B, `[A-Za-z0-9_.-]`) | 409 user_exists; 400 |
 | `/api/users/{u}/disable` | POST | **admin** | `{}` → `{"ok":true}` | 404 |
 | `/api/users/{u}/enable` | POST | **admin** | `{}` → `{"ok":true}` | 404 |
-| `/api/users/{u}/reset-password` | POST | **admin** | `{}` → `{"pw_bootstrap_token":"<hex32B>"}`（旧口令即刻失效） | 404 |
-| `/api/users/{u}/admin` | POST | **admin** | `{"admin":false}` → `{"ok":true}` | 409 cannot_demote_self（目标==会话用户且 admin=false） |
-| `/api/pw-begin` | POST | 公共（令牌） | `{"user":"bob","token":"<hex32B>","m1_b64":"…"}` → `{"m2_b64":"…"}` | 401 bad_token；409 password_exists；429 |
-| `/api/pw-commit` | POST | 公共（令牌） | `{"user":"bob","token":"<hex32B>","record_b64":"…","profile":0}` → `{"ok":true}` | 401 bad_token；409 password_exists |
-| `/api/peers` | GET | 登录（只读） | → `{"peers":[{"device_id":"<hex64B>","vip":"100.64.0.11","hostname":"box","owner":"alice","kind":"device"‖"server","online":true,"status":"active"‖"disabled"‖"revoked"‖"expired","last_seen_unix":1760000000,"tx_bps":120,"rx_bps":80}]}`（VIP 升序） | 401 |
-| `/api/peers/{device_id}/revoke` | POST | **admin** | `{}` → `{"ok":true,"epoch":43}`（Raft Revoke + apply 钩子杀会话，§2.2 吊销传播界） | 404 |
+| `/api/users/{u}/reset-password` | POST | **admin** | `{}` → `{"pw_bootstrap_token":"<hex32B>"}` (the old password is invalidated immediately) | 404 |
+| `/api/users/{u}/admin` | POST | **admin** | `{"admin":false}` → `{"ok":true}` | 409 cannot_demote_self (target == the session user and admin=false) |
+| `/api/pw-begin` | POST | public (token) | `{"user":"bob","token":"<hex32B>","m1_b64":"…"}` → `{"m2_b64":"…"}` | 401 bad_token; 409 password_exists; 429 |
+| `/api/pw-commit` | POST | public (token) | `{"user":"bob","token":"<hex32B>","record_b64":"…","profile":0}` → `{"ok":true}` | 401 bad_token; 409 password_exists |
+| `/api/peers` | GET | logged in (read-only) | → `{"peers":[{"device_id":"<hex64B>","vip":"100.64.0.11","hostname":"box","owner":"alice","kind":"device"‖"server","online":true,"status":"active"‖"disabled"‖"revoked"‖"expired","last_seen_unix":1760000000,"tx_bps":120,"rx_bps":80}]}` (VIP ascending) | 401 |
+| `/api/peers/{device_id}/revoke` | POST | **admin** | `{}` → `{"ok":true,"epoch":43}` (Raft Revoke + the apply hook kills sessions, §2.2 revocation propagation bound) | 404 |
 | `/api/peers/{device_id}/disable` | POST | **admin** | `{}` → `{"ok":true,"epoch":44}` | 404 |
-| `/api/peers/{device_id}/enable` | POST | **admin** | `{}` → `{"ok":true}` | 404；409 invalid_state（Revoked/Expired 终态） |
-| `/api/peers/{device_id}/kick` | POST | **admin** | `{}` → `{"ok":true}`（语义：**尽力本地**——杀本机会话 + detach 本机租约；多主下他机会话不追溯（对方租约 30s TTL 过期后 online 判定转 false；设备自动重连会重新上线——kick ≠ 封禁，确定断离用 disable/revoke）；UI 二次确认文案同义） | 404 |
-| `/api/dashboard/summary` | GET | 登录（只读） | → `{"cluster":{"cluster_id":"<hex32>","epoch":42,"sync_mode":"single"‖"raft"},"servers":[{"node_id":1,"vip":"100.64.0.1","endpoint":"ep:9443","leader":true,"epoch":42,"online":true}],"totals":{"devices":7,"devices_active":5,"devices_online":3,"users":4,"tx_bps_sum":0,"rx_bps_sum":0},"self":{"server_id":"<hex32>","uptime_secs":3600}}` | 401 |
-| `/api/dashboard/series?vip=100.64.0.11` | GET | 登录（只读） | → `{"vip":"100.64.0.11","interval_secs":60,"points":[{"t":1760000000,"tx_bps":100,"rx_bps":50},…≤120 项，旧→新]}` | 401；404（VIP 既无序列也不在注册表） |
-| `/api/config` | GET | 登录（只读） | → `{"listen_mode":"direct"‖"frp","advertise_endpoint":"…","sync_mode":"single"‖"raft","ticket_ttl_secs":60,"peer_retention_days":30,"max_sessions":1024,"webui":{"port":9800,"session_ttl_secs":28800}}`（**字段白名单：无密钥/无 srvmesh 对端表/无根材料**） | 401 |
-| `/api/audit` | GET | **admin** | → `{"entries":[{"ts":1760000000,"user":"alice","action":"user.create","target":"bob","origin":"vpn","result":"ok"},…≤200 项，新→旧]}` | 403 |
+| `/api/peers/{device_id}/enable` | POST | **admin** | `{}` → `{"ok":true}` | 404; 409 invalid_state (Revoked/Expired terminal) |
+| `/api/peers/{device_id}/kick` | POST | **admin** | `{}` → `{"ok":true}` (semantics: **best-effort local** — kill the local session + detach the local lease; under multi-primary, other servers' sessions are not retroactively touched (the peer's online flag flips to false after its 30s lease TTL expires; an auto-reconnecting device comes back online — kick ≠ ban; for a definitive severance use disable/revoke); the UI confirmation-modal copy says the same) | 404 |
+| `/api/dashboard/summary` | GET | logged in (read-only) | → `{"cluster":{"cluster_id":"<hex32>","epoch":42,"sync_mode":"single"‖"raft"},"servers":[{"node_id":1,"vip":"100.64.0.1","endpoint":"ep:9443","leader":true,"epoch":42,"online":true}],"totals":{"devices":7,"devices_active":5,"devices_online":3,"users":4,"tx_bps_sum":0,"rx_bps_sum":0},"self":{"server_id":"<hex32>","uptime_secs":3600}}` | 401 |
+| `/api/dashboard/series?vip=100.64.0.11` | GET | logged in (read-only) | → `{"vip":"100.64.0.11","interval_secs":60,"points":[{"t":1760000000,"tx_bps":100,"rx_bps":50},…≤120 items, old→new]}` | 401; 404 (VIP has neither a series nor a registry entry) |
+| `/api/config` | GET | logged in (read-only) | → `{"listen_mode":"direct"‖"frp","advertise_endpoint":"…","sync_mode":"single"‖"raft","ticket_ttl_secs":60,"peer_retention_days":30,"max_sessions":1024,"webui":{"port":9800,"session_ttl_secs":28800}}` (**field whitelist: no keys / no srvmesh peer table / no root material**) | 401 |
+| `/api/audit` | GET | **admin** | → `{"entries":[{"ts":1760000000,"user":"alice","action":"user.create","target":"bob","origin":"vpn","result":"ok"},…≤200 items, new→old]}` | 403 |
 
-- **action 词表（定死）**：`session.login / session.logout / user.create / user.disable
-  / user.enable / user.reset_password / user.set_admin / peer.revoke / peer.disable /
-  peer.enable / peer.kick`；result ∈ `ok|denied|error`（denied 也记录——含 403 尝试，
-  不记口令/令牌/票据字节）。
-- **装配语义**：`/api/peers` = 注册表全行（含 status/device_id）⋈ 本地租约视图
-  （online/last_seen/EWMA）——与 §7-M7.4 名册同装配源、不同投影（名册仅 Active 且
-  无 device_id；web 面全状态 + device_id 供操作寻址）。`/api/dashboard/summary`：
-  多主 = server_keys 本地视图（node/vip）+ 根签目录 endpoint + 自发布租约 online +
-  `current_leader`；单服 = 本机一条（leader=true、online=true）；totals.users =
-  UserRow 计数（本地已 apply 视图——展示面档位，同名册 §7-M7.4）。
-- **静态资产**：`GET /`（index.html）、`GET /static/*`；content-type：`.html`=
-  text/html、`.js`=text/javascript、`.css`=text/css、`.wasm`=application/wasm；
-  未知 `/api/*` → 404 JSON，其余 → **SPA fallback**（index.html 200，M8b 落地——
-  hash 路由直击/刷新面；API 客户端不吞 HTML 的 404 JSON 面不变）。
+- **Action vocabulary (fixed)**: `session.login / session.logout / user.create / user.disable /
+  user.enable / user.reset_password / user.set_admin / peer.revoke / peer.disable / peer.enable /
+  peer.kick`; result ∈ `ok|denied|error` (denied is also recorded — including 403 attempts;
+  password/token/ticket bytes are never recorded).
+- **Assembly semantics**: `/api/peers` = all registry rows (incl. status/device_id) ⋈ the local
+  lease view (online/last_seen/EWMA) — the same assembly source as the §7-M7.4 roster, a
+  different projection (the roster shows only Active and no device_id; the web surface shows all
+  states + device_id for operational addressing). `/api/dashboard/summary`: multi-primary = the
+  server_keys local view (node/vip) + the root-signed directory endpoint + the self-published
+  lease online + `current_leader`; single-server = one local entry (leader=true, online=true);
+  totals.users = the UserRow count (locally applied view — display-tier, same as the roster
+  §7-M7.4).
+- **Static assets**: `GET /` (index.html), `GET /static/*`; content-type: `.html`=text/html,
+  `.js`=text/javascript, `.css`=text/css, `.wasm`=application/wasm; unknown `/api/*` → 404 JSON,
+  everything else → **SPA fallback** (index.html 200, landed in M8b — the hash-route
+  direct-hit/refresh surface; the 404-JSON face for API clients does not swallow HTML).
 
-#### M8.5 Dashboard 数据面：流量时间序列（内存环形缓冲）
+#### M8.5 Dashboard data plane: traffic time series (in-memory ring buffer)
 
-- 服务端内存环形缓冲（**不进 Raft、不进 gossip**——本机展示面）：per-VIP
-  `VecDeque<(unix_minute, tx_bps, rx_bps)>`，容量 `series_points`（缺省 120）×
-  `series_interval_secs`（缺省 60）⇒ **2 小时窗**。采样任务随 webui 装配：每
-  interval 取本机流量源的当前 EWMA 快照——单服 = `TrafficMeter::stats(vip)`（服务器
-  自身走 SERVER_TRAFFIC_KEY）；多主 = `LeaseTable::peer_stats(device)`（服务器自身走
-  `server_self_device_id`；本机不持有租约的行以最近 gossip 值参与——与名册同视图）。
-  VIP↔Device 映射来自注册表本地快照；行消失（吊销/过期）后序列保留至自然环出。
-- **重启清零（写明、可接受）**——环形缓冲纯内存，进程重启后曲线从零开始；无样本但
-  在册的 VIP 返回空 points 数组（非 404）。
-- 内存预算：每 peer ~3KB（120×24B）× 1k 设备 ≈ 3MB——接受。
+- A per-server in-memory ring buffer (**not into Raft, not into gossip** — a local display
+  surface): per-VIP `VecDeque<(unix_minute, tx_bps, rx_bps)>` with capacity `series_points`
+  (default 120) × `series_interval_secs` (default 60) ⇒ **a 2-hour window**. The sampling task is
+  assembled with webui: every interval it takes the current EWMA snapshot of the local traffic
+  sources — single-server = `TrafficMeter::stats(vip)` (the server itself via SERVER_TRAFFIC_KEY);
+  multi-primary = `LeaseTable::peer_stats(device)` (the server itself via
+  `server_self_device_id`; rows without a local lease participate with the latest gossip value —
+  the same view as the roster). The VIP↔Device mapping comes from the local registry snapshot;
+  after a row disappears (revoked/expired) the series is retained until it naturally rings out.
+- **Restart clears it (written down, accepted)** — the ring buffer is pure memory; after a process
+  restart the curves start from zero; a VIP on the roster but with no samples returns an empty
+  points array (not 404).
+- Memory budget: ~3KB per peer (120×24B) × 1k devices ≈ 3MB — accepted.
 
-#### M8.6 前端（页面 / wasm C-ABI 契约 / 资产清单）
+#### M8.6 Frontend (pages / wasm C-ABI contract / asset inventory)
 
-**页面**（SPA、hash 路由手写、无路由库）：
-1. `#/login`：登录页（用户名/口令；失败文案与锁定倒计时）。
-2. `#/set-password`：初始/重置口令页（引导令牌 + 新口令两遍；走 pw-begin/commit）。
-3. `#/dashboard`：Server 卡片（node/VIP/endpoint/leader/epoch/online）+ 汇总卡片 +
-   每设备流量曲线（uPlot，tx/rx 双序列；60s 轮询 series+summary）。
-4. `#/peers`：设备表（全字段 + 状态徽章 + 在线点）+ 行操作：吊销（**二次确认
-   modal**，Esc/取消可退）/禁用/启用/强制下线（kick 语义文案与 §M8.4 一致）。
-5. `#/users`：账号表（admin 徽章/禁用态/设备数）+ 创建（引导令牌**仅弹窗展示一次**
-   + 复制按钮）/禁用/重置口令（同令牌语义）/设 admin。
-6. `#/settings`：配置只读摘要 + 审计日志表（admin）。
-非 admin 登录后：dashboard/peers 可见；users/settings 隐藏且直击 API 403 → 前端转
-「无权限」页。设计系统：自写深色主题（CSS custom properties：背景/表面/边框/主色/
-语义色）、**系统字体栈（零 webfont）**、组件 = 卡片/表格/按钮/徽章/modal/表单校验态。
+**Pages** (SPA, hand-written hash routing, no router library):
+1. `#/login`: the login page (username/password; failure copy and a lockout countdown).
+2. `#/set-password`: the initial/reset password page (bootstrap token + the new password twice;
+   via pw-begin/commit).
+3. `#/dashboard`: Server cards (node/VIP/endpoint/leader/epoch/online) + summary cards + a
+   per-device traffic curve (uPlot, tx/rx dual series; 60s polling of series+summary).
+4. `#/peers`: the device table (all fields + status badges + an online dot) + row actions: revoke
+   (**a confirmation modal**, Esc/cancel backs out) / disable / enable / force disconnect (kick
+   semantics copy consistent with §M8.4).
+5. `#/users`: the account table (admin badge/disabled state/device count) + create (the bootstrap
+   token **shown exactly once in a modal** + a copy button) / disable / reset password (the same
+   token semantics) / set admin.
+6. `#/settings`: the read-only config summary + the audit log table (admin).
+A non-admin login: dashboard/peers visible; users/settings hidden and direct API hits 403 → the
+frontend shows a "no permission" page. Design system: hand-written dark theme (CSS custom
+properties: background/surface/border/primary/semantic colors), **system font stack (zero
+webfonts)**, components = cards/tables/buttons/badges/modals/form validation states.
 
-**wasm C-ABI 契约**（`webauth_shim.rs`，`#[cfg(all(feature = "wasm",
-target_arch = "wasm32"))]`；全部 `#[no_mangle] pub extern "C"`；返回值 0=ok、负数=
-错误码）：
+**wasm C-ABI contract** (`webauth_shim.rs`, `#[cfg(all(feature = "wasm",
+target_arch = "wasm32"))]`; all `#[no_mangle] pub extern "C"`; return 0 = ok, negative = error
+code):
 
 ```text
-sr_wasm_inject_entropy(ptr: *const u8, len: usize)              // JS 启动即调（crypto.getRandomValues ≥32B）
-sr_wasm_alloc(len: usize) -> *mut u8 / sr_wasm_free(ptr, len)   // JS 写参/读返回的缓冲分配
+sr_wasm_inject_entropy(ptr: *const u8, len: usize)              // called by JS at startup (crypto.getRandomValues ≥32B)
+sr_wasm_alloc(len: usize) -> *mut u8 / sr_wasm_free(ptr, len)   // buffer allocation for JS writing args / reading returns
 sr_web_login_begin(user_ptr, user_len, pw_ptr, pw_len, out_ptr, out_cap) -> i32
-    // WasmRng（GLOBAL_RNG 适配器）驱动 pake::login_start；ClientLogin 状态存模块级
-    // 单槽（Mutex<Option<..>>，后一次 begin 覆盖前一次）；out 写 ke1_b64（NUL 结尾）
+    // WasmRng (GLOBAL_RNG adapter) drives pake::login_start; the ClientLogin state lives in a
+    // module-level single slot (Mutex<Option<..>>; a later begin overwrites the previous one);
+    // out receives ke1_b64 (NUL-terminated)
 sr_web_login_finish(ke2_ptr, ke2_len, server_id_ptr(16B), identity_pub_ptr(32B),
                     bind_token_ptr(16B), anchor_sig_ptr(64B), out_ptr, out_cap) -> i32
-    // pake::login_finish_anchored（anchor 验签）→ out 写 ke3_b64
-sr_web_pw_begin(user_ptr, user_len, pw_ptr, pw_len, out_ptr, out_cap) -> i32   // reg_start → m1_b64（状态单槽同上）
+    // pake::login_finish_anchored (anchor verification) → out receives ke3_b64
+sr_web_pw_begin(user_ptr, user_len, pw_ptr, pw_len, out_ptr, out_cap) -> i32   // reg_start → m1_b64 (state single-slot as above)
 sr_web_pw_finish(m2_ptr, m2_len, out_ptr, out_cap) -> i32                      // reg_finish → record_b64
-错误码：-1 未注入熵；-2 pake 失败（错口令/坏报文同码）；-3 anchor 验签拒；-4 out 容量不足
+error codes: -1 entropy not injected; -2 pake failure (wrong password/bad message share the code);
+-3 anchor verification rejected; -4 out capacity insufficient
 ```
 
-JS 胶水 `assets/flock_pake.js`（手写 ~120 行）：`WebAssembly.instantiate` → 注入熵 →
-暴露 Promise API `loginBegin(user,pw)` / `loginFinish(ke2,anchor)→ke3` /
-`pwBegin/pwFinish`（内部 sr_wasm_alloc 拷参/读返回/sr_wasm_free）。argon2
-（m=19MiB t=2）在主线程 ~100ms 量级——按钮 spinner 态承担，不引 worker（v1 如实
-声明）。
+JS glue `assets/flock_pake.js` (hand-written ~120 lines): `WebAssembly.instantiate` → inject
+entropy → expose a Promise API `loginBegin(user,pw)` / `loginFinish(ke2,anchor)→ke3` /
+`pwBegin/pwFinish` (internally sr_wasm_alloc to copy args/read returns/sr_wasm_free). argon2
+(m=19MiB t=2) is on the order of ~100ms on the main thread — the button spinner state absorbs
+it; no worker (v1, stated as-is).
 
-**资产清单**（`app/flock-server/src/webui/assets/`，全部 include_dir 内嵌 + vendored
-LICENSE 文件同库）：
+**Asset inventory** (`app/flock-server/src/webui/assets/`, all embedded via include_dir with the
+vendored LICENSE files in the same library):
 
 ```text
 index.html  app.js  i18n.js  style.css  flock_pake.js  flock_pake.wasm  vendor/{alpine.min.js, uplot.min.js, uplot.css}
 ```
 
-构建：wasm 产物由 `deploy/build-wasm.sh` 产出后拷入 assets/（**产物提交进库**——CI 无
-wasm 工具链也能出完整二进制；门禁另跑 wasm check + 产物一致性校验防源码/产物漂移）。
+Build: the wasm artifact is produced by `deploy/build-wasm.sh` and copied into assets/ (the
+**artifact is committed** — CI can produce the full binary without a wasm toolchain; the gates
+additionally run a wasm check + artifact-consistency check against source/artifact drift).
 
-#### M8.7 安全清单（定死）
+#### M8.7 Security checklist (fixed)
 
-1. **Cookie/传输**：HttpOnly + SameSite=Strict + Path=/ + Max-Age=TTL；**无 Secure、
-   不做 TLS**——信任域声明（如实）：loopback 上**本机其它用户/进程可嗅探明文与
-   cookie**（具备本机抓包权即已等效半沦陷；多用户机器上 loopback 管理是知情取舍）；
-   VPN 段上传输 = 逐跳 E2E（peer↔接入服务器 + 服务器间 FRWD，§2.2/§2.5）——其它
-   peer 不可见；**服务器端点本身可见（同 §2.5-1 边界，不新增安全主张）**。
-2. **CSRF**：SameSite=Strict + 变更类 POST 双门槛（`X-Flock-Web: 1` + JSON
-   content-type，§M8.4）。
-3. **速率限制**：§M8.3 登录退避 + per-IP 令牌桶；429 带 retry_after_secs。
-   两表容量上限 4096 + 60s 周期清扫（评审修订——未认证面注入任意 user/IP 名不构成
-   无界内存增长）。
-4. **审计**：变更类与登录失败留痕——stderr（journald 接管，与既有 `flock-server:`
-   日志同通道）+ 内存最近 **200** 条（`/api/audit`，admin）；字段 ts/user/action/
-   target/origin/result，**不记口令/令牌/票据字节**；user/target 输出前清洗控制
-   字符（评审修订——stderr 单行格式不可被行注入伪造审计行；入参层四公共认证端点
-   拒含控制字符/超长 user）。
-5. **不泄密**：错误 message 白名单文案（§M8.4 信封）；`/api/config` 字段白名单；
-   日志不打印 ke1/ke2/ke3/record 全文（仅长度与前 8 字符诊断位）。
-6. **会话面**：sid 256bit 随机、内存表、logout 即删；授权判定回读 UserRow——
-   降权/禁用对旧会话下一请求即生效（§M8.3，评审修订）；v1 已知残余（如实）：重置
-   口令不强制踢其它在途会话（旧 sid 可用至 TTL，TTL 8h 封顶暴露——重置不置
-   disabled，不触发 6 的即时回收路径）——「敏感操作后旋转 sid」列后补档期。
+1. **Cookie/transport**: HttpOnly + SameSite=Strict + Path=/ + Max-Age=TTL; **no Secure, no TLS**
+   — trust-domain statement (as-is): on loopback, **other local users/processes can sniff the
+   plaintext and the cookie** (holding local packet capture is already equivalent to a half
+   compromise; loopback administration on a multi-user machine is an informed trade-off); on the
+   VPN segment, transport = per-hop E2E (peer↔access server + inter-server FRWD, §2.2/§2.5) —
+   invisible to other peers; **the server endpoint itself is visible (the same §2.5-1 boundary;
+   no new security claim)**.
+2. **CSRF**: SameSite=Strict + the double gate on mutating POSTs (`X-Flock-Web: 1` + JSON
+   content-type, §M8.4).
+3. **Rate limiting**: the §M8.3 login backoff + per-IP token bucket; 429 carries
+   retry_after_secs. Both tables are capacity-capped at 4096 + a 60s periodic sweep (review
+   revision — arbitrary user/IP names injected on the unauthenticated surface no longer cause
+   unbounded memory growth).
+4. **Audit**: mutations and login failures leave records — stderr (journald-managed, the same
+   channel as the existing `flock-server:` logs) + the most recent **200** entries in memory
+   (`/api/audit`, admin); fields ts/user/action/target/origin/result, **never recording
+   password/token/ticket bytes**; user/target have control characters stripped before output
+   (review revision — the single-line stderr format cannot be line-injected into forged audit
+   rows; at the input layer the four public auth endpoints reject control characters / oversized
+   user values).
+5. **No leaks**: error messages are whitelisted copy (§M8.4 envelope); `/api/config` has a field
+   whitelist; logs never print full ke1/ke2/ke3/record (only lengths and the first 8 characters as
+   a diagnostic hint).
+6. **Session surface**: sid is 256-bit random, in-memory table, deleted on logout; authorization
+   re-reads UserRow — demotion/disable takes effect on an old session's next request (§M8.3,
+   review revision); known v1 residual (as-is): a password reset does not forcibly kick other
+   in-flight sessions (an old sid stays usable until TTL; the 8h TTL caps the exposure — a reset
+   does not set disabled and so does not trigger item 6's immediate-recycling path) — "rotate the
+   sid after sensitive operations" is listed for a later batch.
 
-#### M8.8 文件落位（定死）
+#### M8.8 File placement (fixed)
 
 ```text
-app/flock-server/src/webui/mod.rs        装配：loopback 先行 + VIP 绑定重试任务（5s）；挂进 server::run / sync::run_raft
-app/flock-server/src/webui/http.rs       最小 HTTP/1.1（解析/响应/keep-alive/上限/走私拒绝）
-app/flock-server/src/webui/session.rs    会话表（issue/lookup/logout/256 上限淘汰/清扫）
-app/flock-server/src/webui/access.rs     来源矩阵 + CSRF 双门槛 + 角色矩阵 + 登录退避 + 令牌桶 + 审计环
-app/flock-server/src/webui/api.rs        路由分发 + 全部 handler（调 NetBackend / pake / roster 装配）
-app/flock-server/src/webui/series.rs     流量环形缓冲 + 采样任务
-app/flock-server/src/webui/assets.rs     include_dir 嵌入 + content-type + Cache-Control
-app/flock-server/src/webui/assets/…      前端资产（§M8.6 清单）
-app/flock-server/tests/webui.rs          HTTP e2e（Rust 原生 OPAQUE 驱动登录——绕过 wasm，协议同构）
-app/flock-server/examples/webui_login.rs HTTP-OPAQUE 驱动器（webui_assert.sh 的 CLI 载具：登录/CRUD 探针）
-crates/flock-protocol/src/webauth_shim.rs wasm C-ABI 垫片（feature wasm+anchor 门控）
-deploy/build-wasm.sh                     wasm 构建 + 产物拷入 assets/ + 一致性校验
-deploy/webui.yml / webui_assert.sh       容器集成断言（§M8.9 W1–W7）
-docs/manual/webui-checklist.md           浏览器真机清单（M8c）
+app/flock-server/src/webui/mod.rs        assembly: loopback first + the VIP-bind retry task (5s); hung into server::run / sync::run_raft
+app/flock-server/src/webui/http.rs       minimal HTTP/1.1 (parsing/response/keep-alive/limits/smuggling rejection)
+app/flock-server/src/webui/session.rs    session table (issue/lookup/logout/256-cap eviction/sweep)
+app/flock-server/src/webui/access.rs     origin matrix + CSRF double gate + role matrix + login backoff + token bucket + audit ring
+app/flock-server/src/webui/api.rs        route dispatch + all handlers (calling NetBackend / pake / roster assembly)
+app/flock-server/src/webui/series.rs     traffic ring buffer + the sampling task
+app/flock-server/src/webui/assets.rs     include_dir embedding + content-type + Cache-Control
+app/flock-server/src/webui/assets/…      frontend assets (the §M8.6 inventory)
+app/flock-server/tests/webui.rs          HTTP e2e (login driven by a native-Rust OPAQUE client — bypassing wasm; protocol-isomorphic)
+app/flock-server/examples/webui_login.rs the HTTP-OPAQUE driver (the CLI vehicle of webui_assert.sh: login/CRUD probes)
+crates/flock-protocol/src/webauth_shim.rs the wasm C-ABI shim (feature wasm+anchor gated)
+deploy/build-wasm.sh                     wasm build + artifact copy into assets/ + consistency check
+deploy/webui.yml / webui_assert.sh       container integration assertions (§M8.9 W1–W7)
+docs/manual/webui-checklist.md           browser real-machine checklist (M8c)
 ```
 
-依赖变更：flock-server 增 `serde_json`（workspace 锁内已有）与 `include_dir`（新，
-proc-macro 级小 crate）；flock-protocol 不新增依赖（feature 组合使用）。代码触点：
-config.rs `[webui]` 节 + 端口冲突校验；main.rs `web-admin-add` 子命令；admin.rs 尾部
-追加 `WebPwBegin/WebPwCommit`；control.rs `LoginBegin` 增 disabled 判定（§M8.3）。
+Dependency changes: flock-server gains `serde_json` (already in the workspace lockfile) and
+`include_dir` (new, a small proc-macro-level crate); flock-protocol gains no new dependencies
+(feature composition only). Code touch points: the config.rs `[webui]` section + the port-conflict
+validation; the main.rs `web-admin-add` subcommand; admin.rs tail-appends `WebPwBegin/
+WebPwCommit`; control.rs `LoginBegin` gains the disabled determination (§M8.3).
 
-#### M8.9 测试计划（可验证断言）
+#### M8.9 Test plan (verifiable assertions)
 
-**单测**（`cargo test -p flock-server` / `-p flock-sync`）：
-- session.rs：签发/命中/过期拒/logout 删/**256 上限淘汰最旧**/惰性+周期清扫；
-- access.rs：来源矩阵（127.0.0.1、127.3.2.1、[::1] 放行；100.64.0.11 放行；
-  192.168.x.x、8.8.8.8 ⇒ 403 forbidden_origin）；CSRF（POST 缺自定义头 400、有头
-  缺 JSON content-type 400）；**角色矩阵逐端点三态枚举**（未登录 401 / 非 admin 403
-  / admin 200，含 401 与 403 的先后——先会话后角色）；登录退避（注入时钟：5 锁
-  30s、翻倍、900 封顶、成功清零）；
-- http.rs：请求向量（合法 GET/POST 往返；坏请求行/超长头/超体 413/Transfer-Encoding
-  400/重复 Content-Length 400/半包超时关连接）；
-- series.rs：注入时钟定点采样 → 环出上限 120 → 新实例为空（重启语义）→ 行消失后
-  序列保留；
-- flock-sync：UserRow 往返（新字段）、五新写变体语义（UserExists / 令牌错
-  BadBootstrapToken / 令牌重放拒 / ResetPassword 后旧口令记录失效 / 终态设备 enable
-  拒）、旧快照不可解码干净失败。
+**Unit tests** (`cargo test -p flock-server` / `-p flock-sync`):
+- session.rs: issue/hit/expiry-reject/logout-delete / **256-cap oldest eviction** / lazy +
+  periodic sweep;
+- access.rs: the origin matrix (127.0.0.1, 127.3.2.1, [::1] allowed; 100.64.0.11 allowed;
+  192.168.x.x, 8.8.8.8 ⇒ 403 forbidden_origin); CSRF (a POST missing the custom header 400; with
+  the header but missing the JSON content-type 400); **the role matrix per endpoint, three states
+  enumerated** (not logged in 401 / non-admin 403 / admin 200, including the order of 401 vs 403
+  — session first, then role); login backoff (injected clock: 5th locks 30s, doubling, 900 cap,
+  success clears);
+- http.rs: request vectors (a legal GET/POST round trip; a bad request line / oversized headers /
+  oversized body 413 / Transfer-Encoding 400 / duplicate Content-Length 400 / half-packet timeout
+  closes the connection);
+- series.rs: an injected clock sampling at fixed points → ring-out caps at 120 → a new instance
+  starts empty (restart semantics) → the series is retained after the row disappears;
+- flock-sync: UserRow round trips (new fields), the five new write variants' semantics (UserExists
+  / a wrong token BadBootstrapToken / token replay rejected / the old password record invalidated
+  after ResetPassword / enabling a terminal-state device rejected), and old snapshots failing
+  cleanly as undecodable.
 
-**集成**（tests/webui.rs，进程内真 HTTP + 原生 pake 客户端——协议同构，绕过 wasm）：
-未登录除公共端点外全 401（枚举全部端点）；首 admin 引导（web-admin-add 路径函数）→
-reg/login（anchor 验签过）→ cookie 会话 → me/peers/dashboard/series/config/audit
-读写全链；非 admin 403 矩阵；cannot_demote_self；user_exists/password_exists/
-bad_token/令牌重放；审计环出现（含 denied 行）；logout 后原 sid 401。wasm 门禁：
-`cargo check -p flock-protocol --target wasm32-unknown-unknown --no-default-features
---features wasm,anchor`。
+**Integration** (tests/webui.rs, real HTTP in-process + a native pake client — protocol-isomorphic,
+bypassing wasm): not logged in, everything except the public endpoints is 401 (all endpoints
+enumerated); first-admin bootstrap (the web-admin-add path function) → reg/login (anchor
+verification passes) → cookie session → the me/peers/dashboard/series/config/audit read-write
+full chain; the non-admin 403 matrix; cannot_demote_self; user_exists/password_exists/bad_token/
+token replay; the audit ring shows entries (including denied rows); after logout the original sid
+gets 401. wasm gate: `cargo check -p flock-protocol --target wasm32-unknown-unknown
+--no-default-features --features wasm,anchor`.
 
-**容器集成**（deploy/webui.yml：复用 multinode 双 server + client 拓扑；
-webui_assert.sh 断言）：
+**Container integration** (deploy/webui.yml: reusing the multinode two-server + client topology;
+webui_assert.sh assertions):
 
-| # | 断言 |
+| # | Assertion |
 |---|---|
-| W1 | 未登录：管理 API 全 401（server-a 容器内 curl 127.0.0.1:9800） |
-| W2 | loopback 登录 → CRUD 全链：`web-admin-add`（管道喂口令）引导首 admin → examples/webui_login 驱动 HTTP-OPAQUE 登录 → users 创建/禁用/重置/设 admin → peers 列表/吊销 → dashboard/series → audit 含对应行 |
-| W3 | 非 admin 账户：只读端点 200、users*/revoke/kick/audit 403 |
-| W4 | client-1 容器（flockpub 网络，flock-client 的网络命名空间）内 `curl http://100.64.0.1:9800`（server-a VIP）可达且登录链可用（VPN 段路径实证） |
-| W5 | client-1 内 curl server-a 的 flockpub/LAN 地址 :9800 **不可达**（timeout/refused——未绑定面的连接层证明） |
-| W6 | 双 server VIP（100.64.0.1 / 100.64.0.2）均可访问且**数据一致**：各自登录后 /api/peers 的 (device_id, vip, owner, status) 集合严格一致（ewma/last_seen 容差比较——§7-M7.6 同档）；/api/users 列表一致（Raft 收敛后） |
-| W7 | 配置校验：`[webui] port=9443`（与 bind 冲突）拒起服；配置面不存在 bind 键（结构防误配——toml 未知键忽略不生效，webui 节用显式白名单键集） |
+| W1 | Not logged in: all admin APIs 401 (curl 127.0.0.1:9800 inside the server-a container) |
+| W2 | loopback login → the full CRUD chain: `web-admin-add` (password fed via a pipe) bootstraps the first admin → examples/webui_login drives the HTTP-OPAQUE login → users create/disable/reset/set-admin → peers list/revoke → dashboard/series → audit contains the corresponding rows |
+| W3 | A non-admin account: read-only endpoints 200, users*/revoke/kick/audit 403 |
+| W4 | Inside the client-1 container (the flockpub network, flock-client's network namespace), `curl http://100.64.0.1:9800` (server-a's VIP) is reachable and the login chain works (the VPN-segment path proven live) |
+| W5 | From client-1, curl to server-a's flockpub/LAN address :9800 is **unreachable** (timeout/refused — the connection-layer proof of the unbound surface) |
+| W6 | Both server VIPs (100.64.0.1 / 100.64.0.2) are reachable and **the data agrees**: after logging in to each, the (device_id, vip, owner, status) sets from /api/peers are strictly identical (ewma/last_seen compared with tolerance — the same tier as §7-M7.6); the /api/users lists agree (after Raft convergence) |
+| W7 | Config validation: `[webui] port=9443` (conflicts with bind) refuses server start; the config surface has no bind key (structural misconfiguration-proofing — unknown toml keys are ignored, so the webui section uses an explicit whitelist key set) |
 
-**浏览器目视 = 真机清单**（docs/manual/webui-checklist.md，M8c）：登录/建号（令牌
-一次展示）/Dashboard 曲线刷新/吊销确认 modal/深色主题过 Chrome/Edge/Firefox；可选
-headless 冒烟（资产 content-type + wasm 可下载）进 CI。
+**Browser visual checks = the real-machine checklist** (docs/manual/webui-checklist.md, M8c):
+login/account creation (the token shown once)/Dashboard curve refresh/the revoke confirmation
+modal/the dark theme across Chrome/Edge/Firefox; an optional headless smoke (asset content-types +
+wasm downloadable) goes into CI.
 
-#### M8.10 里程碑切分与完成标准
+#### M8.10 Milestone split and completion criteria
 
-- **M8a 服务端 + API + 内嵌壳页**：webui 模块全部（http/session/access/api/series/
-  assets 骨架壳页）、UserRow/Raft 扩展与五写变体、CLI web-admin-add、tests/webui.rs。
-  浏览器面仅壳页（无 wasm——登录暂不可用，全部行为由 Rust 客户端验证）。完成标准：
-  单测+集成全绿；clippy/fmt/门禁；容器 W1–W3、W5、W7 全 PASS。
-- **M8b 前端 + wasm**：webauth_shim + build-wasm + 全部页面 + vendored 资产内嵌。
-  完成标准：wasm check 门禁绿；浏览器真机清单（登录/建号/dashboard/吊销）全通；
-  W4、W6 PASS（W4 的登录链可用 client 容器内 webui_login 代行）。
-- **M8c 评审 + 实测**：安全清单逐项复核（§M8.7）、多主三机 W6 扩展（含 follower
-  视图陈旧档）、120 点轮询的 CPU/内存抽样、部署文档段（端口/访问方式/信任边界/
-  反代不承诺）。
+- **M8a server + API + an embedded shell page**: the whole webui module (http/session/access/
+  api/series/assets with a skeleton shell page), the UserRow/Raft extensions and the five write
+  variants, the CLI web-admin-add, tests/webui.rs. The browser surface is a shell page only (no
+  wasm — login unavailable for now; all behavior verified by the Rust client). Completion
+  criteria: unit + integration all green; clippy/fmt/gates; containers W1–W3, W5, W7 all PASS.
+- **M8b frontend + wasm**: webauth_shim + build-wasm + all pages + vendored assets embedded.
+  Completion criteria: the wasm check gate green; the browser real-machine checklist
+  (login/account creation/dashboard/revoke) all passing; W4, W6 PASS (W4's login chain can be
+  executed on the client's behalf by webui_login inside the client container).
+- **M8c review + live testing**: the security checklist re-checked item by item (§M8.7), the
+  three-machine W6 extension for multi-primary (including the follower stale-view tier), CPU/
+  memory sampling under 120-point polling, and the deployment-doc section (ports/access methods/
+  trust boundaries/no reverse-proxy promise).
 
 ---
 
-## 8. 风险与对策
+## 8. Risks and countermeasures
 
-| # | 风险 | 依据 | 对策 | 残余 |
+| # | Risk | Basis | Countermeasure | Residual |
 |---|---|---|---|---|
-| R1 | Windows Docker Desktop 下 tun 不可用 | vpn-mesh §1.3 | **已实测消除**：WSL2 后端 `--cap-add NET_ADMIN` + `--device /dev/net/tun` 与 mknod 两路径均建设备成功（附录 B-2/3） | Hyper-V/VMM 后端未核 → 部署约束钉 WSL2 并写进 deploy/README |
-| R2 | ChmlFrp 真实节点未实测（需实名账号） | frp-compat gaps#1 | 自动化用原版 frp×2；协议一致性靠字节透传论证（§1.4）+ golden-file（配置侧）+ ChmlFrp 源码 diff 证据；有账号后按 R1/R6/R7 补测 | 中转侧残差（节点限速/长连接策略）只能在真实节点验证 |
-| R3 | TCP-over-TCP 弱网性能坍缩 | vpn-mesh §3.2（Titz 2001） | 单流限速/队列管理；MTU 1280 控制内层 MSS；远期 UDP 直连（自建节点 xtcp/自研） | 首版接受（形态如此），文档明示 |
-| R4 | 自研握手无形式化验证 | 本设计 §3.5（不用 snow 的理由） | 结构复刻 Noise IK/WireGuard 常量；transcript 测试向量 M1 守门；外部审计前列「实验档」标注；libcrux 备选关注 | 实现缺陷风险在 M1 向量覆盖前存在 |
-| R5 | opaque-ke 3→4 / dalek 2→3 API 代际迁移破坏兼容 | P1-6 | 固定向量互通测试 = M1 硬门槛；不通过则钉老版本并开迁移分支 | — |
-| R6 | ChmlFrp 免费档 8Mbps + 4 隧道上限 | frp-compat §2.1 | 单隧道多会话复用（yamux）设计定型；生产吞吐预期管理写入文档 | 带宽硬限不可解（付费档或自建节点） |
-| R7 | frp 官方 Windows exe 被本机安全策略拦截 | frp-compat gaps#4（本次研究实证） | 服务端 frpc 全部跑 Linux 容器（已验 FRPS_LINUX_OK）；Windows 客户端无需 frpc（直连用户口） | 分发给第三方 Windows 用户的 frpc 需签名/加白评估 |
-| R8 | zstd C 工具链跨平台/交叉编译 | compression-2026 §5 | Windows/MSVC 已证可编译；**容器路径已实测**：rust:1-slim-bookworm 自带 cc/gcc 且 zstd-sys vendored 编译成功（附录 B-9，7.67s）——slim 镜像即够用；lz4_flex 纯 Rust 后备档 | musl 静态链接路径 M1 内验证 |
-| R9 | 多主 Raft 经中转高 RTT → 选举抖动 | vpn-mesh §5.3 约束回顾 | 心跳/选举超时按中转 RTT 调参（M4 注入 100ms RTT 校准）；3 voter 起 | 跨国中转 RTT>500ms 时需实测调参 |
-| R10 | VORACLE/CRIME 长度侧信道 | compression-2026 §3.2（前提全成立） | 压缩默认关 + 策略开 + 填充 + 非膨胀回退（P0-4 全落） | 开启压缩的会话仍有残余信道——文档明示给管理员 |
-| R11 | yamux/TCP 队头阻塞 | vpn-mesh §4.2（RFC 9113 明示 TCP HOL 不可消） | 控制流高优先级 + 流控背压；接受为形态属性 | UDP 路径是唯一根治，远期 |
-| R12 | ML-DSA crate 未审计 | crypto-2026 §5 | `pq-sign` 默认关；启用需显式 opt-in 并读风险说明 | — |
-| R13 | wintun.dll 分发（Windows 客户端） | vpn-mesh §1.1（驱动 GPL、官方签名 DLL 分发例外） | tun-rs 内置 wintun 集成；随程序分发官方 0.14.1 签名 DLL | 杀软误报同 R7 策略 |
-| R14 | 内存态 SR-SIG1 nonce 表多主重启重放面 | verdict §3.6 | 重放状态分级归属（§2.4）：票据短 TTL + 关键操作 Raft 查重 + 会话计数器 | 高频请求级 nonce 非强一致——工程取舍，文档明示 |
-| R15 | 会话票据/共享秘密的多主封装面扩大 | VPN-15 | 逐服务器独立混合公钥 + rewrap 权限点（§3.10）；票据密钥根轮换经 Raft | — |
-| R16 | TOFU 首登在线 MITM 接管（SSH known_hosts 同类限制） | 本设计 §1.3.3f/§2.5-3（verdict §3.9 只被部分关闭） | 组织场景强制邀请文件强路径（含静态混合公钥+签名绑定）；TOFU 首连指纹确认 UI 不得静默 | 个人自建场景残余接受，文档明示 |
-| R17 | 跨 peer 流量在接入服务器明文 + 任一服务器可离线字典全部口令 | §2.5-1/2（与 Tailscale peer-E2E 属性根本不同） | 边界显式写进部署文档；服务器主机加固+准入红线（§4）；远期：peer 内层 E2E overlay、OPRF key 门限化 | 首版接受，防「误读为 peer 级 E2E」 |
-| R18 | 重连风暴把线性一致读全部打到 Raft leader | §1.3.3c lookup 接缝 | DeviceDirectory 两级读：epoch 缓存命中本地答，仅 epoch 变化/miss 才线性一致读（§4 读与缓存） | 吊销恰好与风暴同发时 leader 短时压力（写少场景可承受） |
-| R19 | 集群准入被伪造节点渗透（快照/rewrap 即 OPRF key 泄露面） | §4 准入红线 | 集群根密钥离线保管；服务器-服务器 profile 双向入群凭证；add_voter/rewrap 均需根密钥签名的 Raft 管理操作 | 根密钥泄露=全网重引导（灾难恢复路径文档化） |
-| R20 | ChmlFrp `-u/-p` 自举的 usertoken 经 InsecureSkipVerify HTTPS 传输 | frp-compat §2.2（api.go:30-46） | 默认 `-c` 配置文件模式（面板粘贴导出）；UserTokenAuto 显式 opt-in + 风险标注 | 用户坚持 -u/-p 模式时面板账号接管面存在 |
-| R21 | 租约陈旧窗口内跨服路由黑洞（设备迁移期） | §2.2 容错策略（vpn-mesh §5.2 明示为策略决策） | NOT_HERE → 一次性 location_query 重定向 + 失败丢包/ICMP（不缓存重试）；断言 A15 给 ≤35s 恢复界 | 迁移窗口丢包由上层恢复 |
-| R22 | 持有效会话的恶意设备伪造他人源 VIP（身份嫁祸/反射/未来 ACL 绕过；rp_filter 不覆盖用户态流） | §2.2 第 0 步（vpn-mesh §2 借鉴点 3「每节点入向过滤」） | 会话 DeviceId ↔ src VIP 绑定校验（失配丢+计数+超限断），ForwardEnvelope src_dev 交叉校验；A14 伪造源断言 | — |
-| R23 | 未兑换邀请文件泄露 = expiry 内被抢先兑换一次入网 | §1.3.3f 邀请一生 | invite_id 进 Raft 单次消费（二次拒）+ revoke_invite 吊销 + expiry 默认 7 天 + 文件按一次性凭据管理（0600） | 抢先兑换窗口存在（与 innernet 同边界），部署文档明示 |
-| R24 | follower 落后（分区恢复/追赶）时本地缓存放行已吊销设备 | §4 读与缓存的陈旧读边界披露 | apply-lag >2s 熔断本地缓存、降级线性一致读 + 票据 epoch/TTL 60s 兜底；M4 落后 5s 用例 | 熔断阈值内的 ≤2s 放行窗口与 A6 预算一致（健康前提显式化） |
-| R25 | 多服务器钉扎模型三选一的坑（共享密钥毁逐服务器封装/逐台 TOFU 不可扩展/切换降 2-RTT） | §1.3.3f 定型理由（第三轮评审 blocking） | 方案②：客户端锚定集群根公钥 + 根签 ClusterDirectory 全套材料（端点↔材料映射同签防拼接）；换钥=根签新条目+dir_pull，任意端点 1-RTT | 根密钥泄露=全网重引导（与 R19 同灾难路径） |
-| R26 | 架构强绑 frp 致直连场景多余进程/故障面（可直连的服务器被迫跑 frpc：多余子进程、配置生成、ChmlFrp 三退守护、中转带宽瓶颈与故障点） | 用户硬约束（第四轮，§0）——**已消除**：ListenerMode `Direct` 缺省、Direct 代码路径不触碰 flock-frpc；frp 降级为「无公网 IP/不可直连」场景的可选适配器（§2.1/§2.2/§3.11/§5） | 守门断言：M2 `m2-direct.yml` 直连冒烟（无 frps、容器内无 frp 进程）+ M5 A16（Direct/Frp 同拓扑混布） | — |
-| R27 | M8 Web 管理面扩大攻击面：无 TLS（loopback 可嗅探/VPN 段明文于端点）、口令暴力破解、CSRF、自研 HTTP 解析器缺陷 | §7-M8.2/M8.7（访问矩阵与安全清单） | 双绑定结构性排除 LAN/公网（配置无 bind 字段）；OPAQUE（口令不上线）+ 登录退避 + per-IP 令牌桶；SameSite=Strict + 自定义头双门槛；HTTP 子集化（拒 chunked/重复 Content-Length——不实现歧义特性即无走私面）+ 畸形请求测试向量；审计 + 错误白名单文案；反代不承诺 | loopback 多用户机器上嗅探（知情取舍，文档明示）；VPN 段内端点可见（同 §2.5-1 服务器边界） |
+| R1 | tun unavailable under Windows Docker Desktop | vpn-mesh §1.3 | **Eliminated by live testing**: on the WSL2 backend, both paths — `--cap-add NET_ADMIN` + `--device /dev/net/tun`, and mknod — successfully created devices (Appendix B-2/3) | Hyper-V/VMM backend unchecked → the deployment constraint pins WSL2 and it goes into the deploy/README |
+| R2 | ChmlFrp's real node untested (needs a real-name account) | frp-compat gaps#1 | automation uses original frp ×2; protocol consistency rests on the byte-transparency argument (§1.4) + golden files (config side) + the ChmlFrp source-diff evidence; re-test R1/R6/R7 once an account exists | relay-side residuals (node rate limits / long-connection policies) can only be verified on a real node |
+| R3 | TCP-over-TCP weak-network performance collapse | vpn-mesh §3.2 (Titz 2001) | per-stream rate limiting / queue management; MTU 1280 controls the inner MSS; long-term a UDP direct path (self-hosted node xtcp / in-house) | accepted in the first version (that is the form); documented |
+| R4 | The in-house handshake has no formal verification | this design §3.5 (the reasons for not using snow) | structurally replicates Noise IK / WireGuard constants; transcript test vectors gate M1; labeled "experimental" until an external audit; libcrux watched as an alternative | implementation-defect risk exists until M1 vector coverage |
+| R5 | opaque-ke 3→4 / dalek 2→3 API-generation migration breaks compatibility | P1-6 | fixed-vector interop tests = the hard M1 gate; if they fail, pin the old versions and open a migration branch | — |
+| R6 | ChmlFrp free tier 8Mbps + 4-tunnel cap | frp-compat §2.1 | the single-tunnel multi-session multiplexing (yamux) design is final; production throughput expectations managed in the docs | the bandwidth hard cap is unsolvable (paid tier or a self-hosted node) |
+| R7 | The official frp Windows exe gets blocked by local security policy | frp-compat gaps#4 (proven during this research) | server-side frpc all runs in Linux containers (FRPS_LINUX_OK verified); Windows clients need no frpc (they dial the user port directly) | an frpc distributed to third-party Windows users needs signing/allowlisting assessment |
+| R8 | zstd C toolchain cross-platform / cross-compilation | compression-2026 §5 | Windows/MSVC proven compilable; **the container path was tested live**: rust:1-slim-bookworm ships cc/gcc and zstd-sys vendored compiled successfully (Appendix B-9, 7.67s) — the slim image suffices; lz4_flex pure-Rust fallback | the musl static-linking path to be verified within M1 |
+| R9 | Multi-primary Raft over a relay with high RTT → election jitter | vpn-mesh §5.3 constraint recap | heartbeat/election timeouts tuned to the relay RTT (M4 calibrates with an injected 100ms RTT); 3 voters minimum | transnational relays with RTT>500ms need measured tuning |
+| R10 | VORACLE/CRIME length side channel | compression-2026 §3.2 (all preconditions hold) | compression off by default + policy-enabled + padding + non-expansion fallback (P0-4 all landed) | sessions with compression enabled retain a residual channel — stated for admins |
+| R11 | yamux/TCP head-of-line blocking | vpn-mesh §4.2 (RFC 9113 states TCP HOL is irremovable) | control flow at high priority + flow-control backpressure; accepted as a property of the form | a UDP path is the only cure; long-term |
+| R12 | The ML-DSA crate is unaudited | crypto-2026 §5 | `pq-sign` off by default; enabling requires explicit opt-in plus reading the risk note | — |
+| R13 | wintun.dll distribution (Windows client) | vpn-mesh §1.1 (the driver is GPL; the officially signed DLL has a distribution exception) | tun-rs has built-in wintun integration; ship the official signed 0.14.1 DLL with the program | antivirus false positives follow the R7 policy |
+| R14 | The in-memory SR-SIG1 nonce table's multi-primary restart replay surface | verdict §3.6 | replay-state ownership by tier (§2.4): short-TTL tickets + Raft duplicate checks for critical operations + session counters | high-frequency per-request nonces are not strongly consistent — an engineering trade-off, documented |
+| R15 | The multi-primary sealing surface for session tickets / shared secrets widens | VPN-15 | per-server independent hybrid pubkeys + the rewrap permission point (§3.10); the ticket key root rotates through Raft | — |
+| R16 | TOFU first-login online-MITM takeover (the same class of limitation as SSH known_hosts) | this design §1.3.3f/§2.5-3 (verdict §3.9 only partially closed) | organizational deployments enforce the strong invite-file path (with static hybrid pubkeys + signature binding); the TOFU first-connect fingerprint-confirmation UI must not be silent | a residual accepted for personal self-hosting, documented |
+| R17 | Cross-peer traffic plaintext on the access server + any server can offline-dictionary all passwords | §2.5-1/2 (fundamentally different from Tailscale's peer-E2E property) | the boundaries are written explicitly into the deployment docs; server host hardening + admission red lines (§4); long term: a peer inner-E2E overlay, OPRF key thresholding | accepted in the first version; guards against "misreading it as peer-level E2E" |
+| R18 | A reconnect storm drives all linearizable reads into the Raft leader | the §1.3.3c lookup seam | the DeviceDirectory two-level read: an epoch-cache hit answers locally; only an epoch change/miss goes linearizable (§4 reads and caching) | when a revocation coincides with the storm, short-term leader pressure (tolerable for a low-write workload) |
+| R19 | Cluster admission infiltrated by a fake node (a snapshot/rewrap is an OPRF key leak surface) | §4 admission red line | the cluster root key kept offline; the server-server profile with mutual enrollment credentials; add_voter/rewrap are Raft admin operations requiring root-key signatures | root key leakage = full-network re-bootstrap (the disaster-recovery path documented) |
+| R20 | The ChmlFrp `-u/-p` bootstrapped usertoken travels over InsecureSkipVerify HTTPS | frp-compat §2.2 (api.go:30-46) | the `-c` config-file mode by default (pasted from the panel export); UserTokenAuto explicit opt-in + risk labeling | if a user insists on -u/-p mode, a panel-account takeover surface exists |
+| R21 | A cross-server routing black hole inside the stale-lease window (device migration period) | the §2.2 fault-tolerance policy (vpn-mesh §5.2 explicitly a policy decision) | NOT_HERE → a one-shot location_query redirect + drop/ICMP on failure (no cached retries); assertion A15 gives a ≤35s recovery bound | migration-window packet loss is recovered by upper layers |
+| R22 | A malicious device holding a valid session forges another's source VIP (identity framing/reflection/future ACL bypass; rp_filter does not cover userspace streams) | §2.2 step 0 (vpn-mesh §2 borrowing point 3, "per-node ingress filtering") | the session DeviceId ↔ src VIP binding check (mismatch drop + count + disconnect on excess), the ForwardEnvelope src_dev cross-check; the A14 forged-source assertion | — |
+| R23 | An unredeemed invite file leaking = being redeemed once ahead of the owner within expiry, joining the network | the §1.3.3f life of an invite | invite_id goes into Raft for single consumption (second time rejected) + revoke_invite revocation + expiry default 7 days + the file managed as a one-time credential (0600) | the front-run redemption window exists (the same boundary as innernet), stated in the deployment docs |
+| R24 | A lagging follower (partition recovery / catching up) lets the local cache pass an already-revoked device | the §4 stale-read boundary disclosure in reads and caching | apply-lag >2s circuit-breaks the local cache and degrades to linearizable reads + the ticket epoch/TTL 60s backstop; the M4 5s-lag case | the ≤2s pass window inside the breaker threshold matches the A6 budget (the health precondition made explicit) |
+| R25 | The traps of the three-way choice for the multi-server pinning model (shared keys destroy per-server sealing / per-server TOFU doesn't scale / switching degrades to 2-RTT) | the §1.3.3f finalization rationale (third-round review blocking) | option ②: the client anchors the cluster root pubkey + the root-signed ClusterDirectory with the full material set (the endpoint↔material mapping signed together against splices); key rotation = a root-signed new entry + dir_pull; every endpoint 1-RTT | root key leakage = full-network re-bootstrap (the same disaster path as R19) |
+| R26 | The architecture tightly binding frp causing superfluous processes/failure surfaces in the direct scenario (servers that could be reached directly forced to run frpc: a superfluous subprocess, config generation, the ChmlFrp 3-exit supervision, relay bandwidth bottleneck and failure point) | the user's hard constraint (round four, §0) — **eliminated**: ListenerMode `Direct` default, the Direct code path never touches flock-frpc; frp demoted to an optional adapter for the "no public IP / unreachable" scenario (§2.1/§2.2/§3.11/§5) | gating assertions: the M2 `m2-direct.yml` direct-connection smoke (no frps, no frp process in the container) + M5 A16 (Direct/Frp mixed in one topology) | — |
+| R27 | The M8 web admin plane widens the attack surface: no TLS (sniffable on loopback / plaintext on the VPN segment at the endpoint), password brute force, CSRF, in-house HTTP parser defects | §7-M8.2/M8.7 (the access matrix and security checklist) | the dual binding structurally excludes LAN/public (the config has no bind field); OPAQUE (password never on the wire) + login backoff + a per-IP token bucket; SameSite=Strict + the custom-header double gate; HTTP subsetting (rejecting chunked/duplicate Content-Length — not implementing ambiguous features means no smuggling surface) + malformed-request test vectors; auditing + whitelisted error copy; no reverse-proxy promise | loopback sniffing on multi-user machines (an informed trade-off, documented); the endpoint is visible inside the VPN segment (the same §2.5-1 server boundary) |
 
 ---
 
-## 附录 A：upgradeList 16 项 → 设计落位对照（一项不漏）
+## Appendix A: the 16 upgradeList items → design placement cross-reference (none omitted)
 
-| # | 升级项（verdict §4） | 落位 | 里程碑 |
+| # | Upgrade item (verdict §4) | Placement | Milestone |
 |---|---|---|---|
-| P0-1 | 封装替换 X25519+ML-KEM-768 混合 KEM（RSA 兼容档） | §1.3.3a `kem`、§1.3.3b `envelope` v2（兼容策略=迁移窗口而非双封装，理由见 §1.3.3a） | M1 |
-| P0-2 | 会话/隧道档 AEAD 纪律（计数器 nonce/rekey/硬拒/伪造断链） | §1.3.3c `session` 记录层；信封档前提文档化 | M1 |
-| P0-3 | 信封 v2 段 AAD（v1 只读） | §1.3.3b | M1 |
-| P0-4 | 压缩安全化（默认关/策略开/填充/非膨胀回退） | §1.3.3e `compress` | M1 |
-| P0-5 | 首登信任锚/TOFU/邀请制/bind_token 覆盖 | §1.3.3f `trust`（邀请 v2 含静态混合公钥+签名绑定）+ §1.3.3c 握手 R0/R1 签名与 TOFU 2-RTT 首连 + §1.3.3d `anchor` + 残余风险 §2.5-3 | M1/M2 |
-| P1-6 | crate 代际升级（aes-gcm 0.11.1/opaque-ke 4.0.1/dalek 3.0.0/rand 0.9） | §1.3.2 依赖代际；bench 门槛 | M1 |
-| P1-7 | 压缩档位重构（直通/字典/分块/lz4/上下文复用/level19 归档档） | §1.3.3e | M1 |
-| P1-8 | AEAD 后备档（XChaCha20-Poly1305/AES-256-GCM-SIV） | §1.3.3c `AeadPreference` | M1 |
-| P1-9 | 传输帧与多路复用（yamux/EOF/keepalive/首字节自由） | §1.3.3d `mux`（yamux 0.14.1 内跑加密内） | M1 |
-| P1-10 | 握手 1-RTT Noise-IK + 混合 KEM/漫游/重连=新握手/10s keepalive | §1.3.3c（双形态：已钉扎 1-RTT / TOFU 首连 2-RTT；UKS 签名覆盖契约） | M1 |
-| P2-11 | OPAQUE 维护（4.0.1/argon2 profile/RFC 9807 勘误） | §1.3.2/§1.3.3h | M1 |
-| P2-12 | 签名维护（dalek 3.0/ML-DSA-65 kid 分派预留） | §1.3.3g | M1 |
-| P2-13 | nonce 长度文档回改（以实现为准 16B/32hex） | §1.3.2（库文档+showroom 侧迁移说明） | M1 |
-| ★VPN-14 | tun 数据面接口（帧化/tun-rs/rtnetlink/MTU 1280/移动 fd 缝） | §3.6 `PacketChannel` + §3.12 `TunDevice` 接缝 + §2.3 | M3 |
-| ★VPN-15 | 多主多活同步接口（强一致状态机/gossip 租约/票据下放/重封装权限点） | §3.10 `flock-sync` + §4（含集群准入/rewrap 授权）+ §2.4 + §2.2（票据契约/吊销传播界/跨服转发面） | M4 |
-| ★VPN-16 | frp 中转适配接口（心跳/断链重连/不依赖半关闭/单隧道多会话/frpc 双栈托管）——**可选适配器非前提：Direct 缺省零 frp 逻辑（§0 硬约束/§3.11）** | §1.4（协议侧约束，直连/中转同构）+ §3.9 `flock-frpc`（仅 Frp 模式装配）+ §5 + §2.1 接入端点模型；守门=M2 m2-direct + M5 A16 | M2/M5 |
+| P0-1 | Encapsulation replaced with the X25519+ML-KEM-768 hybrid KEM (RSA compatibility tier) | §1.3.3a `kem`, §1.3.3b `envelope` v2 (compatibility strategy = a migration window rather than dual encapsulation; rationale in §1.3.3a) | M1 |
+| P0-2 | Session/tunnel-tier AEAD discipline (counter nonce/rekey/hard reject/forgery disconnect) | the §1.3.3c `session` record layer; the envelope-tier precondition documented | M1 |
+| P0-3 | Envelope v2 segment AAD (v1 read-only) | §1.3.3b | M1 |
+| P0-4 | Compression hardening (off by default/policy-enabled/padding/non-expansion fallback) | the §1.3.3e `compress` | M1 |
+| P0-5 | First-login trust anchor/TOFU/invite system/bind_token coverage | the §1.3.3f `trust` (invite v2 contains the static hybrid pubkey + signature binding) + the §1.3.3c handshake R0/R1 signatures and the TOFU 2-RTT first connection + the §1.3.3d `anchor` + residual risk §2.5-3 | M1/M2 |
+| P1-6 | crate generation upgrades (aes-gcm 0.11.1/opaque-ke 4.0.1/dalek 3.0.0/rand 0.9) | the §1.3.2 dependency generations; bench threshold | M1 |
+| P1-7 | Compression tier rework (pass-through/dictionary/chunked/lz4/context reuse/level19 archive tier) | §1.3.3e | M1 |
+| P1-8 | AEAD fallback tier (XChaCha20-Poly1305/AES-256-GCM-SIV) | the §1.3.3c `AeadPreference` | M1 |
+| P1-9 | Transport framing and multiplexing (yamux/EOF/keepalive/free first byte) | the §1.3.3d `mux` (yamux 0.14.1 running inside the encryption) | M1 |
+| P1-10 | Handshake 1-RTT Noise-IK + hybrid KEM/roaming/reconnect = new handshake/10s keepalive | §1.3.3c (two forms: pinned 1-RTT / TOFU first-connect 2-RTT; the UKS signature coverage contract) | M1 |
+| P2-11 | OPAQUE maintenance (4.0.1/argon2 profile/RFC 9807 erratum) | §1.3.2/§1.3.3h | M1 |
+| P2-12 | Signature maintenance (dalek 3.0/ML-DSA-65 kid dispatch reserved) | §1.3.3g | M1 |
+| P2-13 | nonce-length doc correction (implementation rules: 16B/32hex) | §1.3.2 (library docs + the showroom-side migration note) | M1 |
+| ★VPN-14 | tun data-plane interface (framing/tun-rs/rtnetlink/MTU 1280/mobile fd seam) | the §3.6 `PacketChannel` + the §3.12 `TunDevice` seam + §2.3 | M3 |
+| ★VPN-15 | Multi-primary active-active sync interface (strongly consistent state machine/gossip leases/ticket delegation/re-sealing permission point) | the §3.10 `flock-sync` + §4 (incl. cluster admission/rewrap authorization) + §2.4 + §2.2 (the ticket contract/revocation propagation bound/cross-server forwarding plane) | M4 |
+| ★VPN-16 | frp relay adaptation interface (heartbeat/link-loss reconnect/no half-close reliance/single-tunnel multi-session/frpc dual-stack supervision) — **an optional adapter, not a prerequisite: Direct defaults to zero frp logic (the §0 hard constraint/§3.11)** | §1.4 (protocol-side constraint; direct and relayed isomorphic) + the §3.9 `flock-frpc` (assembled only in Frp mode) + §5 + the §2.1 access endpoint model; gates = M2 m2-direct + M5 A16 | M2/M5 |
 
-## 附录 B：本会话执行的核实（命令与关键输出）
+## Appendix B: verifications performed in this session (commands and key outputs)
 
-1. `docker version` / `docker info` → Client 29.8.2 (windows/amd64, context desktop-linux)；
-   Server "Docker Desktop 4.95.0" Engine 29.8.2 linux/amd64，
-   Kernel `6.18.54.1-microsoft-standard-WSL2` ⇒ WSL2 后端。
-2. `docker run --rm --cap-add NET_ADMIN --device /dev/net/tun debian:bookworm-slim sh -c '… ip tuntap add mode tun dev flocktest0 && ip link set … up && ip addr add 100.64.0.1/32 …'`
-   → `3: flocktest0: <…,UP> …` + `TUN_CREATE_OK`（Git Bash 下需 `MSYS_NO_PATHCONV=1` 防
-   `/dev/net/tun` 被改写为 Windows 路径——首次未加时报 `adding custom device "C"`，已定位并绕过）。
-3. `docker run --rm --cap-add NET_ADMIN debian:bookworm-slim sh -c 'mknod /dev/net/tun c 10 200 … && ip tuntap add …'`
-   → `MKNOD_PATH_OK`（无 --device 参数的回退路径亦可行）。
-4. `curl -sL -o frp_linux_test.tar.gz …/frp_0.71.1_linux_amd64.tar.gz`（14,140,587B）+
+1. `docker version` / `docker info` → Client 29.8.2 (windows/amd64, context desktop-linux);
+   Server "Docker Desktop 4.95.0" Engine 29.8.2 linux/amd64,
+   Kernel `6.18.54.1-microsoft-standard-WSL2` ⇒ the WSL2 backend.
+2. `docker run --rm --cap-add NET_ADMIN --device /dev/net/tun debian:bookworm-slim sh -c '… ip
+   tuntap add mode tun dev flocktest0 && ip link set … up && ip addr add 100.64.0.1/32 …'`
+   → `3: flocktest0: <…,UP> …` + `TUN_CREATE_OK` (under Git Bash, `MSYS_NO_PATHCONV=1` is needed
+   to stop `/dev/net/tun` being rewritten into a Windows path — without it on the first try it
+   reported `adding custom device "C"`; located and worked around).
+3. `docker run --rm --cap-add NET_ADMIN debian:bookworm-slim sh -c 'mknod /dev/net/tun c 10 200 …
+   && ip tuntap add …'`
+   → `MKNOD_PATH_OK` (the fallback path without the --device argument also works).
+4. `curl -sL -o frp_linux_test.tar.gz …/frp_0.71.1_linux_amd64.tar.gz` (14,140,587B) +
    `docker run … -v …/frp_0.71.1_linux_amd64:/frp:ro debian … /frp/frps --version` →
-   `0.71.1` + `FRPS_LINUX_OK`。
+   `0.71.1` + `FRPS_LINUX_OK`.
 5. `ls .tmp/chmlfrpc/ChmlFrp-0.51.2_251023_linux_amd64/` → `frpc frps frpc.ini frps.ini …`
-   （ChmlFrp 定版 Linux 二进制在位）；`ls .tmp/frp-src .tmp/frp-test .tmp/cryptobench` →
-   上游源码/透传实验/基准工程均在位（frp-compat 附录所述资产属实）。
-6. `cargo --version` → 1.98.1；`rustup target list --installed` →
-   `x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`wasm32-unknown-unknown`。
-7. showroom 源码抽查（只读）：`opaque.rs:1`（RFC 9380 误引）、`opaque.rs:32-39`（Suite）、
-   `opaque.rs:42`（SERVER_ID 字面量）、`opaque.rs:53-70`（argon2id 参数与盐）、
-   `lib.rs:48-55`（常量）、`lib.rs:376-412`（seal 布局/随机 nonce/无 AAD）、
-   Cargo.lock 版本（aes-gcm 0.10.3/argon2 0.5.3/ed25519-dalek 2.2.0/opaque-ke 3.0.0/
-   rand 0.8.8/rsa 0.9.10/zstd 0.13.3）、`Cargo.toml:3`（workspace members）——
-   与 verdict §0 抽查表一致。
-8. 未执行：容器内 Rust 工程 cargo build（仓库尚无代码）；cryptobench 复跑（verdict 复核轮
-   已复跑，本会话直接采信其输出）；ChmlFrp 真实节点连通（需账号）。
-9. rust slim 镜像 cc 核查 + zstd vendored 容器内编译（修订轮，评审非阻塞项触发，**已实测**）：
-   `docker pull rust:1-slim-bookworm` 成功；`docker run --rm rust:1-slim-bookworm sh -c
-   'which cc gcc clang; cc --version'` → `/usr/bin/cc`、`/usr/bin/gcc`（clang 无）、
-   `cc (Debian 12.2.0-14+deb12u1) 12.2.0`——**slim 镜像自带 cc/gcc**（rust 镜像的 rustc
-   需要链接器，官方 slim 变体亦装 gcc；评审「按官方镜像惯例不带 gcc」的假设与实测不符，
-   以实测为准）。进一步 `cargo new + cargo add zstd@0.14 + cargo build --release`
-   → `Compiling zstd-sys v2.1.2+zstd.1.5.7 … Finished release in 7.67s`，
-   `ZSTD_BUILD_CHECK_DONE`——zstd vendored C 编译路径在容器内端到端打通。
-   注：完整 workspace 的容器构建仍待 M1（仓库尚无代码可建）。
+   (the pinned ChmlFrp Linux binaries in place); `ls .tmp/frp-src .tmp/frp-test .tmp/cryptobench`
+   → the upstream source / pass-through experiments / the benchmark project all in place (the
+   assets described in the frp-compat appendix are real).
+6. `cargo --version` → 1.98.1; `rustup target list --installed` →
+   `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `wasm32-unknown-unknown`.
+7. showroom source spot checks (read-only): `opaque.rs:1` (the RFC 9380 misreference),
+   `opaque.rs:32-39` (the Suite), `opaque.rs:42` (the SERVER_ID literal), `opaque.rs:53-70`
+   (argon2id parameters and salt), `lib.rs:48-55` (constants), `lib.rs:376-412` (the seal
+   layout/random nonce/no AAD), the Cargo.lock versions (aes-gcm 0.10.3/argon2 0.5.3/
+   ed25519-dalek 2.2.0/opaque-ke 3.0.0/rand 0.8.8/rsa 0.9.10/zstd 0.13.3), `Cargo.toml:3`
+   (workspace members) — consistent with the verdict §0 spot-check table.
+8. Not executed: cargo build of the Rust project in a container (the repo has no code yet); a
+   cryptobench re-run (the verdict re-check round already re-ran it; this session takes its output
+   on trust); ChmlFrp real-node connectivity (needs an account).
+9. The rust slim image cc check + zstd vendored in-container compilation (revision round,
+   triggered by a non-blocking review item, **tested live**):
+   `docker pull rust:1-slim-bookworm` succeeded; `docker run --rm rust:1-slim-bookworm sh -c
+   'which cc gcc clang; cc --version'` → `/usr/bin/cc`, `/usr/bin/gcc` (no clang),
+   `cc (Debian 12.2.0-14+deb12u1) 12.2.0` — **the slim image ships cc/gcc** (the rust image's
+   rustc needs a linker, and the official slim variant also installs gcc; the review's assumption
+   "per official image convention, no gcc" contradicts the measurement; the measurement rules).
+   Further, `cargo new + cargo add zstd@0.14 + cargo build --release`
+   → `Compiling zstd-sys v2.1.2+zstd.1.5.7 … Finished release in 7.67s`,
+   `ZSTD_BUILD_CHECK_DONE` — the zstd vendored C compilation path works end to end inside the
+   container. Note: the full workspace's in-container build still awaits M1 (the repo has no code
+   to build yet).
 
 ---
 
-## 附录 C：修订记录
+## Appendix C: revision history
 
-- 2026-10-31 第二轮（评审 4 blocking + 9 非阻塞全量吸收）：
-  1. **B1**：握手双形态定型——邀请文件 v2 必含服务器静态混合公钥（1216B）并与身份签名绑定
-     （指纹是哈希不能 encapsulate）；TOFU 首连 2-RTT（I0→R0 出示静态公钥→I1/R1），
-     常态 1-RTT（§1.3.3c/§1.3.3f）；新增 UKS 签名覆盖契约 + M1 失败向量。
-  2. **B2**：`lookup` 接缝改为 `trait DeviceDirectory` 异步（BoxFuture）+
-     `LookupVerdict{NotFound,Revoked,Active}` 三态；`Tunnel::open_stream/open_packet_channel`
-     补 async；新增「读与缓存」两级策略防重连风暴打穿 leader（§1.3.3c/§3.5/§4）。
-  3. **B3**：补全跨服数据面——ForwardEnvelope/hop=1 防环/NOT_HERE 回退/租约未命中容错
-     （丢包+ICMP，不缓存重试）（§2.2）；A2 钉死跨服接入映射、新增 A14 跨服面断言。
-  4. **B4**：集群准入设计——集群根密钥（离线）+ 入群凭证 + 服务器-服务器 profile 双向认证；
-     learner→快照→add_voter→rewrap 全部要求根密钥签名的管理操作（§4/§3.10）；M4 新增
-     admission 测试组。
-  5. 非阻塞：§2.5 威胁模型边界四条（跨 peer 明文/OPRF 离线字典面/TOFU 残余/中转）；
-     票据强制契约（状态变更必带票据、校验先于 nonce 记账、重放窗=min(300s,TTL)）；
-     吊销传播界参数化（apply ≤2s+事件 ≤1s+slack，票据 TTL 60s，租约 TTL 30s/反熵 5s）；
-     ChmlFrp 托管默认 `-c` 模式（usertoken InsecureSkipVerify 风险入 R20）；Windows 真机
-     手工清单入 M3/M5、macOS 标注未验证；构建镜像与 R8 的「slim 无 cc」矛盾以**实测**解决：
-     rust:1-slim-bookworm 自带 cc/gcc 且 zstd-sys vendored 容器内编译成功（附录 B-9）；
-     §6.2 拆 chmlpub/srvmesh/link 三网 + frpc 边车 + A13 直连不可达断言 + A15 租约容错断言。
+- 2026-10-31 round two (review: 4 blocking + 9 non-blocking, all absorbed):
+  1. **B1**: the handshake's two forms finalized — the invite file v2 must contain the server's
+     static hybrid pubkey (1216B) bound to the identity signature (a fingerprint is a hash and
+     cannot be encapsulated to); the TOFU first connection is 2-RTT (I0→R0 presents the static
+     pubkeys → I1/R1); the norm is 1-RTT (§1.3.3c/§1.3.3f); the UKS signature coverage contract +
+     the M1 failure vectors added.
+  2. **B2**: the `lookup` seam becomes an async `trait DeviceDirectory` (BoxFuture) with the three
+     states `LookupVerdict{NotFound,Revoked,Active}`; `Tunnel::open_stream/open_packet_channel`
+     made async; the two-level "reads and caching" policy added to keep reconnect storms from
+     punching through the leader (§1.3.3c/§3.5/§4).
+  3. **B3**: the cross-server data plane completed — ForwardEnvelope/hop=1 loop prevention/
+     NOT_HERE fallback/lease-miss fault tolerance (drop + ICMP, no cached retries) (§2.2); A2 pins
+     the cross-server access mapping, and the A14 cross-server-plane assertion added.
+  4. **B4**: the cluster admission design — the cluster root key (offline) + enrollment
+     credentials + the server-server profile with mutual authentication;
+     learner→snapshot→add_voter→rewrap all require root-key-signed admin operations (§4/§3.10);
+     M4 gains the admission test group.
+  5. Non-blocking: the four §2.5 threat-model boundary items (cross-peer plaintext / the OPRF
+     offline-dictionary surface / the TOFU residual / the relay); the mandatory ticket contract
+     (state changes must carry a ticket; validation precedes nonce accounting; the replay window =
+     min(300s,TTL)); the revocation propagation bound parameterized (apply ≤2s + event ≤1s +
+     slack; ticket TTL 60s; lease TTL 30s/anti-entropy 5s); the ChmlFrp supervision default `-c`
+     mode (the usertoken InsecureSkipVerify risk goes into R20); the Windows real-machine manual
+     checklist into M3/M5, macOS marked not verified; the contradiction between the build image
+     and R8's "slim has no cc" resolved **by measurement**: rust:1-slim-bookworm ships cc/gcc and
+     zstd-sys vendored compiles in-container (Appendix B-9); §6.2 split into the
+     chmlpub/srvmesh/link three networks + frpc sidecars + the A13 direct-unreachable assertion +
+     the A15 lease fault-tolerance assertion.
 
-- 2026-10-31 第三轮（评审 1 blocking + 4 非阻塞全量吸收）：
-  1. **blocking·多服务器钉扎模型定型（方案②）**：客户端锚定**集群根公钥**，持根签
-     **ClusterDirectory**（全套 ServerEntry = 入群凭证公开部分，端点列表与凭证同签一份防
-     拼接）；任意端点 1-RTT（I1 封装给目标服务器自己的静态 KEM 公钥）；TOFU 首连只钉根
-     （R0 携入群凭证链）；换钥=根签新目录条目+dir_pull；明确否决共享服务器密钥（毁逐服务器
-     封装/rewrap 权限点）与切换降 2-RTT（§1.3.3c/§1.3.3f/§3.8/R25）。A5/A15 措辞按
-     「任意端点 1-RTT、I0 不得出现」改齐。
-  2. 非阻塞：§4 读与缓存补**陈旧读边界披露 + apply-lag>2s 熔断**（R24，M4 落后 5s 用例）；
-     §2.2 转发判定序补**第 0 步源 VIP 绑定校验**（R22，A14 伪造源断言——rp_filter 不覆盖
-     用户态流）；**设备位置单一真相源 = 租约域**（NetState 不存当前位置，NOT_HERE 回退改
-     一次性 location_query，杜绝 Raft 写风暴与双源不一致）；**邀请一生 + 开户流程**定死
-     （invite_id 进 Raft 单次消费、revoke_invite、expiry 默认 7 天、用户/设备/口令三分离，
-     R23；M2 开户测试）。
+- 2026-10-31 round three (review: 1 blocking + 4 non-blocking, all absorbed):
+  1. **blocking · the multi-server pinning model finalized (option ②)**: the client anchors the
+     **cluster root pubkey** and holds the root-signed **ClusterDirectory** (the full
+     ServerEntry set = the enrollment credentials' public part; the endpoint list and credentials
+     signed in one document against splices); every endpoint 1-RTT (I1 encapsulates to the target
+     server's own static KEM pubkey); the TOFU first connection pins only the root (R0 carries the
+     enrollment credential chain); key rotation = a root-signed new directory entry + dir_pull;
+     the shared-server-keys option explicitly rejected (destroys per-server sealing / the rewrap
+     permission point) as was switching degrading to 2-RTT (§1.3.3c/§1.3.3f/§3.8/R25). The A5/A15
+     wording aligned to "every endpoint 1-RTT; I0 must not appear".
+  2. Non-blocking: §4 reads and caching gains the **stale-read boundary disclosure + the
+     apply-lag>2s circuit breaker** (R24, the M4 5s-lag case); the §2.2 forwarding decision order
+     gains the **step-0 source VIP binding check** (R22, the A14 forged-source assertion —
+     rp_filter does not cover userspace streams); **the single source of truth for device location
+     = the lease domain** (NetState does not store current location; the NOT_HERE fallback becomes
+     a one-shot location_query, eliminating Raft write storms and dual-source inconsistency); the
+     **invite lifecycle + the provisioning flow** fixed (invite_id into Raft single consumption,
+     revoke_invite, expiry default 7 days, the user/device/password three-way separation, R23;
+     the M2 provisioning tests).
 
-- 2026-11-01 第四轮（**用户硬约束：ChmlVPN 不得与 frp/chmlfrp 强绑定**，最高优先级）：
-  1. §0 增硬约束声明并改分层图（接入端点 = Direct 缺省 / Frp 可选，frp 只服务「服务端无
-     公网 IP 或客户端不可直连」场景，可直连时不执行任何 frp 逻辑）。
-  2. §2.1/§2.2 接入端点模型：每台服务器一个接入端点，`server.toml` `listener.mode`
-     二选一、**Direct 缺省**；同一集群可混布；两种形态对协议层同构。
-  3. §3.11 `ListenerMode` 接缝（Direct 直接监听零 frp 逻辑 / Frp(RelaySpec) 走 Supervisor），
-     Direct 分支不实例化 Supervisor、不生成配置、无 chml-frpc 类型引用；§3.9/§5 标注
-     「仅 Frp 模式装配、可选适配器非前提」。
-  4. §1.3.3f/§3.8：`ServerEntry.relay_endpoint` 更名 `access_endpoint`（+endpoint_form
-     标注），语义=接入端点（直连地址或中转用户口，客户端无感知差异）；客户端选路/探活不变。
-  5. §6/§7：M2 新增直连冒烟变体 `deploy/m2-direct.yml`（无 frps、宿主映射直连、容器内
-     pgrep frp 为空）；§6.2 server-c 改 Direct 形态直挂 chmlpub（去 frpc-c 边车）+ 新增
-     client-3 直连；A13 收窄为仅 Frp 形态 server-a/b；新增 A16（Direct 会话连通 + 容器内
-     无 frp 进程 + Direct↔Frp 跨服转发同构）；M5 断言范围 A1–A16；R 表新增 R26（本约束
-     消除的风险）。A2/A5/A15 语义核对不受影响（client-1/2 的接入映射与跨服路径未变）。
+- 2026-11-01 round four (**the user's hard constraint: ChmlVPN must not be tightly bound to
+  frp/chmlfrp**, highest priority):
+  1. §0 gains the hard-constraint statement and the layering diagram changes (access endpoint =
+     Direct default / Frp optional; frp serves only the "no server public IP or the client cannot
+     dial directly" scenario; when directly reachable, no frp logic is executed).
+  2. the §2.1/§2.2 access endpoint model: one access endpoint per server; `server.toml`
+     `listener.mode`, one of two, **Direct default**; mixing allowed within one cluster; the two
+     forms isomorphic to the protocol layer.
+  3. the §3.11 `ListenerMode` seam (Direct direct listen, zero frp logic / Frp(RelaySpec) via the
+     Supervisor); the Direct branch instantiates no Supervisor, generates no config, has no
+     chml-frpc type references; §3.9/§5 labeled "assembled only in Frp mode; an optional adapter,
+     not a prerequisite".
+  4. §1.3.3f/§3.8: `ServerEntry.relay_endpoint` renamed `access_endpoint` (+ the endpoint_form
+     annotation); the semantics = the access endpoint (a direct address or a relay user port,
+     indistinguishable to the client); client routing/liveness probing unchanged.
+  5. §6/§7: M2 gains the direct-connection smoke variant `deploy/m2-direct.yml` (no frps; host
+     mapping, direct dial; `pgrep frp` empty in the container); §6.2 server-c switches to the
+     Direct form directly on chmlpub (the frpc-c sidecar removed) + the new client-3 direct dial;
+     A13 narrowed to the Frp-form server-a/b only; the new A16 (Direct session connectivity + no
+     frp process in the container + Direct↔Frp cross-server forwarding isomorphic); the M5
+     assertion range A1–A16; the R table gains R26 (the risk this constraint eliminates). The
+     A2/A5/A15 semantics are unaffected (client-1/2's access mapping and cross-server paths
+     unchanged).
 
-- 2026-11-01 命名调整：chml-protocol → flock-protocol（协议层独立于 chml/frp 品牌；flock=雁群，小型分布式网络意象；行为零变化）。
-- 2026-11-02 项目更名：ChmlVPN → Flock VPN（chmlvpn-server/client→flock-server/client、chml-sync/frpc→flock-sync/frpc、网络 chmlpub→flockpub、占位 git URL 换 flock 域；flock-protocol 线上行为零变化）。仓库目录同步更名为 FlockVPN——会话占用期间经 junction 过渡（宿主机两路径等价、Docker 挂载内仅真实路径可见，容器命令暂用 ChmlVPN 路径），收尾步骤见 docs/manual/dir-rename-final.md。
-- 2026-11-06 M6 第一阶段（系统服务化 + 控制面 daemon 侧）：新增 §7-M6——双进程模型（`flock-client service` 系统服务持全部 supervise/数据面 + `flock-client tray` 用户会话托盘经本地 IPC，Windows session 0 托盘约束定案）；控制 IPC v1 契约（postcard over 命名管道/Unix socket + 32B token 信封认证，**每请求带 token**——较「仅 Shutdown 带 token」收紧，Status 不裸奔）；三平台服务安装（Windows AUTO_START+恢复策略 / systemd Restart=on-failure / launchd 无 KeepAlive）+ 托盘自启 + `install/uninstall/status` 子命令 + `tray` feature 门控（cargo 无按平台 default features 的限制如实声明，GUI 依赖留 target 门控给第二阶段）；退出语义定型（Shutdown=优雅停服不复活、服务保持已安装）。IPC 契约固化为 `flock_client::ipc` 模块供托盘工程独立消费。
-- 2026-11-06 M7（成员名册与可观测性·服务端侧）：新增 §7-M7；**§2.1 IP 复用策略修订**（吊销→永不复用不变；离线超保留期→Expired+VIP 归还分配池、记录留册审计、名册排除；`peer_retention_days` 缺省 30、0=永不过期兼容旧行为）；注册表 DeviceRow 增 `hostname/expired_at` + `DeviceStatus::Expired`（终态）+ VIP 释放池（快照/线格式兼容性如实声明：postcard 无字段标签，旧快照不可解码——未发布窗口允许）；动态面搭租约便车（lease 条目 + gossip 携带 per-device EWMA 流量与 last_seen，α=0.2/1s 窗，「投递成功点计数」单点原则防双计）；名册契约 `CtrlRequest::PeerListPull`（票据先行）→ `Vec<PeerInfo>`（VIP 升序，含 Server 条目）；60s 回收器置 Expired。
-- 2026-11-07 M7 第二批次（成员名册·客户端侧）：新增 §7-M7.7——契约类型上收
-  `flock-protocol::roster`（PeerInfo/PeerKind/TicketWire 线格式 + 控制面消息 +
-  key-bind canonical + hostname 规范化；两端同类型无第二真相源，server/sync `pub use`
-  再导出）；客户端控制流半边（凭据 0600 单行 + `[auth] username`；`login` 一次性
-  引导 = 设口令→登录验证→hostname 入册；daemon 登录保持 = anchor 验签 + key-bind
-  re-register + 票据只存内存 + TTL·2/3 相对量重登 + 超时毒化杀会话重连）；IPC 增
-  `Peers{token}`（≤5s 名册缓存 + online 非自身并发 raw ICMP 探测：socket2 薄层
-  3 探针 2s 超时取上中位，raw 缺权降级「—」；MAX_CTRL_FRAME 4KiB→256KiB）；
-  `flock-client peers`（对齐表格：状态三态在线/离线/服务未运行 + `--json` 机读档）；
-  容器实测 `deploy/m7.yml`+`m7_assert.sh`（两 client + server：条目/延迟/iperf3
-  流量列/JSON）；Windows/macOS raw ICMP 真机列 service-install.md §7 清单。
-- 2026-11-06 M6 第二阶段（托盘进程）：新增 §7-M6.7（§7-M6.4 tray 行同步）——`flock-client tray` 落地：三项菜单（连接状态/VPN IP 动态只读 + 退出动作），2s 轮询刷新、Denied/IPC 失败⇒「服务未运行」继续重试；退出=对 token Shutdown⇒托盘退出（服务保持已安装）/daemon 不在⇒仅退托盘/Denied⇒不退出+token 失效重载；程序化 32×32 RGBA 图标（零资产文件）；平台库 tray-icon（Windows 最小 Win32 消息泵/macOS 主线程 NSApp 排空循环）+ ksni（Linux DBus SNI，零 GTK 系统依赖），不引 winit/tauri/egui；GUI 探测（Linux DISPLAY/WAYLAND+会话 DBus 前置判定，win/mac 创建失败兜底）无 GUI 一律优雅退出码 0；M6.5 feature 门控兑现（GUI 依赖全部 target 门控 optional、dep: 引用不匹配 target no-op，--no-default-features 三平台零 GUI 依赖——门禁实测）。验证边界如实：核心单测 + Windows 真进程 mock-daemon 实测（存活/刷新日志/状态一致/Shutdown 停服后转显服务未运行）；图标目视/退出点击/真 daemon 联测（需 invite+管理员）列 service-install.md 托盘真机清单；macOS 无设备未验证（apple target 工具链下载过慢未及编译级核验，API 按 crate 源核对）；Linux 桌面真机未验证（容器编译面过）。
-- 2026-11-07 M6/M7 服务端/同步层评审修复（本批 6 项）：① 回收器 last_seen=0 语义缺陷（§7-M7.5 修正）——DeviceRow 增 `registered_at`（注册/兑换时提交方注入落库，无观测时作保留期起算锚）+ 重启/视图未就绪闸门（单服=流量计零观测跳过；多主=租约表空/无远端事件跳过，`LeaseTable::remote_events` 信号 + 反熵循环自过滤）；② server_vip_of 一致性双形态断言（多主 open_sync 断言 cfg.vip==推导值、错误给期望值；单服 VIP 撞设备分配段拒起）；③ NetError::DeviceExists 独立变体（消灭 "already registered" 字符串契约）+ KeyBind re-register owner 校验（跨户改 hostname ⇒ NotAuthorized）；④ systemd 单元路径修正（/etc/systemd → /etc/systemd/system，样例+文档；install.rs 常量由客户端侧同名项同步）+ launchd plist 补 StandardErrorPath 与 newsyslog 轮转建议；⑤ CtrlResponse 变体位纪律固化（Err 之前冻结区、新变体尾部追加；PeerList 迁至 Err 后）+ 租约 EWMA 离线衰减（过期且无累加按窗 ×4/5 至 <8B/s 置 0——名册不呈现离线非零流量）+ §7-M7.2 措辞修正（「同设备身份复活」→「新设备身份（新钥匙）注册新行新 VIP」，同钥匙重注册走 re-register 的 hostname 更新）。
-- 2026-11-07 M8（服务端 Web UI·设计增补）：新增 §7-M8——进程内嵌 HTTP 管理面（**自研最小 HTTP/1.1，非 axum**：Cargo.lock 无 tower 系构件，暴露面仅 loopback+VIP，子集化拒 chunked/重复 Content-Length）；**双绑定 127.0.0.1:9800 + cfg.vip:9800**（配置不暴露 bind 字段——0.0.0.0 误配结构不可能；tun 未就绪 loopback 先行、VIP 5s 重试补绑）；访问矩阵 W-A1–A4（loopback/100.64.0.0/10 放行、其余 403 纵深、反代不承诺）；认证 = **OPAQUE 复用（HTTP 同语义新端点，不复用控制流消息）**+ anchor 保留（bootstrap 自证，不主张 MITM 防护）+ `UserRow.admin/disabled/pw_bootstrap` 三字段（Raft 行扩展，未发布窗口纪律）+ HttpOnly/SameSite=Strict 会话（32B sid、TTL 8h、上限 256、记录 loopback/vpn 来源）；**授权裁决**：Web 会话不映射控制流票据、写操作走 Raft 普通写（handler 层 admin 裁决）、`admin_op` 根签操作与 cluster-* 不进 UI；API 契约 §M8.4 逐字定死（22 端点/统一错误信封/CSRF 双门槛 X-Flock-Web+JSON）；口令创建/重置 = 一次性 `pw_bootstrap` 令牌（Raft 原子消费）；首 admin = `flock-server web-admin-add`（admin 端点尾部两变体，多主须经在跑服务）；流量时间序列 = 内存环形缓冲 120×60s（重启清零如实声明）；前端 = Alpine.js 3.14 + uPlot 1.6.9 + 自写深色设计系统，include_dir 内嵌，中文先行；wasm = C-ABI 垫片 `webauth_shim.rs`（showroom wasm_shim 手法 + 既有 getrandom custom 后端，无 wasm-bindgen）；测试 W1–W7 容器断言 + Rust 原生 OPAQUE 驱动 e2e；R 表增 R27。
-- 2026-11-07 M8a 落地（服务端全量·本批）：flock-sync 五写 + BadBootstrapToken（令牌判定先于记录——错令牌不泄漏是否已有口令；重放同错）+ users_snapshot；webui 模块七文件（http/session/access/api/series/assets/mod——文件落位 §M8.8 逐字）；netstate/backend 用户操作双臂（redb 行尾追加三字段、pre-M8 旧行宽容解码——与 postcard 快照干净失败是不同编码面）；admin 尾部 WebPwBegin/WebPwCommit（web_pw_commit 单一语义源，CLI 直写 fallback 共用）；控制流 LoginBegin 增 disabled 判定；CLI web-admin-add；[webui] 配置节（deny_unknown_fields 白名单键集 + 四面端口冲突拒起）；tests/webui.rs 4 项 + examples/webui_login 载具（cookie 缓存复用——逐子命令登录会耗尽 per-IP 桶）；deploy/webui.yml + webui_assert.sh + Dockerfile.webui（**W1/W2/W3/W5/W7 容器实测全 PASS**，W4/W6 留 M8b）。实现措辞澄清：disabled 用户 login-begin 用真记录（ke2 同形不泄漏禁用态，user_disabled 在口令证明成立后的 finish 返回——否则该错误码对诚实客户端不可达）。顺带清偿存量 clippy 债（新工具链 -D warnings 下的 dataplane 测试锁/unreachable 臂/needless return）。
-- 2026-11-07 M8b 落地（前端+wasm·本批）：webauth_shim C-ABI 垫片（§M8.6 契约逐字——熵注入/alloc/free/login_begin/login_finish/pw_begin/pw_finish，错误码 -1..-4；编译门在字面 wasm+wasm32 上扩展 anchor feature + native test——单测直调垫片跑通 OPAQUE 全程，注入熵固定断言确定性 ke1）；deploy/build-wasm.sh（wasm32 构建+产物提交进库+幂等 sha256 复核；flock-protocol [lib] 增 cdylib 档）；JS 胶水 vendor/flock_pake.js（yamux→web-time 传递依赖的 wasm-bindgen 占位导入按 Module.imports 动态建惰性 stub——pake 路径不可达）；SPA 全量（Alpine 3.14.9 + uPlot 1.6.9 vendored 含 LICENSE、自写深色设计系统、中文 i18n 单字典、hash 路由 7 段——audit 独立成页为 M8b 拆分、响应式三档全功能 + 44px 触控 + 无横向滚动）；SPA fallback（未知非 /api 路径回 index.html，§M8.4 静态资产行同步修订）；webui_assert.sh W4（client VIP:9800 登录页可达 + webui_login VIP 端点登录链 + origin=vpn）与 W6（--profile dual 双 voter Raft：双 VIP 各自登录 + peers/users/summary 集合一致）；webui.yml dual 档（dual-a/b + operator init-cluster + dual-client，独立项目名 flock-webui-dual 与单服拓扑并行）；docs/manual/webui-checklist.md 骨架（M8c 填充）。实测：本机内嵌浏览器 wasm 登录全链（建号→令牌→设口令→双角色）+ 三档布局核验；容器 W1–W7 全 PASS 见批次回报。W6 实测暴露并修复转发面两处存量缺口（flock-sync forward.rs）：① 服务器段 VIP（§6.2 .1–.10）不在设备注册表 ⇒ 远端服务器 VIP 包落 drop_with_icmp——ingest/route_outbound 增 server_vip_node 回退映射（ForwardEnvelope 至收端 server-self 合成键）、receive 增「dst=本服务器 server-self ⇒ 注内核」分支（§7-M8.2 承诺的 fwd_delivered_kernel 路径此前未实现）；② route_outbound 的 src_dev=[0;32] 占位符使服务器内核回程在收端源绑定必拒——改用 server-self 合成键 + receive 按 origin 的确定性 VIP 校验该面（防伪语义不降）。单测 8 项新增于 forward.rs。
-- 2026-11-07 M8 评审修复批（安全加固·8 项，全部含新增单测、cargo 门禁全绿）：
-  ① 🔴 慢速攻击——http.rs 增**单请求总时限 REQUEST_TOTAL=30s**（head+body 整体读循环
-  抽为 read_request 套总预算；到期关连接 + SLOW_KILLS 计数；keep-alive 每请求重置；
-  测试用 serve_conn_with_budget 注入 300ms 预算驱动逐字节滴注向量）——旧 READ_TIMEOUT
-  是逐 read 超时，逐字节滴注可无限期占用 64 并发许可（VIP 面 DoS 管理面）；
-  ② 🟡 loopback accept 错误分类——瞬态（WouldBlock/Interrupted/ConnAborted/ConnReset/
-  EMFILE/ENFILE）记日志 + 250ms 退避续跑，致命才退出（与 VIP 面 5s 重绑语义对齐）；
-  ③ 🟡 pending 登录态满载逐出改按 (exp_unix, 插入序) 最旧 + put/take 惰性清过期行
-  （旧 keys().min() 字典序最小 ≠ 最旧——admin 等小字典序名的 login-finish 无故失败）；
-  ④ 🟡 审计 stderr 行注入——四公共认证端点 user 入参统一 1..=64B + 拒 ASCII 控制字符
-  （sane_user_param；不复用 valid_username 全集——控制流 device owner 名不受该字符集
-  约束），AuditLog::record 对 user/target 输出前控制字符清洗（stderr 与内存环同清洗）；
-  ⑤ 🟡 LoginBackoff/IpBuckets 容量上限 4096 + 60s 周期清扫（SWEEP_PERIOD 同档复用；
-  写路径先清惰性/idle 行、仍满逐出最旧——未认证面注入任意 user/IP 名不再无界增行）；
-  ⑥ 🟡 降权/禁用会话即时回收——dispatch 会话档回读 UserRow（本地已 apply 视图、
-  不必 linearizable，取舍注释写明）：set_admin=false 后旧会话下一请求 403、disabled
-  下一请求 401 user_disabled（旧行为 admin 快照滞留 8h TTL）；§M8.3/§M8.7 措辞同步
-  （含「禁用账号存在口令正确性 oracle（受退避节流）」如实声明）；
-  ⑦ 🟢 小项——方法错档统一 405（path_known 路径形状分流，对齐错误码表）；flock_pake.js
-  decHex/decB64 期望长度校验 + writeParam 0 长度短路（纯 JS 资产，.wasm 产物不变）；
-  series vip_in_registry 含远端服务器 VIP（多主 server_keys 视图——重启后首样本前
-  不 404，multi-primary 集成测试覆盖）；config.rs admin_bind+1 用 checked_add
-  （65535 溢出不再 debug panic）；session/access 系列 Mutex poison 改 into_inner；
-  ⑧ 本变更日志条目即第 8 项（design.md 措辞与实现行为同步）。
+- 2026-11-01 naming adjustment: chml-protocol → flock-protocol (the protocol layer independent of
+  the chml/frp brands; flock = a flock of geese, the image of a small distributed network; zero
+  behavior change).
+- 2026-11-02 project rename: ChmlVPN → Flock VPN (chmlvpn-server/client→flock-server/client,
+  chml-sync/frpc→flock-sync/frpc, the network chmlpub→flockpub, the placeholder git URL switched
+  to the flock domain; flock-protocol's wire behavior unchanged). The repository directory renamed
+  to FlockVPN in sync — while the session held it, transitioned via a junction (the two host paths
+  equivalent; inside Docker mounts only the real path visible; container commands temporarily used
+  the ChmlVPN path); the closing steps are in docs/manual/dir-rename-final.md.
+- 2026-11-06 M6 phase one (system service + the daemon-side control plane): added §7-M6 — the
+  two-process model (`flock-client service`, the system service holding all supervise/data-plane
+  logic + `flock-client tray`, the user-session tray via local IPC; the Windows session-0 tray
+  constraint settled); the control IPC v1 contract (postcard over a named pipe/Unix socket + a
+  32B token envelope authentication, **every request carries the token** — tighter than "only
+  Shutdown carries a token"; Status is never left bare); service installation on the three
+  platforms (Windows AUTO_START + a recovery policy / systemd Restart=on-failure / launchd without
+  KeepAlive) + tray autostart + the `install/uninstall/status` subcommands + the `tray` feature
+  gate (cargo's lack of per-platform default features stated as-is; the GUI dependencies left
+  target-gated for phase two); the quit semantics finalized (Shutdown = graceful stop without
+  revival; the service stays installed). The IPC contract frozen as the `flock_client::ipc` module
+  for the tray project to consume standalone.
+- 2026-11-06 M7 (member roster and observability, server side): added §7-M7; **the §2.1 IP reuse
+  policy revision** (revoked → never reused, unchanged; offline past retention → Expired + VIP
+  back to the pool, the record kept for audit, excluded from the roster; `peer_retention_days`
+  default 30, 0 = never expire, compatible with the old behavior); the registry's DeviceRow gains
+  `hostname/expired_at` + `DeviceStatus::Expired` (terminal) + the VIP release pool (the
+  snapshot/wire-format compatibility stated as-is: postcard has no field tags; old snapshots
+  cannot be decoded — acceptable in the pre-release window); the dynamic plane rides the leases
+  (lease entries + gossip carrying per-device EWMA traffic and last_seen, α=0.2/1s window; the
+  "count at the successful-delivery point" single-point principle against double counting); the
+  roster contract `CtrlRequest::PeerListPull` (ticket first) → `Vec<PeerInfo>` (VIP ascending,
+  including Server entries); the 60s reaper setting Expired.
+- 2026-11-07 M7 second batch (member roster, client side): added §7-M7.7 — the contract types
+  hoisted to `flock-protocol::roster` (PeerInfo/PeerKind/the TicketWire wire formats + the
+  control-plane messages + the key-bind canonical + hostname normalization; the same types on
+  both ends with no second source of truth; server/sync re-export via `pub use`); the client-side
+  control-flow half (credentials as a 0600 single line + `[auth] username`; `login` as a one-time
+  bootstrap = set password → login verification → hostname onto the roster; the daemon's
+  login-keep = anchor verification + key-bind re-register + the ticket in memory only + the
+  TTL·2/3 relative-quantity re-login + timeout-poisoning kill-and-reconnect); the IPC gains
+  `Peers{token}` (a ≤5s roster cache + concurrent raw-ICMP probing of online non-self entries: a
+  thin socket2 layer, 3 probes, 2s timeout, upper median; raw without permission degrades to "—";
+  MAX_CTRL_FRAME 4KiB→256KiB); `flock-client peers` (an aligned table: the status three-state
+  online/offline/service not running + the `--json` machine-readable build); container live test
+  `deploy/m7.yml` + `m7_assert.sh` (two clients + server: entries/latency/the iperf3 traffic
+  column/JSON); Windows/macOS raw ICMP real machines listed on the service-install.md §7
+  checklist.
+- 2026-11-06 M6 phase two (the tray process): added §7-M6.7 (the §7-M6.4 tray row synced) —
+  `flock-client tray` landed: the three-item menu (connection status / VPN IP as dynamic
+  read-only + quit as the action), 2s polling refresh, Denied/IPC failure ⇒ "service not running"
+  with continued retrying; quit = token Shutdown ⇒ the tray exits (the service stays installed) /
+  daemon absent ⇒ quit the tray only / Denied ⇒ no exit + the token-stale reload; the
+  programmatic 32×32 RGBA icon (zero asset files); the platform libraries tray-icon (Windows
+  minimal Win32 message pump / macOS main-thread NSApp drain loop) + ksni (Linux DBus SNI, zero
+  GTK system dependencies); no winit/tauri/egui; GUI detection (Linux DISPLAY/WAYLAND + session
+  DBus pre-checked; win/mac fall back on creation failure); no GUI always exits gracefully with
+  code 0; the M6.5 feature gates delivered (all GUI dependencies target-gated optional; `dep:`
+  references are no-ops on non-matching targets; --no-default-features gives a zero-GUI-dependency
+  compile surface on all three platforms — gates verified by testing). Verification boundaries
+  as-is: core unit tests + a real Windows process against a mock daemon (alive/refresh logs/state
+  consistency/after a token Shutdown stops the daemon, the tray shows "service not running");
+  icon visuals / the quit click / a real-daemon joint test (needs invite + administrator) are on
+  the service-install.md tray real-machine checklist; macOS unverified (no device; the apple
+  target toolchain downloaded too slowly for compile-level verification; the API checked against
+  crate sources); the Linux desktop real machine unverified (the container compile surface
+  passed).
+- 2026-11-07 M6/M7 server/sync-layer review fixes (6 items in this batch): ① the reaper's
+  last_seen=0 semantic flaw (fixed in §7-M7.5) — DeviceRow gains `registered_at` (injected by the
+  submitter at registration/redemption and persisted; without observation it anchors the retention
+  clock) + the restart/view-not-ready gate (single-server = skip when the traffic meter has zero
+  observations; multi-primary = skip when the lease table is empty / no remote events;
+  `LeaseTable::remote_events` signal + the anti-entropy loop self-filtering); ② the server_vip_of
+  consistency assertion in both forms (multi-primary open_sync asserts cfg.vip == the derived
+  value, giving the expected value on error; single-server rejects startup when the VIP collides
+  with the device allocation segment); ③ NetError::DeviceExists as its own variant (eliminating
+  the "already registered" string contract) + the KeyBind re-register owner check (a cross-owner
+  hostname change ⇒ NotAuthorized); ④ the systemd unit path corrected (/etc/systemd →
+  /etc/systemd/system, sample + docs; the install.rs constant synced from the client-side
+  same-named item) + the launchd plist gains StandardErrorPath and a newsyslog rotation
+  suggestion; ⑤ the CtrlResponse variant-position discipline frozen (the frozen zone before Err,
+  new variants append at the tail; PeerList moved after Err) + the lease EWMA offline decay
+  (expired without accumulation decays ×4/5 per window until <8B/s, then 0 — the roster shows no
+  non-zero traffic for offline devices) + a §7-M7.2 wording fix ("the same device identity
+  revived" → "a new device identity (new keys) registers a new row with a new VIP"; the same keys
+  re-registering goes through re-register's hostname update).
+- 2026-11-07 M8 (server Web UI, design supplement): added §7-M8 — the in-process embedded HTTP
+  admin plane (**an in-house minimal HTTP/1.1, not axum**: Cargo.lock has no tower-family
+  artifacts; the exposure surface is loopback+VIP only; the subset rejects chunked/duplicate
+  Content-Length); **dual binding 127.0.0.1:9800 + cfg.vip:9800** (the config exposes no bind
+  field — a 0.0.0.0 misconfiguration is structurally impossible; loopback first while tun is
+  unready, the VIP re-bound by a 5s retry); the access matrix W-A1–A4 (loopback/100.64.0.0/10
+  allowed, everything else 403 as depth; no reverse-proxy promise); authentication = **OPAQUE
+  reuse (new same-semantics HTTP endpoints, not reusing control-flow messages)** + the anchor
+  kept (bootstrap self-attestation; no MITM protection claimed) + the three `UserRow.admin/
+  disabled/pw_bootstrap` fields (Raft row extension, the pre-release-window discipline) +
+  HttpOnly/SameSite=Strict sessions (32B sid, TTL 8h, cap 256, the loopback/vpn origin recorded);
+  **the authorization ruling**: web sessions do not map to control-flow tickets; writes go through
+  the ordinary Raft path (admin adjudicated at the handler layer); the `admin_op` root-signed
+  operations and cluster-* never enter the UI; the API contract §M8.4 fixed verbatim (22
+  endpoints / the unified error envelope / the CSRF double gate X-Flock-Web + JSON); password
+  create/reset = a one-time `pw_bootstrap` token (atomic Raft consumption); the first admin =
+  `flock-server web-admin-add` (two tail variants on the admin endpoint; multi-primary must go
+  through a running service); the traffic time series = an in-memory ring buffer 120×60s (the
+  restart-clears behavior stated as-is); the frontend = Alpine.js 3.14 + uPlot 1.6.9 + a
+  hand-written dark design system, include_dir-embedded, Chinese first; wasm = the C-ABI shim
+  `webauth_shim.rs` (the showroom wasm_shim approach + the existing getrandom custom backend; no
+  wasm-bindgen); the tests W1–W7 container assertions + an e2e driven by a native-Rust OPAQUE
+  client; the R table gains R27.
+- 2026-11-07 M8a landed (server in full, this batch): the flock-sync five writes +
+  BadBootstrapToken (token adjudication precedes the record — a wrong token does not leak whether
+  a password already exists; replay yields the same error) + users_snapshot; the webui module's
+  seven files (http/session/access/api/series/assets/mod — the §M8.8 file placement verbatim);
+  netstate/backend user operations with dual arms (the redb rows tail-append the three fields;
+  pre-M8 old rows leniently decoded — a different encoding surface from the postcard snapshot's
+  clean failure); the admin tail WebPwBegin/WebPwCommit (web_pw_commit as the single semantic
+  source, shared with the CLI direct-write fallback); the control-flow LoginBegin gains the
+  disabled determination; the CLI web-admin-add; the [webui] config section
+  (deny_unknown_fields whitelist key set + port conflicts on four surfaces refuse startup);
+  tests/webui.rs with 4 items + the examples/webui_login vehicle (cookie-cache reuse — logging in
+  per subcommand would exhaust the per-IP bucket); deploy/webui.yml + webui_assert.sh +
+  Dockerfile.webui (**W1/W2/W3/W5/W7 container-tested all PASS**; W4/W6 left for M8b).
+  Implementation wording clarified: a disabled user's login-begin uses the real record (the ke2
+  same-shape, leaking no disabled state; user_disabled returns at finish after the password proof
+  is established — otherwise that error code is unreachable for an honest client). Also repaid
+  the standing clippy debt along the way (dataplane test locks / unreachable arms / needless
+  returns under the new toolchain's -D warnings).
+- 2026-11-07 M8b landed (frontend + wasm, this batch): the webauth_shim C-ABI shim (the §M8.6
+  contract verbatim — entropy injection/alloc/free/login_begin/login_finish/pw_begin/pw_finish,
+  error codes -1..-4; the compile gate on the literal wasm+wasm32 extended with the anchor
+  feature + a native test — a unit test calls the shim directly and runs OPAQUE end to end, with
+  a fixed injected entropy asserting a deterministic ke1); deploy/build-wasm.sh (the wasm32 build
+  + the artifact committed + an idempotent sha256 re-check; the flock-protocol [lib] gains a
+  cdylib profile); the JS glue vendor/flock_pake.js (the wasm-bindgen placeholder imports from
+  the yamux→web-time transitive dependency get lazily-stubbed dynamically per Module.imports —
+  unreachable on the pake path); the full SPA (Alpine 3.14.9 + uPlot 1.6.9 vendored with their
+  LICENSEs, the hand-written dark design system, the Chinese i18n single dictionary, hash routing
+  with 7 segments — audit split into its own page for M8b, the responsive three-tier layout fully
+  functional + 44px touch + no horizontal scrolling); the SPA fallback (unknown non-/api paths
+  return index.html; the §M8.4 static-asset row revised in sync); webui_assert.sh W4 (the client
+  VIP:9800 login page reachable + webui_login's VIP-endpoint login chain + origin=vpn) and W6
+  (--profile dual, a two-voter Raft: each VIP logs in separately + the peers/users/summary sets
+  agree); the webui.yml dual profile (dual-a/b + operator init-cluster + dual-client, the
+  standalone project name flock-webui-dual parallel to the single-server topology); the
+  docs/manual/webui-checklist.md skeleton (filled in M8c). Live tests: the local embedded-browser
+  wasm login full chain (account creation → token → password set → both roles) + the three-tier
+  layout checks; containers W1–W7 all PASS (see the batch report). The W6 live test exposed and
+  fixed two standing forwarding-plane gaps (flock-sync forward.rs): ① the server-segment VIPs
+  (§6.2 .1–.10) are not in the device registry ⇒ packets to a remote server's VIP fell into
+  drop_with_icmp — ingest/route_outbound gained the server_vip_node fallback mapping (a
+  ForwardEnvelope to the receiver's server-self synthetic key), and receive gained the "dst = this
+  server's server-self ⇒ inject into the kernel" branch (the fwd_delivered_kernel path promised
+  in §7-M8.2 was previously unimplemented); ② route_outbound's src_dev=[0;32] placeholder made
+  the server's kernel return path always fail the receiver's source binding — switched to the
+  server-self synthetic key + receive validating that surface against the origin's deterministic
+  VIP (no loss of anti-forgery semantics). 8 unit tests added in forward.rs.
+- 2026-11-07 M8 review-fix batch (security hardening, 8 items, all with new unit tests; all cargo
+  gates green):
+  ① 🔴 slowloris — http.rs gains the **per-request total deadline REQUEST_TOTAL=30s** (the
+  head+body read loop extracted into read_request under a total budget; on expiry the connection
+  closes + the SLOW_KILLS counter; keep-alive resets per request; tests use
+  serve_conn_with_budget injecting a 300ms budget to drive the byte-dripping vectors) — the old
+  READ_TIMEOUT was per-read, and byte-dripping could hold the 64 concurrency permits indefinitely
+  (a VIP-surface DoS on the admin plane);
+  ② 🟡 loopback accept error classification — transient errors (WouldBlock/Interrupted/
+  ConnAborted/ConnReset/EMFILE/ENFILE) logged + a 250ms backoff and keep running; only fatal ones
+  exit (aligned with the VIP surface's 5s re-bind semantics);
+  ③ 🟡 the pending-login full-load eviction now oldest-by (exp_unix, insertion order) + put/take
+  lazily clearing expired rows (the old keys().min() lexicographic minimum ≠ the oldest —
+  login-finish for admin-like lexicographically-small names failed for no reason);
+  ④ 🟡 audit stderr line injection — the four public auth endpoints' user input uniformly 1..=64B
+  + ASCII control characters rejected (sane_user_param; valid_username's full set is not reused —
+  the control-flow device-owner names are not subject to that charset), and AuditLog::record
+  strips control characters from user/target before output (stderr and the in-memory ring get the
+  same stripping);
+  ⑤ 🟡 LoginBackoff/IpBuckets capacity-capped at 4096 + a 60s periodic sweep (SWEEP_PERIOD reused
+  at the same tier; the write path first clears lazy/idle rows, still evicting the oldest when
+  full — arbitrary user/IP names injected on the unauthenticated surface no longer grow rows
+  unboundedly);
+  ⑥ 🟡 demotion/disable session recycling made immediate — dispatch's session tier re-reads UserRow
+  (the locally applied view; linearizable not required; the trade-off noted in a comment): after
+  set_admin=false an old session gets 403 on the next request; a disabled user gets 401
+  user_disabled on the next request (the old behavior kept the admin snapshot for the 8h TTL);
+  §M8.3/§M8.7 wording synced (including the as-is statement that "a disabled account has a
+  password-correctness oracle (throttled by the backoff)");
+  ⑦ 🟢 small items — a wrong method uniformly 405 (path_known branches on the path shape, aligned
+  with the error-code table); flock_pake.js decHex/decB64 expected-length checks + writeParam's
+  zero-length short-circuit (a pure JS asset; the .wasm artifact unchanged); the series
+  vip_in_registry includes remote server VIPs (the multi-primary server_keys view — no 404 before
+  the first sample after a restart; covered by the multi-primary integration test); config.rs's
+  admin_bind+1 uses checked_add (a 65535 overflow no longer debug-panics); the session/access
+  Mutex-poison handling switched to into_inner;
+  ⑧ this changelog entry is the 8th item (the design.md wording synced with the implementation's
+  behavior).
