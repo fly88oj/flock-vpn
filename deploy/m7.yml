@@ -1,26 +1,32 @@
-# m7.yml —— M7 客户端名册（docs/design.md §7-M7.7：m3 拓扑 + 第二客户端 + peers 实测）。
+# m7.yml —— M7 client roster (docs/design.md §7-M7.7: m3 topology + a second client + peers field test).
 #
 #   docker compose -f deploy/m7.yml up -d --build
 #   bash deploy/m7_assert.sh
 #
-# 拓扑（m3.yml 的 frp 中转变体 + 两台客户端——名册 ≥3 条目：server + client-1/2）：
-#   frps（原版 v0.71.1；用户口 27500/27501 容器网内可达）
-#     └─ server（Frp 模式 + M3 数据面：tun0 VIP 100.64.0.1；与 m3 同构，状态卷独立）
-#   client-1 / client-2（flock-client；**service daemon 形态**（M7：IPC + 登录保持），
-#     hostname=client-1/client-2（key-bind 入册「主机名」列的确定性断言源）；
-#     command 覆盖为卷内配置 /var/lib/flock/client.toml——[auth] username 由
-#     m7_assert.sh bootstrap 写入（卷持久 ⇒ 容器重建不丢））。
+# Topology (the frp-relay variant of m3.yml + two clients —— roster ≥3 entries:
+# server + client-1/2):
+#   frps (stock v0.71.1; user ports 27500/27501 reachable inside the container
+#     network)
+#     └─ server (Frp mode + M3 data plane: tun0 VIP 100.64.0.1; isomorphic to
+#                m3, independent state volume)
+#   client-1 / client-2 (flock-client; **service daemon form** (M7: IPC + login
+#     keepalive), hostname=client-1/client-2 (the deterministic assertion source
+#     for the roster's "hostname" column); the command is overridden to the
+#     in-volume config /var/lib/flock/client.toml —— the [auth] username is
+#     written by the m7_assert.sh bootstrap (the volume persists ⇒ container
+#     rebuilds keep it)).
 #
-# 凭据引导（admin 开户路径，对齐 m3 既有脚本）：gen-keys → 服务端 device-add
-# --user m7cN → invite → ingest → vip → `flock-client login`（设口令 + 登录验证 +
-# hostname 入册）→ ready → restart（daemon 接管）。
+# Credential bootstrap (admin onboarding path, aligned with the existing m3
+# script): gen-keys → server-side device-add --user m7cN → invite → ingest → vip
+# → `flock-client login` (set password + login verification + hostname
+# registered) → ready → restart (daemon takes over).
 
 name: flock-m7
 
 services:
   frps:
     build:
-      context: build            # 仅 Dockerfile.frps + frps.toml（committed）
+      context: build            # only Dockerfile.frps + frps.toml (committed)
       dockerfile: Dockerfile.frps
       additional_contexts:
         bins: ../.tmp/frp_0.71.1_linux_amd64
@@ -30,15 +36,15 @@ services:
 
   server:
     build:
-      context: ..               # workspace 根（源码；.dockerignore 裁剪 target/.tmp）
+      context: ..               # workspace root (sources; .dockerignore trims target/.tmp)
       dockerfile: deploy/Dockerfile.server
       additional_contexts:
         frpbin: ../.tmp/frp_0.71.1_linux_amd64
       args:
-        server_conf: server-m3.toml   # 与 m3 同构（容器网络视角端点 + ticket_ttl 6s）
+        server_conf: server-m3.toml   # isomorphic to m3 (container-network-view endpoints + ticket_ttl 6s)
     image: flock/server:m7
     depends_on: [frps]
-    # M3 数据面：服务端自身也是 peer（tun + 路由，§2.2）。
+    # M3 data plane: the server itself is also a peer (tun + routes, §2.2).
     cap_add: [NET_ADMIN]
     devices:
       - /dev/net/tun:/dev/net/tun
@@ -57,7 +63,8 @@ services:
     image: flock/client:m7
     depends_on: [server]
     hostname: client-1
-    # service daemon 形态（M7：IPC + 登录保持 + peers 面）；配置在卷内（bootstrap 写）。
+    # service daemon form (M7: IPC + login keepalive + the peers face); the
+    # config lives in the volume (written by the bootstrap).
     command: ["--config", "/var/lib/flock/client.toml", "service"]
     cap_add: [NET_ADMIN]
     devices:

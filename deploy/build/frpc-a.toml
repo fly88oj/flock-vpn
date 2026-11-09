@@ -1,7 +1,8 @@
-# frpc-a —— server-a 的中转注册（docs/design.md §6.2 M5）。
-# proxy flock-a-main：server-a:9443 → frps-a 用户口 23000（flock 接入端点）。
-# proxy flock-a-echo：echo-a:9001 → frps-a 23100（A1 字节透传 harness 的 echo 面经
-# 同一中转链路——R1/R2 复刻）。
+# frpc-a —— the relay registration of server-a (docs/design.md §6.2 M5).
+# proxy flock-a-main: server-a:9443 → frps-a user port 23000 (the flock access
+# endpoint).
+# proxy flock-a-echo: echo-a:9001 → frps-a 23100 (the A1 byte-passthrough
+# harness's echo face over the same relay link —— replicated by R1/R2).
 serverAddr = "frps-a"
 serverPort = 7000
 

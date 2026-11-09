@@ -1,10 +1,14 @@
 # syntax=docker/dockerfile:1
-# frpc（原版 v0.71.1 定版）—— e2e 边车容器（docs/design.md §6.2 M5：frpc-a/frpc-b）。
+# frpc (stock v0.71.1 pinned) —— the e2e sidecar container (docs/design.md §6.2
+# M5: frpc-a/frpc-b).
 #
-# 生产形态里 frpc 是 server 进程内子进程（§3.9 Supervisor）；e2e 拓扑用独立边车
-# 容器承担注册（§6.2「同一 Supervisor 代码两种部署」）。配置文件由 compose 卷挂载
-# （frpc-a.toml / frpc-b.toml，二者仅 serverAddr/remotePort 不同）。
-# 二进制经命名构建上下文 `bins` 直取 .tmp/frp_0.71.1_linux_amd64/（同 Dockerfile.frps）。
+# In the production form frpc is an in-process child of the server (§3.9
+# Supervisor); the e2e topology uses a dedicated sidecar container to carry the
+# registration (§6.2 "the same Supervisor code, two deployments"). The config
+# file is volume-mounted by compose (frpc-a.toml / frpc-b.toml, differing only
+# in serverAddr/remotePort).
+# The binary is taken directly from .tmp/frp_0.71.1_linux_amd64/ via the named
+# build context `bins` (same as Dockerfile.frps).
 
 FROM debian:bookworm-slim
 RUN apt-get update \

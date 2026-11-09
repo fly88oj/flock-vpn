@@ -1,15 +1,16 @@
-# flock-client —— M3 客户端镜像（docs/design.md §3.12/§7-M3：m3.yml 的 client 服务）。
+# flock-client —— M3 client image (docs/design.md §3.12/§7-M3: the client service of m3.yml).
 #
-# 构建模式与 Dockerfile.server 相同（manifest+stub 依赖层缓存；glibc 两侧同钉
-# bookworm）。运行段工具：iproute2/iputils-ping（A2/A3 断言）、iperf3（A4）、
-# procps（诊断）。
+# Same build pattern as Dockerfile.server (manifest+stub dependency-layer
+# caching; glibc pinned to bookworm on both sides). Runtime-stage tools:
+# iproute2/iputils-ping (A2/A3 assertions), iperf3 (A4), procps (diagnostics).
 
 FROM rust:1.98-slim-bookworm AS builder
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-# flock-protocol 为 git 依赖（独立仓 v0.1.0）：镜像内构建经 GitHub 拉取。
+# flock-protocol is a git dependency (separate repo, v0.1.0): in-image builds
+# fetch it from GitHub.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
 COPY crates/flock-sync/Cargo.toml crates/flock-sync/
@@ -33,11 +34,13 @@ RUN touch app/flock-client/src/lib.rs \
  && cargo build --release --locked -p flock-client
 
 FROM debian:bookworm-slim
-# 工具面：iproute2/iputils-ping/iperf3/procps（A2/A3/A4 断言与诊断）；
-# netcat-openbsd/tcpdump/iptables/hping3：M5 断言（A1 字节透传 nc echo、A11 压缩
-# 默认关的 iptables 字节计数对照、A14 伪造源的 hping3 + tcpdump 收包面）；
-# jq：M7 断言（peers --json 机读档解析）；
-# curl：M8 W4 断言（client 容器内 curl VIP:9800 登录页可达——VPN 段路径实证）。
+# Tool face: iproute2/iputils-ping/iperf3/procps (A2/A3/A4 assertions and
+# diagnostics); netcat-openbsd/tcpdump/iptables/hping3: the M5 assertions
+# (A1 byte-passthrough nc echo, A11 compression-off iptables byte-count
+# comparison, A14 forged-source hping3 + tcpdump capture face); jq: the M7
+# assertion (peers --json machine-readable parsing); curl: the M8 W4 assertion
+# (curl VIP:9800 login page reachable inside the client container —— VPN-segment
+# path proof).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends iproute2 iputils-ping iperf3 procps \
       netcat-openbsd tcpdump iptables hping3 jq curl \

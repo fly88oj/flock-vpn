@@ -1,31 +1,36 @@
-# m2.yml —— M2 frp 中转路径（docs/design.md §7-M2 完成标准第一项）。
+# m2.yml —— M2 frp relay path (docs/design.md §7-M2 completion criteria, item one).
 #
 #   docker compose -f deploy/m2.yml up -d --build
 #   cargo test -p flock-server --test smoke -- --ignored relay
 #
-# 原版 frp v0.71.1 二进制（frps/frpc）经**命名构建上下文**直取
-# `.tmp/frp_0.71.1_linux_amd64/`（build.additional_contexts）——`up -d --build` 免任何
-# 拷贝前置步骤，各镜像主 context 保持小（frps = deploy/build、server = 仓库根）。
-# 若 .tmp 无该目录（新机器）：下载 v0.71.1 Linux amd64 包解压到 .tmp/ 即可
-# （frp-compat §1：GitHub Releases v0.71.1 / 2026-10-14）。
+# The stock frp v0.71.1 binaries (frps/frpc) are pulled straight from
+# `.tmp/frp_0.71.1_linux_amd64/` via a **named build context**
+# (build.additional_contexts) —— `up -d --build` needs no copy pre-step and each
+# image's main context stays small (frps = deploy/build, server = repo root).
+# If .tmp lacks that directory (a new machine): download the v0.71.1 Linux
+# amd64 package and unpack it into .tmp/
+# (frp-compat §1: GitHub Releases v0.71.1 / 2026-10-14).
 #
-# 拓扑（隔离网络 frpnet = 「模拟不可信公网」，§6.2 同思路）：
-#   frps（原版 v0.71.1，用户口 27500/27501 映射宿主）
-#     └─ server（Frp 模式：内嵌 frpc 双 proxy 注册 → 本地 9443；admin 仅容器 loopback）
-#   client-skeleton（M3 骨架占位：宿主冒烟测试承担 M2 的客户端角色）
+# Topology (isolated network frpnet = "the simulated untrusted public network",
+# same idea as §6.2):
+#   frps (stock v0.71.1, user ports 27500/27501 mapped to the host)
+#     └─ server (Frp mode: embedded frpc dual-proxy registration → local 9443;
+#                admin on container loopback only)
+#   client-skeleton (M3 skeleton placeholder: host smoke tests play M2's client role)
 
 name: flock-m2
 
 services:
   frps:
     build:
-      context: build            # 仅 Dockerfile.frps + frps.toml（committed）
+      context: build            # only Dockerfile.frps + frps.toml (committed)
       dockerfile: Dockerfile.frps
       additional_contexts:
         bins: ../.tmp/frp_0.71.1_linux_amd64
     image: flock/frps:0.71.1
-    # 用户口映射宿主（仅回环，对齐 m3.yml 范式：宿主冒烟/客户端拨号目标走
-    # 127.0.0.1，容器网内口不受影响；advertise_endpoint 与之对应）
+    # User ports mapped to the host (loopback only, aligned with the m3.yml
+    # pattern: host smoke / client dial targets go through 127.0.0.1, the
+    # in-network ports are unaffected; advertise_endpoint matches)
     ports:
       - "127.0.0.1:27500:27500"
       - "127.0.0.1:27501:27501"
@@ -34,7 +39,7 @@ services:
 
   server:
     build:
-      context: ..               # workspace 根（源码；.dockerignore 裁剪 target/.tmp 等）
+      context: ..               # workspace root (sources; .dockerignore trims target/.tmp etc.)
       dockerfile: deploy/Dockerfile.server
       additional_contexts:
         frpbin: ../.tmp/frp_0.71.1_linux_amd64
@@ -45,7 +50,8 @@ services:
       - server-state:/var/lib/flock
     restart: unless-stopped
 
-  # M3 客户端骨架占位（§7-M2「1 client 骨架」）；M2 的客户端断言由宿主冒烟测试执行。
+  # M3 client skeleton placeholder (§7-M2 "1 client skeleton"); M2's client
+  # assertions are executed by the host smoke tests.
   client-skeleton:
     image: alpine:3.20
     command: ["sleep", "infinity"]

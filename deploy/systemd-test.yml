@@ -1,33 +1,37 @@
-# systemd-test.yml —— M6 systemd 开机自启真机语义实测（docs/design.md §7-M6.3/M6.6；
-# 结果记录 docs/manual/service-install.md「Linux 实测」小节）。
+# systemd-test.yml —— M6 systemd boot-autostart real-machine semantics, measured
+# in containers (docs/design.md §7-M6.3/M6.6; results recorded in
+# docs/manual/service-install.md, "Linux field test" section).
 #
 #   MSYS_NO_PATHCONV=1 docker compose -f deploy/systemd-test.yml up -d --build
-#   bash deploy/systemd_assert.sh          # S1–S6 逐项 PASS/FAIL，任一 FAIL ⇒ 退出码非零
+#   bash deploy/systemd_assert.sh          # S1–S6 per-item PASS/FAIL; any FAIL ⇒ non-zero exit
 #
-# 拓扑（最小直接形态，配置面参照 m2-direct.yml）：
-#   server（Direct 模式 + M3 数据面：tun0 VIP 100.64.0.1；server-systemd-test.toml
-#     bind-mount 覆盖镜像内配置——端点为容器网视角 server:9443）
-#   client（Dockerfile.systemd-test：flock-client + systemd，PID 1 = /sbin/init；
-#     --privileged + STOPSIGNAL SIGRTMIN+3（compose 文件/Dockerfile）——docker
-#     restart 容器 = 模拟「关机再开机」，systemd 按单元 enablement 拉起服务）
+# Topology (minimal direct form, config face modeled on m2-direct.yml):
+#   server (Direct mode + M3 data plane: tun0 VIP 100.64.0.1;
+#     server-systemd-test.toml bind-mounts over the in-image config —— endpoints
+#     in the container-network view, server:9443)
+#   client (Dockerfile.systemd-test: flock-client + systemd, PID 1 = /sbin/init;
+#     --privileged + STOPSIGNAL SIGRTMIN+3 (compose file/Dockerfile) —— docker
+#     restart of the container = a simulated "shutdown then boot", systemd
+#     starts the service per the unit enablement)
 #
-# 断言脚本 deploy/systemd_assert.sh：
-#   S1 安装（install --config /etc/flock/client.toml → 单元/is-enabled/daemon-reload）
-#   S2 开机自启（docker restart → systemctl is-active = active）
-#   S3 VPN 连通（tun0 出现 + ping 通 server VIP 100.64.0.1）
-#   S4 IPC（flock-client status → state=connected、vip 正确）
-#   S5 无头（无 DISPLAY/DBus；无 tray 进程；tray 子命令优雅退出码 0）
-#   S6 退出语义（IPC Shutdown → exit 0 不复活；docker restart 又自启）
+# Assertion script deploy/systemd_assert.sh:
+#   S1 install (install --config /etc/flock/client.toml → unit/is-enabled/daemon-reload)
+#   S2 boot autostart (docker restart → systemctl is-active = active)
+#   S3 VPN connectivity (tun0 appears + ping to server VIP 100.64.0.1 works)
+#   S4 IPC (flock-client status → state=connected, vip correct)
+#   S5 headless (no DISPLAY/DBus; no tray process; tray subcommand exits gracefully with code 0)
+#   S6 exit semantics (IPC Shutdown → exit 0 without revival; docker restart autostarts again)
 
 name: flock-systemd-test
 
 services:
   server:
     build:
-      context: ..               # 与 m2-direct 同构（Dockerfile.server-direct 免 prepare）
+      context: ..               # isomorphic to m2-direct (Dockerfile.server-direct, no prepare needed)
       dockerfile: deploy/Dockerfile.server-direct
     image: flock/server:systemd-test
-    # M3 数据面（tun0 VIP 100.64.0.1）+ 管理面（容器内 127.0.0.1:9444——device-add/invite）。
+    # M3 data plane (tun0 VIP 100.64.0.1) + management face (in-container
+    # 127.0.0.1:9444 —— device-add/invite).
     cap_add: [NET_ADMIN]
     devices:
       - /dev/net/tun:/dev/net/tun
@@ -47,7 +51,8 @@ services:
     image: flock/client:systemd-test
     depends_on: [server]
     hostname: sdclient
-    # systemd 需 cgroup 写权（--privileged 即含）；NET_ADMIN/tun 为 daemon 数据面。
+    # systemd needs cgroup write permission (--privileged includes it);
+    # NET_ADMIN/tun are for the daemon's data plane.
     privileged: true
     cap_add: [NET_ADMIN]
     devices:
@@ -56,7 +61,7 @@ services:
       net.ipv4.conf.all.rp_filter: "1"
       net.ipv4.conf.default.rp_filter: "1"
     environment:
-      - container=docker          # systemd 容器探测（免 chroot/mount 面的误判）
+      - container=docker          # systemd container detection (avoids chroot/mount misdetection)
     networks: [sdnet]
     volumes:
       - client-state:/var/lib/flock

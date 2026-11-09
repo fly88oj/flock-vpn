@@ -1,27 +1,32 @@
-# webui.yml —— M8 Web UI 容器集成（docs/design.md §7-M8.9 W1–W7 的拓扑承载）。
+# webui.yml —— M8 Web UI container integration (the topology carrying
+# docs/design.md §7-M8.9 W1–W7).
 #
-#   单服拓扑（W1–W5/W7）：
+#   Single-server topology (W1–W5/W7):
 #     docker compose -f deploy/webui.yml up -d --build
 #     bash deploy/webui_assert.sh
-#   双服 Raft 拓扑（W6；独立项目名隔离——与单服拓扑并行不撞端口/卷/网）：
+#   Dual-server Raft topology (W6; isolated by an independent project name ——
+#   runs in parallel with the single-server topology without port/volume/
+#   network clashes):
 #     docker compose -p flock-webui-dual -f deploy/webui.yml --profile dual up -d --build
-#     bash deploy/webui_assert.sh          # W6 检测到 dual-b 在跑即执行
+#     bash deploy/webui_assert.sh          # W6 runs once it detects dual-b up
 #
-# 拓扑：
-#   server-a（Dockerfile.webui 缺省档：单服 Direct；flock-server + webui_login
-#     驱动器 + curl/jq；Direct 9443 + admin 9444 + webui 双绑定 127.0.0.1:9800/
-#     tun VIP:9800；cap NET_ADMIN + /dev/net/tun——VIP 面随 tun 就绪补绑）
-#   client-1（flock-client 镜像 + curl；W4 的 VPN 段登录链载具 / W5 的连接层
-#     不可达探针——bash /dev/tcp 兜底）
-#   dual-a / dual-b（profile "dual"：multi-primary 构建档 + server-webui-{a,b}.toml
-#     双 voter Raft，VIP 100.64.0.1/.2；enroll 捆绑与 cluster-bootstrap 由
-#     webui_assert.sh W6 幂等驱动）
-#   dual-client（profile "dual"：flock-client，经 cluster-invite 入网——W6 从
-#     VPN 段同时可达双 VIP）
-#   operator（profile "dual"：一次性 init-cluster --voters 2 → /mat 卷）
+# Topology:
+#   server-a (Dockerfile.webui default tier: single-server Direct; flock-server
+#     + the webui_login driver + curl/jq; Direct 9443 + admin 9444 + webui dual
+#     bind 127.0.0.1:9800/tun VIP:9800; cap NET_ADMIN + /dev/net/tun —— the VIP
+#     face is bound once tun is ready)
+#   client-1 (flock-client image + curl; the W4 VPN-segment login-chain vehicle /
+#     the W5 connection-layer unreachability probe —— bash /dev/tcp fallback)
+#   dual-a / dual-b (profile "dual": multi-primary build tier +
+#     server-webui-{a,b}.toml two-voter Raft, VIP 100.64.0.1/.2; enroll bundles
+#     and cluster-bootstrap are driven idempotently by webui_assert.sh W6)
+#   dual-client (profile "dual": flock-client, onboarded via cluster-invite ——
+#     W6 reaches both VIPs simultaneously from the VPN segment)
+#   operator (profile "dual": one-shot init-cluster --voters 2 → /mat volume)
 #
-# 网络单 flockpub：server 的容器网地址（如 172.x.y.z）**不绑 9800**——webui 只绑
-# loopback + tun VIP ⇒ W5 从 client-1 探 server-a:9800（flockpub 地址）必 refused。
+# Single network flockpub: the server's container-network address (e.g.
+# 172.x.y.z) is **not bound on 9800** —— webui binds loopback + tun VIP only ⇒
+# W5's probe from client-1 to server-a:9800 (the flockpub address) is refused.
 
 name: flock-webui
 
@@ -61,9 +66,10 @@ services:
       - client-1-state:/var/lib/flock
     restart: unless-stopped
 
-  # —— dual 档（W6）：双 voter Raft ——
-  # 注意：a/b 构建档不同（server-webui-{a,b}.toml）⇒ **镜像 tag 必须分立**——
-  # 同 tag 双 build 会后者覆盖前者（b 的配置进 a 的容器）。
+  # —— dual tier (W6): two-voter Raft ——
+  # Note: a/b build tiers differ (server-webui-{a,b}.toml) ⇒ **the image tags
+  # must be separate** —— a same-tag double build has the latter overwrite the
+  # former (b's config ending up in a's container).
   dual-a:
     build:
       context: ..
@@ -128,7 +134,7 @@ services:
       - dual-client-state:/var/lib/flock
     restart: unless-stopped
 
-  # —— dual 档：一次性运维容器（init-cluster --voters 2，幂等）——
+  # —— dual tier: one-shot ops container (init-cluster --voters 2, idempotent) ——
   operator:
     build:
       context: ..

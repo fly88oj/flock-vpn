@@ -1,3 +1,4 @@
-# frps（原版 v0.71.1，m2.yml 中转节点）——隔离 docker 网络（frpnet）内专用；
-# token 空：中转口只对 docker 网络暴露，宿主只映射用户口（27500/27501）。
+# frps (stock v0.71.1, the relay node of m2.yml) —— dedicated to the isolated
+# docker network (frpnet); empty token: the relay ports are exposed only to the
+# docker network, the host only maps the user ports (27500/27501).
 bindPort = 7000

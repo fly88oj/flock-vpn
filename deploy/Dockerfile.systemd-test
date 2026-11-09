@@ -1,15 +1,21 @@
-# flock-client —— M6 systemd 真机语义实测容器（deploy/systemd-test.yml 的 client 服务）。
+# flock-client —— M6 systemd real-machine-semantics test container (the client
+# service of deploy/systemd-test.yml).
 #
-# 与 Dockerfile.client 的差异 = 「Linux 服务形态」的物化：
-#   - 运行段装 systemd（PID 1 跑 /sbin/init；--privileged + STOPSIGNAL SIGRTMIN+3 由
-#     systemd-test.yml 给——docker stop/restart 即 systemd 语义的「关机/开机」）；
-#   - 剥物理机单机面（getty/udev/networkd/networkd-wait-online 等——经典
-#     systemd-in-docker 配方；network-online.target.wants 一并剥，防 wait-online 挂起）；
-#   - 工具面：iproute2/iputils-ping/procps（断言与诊断）+ socat（S6：IPC Shutdown 帧
-#     手投——postcard CtrlReq::Shutdown 与 tray 同构，见 systemd_assert.sh）。
-#     不装 dbus/display 栈（S5 无头语义：systemctl 走 /run/systemd/private 私有套接字）。
+# The differences from Dockerfile.client materialize the "Linux service form":
+#   - the runtime stage installs systemd (PID 1 runs /sbin/init; --privileged +
+#     STOPSIGNAL SIGRTMIN+3 come from systemd-test.yml —— docker stop/restart is
+#     then a systemd-semantics "shutdown/boot");
+#   - the physical-machine single-box surface is stripped (getty/udev/networkd/
+#     networkd-wait-online etc. —— the classic systemd-in-docker recipe;
+#     network-online.target.wants stripped too, to prevent wait-online hanging);
+#   - tool face: iproute2/iputils-ping/procps (assertions and diagnostics) +
+#     socat (S6: hand-submitting the IPC Shutdown frame —— the postcard
+#     CtrlReq::Shutdown is isomorphic to the tray's stop, see systemd_assert.sh).
+#     No dbus/display stack installed (S5 headless semantics: systemctl goes
+#     through the /run/systemd/private private socket).
 #
-# 构建段与 Dockerfile.client 逐行同构（BuildKit 指令级层缓存共享，无重复编译成本）。
+# The build stage is line-by-line isomorphic to Dockerfile.client (BuildKit
+# instruction-level layer-cache sharing, no duplicated compile cost).
 
 FROM rust:1.98-slim-bookworm AS builder
 RUN apt-get update \
@@ -21,7 +27,8 @@ COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
 COPY crates/flock-sync/Cargo.toml crates/flock-sync/
 COPY app/flock-server/Cargo.toml app/flock-server/
 COPY app/flock-client/Cargo.toml app/flock-client/
-# flock-protocol 为 git 依赖（独立仓 v0.1.0）：镜像内构建经 GitHub 拉取。
+# flock-protocol is a git dependency (separate repo, v0.1.0): in-image builds
+# fetch it from GitHub.
 RUN mkdir -p crates/flock-frpc/src crates/flock-sync/src \
              app/flock-server/src app/flock-client/src \
  && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
@@ -40,11 +47,13 @@ RUN touch app/flock-client/src/lib.rs \
  && cargo build --release --locked -p flock-client
 
 FROM debian:bookworm-slim
-# systemd-sysv 提供 /sbin/init（Debian 拆包：systemd 本体只有 /lib/systemd/systemd）。
+# systemd-sysv provides /sbin/init (Debian split: the systemd package proper
+# only ships /lib/systemd/systemd).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends iproute2 iputils-ping procps socat systemd systemd-sysv \
  && rm -rf /var/lib/apt/lists/*
-# systemd 容器最小化（剥物理机面；保留 tmpfiles 的 sysinit 位）。
+# systemd container minimization (strip the physical-machine face; keep the
+# tmpfiles sysinit bits).
 RUN for i in /lib/systemd/system/sysinit.target.wants/*; do \
         [ "$(basename "$i")" = systemd-tmpfiles-setup.service ] || rm -f "$i"; \
     done ; \
@@ -60,6 +69,7 @@ RUN for i in /lib/systemd/system/sysinit.target.wants/*; do \
 COPY --from=builder /src/target/release/flock-client /usr/local/bin/flock-client
 RUN mkdir -p /var/lib/flock
 COPY deploy/client.toml /etc/flock/client.toml
-# docker stop/restart → SIGRTMIN+3 = systemd 干净关机（M6「开机自启」实测的关机面）。
+# docker stop/restart → SIGRTMIN+3 = a clean systemd shutdown (the shutdown face
+# of the M6 "boot autostart" field test).
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/sbin/init"]

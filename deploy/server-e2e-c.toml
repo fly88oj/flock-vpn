@@ -1,8 +1,10 @@
-# server.toml —— e2e server-c（docs/design.md §6.2 M5：**Direct 接入形态** + 多主 voter 3）。
+# server.toml —— e2e server-c (docs/design.md §6.2 M5: **Direct access form** + multi-primary voter 3).
 #
-# 硬约束守门样板（§0/§2.1）：Direct = 直接监听 flockpub 地址（172.28.0.22:9443）——
-# 零 frp 逻辑（无 frpc 边车、无 frp 进程，A16 的 pgrep 面）；同一 ServerEntry 材料体系
-# 与 Frp 形态互通（客户端无感知差异）。tun VIP 100.64.0.3（§6.2）。
+# Hard-constraint gatekeeping template (§0/§2.1): Direct = listening directly
+# on the flockpub address (172.28.0.22:9443) —— zero frp logic (no frpc sidecar,
+# no frp process, A16's pgrep face); the same ServerEntry material system
+# interoperates with the Frp form (clients notice no difference). tun VIP
+# 100.64.0.3 (§6.2).
 
 state_dir = "/var/lib/flock"
 mode = "direct"

@@ -1,5 +1,5 @@
-# server.toml —— e2e server-b（docs/design.md §6.2 M5：Frp 接入形态 + 多主 voter 2）。
-# 同 server-e2e-a（边车 frpc-b → frps-b:23001）；tun VIP 100.64.0.2（§6.2）。
+# server.toml —— e2e server-b (docs/design.md §6.2 M5: Frp access form + multi-primary voter 2).
+# Same as server-e2e-a (sidecar frpc-b → frps-b:23001); tun VIP 100.64.0.2 (§6.2).
 
 state_dir = "/var/lib/flock"
 mode = "direct"

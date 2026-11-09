@@ -1,106 +1,124 @@
-# deploy/multinode —— 真·多机组网实测（Windows 本机 Docker × 远端 jowency LXD）
+# deploy/multinode —— real multi-machine networking test (Windows local Docker × remote jowency LXD)
 
-结果与证据：`docs/manual/multinode-test.md`（实测日期 2026-11-07，HEAD b9217c3）。
-拓扑范式沿用 `deploy/` 既有资产（`Dockerfile.server-direct` 的 Direct 形态、
-`e2e.yml/e2e_assert.sh` 的 init-cluster/enroll/cluster-bootstrap 引导、
-`m3/m7_assert.sh` 的 device-add→invite→login 开户路径——跨机化）。
+Results and evidence: `docs/manual/multinode-test.md` (measured 2026-11-07, HEAD
+b9217c3).
+The topology paradigm reuses the existing `deploy/` assets (the Direct form of
+`Dockerfile.server-direct`, the init-cluster/enroll/cluster-bootstrap bootstrap
+of `e2e.yml/e2e_assert.sh`, and the device-add→invite→login onboarding path of
+`m3/m7_assert.sh` —— taken cross-machine).
 
-## 拓扑
+## Topology
 
 ```
-场景一【单 Server · Direct】（S1–S3）
-  Windows 宿主 192.168.31.244 ── Docker bridge
-    ├─ flock-wc1 / flock-wc2（flock-client，service daemon）
-  jowency 192.168.31.221 ── LXD（lxdbr0 10.100.0.0/24 NAT）
-    ├─ flock-s1（flock-server，Direct :9443；proxy device 发布宿主 0.0.0.0:9443）
-    ├─ flock-c3 / flock-c4（flock-client）
-  客户端全部直连 192.168.31.221:9443；全网状 ping（20 格）+ peers 名册 5 节点。
+Scenario 1 [single server · Direct] (S1–S3)
+  Windows host 192.168.31.244 —— Docker bridge
+    ├─ flock-wc1 / flock-wc2 (flock-client, service daemon)
+  jowency 192.168.31.221 —— LXD (lxdbr0 10.100.0.0/24 NAT)
+    ├─ flock-s1 (flock-server, Direct :9443; a proxy device publishes host 0.0.0.0:9443)
+    ├─ flock-c3 / flock-c4 (flock-client)
+  All clients connect directly to 192.168.31.221:9443; full-mesh ping (20
+  cells) + a 5-node peers roster.
 
-场景二【双 Server · 跨机 Raft + 双传输】（R1–R5）
-  server-1 = flock-srv1（Windows Docker；Direct，发布 0.0.0.0:9443 客户端口
-             + 0.0.0.0:9500 Raft 织物口）
-  server-2 = flock-s2（jowency LXD；Frp 接入——宿主 frps :7000/:24000，进程内
-             flock-frpc 注册；Raft :9500 经 proxy device 发布）
+Scenario 2 [two servers · cross-machine Raft + dual transport] (R1–R5)
+  server-1 = flock-srv1 (Windows Docker; Direct, publishing 0.0.0.0:9443 for
+             clients + 0.0.0.0:9500 for the Raft fabric)
+  server-2 = flock-s2 (jowency LXD; Frp access —— host frps :7000/:24000,
+             in-process flock-frpc registration; Raft :9500 published via a
+             proxy device)
   2-voter init-cluster --endpoints 192.168.31.244:9443,192.168.31.221:24000
-  客户端两侧分布：flock-2w1/2w2（→server-1 直连）、flock-c5/c6（→frps 用户口 24000）。
+  Clients split across both sides: flock-2w1/2w2 (→ server-1 direct),
+  flock-c5/c6 (→ the frps user port 24000).
 ```
 
-## 防火墙前置（jowency，必读）
+## Firewall prerequisites (jowency, read first)
 
-实测环境有两道既有拦截，**测试窗口内需临时放行、测毕回收**（下述命令与回收见
-`lxd-cleanup.sh` 头注与 multinode-test.md「环境拦截实录」）：
+The measured environment has two pre-existing blocks that **must be allowed
+temporarily for the test window and reverted afterwards** (the commands and
+reversion also in the `lxd-cleanup.sh` header and multinode-test.md's
+"environment blocks encountered"):
 
-1. `nft` 表 `ip filter` 的 `DOCKER-USER` 链有既设规则 `iifname lxdbr0 → 10/8,
-   172.16/12, 192.168/16 ct state new drop`（拦 LXD 容器到私网——场景二的
-   flock-s2 → server-1 Raft 拨号、c6 换端点直连均被拦）：
+1. The `DOCKER-USER` chain of the `nft` table `ip filter` has a pre-set rule
+   `iifname lxdbr0 → 10/8, 172.16/12, 192.168/16 ct state new drop` (blocking
+   LXD containers toward private networks —— in scenario 2 both flock-s2 →
+   server-1 Raft dialing and c6's endpoint-change direct connection were
+   blocked):
    ```sh
-   # 放行（仅 dst=Windows 宿主 + 本测端口；记 handle，测毕 nft delete rule 按原样回收）
+   # Allow (only dst=Windows host + this test's ports; note the handle,
+   # revert after the test with nft delete rule as recorded)
    sudo nft insert rule ip filter DOCKER-USER iifname "lxdbr0" ip daddr <WIN_IP> \
         tcp dport { 9443, 9500 } ct state new counter accept comment "flock-mn-test-temp"
    ```
-2. `ufw` default deny incoming：LXD 容器源（10.100.0.0/24）到宿主发布口不在
-   「LAN trusted 192.168.0.0/16」内（容器→宿主 INPUT 面被拦——场景一 LXD 客户端、
-   场景二 frps 用户口/注册口）：
+2. `ufw` default deny incoming: LXD container sources (10.100.0.0/24) to the
+   host's published ports are not inside "LAN trusted 192.168.0.0/16" (the
+   container→host INPUT face blocked —— scenario 1's LXD clients and scenario
+   2's frps user/registration ports):
    ```sh
    sudo ufw allow in on lxdbr0 to any port 9443  proto tcp comment "flock-mn-test"
    sudo ufw allow in on lxdbr0 to any port 7000  proto tcp comment "flock-mn-test"
    sudo ufw allow in on lxdbr0 to any port 24000 proto tcp comment "flock-mn-test"
-   # 回收：sudo ufw delete allow <同上三条全文>
+   # Revert: sudo ufw delete allow <the same three lines verbatim>
    ```
 
-Windows 入站探针（第一步必做）：`docker run -d -p 0.0.0.0:19444:19444 alpine …nc -l…`
-后自 jowency `nc -w5 <WIN_IP> 19444`。**本环境实测双向通**（Windows 入站可用），
-场景二保持「server-1 在 Windows Docker」的原拓扑不降级。若入站被拦：
-场景二改为两台 server 均在 LXD（各 proxy device 发布端口，仍跨容器）+ Windows Docker
-只跑出站客户端；且真机补测防火墙放行（管理员）：
+Windows inbound probe (do this first): after `docker run -d -p
+0.0.0.0:19444:19444 alpine …nc -l…`, from jowency run `nc -w5 <WIN_IP> 19444`.
+**Measured bidirectionally working in this environment** (Windows inbound
+usable), so scenario 2 keeps the original topology of "server-1 in Windows
+Docker" without degradation. If inbound is blocked: switch scenario 2 to both
+servers in LXD (each publishing ports via a proxy device, still cross-container)
++ Windows Docker running only outbound clients; and add the firewall allowance
+on the real machine (admin):
 `netsh advfirewall firewall add rule name="flock-mn" dir=in action=allow protocol=TCP localport=9443,9500`
 
-## 复刻步骤
+## Replication steps
 
 ```sh
-# 0) 构建 Linux amd64 发布二进制（三个：单服 Direct 档 / multi-primary 档 / client）
+# 0) Build the Linux amd64 release binaries (three: the single-server Direct
+#    tier / the multi-primary tier / the client)
 docker buildx build -f deploy/multinode/Dockerfile.buildbin \
     --output type=local,dest=deploy/multinode/out .
-# 1) 流式分发到 jowency（tar over ssh；scp/lxc pull 会静默截断大文件）
+# 1) Stream to jowency (tar over ssh; scp/lxc pull silently truncate large files)
 tar -C deploy/multinode/out -cf - flock-server-direct flock-server-mp flock-client \
   | ssh jowency@192.168.31.221 "mkdir -p ~/flock-mn/bin && tar -C ~/flock-mn/bin -xf - && chmod +x ~/flock-mn/bin/*"
 tar -C .tmp/frp_0.71.1_linux_amd64 -cf - frps frpc \
   | ssh jowency@192.168.31.221 "tar -C ~/flock-mn/bin -xf - && chmod +x ~/flock-mn/bin/frp*"
 tar -C deploy/multinode -cf - lxd-setup.sh server-*.toml frps-mn.toml client.toml.example \
   | ssh jowency@192.168.31.221 "mkdir -p ~/flock-mn/assets && tar -C ~/flock-mn/assets -xf -"
-# 2) 防火墙前置（见上节）
-# 3) 供应
+# 2) Firewall prerequisites (see the section above)
+# 3) Provision
 ssh jowency@192.168.31.221 "JOW_LAN_IP=192.168.31.221 bash ~/flock-mn/assets/lxd-setup.sh 1"
 bash deploy/multinode/win-docker-setup.sh 1
-# 4) 断言（bootstrap 幂等 + S1–S3；退出码 0/1/2/64）
+# 4) Assert (idempotent bootstrap + S1–S3; exit codes 0/1/2/64)
 bash deploy/multinode/multinode_assert.sh 1
-# 场景二：lxd-setup.sh 2 / win-docker-setup.sh 2 / multinode_assert.sh 2（R1–R5）
-# 5) 收尾（两侧）
-ssh jowency@192.168.31.221 "bash ~/flock-mn/assets/lxd-cleanup.sh"   # 或 --keep-files
+# Scenario 2: lxd-setup.sh 2 / win-docker-setup.sh 2 / multinode_assert.sh 2 (R1–R5)
+# 5) Teardown (both sides)
+ssh jowency@192.168.31.221 "bash ~/flock-mn/assets/lxd-cleanup.sh"   # or --keep-files
 bash deploy/multinode/win-docker-cleanup.sh
 ```
 
-## 资产清单
+## Asset inventory
 
-| 文件 | 作用 |
+| File | Purpose |
 |---|---|
-| `Dockerfile.buildbin` | Linux amd64 发布二进制构建（依赖层缓存；两档 server + client，strip） |
-| `server-s1-direct.toml` | 场景一 server 配置模板（Direct、无 [sync]） |
-| `server-2w-direct-mp.toml` | 场景二 server-1（Windows Docker，Direct + 跨机 raft_peers） |
-| `server-2s-frp-mp.toml` | 场景二 server-2（LXD，Frp→frps:24000 + 跨机 raft_peers） |
-| `frps-mn.toml` | 场景二 frps（jowency 宿主，bind 7000） |
-| `client.toml.example` | 客户端配置模板（endpoints 钉死 + [auth] username） |
-| `lxd-setup.sh` / `lxd-cleanup.sh` | jowency 侧供应/清理（经 ssh；幂等；只动 flock-*） |
-| `win-docker-setup.sh` / `win-docker-cleanup.sh` | Windows Docker 侧供应/清理（HEAD 二进制覆盖挂载 + 命名卷） |
-| `multinode_assert.sh` | 断言（S1–S3/R1–R5；矩阵+名册+Raft+吊销；退出码 0=全PASS/1=有FAIL/2=bootstrap失败/64=用法） |
-| `windows-host-node.ps1` | Windows 宿主（非 Docker）一键入网节点（真机清单用，需管理员） |
+| `Dockerfile.buildbin` | Linux amd64 release-binary build (dependency-layer caching; two server tiers + client, stripped) |
+| `server-s1-direct.toml` | Scenario-1 server config template (Direct, no [sync]) |
+| `server-2w-direct-mp.toml` | Scenario-2 server-1 (Windows Docker, Direct + cross-machine raft_peers) |
+| `server-2s-frp-mp.toml` | Scenario-2 server-2 (LXD, Frp→frps:24000 + cross-machine raft_peers) |
+| `frps-mn.toml` | Scenario-2 frps (jowency host, bind 7000) |
+| `client.toml.example` | Client config template (pinned endpoints + [auth] username) |
+| `lxd-setup.sh` / `lxd-cleanup.sh` | jowency-side provisioning/teardown (via ssh; idempotent; touches only flock-*) |
+| `win-docker-setup.sh` / `win-docker-cleanup.sh` | Windows Docker-side provisioning/teardown (HEAD-binary override mounts + named volumes) |
+| `multinode_assert.sh` | Assertions (S1–S3/R1–R5; matrix+roster+Raft+revocation; exit 0=all PASS/1=FAIL present/2=bootstrap failure/64=usage) |
+| `windows-host-node.ps1` | Windows-host (non-Docker) one-shot network node (for the real-machine checklist, needs an administrator) |
 
-## 真机清单（未在本会话执行的部分）
+## Real-machine checklist (parts not executed in this session)
 
-- Windows 宿主节点（非 Docker）：`deploy/multinode/windows-host-node.ps1`（管理员
-  PowerShell；编译/取 `target\release\flock-client.exe`、配置指向场景一 server、
-  UAC 自提权、`flock-client run`、输出 ping 矩阵）。
-- Windows 入站防火墙放行（仅当探针被拦时）：`netsh advfirewall firewall add rule
-  name="flock-mn" dir=in action=allow protocol=TCP localport=9443,9500`（管理员）。
-- 场景二若需「两台 server 都在 LXD」的降级拓扑：把 server-2w 配置照
-  server-2s 模式改 advertise/proxy 发布即可（raft_peers 端点同步改 jowency 侧）。
+- Windows host node (non-Docker): `deploy/multinode/windows-host-node.ps1`
+  (admin PowerShell; builds/takes `target\release\flock-client.exe`, config
+  pointing at the scenario-1 server, UAC self-elevation, `flock-client run`,
+  prints the ping matrix).
+- Windows inbound firewall allowance (only if the probe is blocked): `netsh
+  advfirewall firewall add rule name="flock-mn" dir=in action=allow
+  protocol=TCP localport=9443,9500` (admin).
+- If scenario 2 needs the degraded topology with "both servers in LXD": change
+  the server-2w config following the server-2s pattern for advertise/proxy
+  publication (update the raft_peers endpoints on the jowency side to match).

@@ -1,8 +1,9 @@
-# server.toml —— Direct 模式（m2-direct.yml 内的唯一容器；docs/design.md §2.1/§3.11/§7-M2）。
+# server.toml —— Direct mode (the only container in m2-direct.yml; docs/design.md §2.1/§3.11/§7-M2).
 #
-# mode 缺省即 direct：直接监听容器 9443，零 frp 逻辑（不装配 flock-frpc、无子进程、
-# 无 [frp] 段）。宿主映射 9443（主端点）+ 9444→9443（第二暴露口，换端点模拟）。
-# 镜像 = Dockerfile.server-direct（内无任何 frp 二进制）。
+# The default mode is direct: listen directly on the container's 9443, zero frp
+# logic (no flock-frpc assembly, no subprocess, no [frp] section). Host mappings:
+# 9443 (main endpoint) + 9444→9443 (second exposure, endpoint-change simulation).
+# Image = Dockerfile.server-direct (no frp binaries inside).
 
 state_dir = "/var/lib/flock"
 bind = "0.0.0.0:9443"

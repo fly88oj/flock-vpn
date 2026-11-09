@@ -1,13 +1,16 @@
-# flock-webui —— M8 Web UI 断言镜像（docs/design.md §7-M8.9 deploy/webui.yml 的 server 面）。
+# flock-webui —— M8 Web UI assertion image (docs/design.md §7-M8.9, the server
+# face of deploy/webui.yml).
 #
-# 与 Dockerfile.server-direct 的差异：① 运行段带 curl/jq（W1 断言）；② 额外构建并
-# 安装 examples/webui_login（W2/W3/W4/W6 的 HTTP-OPAQUE 驱动器）。构建模式沿用
-# manifest+stub 依赖层缓存；glibc 两侧同钉 bookworm。
+# Differences from Dockerfile.server-direct: ① the runtime stage carries
+# curl/jq (W1 assertions); ② additionally builds and installs
+# examples/webui_login (the HTTP-OPAQUE driver for W2/W3/W4/W6). The build
+# pattern reuses manifest+stub dependency-layer caching; glibc pinned to
+# bookworm on both sides.
 #
-# build args（M8b W6 dual 档）：
-#   server_features 缺省 ""        —— 单服 Direct（W1–W5/W7 拓扑）
-#   server_features "multi-primary" —— 双 voter Raft（server_conf 用
-#   server-webui-{a,b}.toml；W6 双 VIP 一致断言）
+# build args (M8b W6 dual tier):
+#   server_features default ""       —— single-server Direct (W1–W5/W7 topology)
+#   server_features "multi-primary"  —— two-voter Raft (server_conf uses
+#   server-webui-{a,b}.toml; the W6 dual-VIP consistency assertion)
 
 FROM rust:1.98-slim-bookworm AS builder
 ARG server_features=""
@@ -21,7 +24,8 @@ COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
 COPY crates/flock-sync/Cargo.toml crates/flock-sync/
 COPY app/flock-server/Cargo.toml app/flock-server/
 COPY app/flock-client/Cargo.toml app/flock-client/
-# flock-protocol 为 git 依赖（独立仓 v0.1.0）：镜像内构建经 GitHub 拉取。
+# flock-protocol is a git dependency (separate repo, v0.1.0): in-image builds
+# fetch it from GitHub.
 RUN mkdir -p crates/flock-frpc/src crates/flock-sync/src \
              app/flock-server/src app/flock-server/examples app/flock-client/src \
  && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
@@ -50,9 +54,11 @@ RUN if [ -n "$server_features" ]; then FEAT="--features $server_features"; else 
  && cargo build --release --locked -p flock-server --bins --example webui_login $FEAT
 
 FROM debian:bookworm-slim
-# ARG 按构建段作用域——final 段需重声明才能在 COPY 展开（否则空串 ⇒ 整目录拷入）。
+# ARGs are scoped per build stage —— the final stage must redeclare them for
+# COPY expansion (otherwise the empty string ⇒ the whole directory is copied in).
 ARG server_conf="server-webui.toml"
-# curl/jq：W1 未登录 401 断言与响应解析（本机容器内 127.0.0.1:9800）。
+# curl/jq: the W1 not-logged-in 401 assertions and response parsing (inside this
+# container at 127.0.0.1:9800).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends procps curl jq \
  && rm -rf /var/lib/apt/lists/*

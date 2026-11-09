@@ -1,11 +1,15 @@
-# server-2s-frp-mp.toml —— 场景二【双 Server · 跨机 Raft + 双传输】server-2（jowency LXD flock-s2）。
+# server-2s-frp-mp.toml —— scenario 2 [two servers · cross-machine Raft + dual
+# transport] server-2 (jowency LXD flock-s2).
 #
-# Frp 中转接入（§2.1 可选适配器形态）：frps 跑在 jowency 宿主 :7000/:24000，
-# 本 server 进程内 flock-frpc Supervisor（Original 栈代）注册 9443 → 用户口 24000；
-# LXD 侧客户端经 jowency LAN IP:24000 接入。Raft 织物 :9500 经 LXD proxy device
-# 发布到 jowency 0.0.0.0:9500，与 Windows Docker 侧 server-1 跨机组网。
+# Frp relay access (the optional adapter form of §2.1): frps runs on the jowency
+# host :7000/:24000; this server's in-process flock-frpc Supervisor (the
+# Original-stack stand-in) registers 9443 → the user port 24000; LXD-side
+# clients access via jowency LAN IP:24000. The Raft fabric :9500 is published
+# to jowency 0.0.0.0:9500 via an LXD proxy device, forming the cross-machine
+# cluster with the Windows Docker side's server-1.
 #
-# 模板变量：@JOW_LAN_IP@ / @LXD_GW_IP@（lxd-setup.sh 渲染；LXD_GW = lxdbr0 宿主 IP）。
+# Template variables: @JOW_LAN_IP@ / @LXD_GW_IP@ (rendered by lxd-setup.sh;
+# LXD_GW = the lxdbr0 host IP).
 
 state_dir = "/var/lib/flock"
 mode = "frp"

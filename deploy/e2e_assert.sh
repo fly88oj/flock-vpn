@@ -1,53 +1,72 @@
 #!/usr/bin/env bash
-# e2e_assert.sh —— M5 全拓扑断言（docs/design.md §6.3：A1–A16，M5 验收 = 全 PASS）。
+# e2e_assert.sh —— M5 full-topology assertions (docs/design.md §6.3: A1–A16; M5 acceptance = all PASS).
 #
-# 前置：
+# Prerequisites:
 #   docker compose -f deploy/e2e.yml up -d --build
 #   bash deploy/e2e_assert.sh
 #
-# 断言集（§6.3 表逐项；A5/A6/A7/A15 允许设计规定的重试窗口）：
-#   A1  字节透传         经两条中转各 echo 回 全 256 字节值 + 1MiB 随机，sha256 一致
-#   A2  隧道连通（跨服） client-1 ping server-a VIP 0 丢包；client-1↔client-2 互 ping
-#                        （接入钉死 a/b ⇒ 必走 ForwardEnvelope 跨服路径）
-#   A3  MTU              client tun0 mtu 1280；ping -s 1252 -M do 通（1252+28=1280）
-#   A4  吞吐基线         iperf3 over 隧道 ≥100 Mbps（记录数值）
-#   A5  中转故障切换     stop frps-a ⇒ client-1 ≤30s 切 frps-b:23001 全新握手（1-RTT、
-#                        I0 不出现），VIP 不变，ping 恢复
-#   A6  多主吊销         经 server-b revoke client-2 ⇒ 会话杀（apply 回调）+ epoch 前进
-#                        （另一台可见）+ 新握手拒，≤5s
-#   A7  Raft 容错        stop server-a ⇒ B/C 有 quorum、重选举 ≤15s；A2/A6 重跑；
-#                        server-a 重启后重回集群
-#   A8  单隧道多会话     100 并发 yamux 流 60s 无错（单测入口：session_mux ignored 档）
-#   A9  keepalive 断链   network disconnect 静默死链 ⇒ 双侧 ≤30s 检测进重连；恢复后 ping 恢复
-#   A10 rekey 无感       iperf3 ≥5min，epoch 递增 ≥2，无 >1s 吞吐平台（逐秒区间非零）
-#   A11 压缩默认关       隧道内 4MiB 全零 vs 随机的中转字节量差 <5%（若开压缩，全零侧
-#                        应显著缩小）；非膨胀回退 = compress 单测复跑
-#   A12 抗重放           会话层重复/回退计数记录被拒且计入伪造限额（单测入口复跑）
-#   A13 无直连回退       client-1 对 172.28.0.20/21:9443（server-a/b 的 flockpub 位）直连必败
-#   A14 跨服面+源校验    server-a FRWD 计数非零；断 srvmesh 后互 ping 断/本服 ping 仍通；
-#                        hping3 伪造 src=client-2 VIP ⇒ server-a 违例计数递增、client-2 收不到
-#   A15 租约陈旧容错     client-2 迁移到 frps-a 端点重启 ⇒ 丢包 ≤35s 恢复（NOT_HERE→
-#                        location_query 重定向路径，FRWD 计数可见）
-#   A16 Direct 形态      client-3 直连 172.28.0.22:9443 会话连通（无 I0）+ ping 100.64.0.3 通
-#                        + client-1/2↔client-3 互 ping + server-c 容器内无 frp 进程
+# Assertion set (§6.3 table item by item; A5/A6/A7/A15 allow the retry windows
+# the design prescribes):
+#   A1  byte passthrough    full 256-byte value + 1MiB random echoed back over each
+#                           relay, sha256 identical
+#   A2  tunnel connectivity client-1 ping server-a VIP 0 loss; client-1↔client-2 pings
+#                           (pinned access via a/b ⇒ must take the ForwardEnvelope
+#                           cross-server path)
+#   A3  MTU                 client tun0 mtu 1280; ping -s 1252 -M do passes (1252+28=1280)
+#   A4  throughput baseline iperf3 over tunnel ≥100 Mbps (value recorded)
+#   A5  relay failover      stop frps-a ⇒ client-1 ≤30s switches to frps-b:23001 with a
+#                           fresh handshake (1-RTT, no I0), VIP unchanged, ping recovers
+#   A6  multi-primary revoke  via server-b revoke client-2 ⇒ session killed (apply
+#                           callback) + epoch advances (visible on the other server)
+#                           + new handshakes rejected, ≤5s
+#   A7  Raft fault tolerance stop server-a ⇒ B/C keep quorum, re-election ≤15s; A2/A6
+#                           re-run; server-a rejoins the cluster after restart
+#   A8  multi-session tunnel 100 concurrent yamux streams for 60s without error
+#                           (unit-test entry: session_mux ignored tier)
+#   A9  keepalive dead link network disconnect silent dead link ⇒ both sides detect
+#                           within ≤30s and enter reconnect; after recovery ping recovers
+#   A10 seamless rekey       iperf3 ≥5min, epoch increments ≥2, no >1s throughput
+#                           plateau (every per-second interval non-zero)
+#   A11 compression off by default  relay byte volume for 4MiB all-zeros vs random over
+#                           the tunnel differs <5% (with compression on, the all-zeros
+#                           side should shrink markedly); non-expansion fallback =
+#                           compress unit test re-run
+#   A12 anti-replay         session-layer duplicate/regression counters record rejects
+#                           and count into the forgery quota (unit-test entry re-run)
+#   A13 no direct fallback  client-1 to 172.28.0.20/21:9443 (server-a/b flockpub
+#                           addresses) direct connection must fail
+#   A14 cross-server plane + source check  server-a FRWD count non-zero; after cutting
+#                           srvmesh cross-ping dies / same-server ping still works;
+#                           hping3 forged src=client-2 VIP ⇒ server-a violation count
+#                           increments, client-2 receives nothing
+#   A15 stale-lease tolerance  client-2 migrated to the frps-a endpoint and restarted ⇒
+#                           loss recovers ≤35s (NOT_HERE→location_query redirect path,
+#                           FRWD count observable)
+#   A16 Direct form         client-3 direct-connects 172.28.0.22:9443 session up (no I0)
+#                           + ping 100.64.0.3 works + client-1/2↔client-3 mutual pings
+#                           + no frp process inside the server-c container
 #
-# 结果落盘 deploy/e2e-results.md；任一 FAIL ⇒ 退出码非零。
+# Results are written to deploy/e2e-results.md; any FAIL ⇒ non-zero exit code.
 #
-# 观测面（本批新增的运行时可观测性）：
-#   - 服务器 `stats` 子命令（admin 9444）：epoch/leader/sessions_online/转发面计数
-#     （fwd_forwarded/fwd_src_violations/fwd_locate_redirected/…）；
-#   - 客户端日志：「已连接 <endpoint>」「rekey epoch=N」「reason=dead-link」；
-#   - 会话日志（server）：「handshake ok device=… form=pinned-1rtt(I1)|tofu-2rtt(I0)」
-#     —— A5/A16 的 I0-absence grep 面。
+# Observability surface (runtime observability added in this batch):
+#   - server `stats` subcommand (admin 9444): epoch/leader/sessions_online/forwarding
+#     counters (fwd_forwarded/fwd_src_violations/fwd_locate_redirected/…);
+#   - client logs: "connected <endpoint>", "rekey epoch=N", "reason=dead-link";
+#   - session logs (server): "handshake ok device=… form=pinned-1rtt(I1)|tofu-2rtt(I0)"
+#     —— the I0-absence grep surface for A5/A16.
 #
-# 编排细节：
-#   - 吊销为终态（IP 不复用）⇒ A6/A7-A6 各消费一个设备身份；脚本随后以「新设备身份」
-#     re-enroll 复活通道（Raft 分配新 VIP——.14/.15/…）；
-#   - 端点轮询不会自动回首位 ⇒ A5/A7/A9/A16 的恢复序均以 restart re-pin 收尾；
-#   - re-enroll 的注册/签发固定走 server-b（全程存活的 Raft 节点，任意节点等价）。
+# Orchestration details:
+#   - revocation is terminal (IPs are not reused) ⇒ A6/A7-A6 each consume one device
+#     identity; the script then revives the channel via re-enroll with a "new device
+#     identity" (Raft assigns a new VIP —— .14/.15/…);
+#   - endpoint rotation never returns to the first slot automatically ⇒ the recovery
+#     sequences of A5/A7/A9/A16 all end with a restart re-pin;
+#   - re-enroll registration/issuance is pinned to server-b (the Raft node alive
+#     throughout; any node is equivalent).
 #
-# Git Bash（MSYS）路径改写坑（设计附录 B-2）：脚本内部 export MSYS_NO_PATHCONV=1。
-# WSL bash 垫片兜底（m3_assert.sh 同款）：转投 Windows 侧 Git Bash 执行。
+# Git Bash (MSYS) path-rewriting pitfall (design appendix B-2): the script exports
+# MSYS_NO_PATHCONV=1 internally.
+# WSL bash shim fallback (same as m3_assert.sh): re-exec via Windows-side Git Bash.
 if grep -qi microsoft /proc/version 2>/dev/null && [ -d /mnt/c ]; then
     _gb="/mnt/c/Program Files/Git/bin/bash.exe"
     if [ -x "$_gb" ]; then
@@ -69,12 +88,12 @@ RESULTS="$HERE/e2e-results.md"
 NET_PUB="flock-e2e-flockpub"
 NET_MESH="flock-e2e-srvmesh"
 
-VIP_A="100.64.0.1"    # server-a（Frp 形态，tun VIP）
-VIP_B="100.64.0.2"    # server-b（Frp 形态）
-VIP_C="100.64.0.3"    # server-c（Direct 形态）
+VIP_A="100.64.0.1"    # server-a (Frp form, tun VIP)
+VIP_B="100.64.0.2"    # server-b (Frp form)
+VIP_C="100.64.0.3"    # server-c (Direct form)
 EP_C="172.28.0.22:9443"
 
-# 客户端 VIP：Raft 分配（.11 起，§6.2：client-1/2/3 = .11/.12/.13）——bootstrap 回填。
+# Client VIPs: Raft-assigned (from .11, §6.2: client-1/2/3 = .11/.12/.13) —— backfilled after bootstrap.
 VIP_C1="" ; VIP_C2="" ; VIP_C3=""
 
 A4_MIN_MBPS=100
@@ -88,7 +107,7 @@ compose() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
 PASS=0; FAIL=0
 declare -a SUMMARY
-record() { # record PASS|FAIL <id> <detail>（表格行以 | 分隔）
+record() { # record PASS|FAIL <id> <detail> (table rows are |-separated)
     if [ "$1" = "PASS" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
     SUMMARY+=("$1|$2|$3")
     printf '[%s] %-3s | %s\n' "$1" "$2" "$3"
@@ -98,12 +117,16 @@ log() { printf '\n== %s ==\n' "$*"; }
 ec() { compose exec -T "client-$1" "${@:2}"; }          # exec client-N
 es_() { compose exec -T "server-$1" "${@:2}"; }         # exec server-N
 
-# A10 的 iperf3 JSON 解析依赖宿主 python：python3 优先、python 兜底；均缺 ⇒ A10 如实
-# FAIL（失败方向安全——绝不因工具缺失把断言记 PASS）。
-# 探测必须验证**可执行**而非仅存在：Windows 的 Microsoft Store「应用执行别名」使
-# python3 在 PATH 上存在但执行即失败（"Python was not found"）——只查 command -v 会
-# 选中死壳，A10 的 min_interval 恒为 PARSE_ERR（6a818a5 引入的探测缺口，实测踩中）。
-# 以 `import json` 干跑校验：死壳/缺 stdlib 的解释器一律跳过，不改变失败方向。
+# A10's iperf3 JSON parsing relies on a host python: python3 first, python as
+# fallback; both missing ⇒ A10 honestly FAILs (fail-safe direction —— never
+# record PASS for an assertion merely because a tool is absent).
+# The probe must verify **executability**, not mere existence: on Windows the
+# Microsoft Store "app execution alias" puts a python3 on PATH that fails the
+# moment it runs ("Python was not found") —— checking only `command -v` picks
+# the dead shell and A10's min_interval stays PARSE_ERR forever (probe gap
+# introduced by 6a818a5, hit in practice). Validate with an `import json` dry
+# run: dead shells / interpreters missing the stdlib are skipped; the failure
+# direction is unchanged.
 PY_BIN=""
 for _py in python3 python; do
     if command -v "$_py" >/dev/null 2>&1 && "$_py" -c 'import json' >/dev/null 2>&1; then
@@ -111,13 +134,16 @@ for _py in python3 python; do
     fi
 done
 
-# —— 观测面助手 ——
+# —— observability helpers ——
 stat_of() { es_ "$1" flock-server --config /etc/flock/server.toml stats 2>/dev/null; }
-conn_count() { compose logs "client-$1" 2>/dev/null | grep -c '已连接'; }
-last_ep() { compose logs "client-$1" 2>/dev/null | grep '已连接' | tail -1 | grep -o '已连接 [^（ ]*' | sed 's/已连接 //'; }
-# wait_new_conn <n> <ep|-> <timeout-s> [baseline]：等一条**新**「已连接」（count 超基线）
-# 且端点匹配。基线可选预捕（**必须在 restart 之前取**——restart 触发的重连可能先于
-# 本函数读基线完成，实测竞态会把「已发生的新连接」当基线内旧账 ⇒ 永假超时）。
+conn_count() { compose logs "client-$1" 2>/dev/null | grep -c 'flock-client: connected '; }
+last_ep() { compose logs "client-$1" 2>/dev/null | grep 'flock-client: connected ' | tail -1 | grep -o 'connected [^( ]*' | sed 's/connected //'; }
+# wait_new_conn <n> <ep|-> <timeout-s> [baseline]: wait for a **new** "connected"
+# line (count above baseline) with a matching endpoint. The baseline may be
+# pre-captured (**it must be taken before the restart** —— the reconnect the
+# restart triggers may complete before this function reads the baseline; the
+# observed race then books an "already-happened new connection" as old
+# baseline stock ⇒ permanent false timeout).
 wait_new_conn() {
     local n="$1" want="$2" t=$((SECONDS + $3)) base="${4:-}"
     [ -n "$base" ] || base="$(conn_count "$n")"
@@ -138,7 +164,7 @@ wait_ping() { # wait_ping <client> <vip> <timeout-s>
     done
     return 1
 }
-# ping_ok <from-client> <vip> —— 3 包 0 丢包（', 0%' 定界防匹配 '100%'）。
+# ping_ok <from-client> <vip> —— 3 packets 0 loss (', 0%' delimiter avoids matching '100%').
 ping_ok() {
     local out
     out="$(ec "$1" ping -c 3 -W 3 "$2" 2>&1)"
@@ -147,31 +173,35 @@ ping_ok() {
 }
 
 # ============================================================================
-# bootstrap（幂等）：enroll → cluster-bootstrap → 设备注册 → 邀请 → 客户端起服
+# bootstrap (idempotent): enroll → cluster-bootstrap → device registration →
+# invite → start clients
 # ============================================================================
 
 bootstrap() {
-    log "bootstrap 0: 拓扑在位（三台 server + 三 client）"
+    log "bootstrap 0: topology in place (three servers + three clients)"
     local t=$((SECONDS + 180)) s
     for s in a b c; do
         until compose ps --status running "server-$s" 2>/dev/null | grep -q "server-$s"; do
-            if [ $SECONDS -ge $t ]; then echo "server-$s 180s 未运行"; return 1; fi
+            if [ $SECONDS -ge $t ]; then echo "server-$s not running after 180s"; return 1; fi
             sleep 2
         done
     done
 
-    # 自愈：client-2 的配置经 bind mount 透传到宿主文件——历史失败跑可能把它留在 A15
-    # 迁移形态（首位 frps-a）。复位为钉死端点 frps-b（§6.2 映射）并重启三客户端
-    # （幂等：进程按配置重载；client-1/3 的 ro 挂载写失败即原样）。
+    # Self-healing: client-2's config is passed through to the host file via a
+    # bind mount —— a previously failed run may have left it in the A15
+    # migrated form (first endpoint frps-a). Reset it to the pinned endpoint
+    # frps-b (§6.2 mapping) and restart all three clients (idempotent: the
+    # process reloads from config; client-1/3's ro mounts just keep failing the
+    # write, unchanged).
     ec 2 sh -c "printf '%s
 ' 'state_dir = \"/var/lib/flock\"' '' 'tun_name = \"tun0\"' 'mtu = 1280' '' 'endpoints = [\"frps-b:23001\", \"frps-a:23000\", \"172.28.0.22:9443\"]' > /etc/flock/client.toml" || true
     compose restart client-1 client-2 client-3 >/dev/null 2>&1 || true
 
-    log "bootstrap 1: 三台 enroll（/mat 捆绑 → state_dir/bundle.bin）"
+    log "bootstrap 1: enroll on all three (/mat bundle → state_dir/bundle.bin)"
     local i=0
     for s in a b c; do
         if es_ "$s" sh -c 'test -f /var/lib/flock/bundle.bin'; then
-            echo "server-$s: 已 enroll（幂等跳过）"
+            echo "server-$s: already enrolled (idempotent skip)"
         else
             es_ "$s" flock-server --config /etc/flock/server.toml \
                 enroll --bundle "/mat/node-$i.bundle" || return 1
@@ -179,18 +209,18 @@ bootstrap() {
         i=$((i+1))
     done
 
-    log "bootstrap 2: cluster-bootstrap（根签 Bootstrap+SetOprf；经 server-a，幂等）"
+    log "bootstrap 2: cluster-bootstrap (root-signed Bootstrap+SetOprf; via server-a, idempotent)"
     t=$((SECONDS + 240))
     until es_ a flock-server --config /etc/flock/server.toml \
-            cluster-bootstrap --root-seed /mat/root.seed 2>&1 | tee /tmp/e2e-boot.txt | grep -q 'cluster-bootstrap ok\|幂等'; do
+            cluster-bootstrap --root-seed /mat/root.seed 2>&1 | tee /tmp/e2e-boot.txt | grep -q 'cluster-bootstrap ok\|idempotent: already bootstrapped'; do
         if [ $SECONDS -ge $t ]; then
-            echo "cluster-bootstrap 240s 未成功"; cat /tmp/e2e-boot.txt
+            echo "cluster-bootstrap not successful within 240s"; cat /tmp/e2e-boot.txt
             compose logs --tail 30 server-a server-b server-c; return 1
         fi
         sleep 5
     done
 
-    log "bootstrap 3: 三台就绪（stats 应答 = Bootstrap/SetOprf 已 apply + admin 已起）"
+    log "bootstrap 3: all three ready (stats responds = Bootstrap/SetOprf applied + admin up)"
     t=$((SECONDS + 180))
     local ok=""
     while [ -z "$ok" ]; do
@@ -199,38 +229,38 @@ bootstrap() {
             es_ "$s" flock-server --config /etc/flock/server.toml stats 2>/dev/null | grep -q '^epoch=' || ok=""
         done
         [ -n "$ok" ] && break
-        if [ $SECONDS -ge $t ]; then echo "三台 stats 未齐（180s）"; return 1; fi
+        if [ $SECONDS -ge $t ]; then echo "stats not ready on all three (180s)"; return 1; fi
         sleep 3
     done
 
-    log "bootstrap 4: 数据面确认（三台 tun0 在位）"
+    log "bootstrap 4: data-plane confirmation (tun0 in place on all three)"
     for s in a b c; do
         es_ "$s" ip link show tun0 >/dev/null 2>&1 \
-            || { echo "server-$s tun0 未创建"; compose logs --tail 20 "server-$s"; return 1; }
+            || { echo "server-$s tun0 not created"; compose logs --tail 20 "server-$s"; return 1; }
     done
 
-    # —— 客户端设备注册 + 邀请（幂等：ready 标记）——
+    # —— client device registration + invite (idempotent: ready marker) ——
     for n in 1 2 3; do
         if ec "$n" sh -c 'test -f /var/lib/flock/ready'; then
-            echo "client-$n: 已就绪（幂等跳过）"
+            echo "client-$n: already ready (idempotent skip)"
             continue
         fi
-        log "bootstrap 5: client-$n gen-keys → device-add（server-a admin，Raft 提交）"
+        log "bootstrap 5: client-$n gen-keys → device-add (server-a admin, Raft-committed)"
         local keys dx de out vip inv
         keys="$(ec "$n" flock-client --config /etc/flock/client.toml gen-keys)" || return 1
         dx="$(printf '%s\n' "$keys" | sed -n 's/^device-x=//p')"
         de="$(printf '%s\n' "$keys" | sed -n 's/^device-ed=//p')"
-        [ -n "$dx" ] && [ -n "$de" ] || { echo "client-$n gen-keys 输出异常"; return 1; }
+        [ -n "$dx" ] && [ -n "$de" ] || { echo "client-$n gen-keys output abnormal"; return 1; }
         out="$(es_ a flock-server --config /etc/flock/server.toml \
             device-add --user "e2eclient$n" --device-x "$dx" --device-ed "$de" 2>&1)" \
-            || { echo "client-$n device-add 失败：$out"; return 1; }
+            || { echo "client-$n device-add failed: $out"; return 1; }
         vip="$(printf '%s\n' "$out" | sed -n 's/^vip=//p' | tr -d '\r')"
-        case "$vip" in 100.64.*) ;; *) echo "client-$n VIP 异常：$out"; return 1;; esac
+        case "$vip" in 100.64.*) ;; *) echo "client-$n VIP abnormal: $out"; return 1;; esac
 
-        log "bootstrap 6: cluster-invite（根签 v3）→ client-$n ingest + vip + ready"
+        log "bootstrap 6: cluster-invite (root-signed v3) → client-$n ingest + vip + ready"
         inv="$(es_ a flock-server --config /etc/flock/server.toml \
             cluster-invite --root-seed /mat/root.seed --bundle /mat/node-0.bundle --ttl-secs 86400 | tail -1)" \
-            || { echo "cluster-invite 失败"; return 1; }
+            || { echo "cluster-invite failed"; return 1; }
         printf '%s' "$inv" | ec "$n" sh -c 'cat > /var/lib/flock/invite.b64' || return 1
         ec "$n" flock-client --config /etc/flock/client.toml \
             invite /var/lib/flock/invite.b64 || return 1
@@ -240,36 +270,36 @@ bootstrap() {
         compose restart "client-$n" >/dev/null 2>&1 || return 1
     done
 
-    log "bootstrap 7: 三客户端握手（tun0 + ping 各自接入服务器的 VIP）"
+    log "bootstrap 7: handshakes for all three clients (tun0 + ping of each access server's VIP)"
     for n in 1 2 3; do
         local tgt
         case "$n" in 1) tgt=$VIP_A;; 2) tgt=$VIP_B;; 3) tgt=$VIP_C;; esac
         t=$((SECONDS + 90))
         until ec "$n" sh -c 'ip link show tun0' >/dev/null 2>&1; do
-            if [ $SECONDS -ge $t ]; then echo "client-$n tun0 90s 未创建"; compose logs --tail 30 "client-$n"; return 1; fi
+            if [ $SECONDS -ge $t ]; then echo "client-$n tun0 not created within 90s"; compose logs --tail 30 "client-$n"; return 1; fi
             sleep 2
         done
-        wait_ping "$n" "$tgt" 90 || { echo "client-$n ping $tgt 90s 未通"; compose logs --tail 30 "client-$n"; return 1; }
+        wait_ping "$n" "$tgt" 90 || { echo "client-$n ping $tgt not working within 90s"; compose logs --tail 30 "client-$n"; return 1; }
     done
 
-    # 幂等重跑路径：VIP 回填。
+    # Idempotent re-run path: VIP backfill.
     [ -n "$VIP_C1" ] || VIP_C1="$(ec 1 sh -c 'cat /var/lib/flock/vip' 2>/dev/null | tr -d '\r')"
     [ -n "$VIP_C2" ] || VIP_C2="$(ec 2 sh -c 'cat /var/lib/flock/vip' 2>/dev/null | tr -d '\r')"
     [ -n "$VIP_C3" ] || VIP_C3="$(ec 3 sh -c 'cat /var/lib/flock/vip' 2>/dev/null | tr -d '\r')"
     echo "VIP: client-1=$VIP_C1 client-2=$VIP_C2 client-3=$VIP_C3"
-    log "bootstrap 完成"
+    log "bootstrap done"
 }
 
 # ============================================================================
-# A1：字节透传（两条中转：frps-a:23100 / frps-b:23101 → echo 端点）
+# A1: byte passthrough (two relays: frps-a:23100 / frps-b:23101 → echo endpoints)
 # ============================================================================
 
 a1() {
-    log "A1 字节透传：全 256 字节值 + 1MiB 随机经两条中转 echo，sha256 对比"
+    log "A1 byte passthrough: full 256-byte value + 1MiB random echoed over both relays, sha256 compared"
     ec 1 bash -c '
         for i in $(seq 0 255); do printf "\\$(printf "%03o" $i)"; done > /tmp/a1_charset
         head -c 1048576 /dev/urandom > /tmp/a1_rand
-    ' || { record FAIL A1 "载荷生成失败"; return; }
+    ' || { record FAIL A1 "payload generation failed"; return; }
     local csum_c csum_r
     csum_c="$(ec 1 sha256sum /tmp/a1_charset | awk '{print $1}')"
     csum_r="$(ec 1 sha256sum /tmp/a1_rand | awk '{print $1}')"
@@ -286,35 +316,35 @@ a1() {
         [ "$got_c" = "$csum_c" ] && [ "$got_r" = "$csum_r" ] || { ok=0; detail="$detail $ep"; }
     done
     if [ "$ok" = 1 ]; then
-        record PASS A1 "256 字节全集 + 1MiB 随机经 frps-a:23100 与 frps-b:23101 echo 往返 sha256 一致"
+        record PASS A1 "full 256-byte set + 1MiB random round-tripped via frps-a:23100 and frps-b:23101 echo, sha256 identical"
     else
-        record FAIL A1 "sha256 不一致：$detail"
+        record FAIL A1 "sha256 mismatch: $detail"
     fi
 }
 
 # ============================================================================
-# A2：隧道连通（同服 + 跨服）
+# A2: tunnel connectivity (same server + cross server)
 # ============================================================================
 
 a2() {
-    log "A2 隧道连通：client-1 ping $VIP_A（同服）+ client-1↔client-2（跨服 ForwardEnvelope）"
+    log "A2 tunnel connectivity: client-1 ping $VIP_A (same server) + client-1↔client-2 (cross-server ForwardEnvelope)"
     local rc=0
     ping_ok 1 "$VIP_A" || rc=1
     ping_ok 1 "$VIP_C2" || rc=1
     ping_ok 2 "$VIP_C1" || rc=1
     if [ $rc -eq 0 ]; then
-        record PASS A2 "同服 ping $VIP_A 与跨服互 ping（c1↔c2）均 3/3 0% 丢包"
+        record PASS A2 "same-server ping $VIP_A and cross-server mutual pings (c1↔c2) all 3/3 0% loss"
     else
-        record FAIL A2 "存在丢包/不通（见上）"
+        record FAIL A2 "loss or unreachable (see above)"
     fi
 }
 
 # ============================================================================
-# A3：MTU 1280 + DF 大包
+# A3: MTU 1280 + DF large packets
 # ============================================================================
 
 a3() {
-    log "A3 MTU：client-1 tun0 mtu 1280 + ping -s 1252 -M do $VIP_A"
+    log "A3 MTU: client-1 tun0 mtu 1280 + ping -s 1252 -M do $VIP_A"
     local link mtu_ok=no out
     link="$(ec 1 ip link show tun0 2>&1)"
     printf '%s\n' "$link" | head -1 | sed 's/^/    /'
@@ -322,14 +352,14 @@ a3() {
     out="$(ec 1 ping -c 2 -W 3 -s 1252 -M do "$VIP_A" 2>&1)"; local rc=$?
     printf '%s\n' "$out" | grep 'packet loss' | sed 's/^/    /'
     if [ "$mtu_ok" = yes ] && [ $rc -eq 0 ]; then
-        record PASS A3 "tun0 mtu=1280；-s 1252 -M do 通（1252+28=1280）"
+        record PASS A3 "tun0 mtu=1280; -s 1252 -M do passes (1252+28=1280)"
     else
         record FAIL A3 "mtu_ok=$mtu_ok df_ping_rc=$rc"
     fi
 }
 
 # ============================================================================
-# A4：吞吐基线（iperf3 over 隧道）
+# A4: throughput baseline (iperf3 over the tunnel)
 # ============================================================================
 
 iperf_server() { # iperf_server <server-node> <vip>
@@ -339,7 +369,7 @@ iperf_server() { # iperf_server <server-node> <vip>
 
 a4() { # a4 <client> <server-node> <server-vip> <tag> [secs]
     local cl="$1" node="$2" svip="$3" tag="$4" secs="${5:-5}"
-    log "$tag 吞吐：client-$cl iperf3 → $svip（阈值 ${A4_MIN_MBPS} Mbps，${secs}s）"
+    log "$tag throughput: client-$cl iperf3 → $svip (threshold ${A4_MIN_MBPS} Mbps, ${secs}s)"
     iperf_server "$node" "$svip"
     local out mbps
     out="$(ec "$cl" iperf3 -c "$svip" -t "$secs" --format m 2>&1)"; local rc=$?
@@ -347,24 +377,24 @@ a4() { # a4 <client> <server-node> <server-vip> <tag> [secs]
     mbps="$(printf '%s\n' "$out" | awk '/sender/ {for (i = 1; i <= NF; i++) if ($(i+1) == "Mbits/sec") {print $i; exit}}')"
     case "$mbps" in
         ''|*[!0-9.]*)
-            record FAIL "$tag" "iperf3 失败/未解析速率（rc=$rc）"
+            record FAIL "$tag" "iperf3 failed / rate unparsed (rc=$rc)"
             ;;
         *)
             if awk -v m="$mbps" -v t="$A4_MIN_MBPS" 'BEGIN{exit !(m>=t)}'; then
-                record PASS "$tag" "iperf3 sender = ${mbps} Mbits/sec（≥ ${A4_MIN_MBPS}）"
+                record PASS "$tag" "iperf3 sender = ${mbps} Mbits/sec (≥ ${A4_MIN_MBPS})"
             else
-                record FAIL "$tag" "iperf3 sender = ${mbps} Mbits/sec（< ${A4_MIN_MBPS}）"
+                record FAIL "$tag" "iperf3 sender = ${mbps} Mbits/sec (< ${A4_MIN_MBPS})"
             fi
             ;;
     esac
 }
 
 # ============================================================================
-# A5：中转故障切换
+# A5: relay failover
 # ============================================================================
 
 a5() {
-    log "A5 中转故障切换：stop frps-a ⇒ client-1 ≤${A5_DEADLINE}s 切 frps-b:23001 全新握手"
+    log "A5 relay failover: stop frps-a ⇒ client-1 ≤${A5_DEADLINE}s switches to frps-b:23001 with a fresh handshake"
     compose stop frps-a >/dev/null 2>&1
     local t0=$SECONDS
     local connected=""
@@ -372,7 +402,7 @@ a5() {
     local dt=$((SECONDS - t0))
     if [ -z "$connected" ]; then
         compose start frps-a >/dev/null 2>&1
-        record FAIL A5 "${A5_DEADLINE}s 内未切换到 frps-b:23001（last=$(last_ep 1)）"
+        record FAIL A5 "no switch to frps-b:23001 within ${A5_DEADLINE}s (last=$(last_ep 1))"
         return
     fi
 
@@ -384,47 +414,48 @@ a5() {
 
     compose start frps-a >/dev/null 2>&1
     if [ -n "$ping_ok" ] && [ "$vip_now" = "$VIP_C1" ] && [ "$i0_ok" = yes ]; then
-        record PASS A5 "${dt}s 切 frps-b:23001（全新握手），ping $VIP_B 恢复，VIP 不变（$vip_now），I0 未出现（server-b 无 TOFU 日志）"
+        record PASS A5 "switched to frps-b:23001 in ${dt}s (fresh handshake), ping $VIP_B recovered, VIP unchanged ($vip_now), no I0 (no TOFU log on server-b)"
     else
-        record FAIL A5 "dt=${dt}s ping_ok=$ping_ok vip=$vip_now（期望 $VIP_C1） i0_absent=$i0_ok"
+        record FAIL A5 "dt=${dt}s ping_ok=$ping_ok vip=$vip_now (expected $VIP_C1) i0_absent=$i0_ok"
     fi
 
-    # 恢复现场：frps-a 回来 + client-1 重启回钉死端点 frps-a（后续 A6+/A14 依赖其挂 server-a）。
+    # Restore the scene: frps-a back + client-1 restarted onto the pinned endpoint
+    # frps-a (later A6+/A14 depend on it hanging off server-a).
     local t=$((SECONDS + 60))
     until compose ps --status running frps-a 2>/dev/null | grep -q frps-a; do
-        [ $SECONDS -ge $t ] && { echo "A5 恢复：frps-a 未起来"; return; }
+        [ $SECONDS -ge $t ] && { echo "A5 recovery: frps-a did not come up"; return; }
         sleep 2
     done
-    sleep 5   # frpc-a 向新 frps 重新注册 proxy 的余量
+    sleep 5   # margin for frpc-a to re-register its proxy with the new frps
     local cbase1; cbase1="$(conn_count 1)"
     compose restart client-1 >/dev/null 2>&1
     if wait_new_conn 1 "frps-a:23000" 120 "$cbase1" && wait_ping 1 "$VIP_A" 60; then
-        echo "A5 恢复：client-1 已回 frps-a:23000"
+        echo "A5 recovery: client-1 back on frps-a:23000"
     else
-        echo "A5 恢复：client-1 未回 frps-a（后续断言将如实失败）"
+        echo "A5 recovery: client-1 not back on frps-a (later assertions will honestly fail)"
     fi
 }
 
 # ============================================================================
-# A6：多主吊销（revoke <client> 经 <via>；会话在 <on>；≤5s）
+# A6: multi-primary revoke (revoke <client> via <via>; session lives on <on>; ≤5s)
 # ============================================================================
 
 a6() { # a6 <tag> <via> <client-n> <on>
     local tag="$1" via="$2" cn="$3" on="$4"
-    log "$tag 多主吊销：经 server-$via revoke client-$cn（会话在 server-$on）≤${A6_DEADLINE}s"
+    log "$tag multi-primary revoke: via server-$via revoke client-$cn (session on server-$on) ≤${A6_DEADLINE}s"
     local dev_id
     dev_id="$(ec "$cn" flock-client --config /etc/flock/client.toml gen-keys | sed -n 's/^device-id=//p')"
-    [ -n "$dev_id" ] || { record FAIL "$tag" "取 client-$cn device-id 失败"; return; }
+    [ -n "$dev_id" ] || { record FAIL "$tag" "failed to get client-$cn device-id"; return; }
 
     local online_before epoch_before conn_base
     online_before="$(stat_of "$on" | sed -n 's/^sessions_online=//p')"
     epoch_before="$(stat_of "$via" | sed -n 's/^epoch=//p')"
     conn_base="$(conn_count "$cn")"
-    [ -n "$epoch_before" ] || { record FAIL "$tag" "stats 未就绪"; return; }
+    [ -n "$epoch_before" ] || { record FAIL "$tag" "stats not ready"; return; }
 
     local t0=$SECONDS out
     out="$(es_ "$via" flock-server --config /etc/flock/server.toml revoke --device "$dev_id" 2>&1)" \
-        || { record FAIL "$tag" "revoke 提交失败：$out"; return; }
+        || { record FAIL "$tag" "revoke submission failed: $out"; return; }
 
     local killed=0 adv=0 dt=999
     while [ $SECONDS -lt $((t0 + A6_DEADLINE)) ]; do
@@ -443,23 +474,25 @@ a6() { # a6 <tag> <via> <client-n> <on>
     done
 
     if [ "$killed" = 1 ] && [ "$adv" = 1 ] && [ "$no_reconn" = 1 ]; then
-        record PASS "$tag" "≤${A6_DEADLINE}s（实测 ${dt}s 内）：server-$on 会话被杀（apply 回调）、epoch 前进（server-$via 视角 $epoch_before→$(stat_of "$via" | sed -n 's/^epoch=//p')）、新握手被拒（15s 观察窗无新连接）"
+        record PASS "$tag" "≤${A6_DEADLINE}s (measured within ${dt}s): server-$on session killed (apply callback), epoch advanced (server-$via view $epoch_before→$(stat_of "$via" | sed -n 's/^epoch=//p')), new handshakes rejected (no new connection in the 15s observation window)"
     else
         record FAIL "$tag" "killed=$killed epoch_adv=$adv no_reconnect=$no_reconn"
         return 1
     fi
 }
 
-# 吊销为终态 ⇒ 复活通道：新设备身份注册（新 VIP；Raft 分配不复用 IP）。
+# Revocation is terminal ⇒ revival channel: register with a new device identity
+# (new VIP; Raft assignment does not reuse IPs).
 re_enroll_client() { # re_enroll_client <n> <first-endpoint>
     local n="$1" first="$2"
-    log "re-enroll client-$n（吊销终态后以新设备身份注册；新 VIP 由 Raft 分配，IP 不复用）"
+    log "re-enroll client-$n (after terminal revocation, register with a new device identity; new VIP assigned by Raft, IP not reused)"
     ec "$n" sh -c 'rm -f /var/lib/flock/ready /var/lib/flock/vip /var/lib/flock/device.keys /var/lib/flock/pins.bin /var/lib/flock/directory.bin' || return 1
     local keys dx de out vip inv
     keys="$(ec "$n" flock-client --config /etc/flock/client.toml gen-keys)" || return 1
     dx="$(printf '%s\n' "$keys" | sed -n 's/^device-x=//p')"
     de="$(printf '%s\n' "$keys" | sed -n 's/^device-ed=//p')"
-    # 注册/签发固定走 server-b（a7 停 server-a 期间仍存活；Raft 任意节点等价）。
+    # Registration/issuance is pinned to server-b (still alive while a7 has
+    # server-a stopped; any Raft node is equivalent).
     out="$(es_ b flock-server --config /etc/flock/server.toml \
         device-add --user "e2eclient$n-r" --device-x "$dx" --device-ed "$de" 2>&1)" || return 1
     vip="$(printf '%s\n' "$out" | sed -n 's/^vip=//p' | tr -d '\r')"
@@ -472,19 +505,20 @@ re_enroll_client() { # re_enroll_client <n> <first-endpoint>
     eval "VIP_C$n=\"\$vip\""
     local cbase; cbase="$(conn_count "$n")"
     compose restart "client-$n" >/dev/null 2>&1
-    wait_new_conn "$n" "$first" 120 "$cbase" || { echo "client-$n 未接到 $first"; return 1; }
-    echo "client-$n 新 VIP=$vip（接入 $first）"
+    wait_new_conn "$n" "$first" 120 "$cbase" || { echo "client-$n did not attach to $first"; return 1; }
+    echo "client-$n new VIP=$vip (attached to $first)"
 }
 
 # ============================================================================
-# A7：Raft 容错
+# A7: Raft fault tolerance
 # ============================================================================
 
 a7() {
-    log "A7 Raft 容错：stop server-a（+frpc-a）⇒ B/C quorum、重选举 ≤${A7_ELECTION}s"
+    log "A7 Raft fault tolerance: stop server-a (+frpc-a) ⇒ B/C quorum, re-election ≤${A7_ELECTION}s"
     compose stop server-a frpc-a >/dev/null 2>&1
 
-    # leader 必须落在存活节点（2/3）——a 的旧 leader 值在心跳超时前仍可能残留。
+    # The leader must land on a surviving node (2/3) —— a's old leader value can
+    # still linger until the heartbeat timeout expires.
     local t0=$SECONDS leader_after=""
     while [ $SECONDS -lt $((t0 + A7_ELECTION)) ]; do
         local l
@@ -494,37 +528,38 @@ a7() {
     done
     local dt=$((SECONDS - t0))
     if [ -z "$leader_after" ]; then
-        record FAIL A7 "${A7_ELECTION}s 内 B/C 未选出可用 leader（leader=$(stat_of b | sed -n 's/^leader=//p')）"
+        record FAIL A7 "B/C elected no usable leader within ${A7_ELECTION}s (leader=$(stat_of b | sed -n 's/^leader=//p'))"
         compose start server-a frpc-a >/dev/null 2>&1
         return
     fi
-    printf '    leader → %s（%ss；node 1=a 2=b 3=c）\n' "$leader_after" "$dt"
+    printf '    leader → %s (%ss; node 1=a 2=b 3=c)\n' "$leader_after" "$dt"
 
-    # client-1 端点轮询切到存活端点（frps-a 无后端）。
-    wait_new_conn 1 "-" 60 || echo "A7: client-1 未见新连接"
-    wait_ping 1 "$VIP_B" 45 || echo "A7: client-1 ping $VIP_B 未恢复"
+    # client-1's endpoint rotation switches to a live endpoint (frps-a has no backend).
+    wait_new_conn 1 "-" 60 || echo "A7: no new connection seen for client-1"
+    wait_ping 1 "$VIP_B" 45 || echo "A7: client-1 ping $VIP_B not recovered"
 
-    log "A7-A2 重跑：c1→VIP_B（新接入服）、c3→VIP_C（同服）、c2↔c3（B→C 跨服 FRWD）"
+    log "A7-A2 re-run: c1→VIP_B (new access server), c3→VIP_C (same server), c2↔c3 (B→C cross-server FRWD)"
     local rc=0 sub_a2=1
     ping_ok 1 "$VIP_B" || rc=1
     ping_ok 3 "$VIP_C" || rc=1
     ping_ok 2 "$VIP_C3" || rc=1
     ping_ok 3 "$VIP_C2" || rc=1
-    if [ $rc -eq 0 ]; then record PASS A7-A2 "停 a 后同服（c1→B、c3→C）与跨服（c2↔c3 经 B→C FRWD）全 0 丢包";
-    else record FAIL A7-A2 "重跑存在丢包/不通"; sub_a2=0; fi
+    if [ $rc -eq 0 ]; then record PASS A7-A2 "after stopping a, same-server (c1→B, c3→C) and cross-server (c2↔c3 via B→C FRWD) all 0 loss";
+    else record FAIL A7-A2 "re-run had loss or unreachable"; sub_a2=0; fi
 
     local sub_a6=1
     a6 A7-A6 c 2 b || sub_a6=0
 
-    # 恢复序：先重启 server-a（3 voter 回位）→ c2 复活（注册走 server-b）→ c1 回钉死端点。
+    # Recovery order: restart server-a first (3 voters back) → revive c2
+    # (registration via server-b) → c1 back to the pinned endpoint.
     compose start server-a frpc-a >/dev/null 2>&1
     local t=$((SECONDS + 180)) rejoined=""
     while [ $SECONDS -lt $t ]; do
         if stat_of a 2>/dev/null | grep -q '^epoch='; then rejoined=1; break; fi
         sleep 3
     done
-    sleep 5   # 追平/心跳余量
-    re_enroll_client 2 "frps-b:23001" || record FAIL A7 "client-2 re-enroll 失败"
+    sleep 5   # catch-up/heartbeat margin
+    re_enroll_client 2 "frps-b:23001" || record FAIL A7 "client-2 re-enroll failed"
     local cbase1; cbase1="$(conn_count 1)"
     compose restart client-1 >/dev/null 2>&1
     local back=""
@@ -537,53 +572,62 @@ a7() {
     [ "$sub_a2" = 1 ] || pass=no
     [ "$sub_a6" = 1 ] || pass=no
     if [ "$pass" = yes ]; then
-        record PASS A7 "重选举 ${dt}s（≤${A7_ELECTION}s，leader=node$leader_after）；A2/A6 重跑通过；server-a 恢复并重回集群；client-1 回钉死端点"
+        record PASS A7 "re-election in ${dt}s (≤${A7_ELECTION}s, leader=node$leader_after); A2/A6 re-runs passed; server-a recovered and rejoined the cluster; client-1 back on the pinned endpoint"
     else
-        record FAIL A7 "重选举 ${dt}s；server-a 恢复=$rejoined；client-1 回 frps-a=$back"
+        record FAIL A7 "re-election ${dt}s; server-a recovered=$rejoined; client-1 back on frps-a=$back"
     fi
 }
 
 # ============================================================================
-# A8：单隧道 100 并发流 60s（单测入口，R11）
+# A8: single tunnel, 100 concurrent streams for 60s (unit-test entry, R11)
 # ============================================================================
 
 a8() {
-    log "A8 单隧道多会话：100 并发 yamux 流持续 60s 无错（单测入口：session_mux ignored 档）"
+    log "A8 multi-session single tunnel: 100 concurrent yamux streams for 60s without error (unit-test entry: session_mux ignored tier)"
     local out
     out="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux hundred_streams -- --ignored --nocapture 2>&1)"
     printf '%s\n' "$out" | grep -E 'A8:|test hundred|test result' | sed 's/^/    /'
-    # 判据必须是**真执行**：具名测试 ok + "N passed" 且 N≥1——空跑（0 passed，如
-    # --ignored 配无 ignore 标记的历史缺陷）绝不得记 PASS。
+    # The criterion must be a **real execution**: the named test ok + "N passed"
+    # with N≥1 —— an empty run (0 passed, e.g. --ignored combined with the
+    # historical no-ignore-marker bug) must never record PASS.
     if printf '%s\n' "$out" | grep -q 'test hundred_streams_sixty_seconds_sustained ... ok' \
         && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
-        record PASS A8 "100 流 × 60s × 4KiB 双向无错（hundred_streams_sixty_seconds_sustained 真执行 ok）"
+        record PASS A8 "100 streams × 60s × 4KiB bidirectional without error (hundred_streams_sixty_seconds_sustained really executed ok)"
     else
-        record FAIL A8 "单测未执行或失败（判据：具名 ok + ≥1 passed；见上）"
+        record FAIL A8 "unit test not executed or failed (criterion: named ok + ≥1 passed; see above)"
     fi
 }
 
 # ============================================================================
-# A9：静默死链双侧 ≤30s 检测（client-3 disconnect flockpub）
+# A9: silent dead link detected on both sides ≤30s (client-3 disconnect flockpub)
 # ============================================================================
 
 a9() {
-    log "A9 静默死链：disconnect client-3（flockpub）⇒ 双侧 ≤${A9_DEADLINE}s 检测并重连"
+    log "A9 silent dead link: disconnect client-3 (flockpub) ⇒ both sides detect within ≤${A9_DEADLINE}s and reconnect"
     local cid scid
     cid="$(compose ps -q client-3)"
-    [ -n "$cid" ] || { record FAIL A9 "client-3 容器 id 为空"; return; }
+    [ -n "$cid" ] || { record FAIL A9 "client-3 container id empty"; return; }
     scid="$(compose ps -q server-c)"
-    [ -n "$scid" ] || { record FAIL A9 "server-c 容器 id 为空"; return; }
+    [ -n "$scid" ] || { record FAIL A9 "server-c container id empty"; return; }
     local base_c base_s
     base_c="$(docker logs "$cid" 2>&1 | grep -c 'reason=dead-link' || true)"
     base_s="$(docker logs "$scid" 2>&1 | grep -c 'reason=dead-link' || true)"
 
-    docker network disconnect "$NET_PUB" "$cid" || { record FAIL A9 "network disconnect 失败"; return; }
-    # 观测循环纪律：**先采样、后判窗**——窗口到点后必做一次末次采样才可判 FAIL。原实现
-    # （SECONDS 到点即盲退出）会把落在 30–32s 观测容差带尾部的检出漏采成假 FAIL：检出时刻
-    # = 断链前最后入站记录 + 3×keepalive(30s) + 50ms tick，随 ping 相位落在断链后 [20,30.3]s
-    # ——2026-11-07 一轮实测 ~31.1s 检出（相位贴界 + disconnect 生效尾延）恰入容差带，而末次
-    # 采样停在其前 0.1s。已检出侧不再轮询 + docker logs 直读容器 id（省 compose 解析 ~40%），
-    # 采样密度翻倍。语义不变：A9_DEADLINE=30s 预算 + 既有 +2s 观测容差，双侧检出缺一不可。
+    docker network disconnect "$NET_PUB" "$cid" || { record FAIL A9 "network disconnect failed"; return; }
+    # Observation-loop discipline: **sample first, judge the window after** ——
+    # when the window expires, one final sample must be taken before judging
+    # FAIL. The original implementation (blindly exiting the moment SECONDS
+    # hit the limit) could miss a detection landing in the tail of the
+    # 30–32s observation tolerance band and record a false FAIL: the detection
+    # moment = last inbound record before the cut + 3×keepalive(30s) + 50ms
+    # tick, landing in [20,30.3]s after the cut depending on the ping phase
+    # —— a measured run on 2026-11-07 detected at ~31.1s (phase at the edge +
+    # disconnect effective-lag tail) falling exactly into the tolerance band,
+    # while the final sample stopped 0.1s earlier. Sides already detected are
+    # no longer polled + docker logs reads the container id directly (saves
+    # ~40% of compose resolution), sampling density doubled. Semantics
+    # unchanged: A9_DEADLINE=30s budget + the existing +2s observation
+    # tolerance, detection on both sides is mandatory.
     local t0=$SECONDS saw_c=0 saw_s=0 elapsed=0
     while :; do
         [ "$saw_c" = 0 ] && [ "$(docker logs "$cid" 2>&1 | grep -c 'reason=dead-link' || true)" -gt "$base_c" ] && saw_c=1
@@ -595,30 +639,32 @@ a9() {
     done
     if [ "$saw_c" != 1 ] || [ "$saw_s" != 1 ]; then
         docker network connect "$NET_PUB" "$cid" 2>/dev/null || true
-        record FAIL A9 "双侧未都在 ${A9_DEADLINE}s 内检出（client=$saw_c server=$saw_s，elapsed=${elapsed}s）"
+        record FAIL A9 "both sides did not detect within ${A9_DEADLINE}s (client=$saw_c server=$saw_s, elapsed=${elapsed}s)"
         return
     fi
-    docker network connect "$NET_PUB" "$cid" || { record FAIL A9 "network connect 失败"; return; }
-    # 端点轮询不自动回首位 ⇒ 重启 re-pin 回 Direct 端点（A16 依赖），再验证 ping。
+    docker network connect "$NET_PUB" "$cid" || { record FAIL A9 "network connect failed"; return; }
+    # Endpoint rotation does not return to the first slot automatically ⇒
+    # restart to re-pin onto the Direct endpoint (A16 depends on it), then
+    # verify ping.
     local cbase3; cbase3="$(conn_count 3)"
     compose restart client-3 >/dev/null 2>&1
     local reconn=""
     wait_new_conn 3 "$EP_C" 90 "$cbase3" && wait_ping 3 "$VIP_C" 60 && reconn=1
     if [ -n "$reconn" ]; then
-        record PASS A9 "双侧 ${elapsed}s 检出 dead-link 进入重连；网络恢复 + re-pin 后 ping 恢复（≤${A9_DEADLINE}s 预算）"
+        record PASS A9 "both sides detected dead-link in ${elapsed}s and entered reconnect; after network recovery + re-pin, ping recovered (≤${A9_DEADLINE}s budget)"
     else
-        record FAIL A9 "检出 ${elapsed}s 达标，但恢复后未回 Direct 端点/ping 未恢复"
+        record FAIL A9 "detection ${elapsed}s met the bar, but after recovery it did not return to the Direct endpoint / ping did not recover"
     fi
 }
 
 # ============================================================================
-# A10：rekey 无感（iperf3 300s，epoch ≥2，无 >1s 吞吐平台）
+# A10: seamless rekey (iperf3 300s, epoch ≥2, no >1s throughput plateau)
 # ============================================================================
 
 a10() {
-    log "A10 rekey 无感：iperf3 300s + client-1 epoch 日志（epoch≥2、逐秒区间非零）"
+    log "A10 seamless rekey: iperf3 300s + client-1 epoch logs (epoch≥2, every per-second interval non-zero)"
     if [ -z "$PY_BIN" ]; then
-        record FAIL A10 "宿主缺 python3/python，无法解析 iperf3 JSON（安装任一后重跑；不因工具缺失记 PASS）"
+        record FAIL A10 "host has no python3/python; cannot parse iperf3 JSON (install either and re-run; never record PASS for a missing tool)"
         return
     fi
     iperf_server a "$VIP_A"
@@ -635,24 +681,25 @@ try:
 except Exception:
     print("PARSE_ERR")
 ' 2>/dev/null || echo PARSE_ERR)"
-    printf '    rekey 新增=%s 次；最小 1s 区间吞吐=%s Mbps\n' "$epochs" "$min_mbps"
+    printf '    rekey new=%s events; minimum 1s-interval throughput=%s Mbps\n' "$epochs" "$min_mbps"
 
     local ok=1
     [ "$epochs" -ge 2 ] || ok=0
     case "$min_mbps" in ''|NONE|PARSE_ERR) ok=0;; *) awk -v m="$min_mbps" 'BEGIN{exit !(m > 0)}' || ok=0;; esac
     if [ "$ok" = 1 ]; then
-        record PASS A10 "300s 负载 rekey ${epochs} 次（≥2）；最小逐秒区间 ${min_mbps} Mbps（无 >1s 平台）"
+        record PASS A10 "300s under load, rekey ${epochs} times (≥2); minimum per-second interval ${min_mbps} Mbps (no >1s plateau)"
     else
-        record FAIL A10 "rekeys=$epochs（≥2?） min_interval=${min_mbps}Mbps（>0?）"
+        record FAIL A10 "rekeys=$epochs (≥2?) min_interval=${min_mbps}Mbps (>0?)"
     fi
 }
 
 # ============================================================================
-# A11：压缩默认关（中转字节量对照）+ 非膨胀回退（单测复跑）
+# A11: compression off by default (relay byte-volume comparison) +
+#      non-expansion fallback (unit test re-run)
 # ============================================================================
 
 a11() {
-    log "A11 压缩默认关：4MiB 全零 vs 随机经隧道，中转 OUTPUT（dport 23000）字节量对照"
+    log "A11 compression off by default: 4MiB all-zeros vs random over the tunnel, relay OUTPUT (dport 23000) byte-volume comparison"
     es_ a sh -c 'pgrep -x nc >/dev/null 2>&1 || (setsid nc -lk 9090 >/dev/null 2>&1 &)' || true
     sleep 1
     ec 1 iptables -I OUTPUT -p tcp --dport 23000 -j ACCEPT >/dev/null 2>&1
@@ -679,7 +726,7 @@ a11() {
     bytes0="$(send_and_measure /dev/zero)"
     bytesR="$(send_and_measure /dev/urandom)"
     ec 1 iptables -D OUTPUT -p tcp --dport 23000 -j ACCEPT >/dev/null 2>&1
-    printf '    zeros=%sB random=%sB（内层各 4MiB=4194304B）\n' "$bytes0" "$bytesR"
+    printf '    zeros=%sB random=%sB (inner payload 4MiB=4194304B each)\n' "$bytes0" "$bytesR"
 
     local unit
     unit="$(cd "$REPO" && cargo test -p flock-protocol --lib compress 2>&1 | grep 'test result')"
@@ -689,88 +736,92 @@ a11() {
     if case "$bytes0" in ''|0) false;; esac && case "$bytesR" in ''|0) false;; esac; then
         awk -v a="$bytes0" -v b="$bytesR" 'BEGIN{d=a-b; if (d<0) d=-d; exit !(d <= 0.05*(a+b)/2)}' && ok_wire=1
     fi
-    # ≥1 passed：空跑不得记 PASS（同 A8 判据纪律）。
+    # ≥1 passed: an empty run must not record PASS (same criterion discipline as A8).
     printf '%s\n' "$unit" | grep -qE 'test result: ok\. [1-9][0-9]* passed' && ok_unit=1
 
     if [ "$ok_wire" = 1 ] && [ "$ok_unit" = 1 ]; then
-        record PASS A11 "中转字节量 zeros=${bytes0}B ≈ random=${bytesR}B（差 <5% ⇒ 压缩未启用）；compress 单测（默认关/非膨胀回退）全绿"
+        record PASS A11 "relay byte volume zeros=${bytes0}B ≈ random=${bytesR}B (difference <5% ⇒ compression not enabled); compress unit tests (default off / non-expansion fallback) all green"
     else
-        record FAIL A11 "wire_ok=$ok_wire unit_ok=$ok_unit（zeros=$bytes0 random=$bytesR）"
+        record FAIL A11 "wire_ok=$ok_wire unit_ok=$ok_unit (zeros=$bytes0 random=$bytesR)"
     fi
 }
 
 # ============================================================================
-# A12：抗重放（单测入口复跑：重放拒+计数、伪造限额）
+# A12: anti-replay (unit-test entry re-run: replay reject+count, forgery quota)
 # ============================================================================
 
 a12() {
-    log "A12 抗重放：replayed_record_rejected_and_counted + forge 限额（单测入口复跑）"
+    log "A12 anti-replay: replayed_record_rejected_and_counted + forge quota (unit-test entry re-run)"
     local out1 out2
     out1="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux replayed_record 2>&1)"
     out2="$(cd "$REPO" && cargo test -p flock-protocol --test session_mux forge 2>&1)"
     printf '%s\n' "$out1$out2" | grep -E 'test .*(replay|forge)' | sed 's/^/    /'
-    # 判据必须是**真执行**（A8 纪律，同 a8()）：只数 `test result: ok` 会把「过滤器
-    # 无匹配」的空跑（0 passed 同样带 ok 行）记成 PASS。两次复跑各断言：具名测试
-    # `... ok` 行 + `test result: ok. N passed` 且 N≥1。注：`forge` 过滤器同时命中
-    # forge_limit_breaks_link_at_100 与 forged_records_below_limit_keep_link——两个
-    # 具名都得 ok。测试不存在/更名 ⇒ 在此 FAIL。
+    # The criterion must be a **real execution** (A8 discipline, same as
+    # a8()): counting only `test result: ok` lines would book an empty run
+    # with no filter matches (0 passed also carries the ok line) as PASS.
+    # Both re-runs each assert: the named test's `... ok` line +
+    # `test result: ok. N passed` with N≥1. Note: the `forge` filter hits
+    # both forge_limit_breaks_link_at_100 and
+    # forged_records_below_limit_keep_link —— both named tests must be ok.
+    # Missing/renamed tests ⇒ FAIL here.
     if printf '%s\n' "$out1" | grep -q 'test replayed_record_rejected_and_counted ... ok' \
         && printf '%s\n' "$out1" | grep -qE 'test result: ok\. [1-9][0-9]* passed' \
         && printf '%s\n' "$out2" | grep -q 'test forge_limit_breaks_link_at_100 ... ok' \
         && printf '%s\n' "$out2" | grep -q 'test forged_records_below_limit_keep_link ... ok' \
         && printf '%s\n' "$out2" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
-        record PASS A12 "重放拒+计数（replayed_record_rejected_and_counted）、伪造 ≤N 存活 + 100 次断链（forge 两用例）复跑真执行通过"
+        record PASS A12 "replay reject + count (replayed_record_rejected_and_counted), forgery ≤N keeps link + 100 breaks it (both forge cases) re-run with real execution, passed"
     else
-        record FAIL A12 "复跑未全绿或未真执行（判据：两个 replay/forge 具名 ok + 各 ≥1 passed；见上）"
+        record FAIL A12 "re-run not all green or not really executed (criterion: both replay/forge named oks + ≥1 passed each; see above)"
     fi
 }
 
 # ============================================================================
-# A13：无直连回退（server-a/b 不挂 flockpub ⇒ 其位址必败）
+# A13: no direct-connection fallback (server-a/b not on flockpub ⇒ their
+#      addresses must be unreachable)
 # ============================================================================
 
 a13() {
-    log "A13 无直连回退：client-1 → 172.28.0.20:9443 / 172.28.0.21:9443 必败"
+    log "A13 no direct-connection fallback: client-1 → 172.28.0.20:9443 / 172.28.0.21:9443 must fail"
     local ip bad=0 out
     for ip in 172.28.0.20 172.28.0.21; do
         out="$(ec 1 bash -c "timeout 2 bash -c 'exec 3<>/dev/tcp/$ip/9443' && echo OPEN" 2>&1)"
         if [ "$out" = "OPEN" ]; then
-            printf '    %s:9443 直连成功（违规！）\n' "$ip"
+            printf '    %s:9443 direct connection succeeded (violation!)\n' "$ip"
             bad=$((bad+1))
         else
-            printf '    %s:9443 不可达（OK）\n' "$ip"
+            printf '    %s:9443 unreachable (OK)\n' "$ip"
         fi
     done
     if [ $bad -eq 0 ]; then
-        record PASS A13 "172.28.0.20/.21:9443 均不可达（Frp 形态两台不挂 flockpub——拓扑有效性）"
+        record PASS A13 "172.28.0.20/.21:9443 both unreachable (the two Frp-form servers are not on flockpub —— topology validity)"
     else
-        record FAIL A13 "$bad 个地址可直连（经中转语义已被绕过）"
+        record FAIL A13 "$bad addresses directly reachable (the via-relay semantics were bypassed)"
     fi
 }
 
 # ============================================================================
-# A14：跨服转发面 + 源 VIP 伪造
+# A14: cross-server forwarding plane + source VIP forgery
 # ============================================================================
 
 a14() {
-    log "A14 跨服面+源校验：FRWD 非零；断 srvmesh（server-b）互 ping 断/本服仍通；伪造 src=$VIP_C2"
+    log "A14 cross-server plane + source check: FRWD non-zero; cut srvmesh (server-b) ⇒ cross-ping dies / same-server still works; forged src=$VIP_C2"
     local fwd_before fwd_after
     fwd_before="$(stat_of a | sed -n 's/^fwd_forwarded=//p')"
     wait_ping 1 "$VIP_C2" 20
     ec 1 ping -c 3 -W 3 "$VIP_C2" >/dev/null 2>&1
     fwd_after="$(stat_of a | sed -n 's/^fwd_forwarded=//p')"
-    printf '    FRWD（server-a）: %s → %s\n' "$fwd_before" "$fwd_after"
+    printf '    FRWD (server-a): %s → %s\n' "$fwd_before" "$fwd_after"
     local fwd_ok=no
     [ -n "$fwd_after" ] && [ "$fwd_after" -gt "$fwd_before" ] 2>/dev/null && fwd_ok=yes
 
     local cid
     cid="$(compose ps -q server-b)"
-    docker network disconnect "$NET_MESH" "$cid" || { record FAIL A14 "disconnect srvmesh 失败"; return; }
+    docker network disconnect "$NET_MESH" "$cid" || { record FAIL A14 "disconnect srvmesh failed"; return; }
     sleep 3
     local cross_dead=no local_alive=no
     ec 1 ping -c 2 -W 3 "$VIP_C2" >/dev/null 2>&1 || cross_dead=yes
     wait_ping 1 "$VIP_A" 15 && local_alive=yes
-    printf '    srvmesh 断：互 ping 断=%s；本服 ping %s 通=%s\n' "$cross_dead" "$VIP_A" "$local_alive"
+    printf '    srvmesh cut: cross-ping dead=%s; same-server ping %s works=%s\n' "$cross_dead" "$VIP_A" "$local_alive"
     docker network connect --alias raft-2 "$NET_MESH" "$cid" 2>/dev/null \
         || docker network connect "$NET_MESH" "$cid"
     sleep 15
@@ -792,8 +843,8 @@ a14() {
     sleep 2
     viol_after="$(stat_of a | sed -n 's/^fwd_src_violations=//p')"
     wait $td1 2>/dev/null; td_rc1=$?
-    printf '    tcpdump 阳性对照 rc=%s（0=可捕）；伪造窗 rc=%s（124=未收到）\n' "$td_rc0" "$td_rc1"
-    printf '    src_violations（server-a）: %s → %s\n' "$viol_before" "$viol_after"
+    printf '    tcpdump positive control rc=%s (0=capturable); forgery window rc=%s (124=nothing received)\n' "$td_rc0" "$td_rc1"
+    printf '    src_violations (server-a): %s → %s\n' "$viol_before" "$viol_after"
 
     local ctrl_ok=no spoof_ok=no
     [ "$td_rc0" = 0 ] && ctrl_ok=yes
@@ -801,26 +852,30 @@ a14() {
 
     if [ "$fwd_ok" = yes ] && [ "$cross_dead" = yes ] && [ "$local_alive" = yes ] \
         && [ "$cross_back" = yes ] && [ "$ctrl_ok" = yes ] && [ "$spoof_ok" = yes ]; then
-        record PASS A14 "FRWD 计数 ${fwd_before}→${fwd_after}；srvmesh 断后互 ping 断/本服通、恢复回通；伪造 src 违例 +$((viol_after - viol_before)) 且 client-2 未收到（捕获面对照有效）"
+        record PASS A14 "FRWD count ${fwd_before}→${fwd_after}; after the srvmesh cut cross-ping dead / same-server works, recovered after reconnect; forged src violations +$((viol_after - viol_before)) and client-2 received nothing (capture-plane control valid)"
     else
         record FAIL A14 "fwd=$fwd_ok cross_dead=$cross_dead local=$local_alive cross_back=$cross_back ctrl=$ctrl_ok spoof=$spoof_ok"
     fi
 }
 
 # ============================================================================
-# A15：租约陈旧容错（client-2 迁移到 frps-a 端点重启，≤35s 恢复）
+# A15: stale-lease tolerance (client-2 migrated to the frps-a endpoint and
+#      restarted, recovery ≤35s)
 # ============================================================================
 
 write_client2_endpoints() { # write_client2_endpoints <first> <relay-fallback>
-    # 第二端点必须显式传入：恢复序（首位 frps-b）若沿用硬编码 frps-b 会把重复端点写进
-    # rw bind mount（deploy/client-e2e-2.toml 落盘 ["frps-b","frps-b",direct]——093838a
-    # 修过的同源形态被每轮 a15 复发；中继故障时 client-2 将直跳 Direct 而非 frps-a）。
+    # The second endpoint must be passed in explicitly: the recovery sequence
+    # (first slot frps-b) reusing a hard-coded frps-b would write a duplicate
+    # endpoint into the rw bind mount (deploy/client-e2e-2.toml ends up as
+    # ["frps-b","frps-b",direct] —— the same-shape bug fixed by 093838a
+    # recurring on every a15 run; during a relay fault client-2 would then
+    # jump straight to Direct instead of frps-a).
     ec 2 sh -c "printf '%s\n' 'state_dir = \"/var/lib/flock\"' '' 'tun_name = \"tun0\"' 'mtu = 1280' '' 'endpoints = [\"$1\", \"$2\", \"172.28.0.22:9443\"]' > /etc/flock/client.toml" \
         && printf '    client-2 endpoints = [%s, %s, direct]\n' "$1" "$2"
 }
 
 a15() {
-    log "A15 租约陈旧容错：client-2 迁到 frps-a 端点重启 ⇒ client-1→client-2 ≤${A15_DEADLINE}s 恢复"
+    log "A15 stale-lease tolerance: client-2 migrated to the frps-a endpoint and restarted ⇒ client-1→client-2 recovers ≤${A15_DEADLINE}s"
     local base_redir
     base_redir="$(stat_of a | sed -n 's/^fwd_locate_redirected=//p')"
     write_client2_endpoints "frps-a:23000" "frps-b:23001"
@@ -834,37 +889,37 @@ a15() {
     local dt=$((SECONDS - t0))
     local redir_after
     redir_after="$(stat_of a | sed -n 's/^fwd_locate_redirected=//p')"
-    printf '    迁移=%s 恢复 dt=%ss；locate_redirected（server-a）: %s → %s\n' \
+    printf '    migrated=%s recovery dt=%ss; locate_redirected (server-a): %s → %s\n' \
         "${migrated:-0}" "$dt" "$base_redir" "$redir_after"
 
     write_client2_endpoints "frps-b:23001" "frps-a:23000"
     local cbase2; cbase2="$(conn_count 2)"
     compose restart client-2 >/dev/null 2>&1
-    wait_new_conn 2 "frps-b:23001" 60 "$cbase2" || echo "A15 恢复：client-2 未回 frps-b"
+    wait_new_conn 2 "frps-b:23001" 60 "$cbase2" || echo "A15 recovery: client-2 did not return to frps-b"
 
     if [ -n "$recovered" ] && [ "$migrated" = 1 ] && [ $dt -le $A15_DEADLINE ]; then
         local redir_note
         if [ "${redir_after:-0}" -gt "${base_redir:-0}" ] 2>/dev/null; then
-            redir_note="locate 重定向计数 ${base_redir:-0}→${redir_after:-0}（NOT_HERE→location_query 路径被走到）"
+            redir_note="locate redirect count ${base_redir:-0}→${redir_after:-0} (the NOT_HERE→location_query path was exercised)"
         else
-            redir_note="locate 重定向计数未动（租约事件推送 ≤1s 先于陈旧窗生效；redirect 路径由 flock-sync forward 单测覆盖）"
+            redir_note="locate redirect count unchanged (lease event push ≤1s took effect before the stale window; the redirect path is covered by the flock-sync forward unit tests)"
         fi
-        record PASS A15 "迁移后 ${dt}s（≤${A15_DEADLINE}s）client-1→client-2 ping 恢复；${redir_note}"
+        record PASS A15 "after migration ${dt}s (≤${A15_DEADLINE}s) client-1→client-2 ping recovered; ${redir_note}"
     else
-        record FAIL A15 "recovered=$recovered migrated=$migrated dt=${dt}s（≤${A15_DEADLINE}s?）"
+        record FAIL A15 "recovered=$recovered migrated=$migrated dt=${dt}s (≤${A15_DEADLINE}s?)"
     fi
 }
 
 # ============================================================================
-# A16：Direct 形态（硬约束守门）
+# A16: Direct form (hard-constraint gatekeeping)
 # ============================================================================
 
 a16() {
-    log "A16 Direct 形态：client-3 直连 $EP_C 会话连通（无 I0）+ ping $VIP_C + 与 c1/c2 互 ping + server-c 无 frp 进程"
+    log "A16 Direct form: client-3 direct-connects $EP_C session up (no I0) + ping $VIP_C + mutual pings with c1/c2 + no frp process in server-c"
     if [ "$(last_ep 3)" != "$EP_C" ]; then
         local cbase3; cbase3="$(conn_count 3)"
         compose restart client-3 >/dev/null 2>&1
-        wait_new_conn 3 "$EP_C" 90 "$cbase3" || record FAIL A16 "client-3 未能回 Direct 端点（last=$(last_ep 3)）"
+        wait_new_conn 3 "$EP_C" 90 "$cbase3" || record FAIL A16 "client-3 could not return to the Direct endpoint (last=$(last_ep 3))"
     fi
     local rc=0
     ping_ok 3 "$VIP_C" || rc=1
@@ -875,30 +930,30 @@ a16() {
 
     local tofu_c ep
     tofu_c="$(compose logs server-c 2>/dev/null | grep -c 'TOFU bootstrap (I0)')"
-    [ "$tofu_c" = "0" ] || { rc=1; echo "    server-c 出现 I0（$tofu_c 次）"; }
+    [ "$tofu_c" = "0" ] || { rc=1; echo "    server-c saw I0 ($tofu_c times)"; }
     ep="$(last_ep 3)"
-    [ "$ep" = "$EP_C" ] || { rc=1; echo "    client-3 当前端点 $ep（期望 $EP_C）"; }
+    [ "$ep" = "$EP_C" ] || { rc=1; echo "    client-3 current endpoint $ep (expected $EP_C)"; }
 
     local frp_procs frpc_containers
     frp_procs="$(es_ c sh -c "ps ax -o comm= 2>/dev/null | grep -i '^frp' || true")"
     frpc_containers="$(docker ps --filter name=frpc --format '{{.Names}}' | sort | tr '\n' ' ')"
-    printf '    server-c frp 进程: %s；frpc 容器: %s\n' "${frp_procs:-（无）}" "$frpc_containers"
+    printf '    server-c frp processes: %s; frpc containers: %s\n' "${frp_procs:-(none)}" "$frpc_containers"
     [ -z "$frp_procs" ] || rc=1
     [ "$frpc_containers" = "flock-e2e-frpc-a-1 flock-e2e-frpc-b-1 " ] || rc=1
 
     if [ $rc -eq 0 ]; then
-        record PASS A16 "直连会话（无 I0，端点 $EP_C）；ping $VIP_C 与 c1/c2↔c3 互 ping 0 丢包（Direct↔Frp 跨服同构）；server-c 无 frp 进程、无边车"
+        record PASS A16 "direct session (no I0, endpoint $EP_C); ping $VIP_C and c1/c2↔c3 mutual pings 0 loss (Direct↔Frp cross-server isomorphic); server-c has no frp process, no sidecar"
     else
-        record FAIL A16 "rc=$rc（见上分行）"
+        record FAIL A16 "rc=$rc (see lines above)"
     fi
 }
 
 # ============================================================================
-# 入口
+# Entry point
 # ============================================================================
 
 if ! docker info >/dev/null 2>&1; then
-    echo "docker 不可用（Docker Desktop 是否在跑？）" >&2
+    echo "docker unavailable (is Docker Desktop running?)" >&2
     exit 2
 fi
 topology_up=""
@@ -909,13 +964,13 @@ for _ in $(seq 1 60); do
     sleep 2
 done
 if [ -z "$topology_up" ]; then
-    echo "e2e 拓扑未运行：先 docker compose -f $COMPOSE_FILE up -d --build" >&2
+    echo "e2e topology not running: first docker compose -f $COMPOSE_FILE up -d --build" >&2
     exit 2
 fi
 
 START_TS="$(date '+%F %T')"
 if ! bootstrap; then
-    echo "bootstrap 失败" >&2
+    echo "bootstrap failed" >&2
     exit 2
 fi
 
@@ -925,7 +980,7 @@ a3
 a4 1 a "$VIP_A" A4
 a5
 a6 A6 b 2 b
-re_enroll_client 2 "frps-b:23001" || record FAIL A6 "client-2 re-enroll 失败（后续依赖其连通的断言将如实失败）"
+re_enroll_client 2 "frps-b:23001" || record FAIL A6 "client-2 re-enroll failed (later assertions depending on its connectivity will honestly fail)"
 a7
 a8
 a9
@@ -938,40 +993,50 @@ a15
 a16
 
 # ============================================================================
-# 结果落盘 deploy/e2e-results.md
+# Results written to deploy/e2e-results.md
 # ============================================================================
 FOOTNOTES=$(cat <<'FN'
 
-脚注（如实记录）：
-1. client-2 终值 VIP 高于 .12：A6/A7-A6 两次吊销各消耗一个设备身份（吊销终态、IP 不复用），
-   脚本以「新设备身份 re-enroll」复活通道；A15 迁移断言按当时 VIP 执行。
-2. A15 的 locate 重定向计数若未动：迁移恢复（实测 1s）由租约事件推送（≤1s）在陈旧窗生效前
-   完成——NOT_HERE→location_query 路径未被触发时如实记录；该路径由 flock-sync tests/forward
-   单测覆盖。
-3. A8/A11/A12 为设计指定的单测复跑入口（A8：session_mux #[ignore] 档 100 流×60s，以 --ignored
-   真执行——判据要求具名测试 ok 且 ≥1 passed，空跑不得记 PASS；A11：compress 档；A12：replay/forge
-   ——判据同 A8 纪律：每轮复跑均须具名测试 ok + ≥1 passed，空跑/过滤器无匹配即 FAIL）。
-4. 实测暴露并修复的三处产品缺陷：redb vote 编解码不对称（tests/store_reopen 回归）；长寿命
-   会话租约蒸发（lease_refresh_loop TTL/3 续期）；互连全局锁跨网络 await + 无拨号预算（锁外
-   拨号 + TcpFabric 3s 预算）。
-5. link-a/b 网段为 /29：Docker bridge 需网关+广播各占一位，/30 撑不起「网关 + 边车 + server」
-   三元（隔离语义不变）。
+Footnotes (recorded as-is):
+1. client-2's final VIP is above .12: the two revocations in A6/A7-A6 each
+   consume one device identity (revocation is terminal, IPs are not reused);
+   the script revives the channel via re-enroll with a "new device identity";
+   the A15 migration assertion runs against the then-current VIP.
+2. If A15's locate redirect count did not move: migration recovery (measured
+   1s) is completed by the lease event push (≤1s) before the stale window
+   takes effect —— recorded as-is when the NOT_HERE→location_query path was
+   never triggered; that path is covered by the flock-sync tests/forward unit
+   tests.
+3. A8/A11/A12 are the design-designated unit-test re-run entries (A8:
+   session_mux #[ignore] tier 100 streams×60s, really executed via --ignored
+   —— the criterion requires the named test ok plus ≥1 passed, an empty run
+   must not record PASS; A11: the compress tier; A12: replay/forge —— same
+   criterion discipline as A8: every re-run must show the named test ok +
+   ≥1 passed; an empty run / no filter match is a FAIL).
+4. Three product defects exposed and fixed by the measured runs: redb vote
+   codec asymmetry (tests/store_reopen regression); long-lived session lease
+   evaporation (lease_refresh_loop TTL/3 renewal); interconnect global lock
+   awaited across the network + no dialing budget (dial outside the lock +
+   TcpFabric 3s budget).
+5. link-a/b subnets are /29: a Docker bridge needs one address each for the
+   gateway and broadcast; a /30 cannot hold the "gateway + sidecar + server"
+   triple (isolation semantics unchanged).
 FN
 )
 {
-    printf '# M5 e2e 实测结果（docs/design.md §6.3 A1–A16）\n\n'
-    printf -- '- 执行：%s 起；主机 = Windows + Docker Desktop 29.8.2（WSL2）；脚本 deploy/e2e_assert.sh\n' "$START_TS"
-    printf -- '- 拓扑：deploy/e2e.yml——三网隔离（flockpub 172.28.0.0/24 / srvmesh 172.29.0.0/24 / link-a·b 各 /29）；'
-    printf -- 'frps-a/b = 原版 frp 0.71.1 + frpc-a/b 边车；server-a/b/c = 3 voter（Frp/Frp/Direct 混布，srvmesh 服务器-服务器 profile 互连）；client-1/2/3 钉死 frps-a:23000 / frps-b:23001 / 172.28.0.22:9443\n'
-    printf -- '- VIP：server a/b/c = %s/%s/%s；client 1/2/3 = %s/%s/%s（Raft 分配，从 .11 起）\n\n' \
+    printf '# M5 e2e measured results (docs/design.md §6.3 A1–A16)\n\n'
+    printf -- '- Executed: from %s; host = Windows + Docker Desktop 29.8.2 (WSL2); script deploy/e2e_assert.sh\n' "$START_TS"
+    printf -- '- Topology: deploy/e2e.yml —— three isolated networks (flockpub 172.28.0.0/24 / srvmesh 172.29.0.0/24 / link-a·b one /29 each);'
+    printf -- 'frps-a/b = stock frp 0.71.1 + frpc-a/b sidecars; server-a/b/c = 3 voters (Frp/Frp/Direct mix, srvmesh server-server profile interconnect); client-1/2/3 pinned to frps-a:23000 / frps-b:23001 / 172.28.0.22:9443\n'
+    printf -- '- VIPs: server a/b/c = %s/%s/%s; client 1/2/3 = %s/%s/%s (Raft-assigned, starting at .11)\n\n' \
         "$VIP_A" "$VIP_B" "$VIP_C" "${VIP_C1:-?}" "${VIP_C2:-?}" "${VIP_C3:-?}"
-    printf '| 结果 | 断言 | 说明 |\n|---|---|---|\n'
+    printf '| Result | Assertion | Notes |\n|---|---|---|\n'
     for l in "${SUMMARY[@]}"; do printf '| %s |\n' "$l"; done
     printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
     printf '%s' "$FOOTNOTES"
 } > "$RESULTS"
 
-printf '\n== 汇总（已写 %s）==\n' "$RESULTS"
+printf '\n== Summary (written to %s) ==\n' "$RESULTS"
 printf '%s\n' "${SUMMARY[@]}" | tr '|' ' '
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

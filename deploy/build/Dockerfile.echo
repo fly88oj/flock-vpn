@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
-# echo —— A1 字节透传 harness 的回显端点（docs/design.md §6.3 A1：经中转 echo 回
-# 1MiB 随机 + 全 256 字节值，sha256 一致——frp-compat T1/T2 的 e2e 复刻面）。
-# socat TCP-LISTEN fork + EXEC:cat = 全双工字节回显（无框定/无改写）。
+# echo —— the echo endpoint of the A1 byte-passthrough harness (docs/design.md
+# §6.3 A1: 1MiB random + the full 256-byte value echoed back over the relay,
+# sha256 identical —— the e2e replica of frp-compat T1/T2).
+# socat TCP-LISTEN fork + EXEC:cat = full-duplex byte echo (no framing, no
+# rewriting).
 
 FROM debian:bookworm-slim
 RUN apt-get update \

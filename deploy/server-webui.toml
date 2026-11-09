@@ -1,9 +1,13 @@
-# server-webui.toml —— M8 Web UI 断言拓扑的 server 配置（deploy/webui.yml 内嵌）。
+# server-webui.toml —— the server config of the M8 Web UI assertion topology
+# (embedded in deploy/webui.yml).
 #
-# Direct 模式（与 server-direct.toml 同构）+ [webui] 显式节（§7-M8.2：双绑定
-# 127.0.0.1:9800 + tun VIP 100.64.0.1:9800——不绑 LAN/公网 ⇒ W5 的连接层不可达）。
-# advertise_endpoint 用 compose 服务名（127.0.0.1 对 client-1 容器不可达——W4 的
-# VPN 段登录链需 client 经目录端点拨入；目录为根签产物、优先于 client 配置覆盖）。
+# Direct mode (isomorphic to server-direct.toml) + an explicit [webui] section
+# (§7-M8.2: dual bind 127.0.0.1:9800 + tun VIP 100.64.0.1:9800 —— no LAN/public
+# bind ⇒ W5's connection-layer unreachability).
+# advertise_endpoint uses the compose service name (127.0.0.1 is unreachable
+# from the client-1 container —— W4's VPN-segment login chain needs the client
+# to dial in via the directory endpoint; the directory is a root-signed product
+# and takes precedence over the client config override).
 
 state_dir = "/var/lib/flock"
 bind = "0.0.0.0:9443"

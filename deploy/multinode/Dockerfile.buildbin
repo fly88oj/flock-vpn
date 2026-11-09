@@ -1,16 +1,20 @@
 # syntax=docker/dockerfile:1
-# Dockerfile.buildbin —— 真·多机组网实测的发布二进制构建（真机清单 docs/manual/multinode-test.md）。
+# Dockerfile.buildbin —— release-binary build for the real multi-machine
+# networking test (real-machine checklist docs/manual/multinode-test.md).
 #
 #   docker buildx build -f deploy/multinode/Dockerfile.buildbin \
 #     --output type=local,dest=deploy/multinode/out .
 #
-# 产物（out/）：flock-server-direct（单服 Direct 构建档，无 multi-primary——
-# 与 Dockerfile.server-direct 同档）、flock-server-mp（multi-primary 档——跨机 Raft
-# 用，与 e2e.yml 的 server_features 同档）、flock-client（strip 过）。全部 Linux amd64
-# release，glibc bookworm（与既有 deploy 镜像运行段一致）。
+# Artifacts (out/): flock-server-direct (the single-server Direct build tier,
+# no multi-primary —— same tier as Dockerfile.server-direct), flock-server-mp
+# (the multi-primary tier —— for cross-machine Raft, same tier as the
+# server_features of e2e.yml), flock-client (stripped). All Linux amd64
+# release, glibc bookworm (matching the existing deploy image runtime stages).
 #
-# 构建段/运行环境同一 Debian suite 钉 bookworm（glibc 符号版本，见 Dockerfile.server
-# 头注）；依赖层缓存手法与 Dockerfile.server 相同（manifest+stub 先行）。
+# Build stage / runtime environment pinned to the same Debian suite bookworm
+# (glibc symbol versions, see the Dockerfile.server header); the
+# dependency-layer caching technique is the same as Dockerfile.server
+# (manifest+stub first).
 
 FROM rust:1.98-slim-bookworm AS builder
 RUN apt-get update \
@@ -22,8 +26,9 @@ COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
 COPY crates/flock-sync/Cargo.toml crates/flock-sync/
 COPY app/flock-server/Cargo.toml app/flock-server/
 COPY app/flock-client/Cargo.toml app/flock-client/
-# —— 依赖层（stub 源）——
-# flock-protocol 为 git 依赖（独立仓 v0.1.0）：镜像内构建经 GitHub 拉取。
+# —— dependency layer (stub sources) ——
+# flock-protocol is a git dependency (separate repo, v0.1.0): in-image builds
+# fetch it from GitHub.
 RUN mkdir -p crates/flock-frpc/src crates/flock-sync/src \
              app/flock-server/src app/flock-client/src \
  && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
@@ -37,7 +42,7 @@ RUN mkdir -p crates/flock-frpc/src crates/flock-sync/src \
           target/release/deps/flock_frpc* target/release/deps/flock_sync* \
  && rm -f target/release/flock-server target/release/flock-client
 
-# —— 源码层：两个构建档 + 客户端 ——
+# —— source layer: two build tiers + the client ——
 COPY crates/flock-frpc/src crates/flock-frpc/src
 COPY crates/flock-sync/src crates/flock-sync/src
 COPY app/flock-client/src app/flock-client/src
@@ -45,10 +50,10 @@ COPY app/flock-server/src app/flock-server/src
 RUN touch crates/flock-frpc/src/lib.rs crates/flock-sync/src/lib.rs \
       app/flock-client/src/lib.rs app/flock-client/src/main.rs \
       app/flock-server/src/lib.rs app/flock-server/src/main.rs \
- # 单服 Direct 档（与 Dockerfile.server-direct 一致：无 multi-primary）
+ # single-server Direct tier (same as Dockerfile.server-direct: no multi-primary)
  && cargo build --release --locked -p flock-server \
  && cp target/release/flock-server /tmp/flock-server-direct \
- # multi-primary 档（跨机 Raft；与 e2e.yml server_features 一致）
+ # multi-primary tier (cross-machine Raft; same as the e2e.yml server_features)
  && cargo build --release --locked -p flock-server --features multi-primary \
  && cp target/release/flock-server /tmp/flock-server-mp \
  && cargo build --release --locked -p flock-client \

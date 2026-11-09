@@ -1,17 +1,21 @@
 #!/bin/sh
-# M3 客户端入口（docs/design.md §7-M3）。
+# M3 client entrypoint (docs/design.md §7-M3).
 #
-# 编排序（deploy/m3_assert.sh 驱动）：
-#   1. 客户端 `gen-keys`（生成/复用设备密钥并打印公钥）；
-#   2. 服务端 `device-add`（注册设备 + 分 VIP）与 `invite`（签发 v3 邀请）；
-#   3. 客户端 `invite <file>`（钉扎根公钥 + 存根签目录）+ 写 vip 文件；
-#   4. `touch /var/lib/flock/ready` 后 `docker compose restart client`
-#      ⇒ 本入口 exec 客户端主进程（日志进 `docker compose logs client`，A9 grep 面）。
+# Orchestration order (driven by deploy/m3_assert.sh):
+#   1. client `gen-keys` (generate/reuse device keys and print the public keys);
+#   2. server `device-add` (register the device + assign a VIP) and `invite`
+#      (issue a v3 invite);
+#   3. client `invite <file>` (pin the cluster root key + store the signed
+#      directory) + write the vip file;
+#   4. after `touch /var/lib/flock/ready`, `docker compose restart client`
+#      ⇒ this entrypoint execs the client main process (logs go to
+#      `docker compose logs client`, the A9 grep face).
 set -e
 STATE=/var/lib/flock
 
 if [ -f "$STATE/ready" ]; then
-    # $@ 覆盖缺省（M7：compose command 注入 --config 卷内配置 + service 子命令）。
+    # $@ overrides the default (M7: the compose command injects --config with
+    # the in-volume config + the service subcommand).
     if [ "$#" -eq 0 ]; then
         set -- --config /etc/flock/client.toml
     fi

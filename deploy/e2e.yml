@@ -1,22 +1,29 @@
-# e2e.yml —— M5 全拓扑（docs/design.md §6.2/§6.3：三网隔离 + Direct/Frp 混布 + 3 voter）。
+# e2e.yml —— M5 full topology (docs/design.md §6.2/§6.3: three isolated networks + Direct/Frp mix + 3 voters).
 #
 #   docker compose -f deploy/e2e.yml up -d --build
-#   bash deploy/e2e_assert.sh          # A1–A16（§6.3）
+#   bash deploy/e2e_assert.sh          # A1–A16 (§6.3)
 #
-# 三网隔离（§6.2：单网段会让「模拟不可信公网」名不副实）：
-#   flockpub 172.28.0.0/24  bridge —— 模拟不可信公网：frps-a/b、frpc-a/b 边车、
-#                            client-1/2/3、Direct 形态的 server-c（172.28.0.22）；
-#                            密文流经它。172.28.0.20/.21 **故意不分配**——A13 的
-#                            「server-a/b 直连不可达」目标地址。
-#   srvmesh 172.29.0.0/24  internal —— 只挂三台 server（Raft/gossip/FRWD 互连不出公网；
-#                            网络别名 raft-1/2/3 = TcpFabric 拨号表）。
-#   link-a/b 各 /30        frpc 边车 ↔ 对应 server（边车把 server:9443 经中转暴露）。
+# Three isolated networks (§6.2: a single subnet would make "simulating an
+# untrusted public network" a misnomer):
+#   flockpub 172.28.0.0/24  bridge —— the simulated untrusted public network:
+#                            frps-a/b, the frpc-a/b sidecars, client-1/2/3, and
+#                            the Direct-form server-c (172.28.0.22); ciphertext
+#                            flows through it. 172.28.0.20/.21 are **deliberately
+#                            unassigned** —— the "server-a/b direct connection
+#                            unreachable" target addresses of A13.
+#   srvmesh 172.29.0.0/24  internal —— only the three servers attach (Raft/gossip/
+#                            FRWD interconnect never leaves for the public network;
+#                            network aliases raft-1/2/3 = the TcpFabric dial table).
+#   link-a/b each /30        frpc sidecar ↔ its server (the sidecar exposes
+#                            server:9443 through the relay).
 #
-# 编排（e2e_assert.sh 驱动，幂等）：
-#   up 时 operator（一次性）init-cluster --voters 3 --endpoints …（已有 root.seed 即跳过）
-#   → 三台 enroll（捆绑自 /mat 卷）→ server 侧 cluster-bootstrap（根签 Bootstrap+SetOprf）
-#   → device-add/cluster-invite → 客户端 gen-keys/invite/vip/ready → restart client。
-# server 容器在捆绑/集群就绪前**等待**（sync.rs 等待语义），`up -d` 一次全起不崩循环。
+# Orchestration (driven by e2e_assert.sh, idempotent):
+#   at up time the operator (one-shot) runs init-cluster --voters 3 --endpoints …
+#   (skipped if root.seed already exists) → three enrolls (bundles from the /mat
+#   volume) → server-side cluster-bootstrap (root-signed Bootstrap+SetOprf)
+#   → device-add/cluster-invite → client gen-keys/invite/vip/ready → restart client.
+# The server containers **wait** until the bundle/cluster are ready (the
+# sync.rs wait semantics); `up -d` starts everything at once without crash loops.
 
 name: flock-e2e
 
@@ -27,7 +34,7 @@ x-e2e-server: &e2e-server
     additional_contexts:
       frpbin: ../.tmp/frp_0.71.1_linux_amd64
     args:
-      server_features: multi-primary   # §6.2 M5：NetBackend::Sync/Raft 装配档
+      server_features: multi-primary   # §6.2 M5: NetBackend::Sync/Raft assembly tier
   cap_add: [NET_ADMIN]
   devices:
     - /dev/net/tun:/dev/net/tun
@@ -35,11 +42,11 @@ x-e2e-server: &e2e-server
     net.ipv4.conf.all.rp_filter: "1"
     net.ipv4.conf.default.rp_filter: "1"
   volumes:
-    - cluster-mat:/mat:ro              # init-cluster 产物（enroll 输入；root.seed 只在运维侧）
+    - cluster-mat:/mat:ro              # init-cluster products (enroll inputs; root.seed stays on the ops side)
   restart: unless-stopped
 
 services:
-  # —— 中转（原版 frps v0.71.1 定版；用户口 23000/23100、23001/23101 由 frpc proxy 注册）——
+  # —— relays (stock frps v0.71.1 pinned; user ports 23000/23100, 23001/23101 registered by the frpc proxies) ——
   frps-a:
     build:
       context: build
@@ -64,7 +71,7 @@ services:
         ipv4_address: 172.28.0.3
     restart: unless-stopped
 
-  # —— frpc 边车（server-a/b 的中转注册；A1 echo 面同链路）——
+  # —— frpc sidecars (relay registration of server-a/b; the A1 echo face rides the same links) ——
   frpc-a:
     build:
       context: build
@@ -99,7 +106,7 @@ services:
       link-b: {}
     restart: unless-stopped
 
-  # —— A1 字节透传 echo 端点（link 网内；经中转暴露成 23100/23101）——
+  # —— A1 byte-passthrough echo endpoints (inside the link networks; exposed through the relays as 23100/23101) ——
   echo-a:
     build:
       context: build
@@ -116,7 +123,7 @@ services:
     networks: [link-b]
     restart: unless-stopped
 
-  # —— 三台 server（3 voter 仲裁，§4；Direct/Frp 混布，§6.2）——
+  # —— three servers (3-voter quorum, §4; Direct/Frp mix, §6.2) ——
   server-a:
     <<: *e2e-server
     build:
@@ -158,8 +165,10 @@ services:
         aliases: [raft-2]
 
   server-c:
-    # Direct 形态（硬约束守门样板，§0/§2.1）：直挂 flockpub，无 frpc 边车、无 frp 进程
-    # （A16 的 pgrep 面）；镜像与 a/b 同源（build 无 [frp] 段即零 frp 装配）。
+    # Direct form (the hard-constraint gatekeeping template, §0/§2.1): directly
+    # on flockpub, no frpc sidecar, no frp process (A16's pgrep face); the
+    # image shares the a/b source (a build without an [frp] section assembles
+    # zero frp).
     <<: *e2e-server
     build:
       context: ..
@@ -179,7 +188,7 @@ services:
       srvmesh:
         aliases: [raft-3]
 
-  # —— 一次性运维容器：init-cluster（幂等——root.seed 已在即跳过）——
+  # —— one-shot ops container: init-cluster (idempotent —— skipped if root.seed already present) ——
   operator:
     build:
       context: ..
@@ -208,7 +217,7 @@ services:
         ipv4_address: 172.28.0.6
     restart: "no"
 
-  # —— 客户端 ×3（接入映射钉死，§6.2：client-1→frps-a、client-2→frps-b、client-3→直连）——
+  # —— clients ×3 (pinned access mapping, §6.2: client-1→frps-a, client-2→frps-b, client-3→direct) ——
   client-1:
     build:
       context: ..
@@ -240,7 +249,7 @@ services:
       net.ipv4.conf.all.rp_filter: "1"
       net.ipv4.conf.default.rp_filter: "1"
     volumes:
-      - ./client-e2e-2.toml:/etc/flock/client.toml   # rw：A15 迁移需在容器内改写端点序
+      - ./client-e2e-2.toml:/etc/flock/client.toml   # rw: the A15 migration rewrites the endpoint order inside the container
       - client-2-state:/var/lib/flock
     networks:
       flockpub:
@@ -281,8 +290,10 @@ networks:
       config:
         - subnet: 172.29.0.0/24
   link-a:
-    # 设计 §6.2 写 /30；Docker bridge 需网关 + 广播各占一位，/30 仅剩 2 可用地址
-    # 撑不起「网关 + 边车 + server」三元——取最小可用的 /29（隔离语义不变）。
+    # Design §6.2 says /30; a Docker bridge needs one address each for the
+    # gateway and broadcast, leaving only 2 usable in a /30 —— not enough for
+    # the "gateway + sidecar + server" triple —— so the smallest usable /29
+    # (isolation semantics unchanged).
     name: flock-e2e-link-a
     driver: bridge
     ipam:

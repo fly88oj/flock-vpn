@@ -1,5 +1,5 @@
-# server-webui-b.toml —— M8b W6 dual 档 server-b（双 voter Raft + webui，
-# VIP 100.64.0.2；其余同 server-webui-a.toml 头注）。
+# server-webui-b.toml —— M8b W6 dual-tier server-b (two-voter Raft + webui,
+# VIP 100.64.0.2; otherwise see the server-webui-a.toml header).
 
 state_dir = "/var/lib/flock"
 bind = "0.0.0.0:9443"

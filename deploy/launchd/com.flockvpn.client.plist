@@ -1,9 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- flock-client LaunchDaemon 样例（docs/design.md §7-M6.3）。
-     正式安装由 `flock-client install` 写 /Library/LaunchDaemons/com.flockvpn.client.plist。
-     退出语义（§7-M6.1）：不设 KeepAlive——IPC Shutdown/SIGTERM 优雅停服后 launchd 不复活。
-     ⚠ macOS 路径本机无设备 ⇒ 未验证（真机清单：docs/manual/service-install.md）。 -->
+<!-- flock-client LaunchDaemon sample (docs/design.md §7-M6.3).
+     The real install is written by `flock-client install` to
+     /Library/LaunchDaemons/com.flockvpn.client.plist.
+     Exit semantics (§7-M6.1): no KeepAlive —— after a graceful stop via IPC
+     Shutdown/SIGTERM, launchd does not revive it.
+     Warning: no macOS device locally ⇒ unverified (real-machine checklist:
+     docs/manual/service-install.md). -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -17,10 +20,12 @@
     </array>
     <key>RunAtLoad</key>
     <true/>
-    <!-- stderr 落盘（launchd 不继承会话 stdout/stderr——不指定则丢）。轮转建议：
-         macOS 用 newsyslog，/etc/newsyslog.d/flock-client.conf 加一行
+    <!-- stderr persisted to disk (launchd does not inherit the session's
+         stdout/stderr —— unspecified means lost). Rotation suggestion: on macOS
+         use newsyslog, adding a line to /etc/newsyslog.d/flock-client.conf:
          `/var/log/flock-client.log root:wheel 640 3 1024 * J`
-         （3 份归档、单份 1024KB、J=压缩），防长期运行无限增长。 -->
+         (3 archives, 1024KB each, J=compress), guarding against unbounded
+         growth over long runs. -->
     <key>StandardErrorPath</key>
     <string>/var/log/flock-client.log</string>
 </dict>

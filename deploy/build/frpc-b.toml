@@ -1,5 +1,5 @@
-# frpc-b —— server-b 的中转注册（docs/design.md §6.2 M5）。
-# 用户口 23001（server-b 接入端点）+ echo 23101（A1 第二条中转）。
+# frpc-b —— the relay registration of server-b (docs/design.md §6.2 M5).
+# User port 23001 (server-b access endpoint) + echo 23101 (A1's second relay).
 serverAddr = "frps-b"
 serverPort = 7000
 

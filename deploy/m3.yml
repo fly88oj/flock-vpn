@@ -1,30 +1,38 @@
-# m3.yml —— M3 客户端数据面（docs/design.md §7-M3：m2 拓扑 + client 容器）。
+# m3.yml —— M3 client data plane (docs/design.md §7-M3: the m2 topology + a client container).
 #
 #   docker compose -f deploy/m3.yml up -d --build
-#   bash deploy/m3_assert.sh          # A2/A3/A4/A9 单服版
+#   bash deploy/m3_assert.sh          # single-server versions of A2/A3/A4/A9
 #
-# 拓扑（m2.yml 的 frp 中转变体加真客户端；网络 m3net = 「模拟不可信公网」）：
-#   frps（原版 v0.71.1；用户口 27500/27501 容器网内可达；宿主 127.0.0.1 映射口
-#     供 Windows 真机手工清单——§7-M3/§7-M5 宿主 `--smoke`/run 连本地中转）
-#     └─ server（Frp 模式 + M3 数据面：tun0 VIP 100.64.0.1；--cap-add NET_ADMIN
-#                --device /dev/net/tun，§6.1 实测可行的 WSL2 后端 tun 直通）
-#   client（flock-client；tun0 VIP = device-add 分配值；同 NET_ADMIN/tun 直通）
+# Topology (the frp-relay variant of m2.yml plus a real client; network m3net =
+# "the simulated untrusted public network"):
+#   frps (stock v0.71.1; user ports 27500/27501 reachable inside the container
+#     network; the host 127.0.0.1 mapped ports serve the Windows real-machine
+#     manual checklist —— §7-M3/§7-M5 host `--smoke`/run connecting to the local
+#     relay)
+#     └─ server (Frp mode + M3 data plane: tun0 VIP 100.64.0.1; --cap-add
+#                NET_ADMIN --device /dev/net/tun, the WSL2-backend tun passthrough
+#                proven in §6.1)
+#   client (flock-client; tun0 VIP = the device-add assignment; same
+#           NET_ADMIN/tun passthrough)
 #
-# 原版 frp 二进制经命名构建上下文直取 .tmp/frp_0.71.1_linux_amd64/（同 m2.yml）。
-# 编排（gen-keys → device-add → invite → vip → ready → restart）由 m3_assert.sh 驱动。
+# The stock frp binaries are pulled from .tmp/frp_0.71.1_linux_amd64/ via the
+# named build context (same as m2.yml).
+# The orchestration (gen-keys → device-add → invite → vip → ready → restart) is
+# driven by m3_assert.sh.
 
 name: flock-m3
 
 services:
   frps:
     build:
-      context: build            # 仅 Dockerfile.frps + frps.toml（committed）
+      context: build            # only Dockerfile.frps + frps.toml (committed)
       dockerfile: Dockerfile.frps
       additional_contexts:
         bins: ../.tmp/frp_0.71.1_linux_amd64
     image: flock/frps:0.71.1
-    # 宿主映射（仅回环）：Windows 真机清单（§7-M3/§7-M5）宿主 client 经
-    # 127.0.0.1:27500/27501 连本地中转；容器网内口不受影响。
+    # Host mapping (loopback only): the Windows real-machine checklist
+    # (§7-M3/§7-M5) host client connects to the local relay via
+    # 127.0.0.1:27500/27501; the in-network ports are unaffected.
     ports:
       - "127.0.0.1:27500:27500"
       - "127.0.0.1:27501:27501"
@@ -33,20 +41,22 @@ services:
 
   server:
     build:
-      context: ..               # workspace 根（源码；.dockerignore 裁剪 target/.tmp）
+      context: ..               # workspace root (sources; .dockerignore trims target/.tmp)
       dockerfile: deploy/Dockerfile.server
       additional_contexts:
         frpbin: ../.tmp/frp_0.71.1_linux_amd64
       args:
-        server_conf: server-m3.toml   # 容器网络视角端点（frps:27500/27501）
+        server_conf: server-m3.toml   # container-network-view endpoints (frps:27500/27501)
     image: flock/server:m3
     depends_on: [frps]
-    # M3 数据面：服务端自身也是 peer（tun + 路由，§2.2）。
+    # M3 data plane: the server itself is also a peer (tun + routes, §2.2).
     cap_add: [NET_ADMIN]
     devices:
       - /dev/net/tun:/dev/net/tun
-    # rp_filter=1（§2.3，innernet 建议）：无特权容器 /proc/sys 只读——namespaced
-    # sysctl 由运行时设置（default ⇒ 新建 tun0 继承 1；代码内 /proc 写兜底宿主路径）。
+    # rp_filter=1 (§2.3, innernet recommendation): an unprivileged container has
+    # a read-only /proc/sys —— the namespaced sysctls are set at runtime
+    # (default ⇒ a newly created tun0 inherits 1; the in-code /proc write falls
+    # back to the host path).
     sysctls:
       net.ipv4.conf.all.rp_filter: "1"
       net.ipv4.conf.default.rp_filter: "1"

@@ -1,12 +1,16 @@
-# server-2w-direct-mp.toml —— 场景二【双 Server · 跨机 Raft】server-1（Windows Docker）。
+# server-2w-direct-mp.toml —— scenario 2 [two servers · cross-machine Raft]
+# server-1 (Windows Docker).
 #
-# Direct 接入 + multi-primary 构建档：发布 0.0.0.0:9443（客户端主端点）与
-# 0.0.0.0:9500（Raft 织物）到 Windows 宿主。raft_peers 跨真实网络：
-#   node 1 = Windows 宿主（本机，Docker NAT 拉入）
-#   node 2 = jowency 宿主（LXD proxy device 发布 flock-s2:9500）
-# 两台 server 的 raft_peers 表一致（§6.2 TcpFabric 拨号表）。
+# Direct access + the multi-primary build tier: publishes 0.0.0.0:9443 (the
+# clients' main endpoint) and 0.0.0.0:9500 (the Raft fabric) to the Windows
+# host. raft_peers crosses the real network:
+#   node 1 = the Windows host (this machine, pulled in via Docker NAT)
+#   node 2 = the jowency host (the LXD proxy device publishing flock-s2:9500)
+# Both servers' raft_peers tables are identical (the §6.2 TcpFabric dial
+# table).
 #
-# 模板变量：@WIN_LAN_IP@ / @JOW_LAN_IP@（win-docker-setup.sh 渲染）。
+# Template variables: @WIN_LAN_IP@ / @JOW_LAN_IP@ (rendered by
+# win-docker-setup.sh).
 
 state_dir = "/var/lib/flock"
 bind = "0.0.0.0:9443"

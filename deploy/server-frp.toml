@@ -1,8 +1,10 @@
-# server.toml —— Frp 模式（m2.yml 内的 server 容器；docs/design.md §2.1/§3.11/§7-M2）。
+# server.toml —— Frp mode (the server container in m2.yml; docs/design.md §2.1/§3.11/§7-M2).
 #
-# 单一接入端点 = frps 用户口（宿主 127.0.0.1:27500/27501 映射）；本地监听 9443 不出容器。
-# advertise/extra = 客户端（宿主冒烟测试）视角的端点；extra 即「第二暴露口」——同一服务器
-# 经 frps 的第二个 proxy 暴露，用于 §7-M2「换端点仍 1-RTT」模拟。
+# The single access endpoint = the frps user ports (host 127.0.0.1:27500/27501
+# mappings); the local listener on 9443 never leaves the container.
+# advertise/extra = the endpoints from the client's (host smoke test) view;
+# extra is the "second exposure" —— the same server exposed via a second proxy
+# through frps, for the §7-M2 "still 1-RTT after an endpoint change" simulation.
 
 state_dir = "/var/lib/flock"
 mode = "frp"
@@ -13,12 +15,14 @@ advertise_endpoint = "127.0.0.1:27500"
 extra_endpoints = ["127.0.0.1:27501"]
 dir_version = 1
 
-# 票据 TTL：缺省 60（§2.2 硬顶）；冒烟部署调小以便「过期票据」断言不必等 60s。
+# Ticket TTL: default 60 (§2.2 hard cap); smoke deployments lower it so the
+# "expired ticket" assertion need not wait 60s.
 ticket_ttl_secs = 6
 
 [frp]
 frpc_bin = "/usr/local/bin/frpc"
-# 原版 frpc TOML（v0.71.1 方言）内嵌注册：两条 tcp proxy = 主端点 + 第二暴露口。
+# Embedded registration with the stock frpc TOML (v0.71.1 dialect): two tcp
+# proxies = main endpoint + second exposure.
 original_toml = """
 serverAddr = "frps"
 serverPort = 7000

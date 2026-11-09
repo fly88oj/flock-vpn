@@ -1,15 +1,20 @@
-# flock-server —— Frp 模式镜像（docs/design.md §7-M2：m2.yml 的 server 服务）。
+# flock-server —— Frp-mode image (docs/design.md §7-M2: the server service of m2.yml).
 #
-# 依赖层缓存：先只拷 manifest + stub 源构建依赖层，再拷真实源重编——源码改动不重拉依赖。
-# frpc 二进制经命名构建上下文 `frpbin` 直取 .tmp/frp_0.71.1_linux_amd64/
-# （compose build.additional_contexts——免拷贝前置步骤）。
-# 直连变体用 Dockerfile.server-direct（镜像内连 frpc 二进制都没有）。
+# Dependency-layer caching: first copy only manifests + stub sources to build the
+# dependency layer, then copy the real sources and rebuild —— source changes do
+# not re-pull dependencies. The frpc binary is taken directly from
+# .tmp/frp_0.71.1_linux_amd64/ via the named build context `frpbin`
+# (compose build.additional_contexts —— no copy pre-step).
+# For the direct variant use Dockerfile.server-direct (that image does not even
+# contain the frpc binary).
 
-# 构建段与运行段必须同一 Debian suite（glibc 符号版本兼容）：binary 链接的
-# GLIBC_2.x 取决于构建段基底；rust:1.98-slim 当前=trixie(glibc 2.41)，而运行段若用
-# bookworm(2.36) 会 crash（GLIBC_2.39 not found）——两侧显式钉 bookworm。
+# The build stage and the runtime stage must be the same Debian suite (glibc
+# symbol-version compatibility): the GLIBC_2.x the binary links against depends
+# on the build-stage base; rust:1.98-slim currently = trixie (glibc 2.41), while
+# a bookworm (2.36) runtime stage would crash (GLIBC_2.39 not found) —— both
+# sides are pinned explicitly to bookworm.
 FROM rust:1.98-slim-bookworm AS builder
-# zstd-sys（flock-protocol 默认档）含 C 源，需要 gcc
+# zstd-sys (flock-protocol default tier) contains C sources and needs gcc
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc \
  && rm -rf /var/lib/apt/lists/*
@@ -18,11 +23,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/flock-frpc/Cargo.toml crates/flock-frpc/
 COPY crates/flock-sync/Cargo.toml crates/flock-sync/
 COPY app/flock-server/Cargo.toml app/flock-server/
-# flock-server 依赖 flock-client（M3 数据面：TunDevice/route 接缝复用，§2.2/§3.12）。
+# flock-server depends on flock-client (M3 data plane: TunDevice/route seam
+# reuse, §2.2/§3.12).
 COPY app/flock-client/Cargo.toml app/flock-client/
-# —— 依赖层（stub 源）——
-# flock-protocol 已是 git 依赖（独立仓 v0.1.0）：镜像内构建经 GitHub 拉取，
-# 不再进 stub 层（随真实 lockfile 一次构建、两阶段复用缓存）。
+# —— dependency layer (stub sources) ——
+# flock-protocol is already a git dependency (separate repo, v0.1.0): in-image
+# builds fetch it from GitHub; it no longer enters the stub layer (one build
+# with the real lockfile, the cache reused across both stages).
 RUN mkdir -p crates/flock-frpc/src crates/flock-sync/src \
              app/flock-server/src app/flock-client/src \
  && echo 'pub fn _stub() {}' > crates/flock-frpc/src/lib.rs \
@@ -37,8 +44,9 @@ RUN mkdir -p crates/flock-frpc/src crates/flock-sync/src \
           target/release/deps/flock_frpc* target/release/deps/flock_sync* \
  && rm -f target/release/flock-server target/release/flock-client
 
-# —— 源码层 ——
-# server_features：构建档（e2e 多主拓扑传 "multi-primary"——§6.2 M5；缺省空 = 单服）。
+# —— source layer ——
+# server_features: the build tier (the e2e multi-primary topology passes
+# "multi-primary" —— §6.2 M5; default empty = single server).
 ARG server_features=""
 COPY crates/flock-frpc/src crates/flock-frpc/src
 COPY crates/flock-sync/src crates/flock-sync/src
@@ -50,18 +58,21 @@ RUN touch crates/flock-frpc/src/lib.rs crates/flock-sync/src/lib.rs \
  && cargo build --release --locked -p flock-server --features "${server_features}"
 
 FROM debian:bookworm-slim
-# procps：§7-M2 的 Direct 形态断言（容器内 pgrep -f frp 无进程）需要 pgrep；
-# iproute2/iperf3：M3 数据面断言（A3 ip link / A4 iperf3 服务端）；
-# netcat-openbsd：M5 A11 压缩默认关的隧道内 nc 吞吐对照面。
+# procps: the §7-M2 Direct-form assertion (pgrep -f frp finds no process inside
+# the container) needs pgrep; iproute2/iperf3: the M3 data-plane assertions
+# (A3 ip link / A4 iperf3 server); netcat-openbsd: the in-tunnel nc throughput
+# comparison face for M5 A11's compression-off-by-default check.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends procps iproute2 iperf3 netcat-openbsd \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/flock-server /usr/local/bin/flock-server
-# 原版 frpc v0.71.1 定版二进制（命名 context `frpbin` ← .tmp；主 context 无需携带）
+# Stock frpc v0.71.1 pinned binary (named context `frpbin` ← .tmp; the main
+# context need not carry it)
 COPY --from=frpbin frpc /usr/local/bin/frpc
 RUN chmod +x /usr/local/bin/frpc && mkdir -p /var/lib/flock
-# server.toml 可经构建参数替换（m3.yml 传 server-m3.toml：容器网络视角端点）；
-# 缺省 = server-frp.toml（M2 宿主视角，行为不变）。
+# server.toml can be swapped via a build argument (m3.yml passes server-m3.toml:
+# container-network-view endpoints); default = server-frp.toml (M2 host view,
+# behavior unchanged).
 ARG server_conf=server-frp.toml
 COPY deploy/${server_conf} /etc/flock/server.toml
 ENTRYPOINT ["/usr/local/bin/flock-server"]

@@ -1,39 +1,43 @@
 #!/usr/bin/env bash
-# lxd-cleanup.sh —— 多机实测收尾（jowency 侧，经 ssh 执行）：
-#   bash lxd-cleanup.sh            # 全清：flock-* 容器（含 proxy device）+ frps 进程
-#                                  #        + ~/flock-mn（二进制/集群材料/临时文件）
-#   bash lxd-cleanup.sh --keep-files   # 只删容器与 frps（保留 ~/flock-mn 复用材料）
+# lxd-cleanup.sh —— multi-machine test teardown (jowency side, executed via ssh):
+#   bash lxd-cleanup.sh            # full clean: flock-* containers (incl. proxy
+#                                  # devices) + the frps process + ~/flock-mn
+#                                  # (binaries/cluster material/temp files)
+#   bash lxd-cleanup.sh --keep-files   # delete only the containers and frps
+#                                  # (keep ~/flock-mn for reuse)
 #
-# 边界：只删 flock-* 前缀容器（proxy device 随容器消亡）；既有容器
-# （dmgvm/krymux-*/l2ctest/uesktop-ui-audit 等）零触碰。退出码：恒 0（缺项即已净）。
+# Boundary: deletes only flock-* prefixed containers (proxy devices die with
+# the container); existing containers (dmgvm/krymux-*/l2ctest/uesktop-ui-audit
+# etc.) are never touched. Exit code: always 0 (a missing item is already
+# clean).
 
 set -u
 
 KEEP_FILES=0
 [ "${1:-}" = "--keep-files" ] && KEEP_FILES=1
 
-echo "== flock-* 容器 =="
+echo "== flock-* containers =="
 mapfile -t ct < <(lxc list flock- -c n --format csv 2>/dev/null)
 if [ "${#ct[@]}" -gt 0 ] && [ -n "${ct[0]}" ]; then
     lxc delete --force "${ct[@]}"
-    echo "已删：${ct[*]}"
+    echo "deleted: ${ct[*]}"
 else
-    echo "（无）"
+    echo "(none)"
 fi
 
-echo "== frps 宿主进程（lxd-setup.sh 场景二启动）=="
+echo "== frps host process (started by lxd-setup.sh scenario 2) =="
 if pkill -f 'flock-mn/bin/frps' 2>/dev/null; then
-    echo "已停 frps"
+    echo "frps stopped"
 else
-    echo "（未在跑）"
+    echo "(not running)"
 fi
 
 if [ "$KEEP_FILES" = 0 ]; then
-    echo "== ~/flock-mn（二进制/集群材料/日志/临时文件）=="
+    echo "== ~/flock-mn (binaries/cluster material/logs/temp files) =="
     rm -rf ~/flock-mn
-    echo "已收走"
+    echo "removed"
 else
-    echo "--keep-files：~/flock-mn 保留"
+    echo "--keep-files: ~/flock-mn kept"
 fi
 
-echo "清理完成。剩余 flock-* 容器：$(lxc list flock- -c n --format csv 2>/dev/null | tr '\n' ' ')"
+echo "cleanup complete. Remaining flock-* containers: $(lxc list flock- -c n --format csv 2>/dev/null | tr '\n' ' ')"

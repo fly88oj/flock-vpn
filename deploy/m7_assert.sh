@@ -1,29 +1,38 @@
 #!/usr/bin/env bash
-# m7_assert.sh —— M7 客户端名册断言（docs/design.md §7-M7.7 完成标准：容器实测）。
+# m7_assert.sh —— M7 client roster assertions (docs/design.md §7-M7.7 completion
+# criteria: measured in containers).
 #
-# 前置：
+# Prerequisites:
 #   docker compose -f deploy/m7.yml up -d --build
 #   bash deploy/m7_assert.sh
 #
-# 断言集：
-#   P1 名册装配   client-1 `flock-client peers`：含 server 与 client-2 条目
-#                （hostname client-2 / 账户 m7c2 / 在线 / 延迟非 —）；自身行 (self)
-#   P2 流量观测   iperf3 client-1→client-2 跑流后（EWMA 收敛窗 ~10s）再次 peers：
-#                client-1 tx 与 client-2 rx 非 0（「设备视角」计数点）
-#   P3 机读档     `peers --json` 可解析（jq）且字段语义（vip/online/latency）
+# Assertion set:
+#   P1 roster assembly   client-1 `flock-client peers`: contains the server and
+#                        client-2 entries (hostname client-2 / account m7c2 /
+#                        online / latency not —) plus its own (self) row
+#   P2 traffic observability  after iperf3 client-1→client-2 runs a flow (EWMA
+#                        convergence window ~10s), peers again: client-1 tx and
+#                        client-2 rx non-zero (the "device view" counters)
+#   P3 machine-readable  `peers --json` parseable (jq) with correct field
+#                        semantics (vip/online/latency)
 #
-# 凭据引导 = admin 开户路径（对齐 m3 既有脚本）：gen-keys → device-add → invite →
-# ingest → vip → `flock-client login`（设口令 + 登录验证 + hostname 入册）→ ready。
+# Credential bootstrap = the admin onboarding path (aligned with the existing
+# m3 script): gen-keys → device-add → invite → ingest → vip → `flock-client
+# login` (set password + login verification + hostname registered) → ready.
 #
-# re-login 窗重试：daemon 登录保持按 refresh_after 周期重登（server ticket_ttl=6s ⇒
-# 4s），LoggingIn 短窗内 peers 返回 PeersUnavailable（指引文案即「稍候重试」）——
-# peers 类查询经 flock_retry/sh_retry 有界重试（PEERS_RETRIES 次）对齐该 transient；
-# 断言门槛（条目数/在线/延迟/流量非 0）不随重试放宽。
+# re-login window retries: the daemon's login keepalive re-logs-in per the
+# refresh_after period (server ticket_ttl=6s ⇒ 4s); during the brief LoggingIn
+# window peers returns PeersUnavailable (the guidance message says "retry
+# shortly") —— peers-type queries get bounded retries via flock_retry/sh_retry
+# (PEERS_RETRIES times) to ride out that transient; the assertion thresholds
+# (entry count / online / latency / traffic non-zero) are not relaxed by the
+# retries.
 #
-# Windows 宿主不跑本实测（tun 需提权 + WSL2 后端）——真机清单：
-# docs/manual/service-install.md（M7 条目）。
+# This run is not executed on a Windows host (tun needs privileges + the WSL2
+# backend) —— the real-machine checklist:
+# docs/manual/service-install.md (the M7 entry).
 #
-# 汇总：末尾逐项 PASS/FAIL；任一 FAIL ⇒ 退出码非零。
+# Summary: per-item PASS/FAIL at the end; any FAIL ⇒ non-zero exit code.
 if grep -qi microsoft /proc/version 2>/dev/null && [ -d /mnt/c ]; then
     _gb="/mnt/c/Program Files/Git/bin/bash.exe"
     if [ -x "$_gb" ]; then
@@ -47,12 +56,16 @@ CLIENT_USER_2="m7c2"
 PASS_1="m7-pass-1"
 PASS_2="m7-pass-2"
 CFG_1="/var/lib/flock/client.toml"
-EWMA_SETTLE=12   # iperf 停流后等 EWMA 收敛展示（α=0.2/1s 折——10s 量级窗）
-# daemon 登录保持的 re-login 窗重试（M7 复跑实证：server ticket_ttl=6s ⇒ refresh_after
-# =4s 周期重登，phase=LoggingIn 的短暂窗口内 peers 返回 PeersUnavailable「登录进行中
-# （稍候重试）」——CLI 指引文案即「稍候重试」；断言脚本对**该语义 transient** 有界
-# 重试（单查询 ~5% 命中率，6 次×2s 退避后残余概率可忽略）。数值/语义门槛不变——
-# 仍对最终成功返回的输出做原断言（条目数/字段/流量列阈值一律不放宽）。
+EWMA_SETTLE=12   # wait for EWMA convergence display after the iperf flow stops (α=0.2/1s fold —— a 10s-scale window)
+# Retries for the re-login window of the daemon's login keepalive (M7 re-run
+# field-proven: server ticket_ttl=6s ⇒ re-login every refresh_after=4s; during
+# the brief phase=LoggingIn window peers returns PeersUnavailable ("login in
+# progress (retry shortly)") —— the CLI guidance message says exactly that;
+# the assertion script applies bounded retries to **that semantic transient**
+# (~5% hit rate per query; residual probability after 6×2s backoff is
+# negligible). Numeric/semantic thresholds unchanged —— the original
+# assertions still apply to the final successful output (entry count / fields
+# / traffic-column thresholds are not relaxed at all).
 PEERS_RETRIES=6
 PEERS_RETRY_SLEEP=2
 
@@ -75,22 +88,24 @@ esrv() { compose exec -T server "$@"; }
 log() { printf '\n== %s ==\n' "$*"; }
 
 # ============================================================================
-# bootstrap（幂等：ready 标记跳过；admin 开户路径对齐 m3_assert.sh）
+# bootstrap (idempotent: ready marker skips; admin onboarding path aligned
+# with m3_assert.sh)
 # ============================================================================
 
 bootstrap_client() { # bootstrap_client <n:1|2> <user> <pass>
     local n="$1" user="$2" pass="$3"
     ec() { compose exec -T "client-$n" "$@"; }
     if ec sh -c "test -f /var/lib/flock/ready" 2>/dev/null; then
-        log "bootstrap client-$n: 已就绪（幂等跳过）"
-        # VIP 从卷内 vip 文件回填（后续断言用）。
+        log "bootstrap client-$n: already ready (idempotent skip)"
+        # VIP backfilled from the in-volume vip file (used by later assertions).
         local v
         v="$(ec sh -c 'cat /var/lib/flock/vip' 2>/dev/null | tr -d '\r\n')"
-        case "$v" in 100.64.*) eval "VIP_C$n=\$v" ;; *) echo "client-$n vip 文件异常：$v"; return 1;; esac
+        case "$v" in 100.64.*) eval "VIP_C$n=\$v" ;; *) echo "client-$n vip file abnormal: $v"; return 1;; esac
         return 0
     fi
 
-    # 卷内配置（[auth] username——daemon 登录态与 login 子命令共用）。
+    # In-volume config ([auth] username —— shared by the daemon's login state
+    # and the login subcommand).
     ec sh -c "printf 'state_dir = \"/var/lib/flock\"\ntun_name = \"tun0\"\nmtu = 1280\n\n[auth]\nusername = \"$user\"\n' > $CFG_1" || return 1
 
     log "bootstrap client-$n: gen-keys"
@@ -99,15 +114,15 @@ bootstrap_client() { # bootstrap_client <n:1|2> <user> <pass>
     local dev_x dev_ed
     dev_x="$(printf '%s\n' "$keys" | sed -n 's/^device-x=//p')"
     dev_ed="$(printf '%s\n' "$keys" | sed -n 's/^device-ed=//p')"
-    [ -n "$dev_x" ] && [ -n "$dev_ed" ] || { echo "client-$n gen-keys 输出异常：$keys"; return 1; }
+    [ -n "$dev_x" ] && [ -n "$dev_ed" ] || { echo "client-$n gen-keys output abnormal: $keys"; return 1; }
 
-    log "bootstrap client-$n: 服务端 device-add（--user $user）"
+    log "bootstrap client-$n: server-side device-add (--user $user)"
     local out vip
     out="$(esrv flock-server --config /etc/flock/server.toml \
         device-add --user "$user" --device-x "$dev_x" --device-ed "$dev_ed" 2>&1)" \
-        || { echo "client-$n device-add 失败：$out"; return 1; }
+        || { echo "client-$n device-add failed: $out"; return 1; }
     vip="$(printf '%s\n' "$out" | sed -n 's/^vip=//p' | tr -d '\r')"
-    case "$vip" in 100.64.*) ;; *) echo "client-$n VIP 异常：$out"; return 1;; esac
+    case "$vip" in 100.64.*) ;; *) echo "client-$n VIP abnormal: $out"; return 1;; esac
     eval "VIP_C$n=\$vip"
 
     log "bootstrap client-$n: invite → ingest → vip=$vip"
@@ -117,18 +132,18 @@ bootstrap_client() { # bootstrap_client <n:1|2> <user> <pass>
     ec flock-client --config "$CFG_1" invite /var/lib/flock/invite.b64 || return 1
     printf '%s' "$vip" | ec sh -c 'cat > /var/lib/flock/vip' || return 1
 
-    log "bootstrap client-$n: login（设口令 + 登录验证 + hostname 入册）"
+    log "bootstrap client-$n: login (set password + login verification + hostname registered)"
     printf '%s\n' "$pass" | ec flock-client --config "$CFG_1" login 2>&1 | tee /tmp/m7_login_$n.log | sed 's/^/    /'
-    grep -q '^login ok:' /tmp/m7_login_$n.log || { echo "client-$n login 失败（见上）"; return 1; }
+    grep -q '^login ok:' /tmp/m7_login_$n.log || { echo "client-$n login failed (see above)"; return 1; }
 
-    log "bootstrap client-$n: ready + restart（service daemon 接管）"
+    log "bootstrap client-$n: ready + restart (service daemon takes over)"
     ec sh -c 'touch /var/lib/flock/ready' || return 1
     compose restart "client-$n" >/dev/null 2>&1 || return 1
 
     local t=$((SECONDS + 90))
     until ec sh -c 'ip link show tun0' >/dev/null 2>&1; do
         if [ $SECONDS -ge $t ]; then
-            echo "client-$n tun0 90s 未创建"; compose logs --tail 30 "client-$n"; return 1
+            echo "client-$n tun0 not created within 90s"; compose logs --tail 30 "client-$n"; return 1
         fi
         sleep 2
     done
@@ -138,26 +153,26 @@ bootstrap_client() { # bootstrap_client <n:1|2> <user> <pass>
         if ec ping -c 1 -W 2 "$SERVER_VIP" >/dev/null 2>&1; then ok=1; break; fi
         sleep 2
     done
-    [ -n "$ok" ] || { echo "client-$n 90s 内 ping 不通 $SERVER_VIP"; compose logs --tail 30 "client-$n"; return 1; }
+    [ -n "$ok" ] || { echo "client-$n ping to $SERVER_VIP not working within 90s"; compose logs --tail 30 "client-$n"; return 1; }
     return 0
 }
 
 bootstrap() {
-    log "bootstrap: 等待 server 就绪（admin 端点）"
+    log "bootstrap: waiting for the server to be ready (admin endpoint)"
     local deadline=$((SECONDS + 120))
     until esrv bash -c 'exec 3<>/dev/tcp/127.0.0.1/9444 && echo ok' 2>/dev/null | grep -q ok; do
         if [ $SECONDS -ge $deadline ]; then
-            echo "server admin 端点 120s 未就绪"; return 1
+            echo "server admin endpoint not ready within 120s"; return 1
         fi
         sleep 2
     done
     esrv sh -c 'ip link show tun0' >/dev/null 2>&1 \
-        || { echo "server tun0 未创建（dataplane down）"; compose logs --tail 40 server; return 1; }
+        || { echo "server tun0 not created (dataplane down)"; compose logs --tail 40 server; return 1; }
 
     bootstrap_client 1 "$CLIENT_USER_1" "$PASS_1" || return 1
     bootstrap_client 2 "$CLIENT_USER_2" "$PASS_2" || return 1
 
-    # 等两台 daemon 登录保持就绪（login ok 日志）。
+    # Wait for both daemons' login keepalive to be ready (login ok logs).
     local t=$((SECONDS + 60)) ok1=0 ok2=0
     while [ $SECONDS -lt $t ]; do
         [ "$ok1" -eq 0 ] && [ "$(compose logs client-1 2>/dev/null | grep -c 'login ok' || true)" -gt 0 ] && ok1=1
@@ -165,16 +180,17 @@ bootstrap() {
         [ "$ok1" -eq 1 ] && [ "$ok2" -eq 1 ] && break
         sleep 2
     done
-    [ "$ok1" -eq 1 ] && [ "$ok2" -eq 1 ] || { echo "daemon 登录未就绪（c1=$ok1 c2=$ok2）"; compose logs --tail 20 client-1 client-2; return 1; }
+    [ "$ok1" -eq 1 ] && [ "$ok2" -eq 1 ] || { echo "daemon login not ready (c1=$ok1 c2=$ok2)"; compose logs --tail 20 client-1 client-2; return 1; }
     echo "VIP: client-1=${VIP_C1:-?} client-2=${VIP_C2:-?}"
     return 0
 }
 
 # ============================================================================
-# peers 查询重试包装（daemon re-login 窗 transient；语义门槛不降——见文件头注）
+# peers query retry wrapper (the daemon re-login window transient; semantic
+# thresholds not lowered —— see the file header)
 # ============================================================================
 
-flock_retry() { # flock_retry <n:1|2> <flock-client 子命令/参数...> → stdout（rc 随最终次）
+flock_retry() { # flock_retry <n:1|2> <flock-client subcommand/args...> → stdout (rc from the final attempt)
     local n="$1"; shift
     local out="" rc=1
     for _ in $(seq 1 "$PEERS_RETRIES"); do
@@ -186,8 +202,9 @@ flock_retry() { # flock_retry <n:1|2> <flock-client 子命令/参数...> → std
     return "$rc"
 }
 
-sh_retry() { # sh_retry <sh -c payload>（client-1 容器内）→ stdout；空输出 = re-login 窗
-    # （peers CLI 报错 ⇒ jq 无输入不出值）⇒ 有界重试后仍空 ⇒ 非零。
+sh_retry() { # sh_retry <sh -c payload> (inside the client-1 container) → stdout; empty output = re-login window
+    # (peers CLI error ⇒ jq gets no input, no value) ⇒ still empty after
+    # bounded retries ⇒ non-zero.
     local payload="$1" out=""
     for _ in $(seq 1 "$PEERS_RETRIES"); do
         out="$(compose exec -T client-1 sh -c "$payload" 2>/dev/null | tr -d '\r')"
@@ -199,75 +216,77 @@ sh_retry() { # sh_retry <sh -c payload>（client-1 容器内）→ stdout；空�
 }
 
 # ============================================================================
-# P1：名册装配（server + client-2 + self 三类条目）
+# P1: roster assembly (three kinds of entries: server + client-2 + self)
 # ============================================================================
 
-peers_table() { # peers_table <n:1|2> → stdout（表格；re-login 窗重试见 flock_retry）
+peers_table() { # peers_table <n:1|2> → stdout (table; re-login window retries via flock_retry)
     flock_retry "$1" peers
 }
 
 p1() {
-    log "P1 名册：client-1 peers（server + client-2 + self 条目）"
+    log "P1 roster: client-1 peers (server + client-2 + self entries)"
     local out
     out="$(peers_table 1)"; local rc=$?
     printf '%s\n' "$out" | sed 's/^/    /'
     if [ $rc -ne 0 ]; then
-        record FAIL P1 "peers 命令失败（rc=$rc）"
+        record FAIL P1 "peers command failed (rc=$rc)"
         return
     fi
     local ok=1 why=""
-    # 服务器条目：VIP .1 + 在线 + 延迟列数字（在线 ⇒ 必有探测值）。
-    printf '%s\n' "$out" | grep -E "^100\.64\.0\.1\b" | grep -q '在线' || { ok=0; why="$why server 行非在线;"; }
+    # Server entry: VIP .1 + online + a number in the latency column (online ⇒
+    # a probe value must exist).
+    printf '%s\n' "$out" | grep -E "^100\.64\.0\.1\b" | grep -q 'online' || { ok=0; why="$why server row not online;"; }
     local srv_row
     srv_row="$(printf '%s\n' "$out" | grep -E '^100\.64\.0\.1\b')"
-    if printf '%s' "$srv_row" | awk -F'|' '{gsub(/ /,"",$6); exit ($6=="—" || $6=="") ? 1 : 0}'; then :; else ok=0; why="$why server 延迟列为—;"; fi
-    # client-2 条目：hostname client-2 + 账户 m7c2 + 在线 + 延迟非 —。
-    printf '%s\n' "$out" | grep -q 'client-2' || { ok=0; why="$why 无 client-2 行;"; }
-    printf '%s\n' "$out" | grep 'client-2' | grep -q "$CLIENT_USER_2" || { ok=0; why="$why client-2 账户列异常;"; }
-    printf '%s\n' "$out" | grep 'client-2' | grep -q '在线' || { ok=0; why="$why client-2 非在线;"; }
-    if printf '%s\n' "$out" | grep 'client-2' | awk -F'|' '{gsub(/ /,"",$6); exit ($6=="—" || $6=="") ? 1 : 0}'; then :; else ok=0; why="$why client-2 延迟列为—;"; fi
-    # 自身行：(self) 标注。
-    printf '%s\n' "$out" | grep -q '(self)' || { ok=0; why="$why 无 (self) 行;"; }
+    if printf '%s' "$srv_row" | awk -F'|' '{gsub(/ /,"",$6); exit ($6=="—" || $6=="") ? 1 : 0}'; then :; else ok=0; why="$why server latency column is —;"; fi
+    # client-2 entry: hostname client-2 + account m7c2 + online + latency not —.
+    printf '%s\n' "$out" | grep -q 'client-2' || { ok=0; why="$why no client-2 row;"; }
+    printf '%s\n' "$out" | grep 'client-2' | grep -q "$CLIENT_USER_2" || { ok=0; why="$why client-2 account column abnormal;"; }
+    printf '%s\n' "$out" | grep 'client-2' | grep -q 'online' || { ok=0; why="$why client-2 not online;"; }
+    if printf '%s\n' "$out" | grep 'client-2' | awk -F'|' '{gsub(/ /,"",$6); exit ($6=="—" || $6=="") ? 1 : 0}'; then :; else ok=0; why="$why client-2 latency column is —;"; fi
+    # Own row: marked (self).
+    printf '%s\n' "$out" | grep -q '(self)' || { ok=0; why="$why no (self) row;"; }
 
     if [ "$ok" -eq 1 ]; then
-        record PASS P1 "server/client-2/self 条目齐（在线 + 延迟数字 + 账户/主机名正确）"
+        record PASS P1 "server/client-2/self entries complete (online + numeric latency + correct account/hostname)"
     else
-        record FAIL P1 "缺项：$why"
+        record FAIL P1 "missing items: $why"
     fi
 }
 
 # ============================================================================
-# P2：iperf3 跑流 → EWMA 收敛 → tx/rx 非 0
+# P2: iperf3 flow → EWMA convergence → tx/rx non-zero
 # ============================================================================
 
 p2() {
-    log "P2 流量观测：iperf3 client-1→client-2（VIP ${VIP_C2:-?}）→ ${EWMA_SETTLE}s 收敛 → peers 断言"
+    log "P2 traffic observability: iperf3 client-1→client-2 (VIP ${VIP_C2:-?}) → ${EWMA_SETTLE}s convergence → peers assertion"
     if [ -z "${VIP_C2:-}" ]; then
-        record FAIL P2 "client-2 VIP 未知（bootstrap 未跑）"
+        record FAIL P2 "client-2 VIP unknown (bootstrap not run)"
         return
     fi
-    # iperf3 服务端挂 client-2 的 VIP（-B 绑定 ⇒ 只经隧道可达；pgrep -x 防重复起）。
+    # iperf3 server bound to client-2's VIP (-B ⇒ reachable only via the
+    # tunnel; pgrep -x prevents duplicate launches).
     ec2 sh -c "pgrep -x iperf3 >/dev/null 2>&1 || iperf3 -s -D -B ${VIP_C2}" || true
     sleep 1
     local out
     out="$(ec1 iperf3 -c "$VIP_C2" -t 5 --format m 2>&1)"; local rc=$?
     printf '%s\n' "$out" | grep -E 'sender|receiver' | sed 's/^/    /'
     if [ $rc -ne 0 ]; then
-        record FAIL P2 "iperf3 失败（rc=$rc）"
+        record FAIL P2 "iperf3 failed (rc=$rc)"
         return
     fi
-    echo "    等 ${EWMA_SETTLE}s（EWMA 收敛窗）…"
+    echo "    waiting ${EWMA_SETTLE}s (EWMA convergence window)..."
     sleep "$EWMA_SETTLE"
     local tbl
     tbl="$(peers_table 1)"
     printf '%s\n' "$tbl" | sed 's/^/    /'
     local ok=1 why=""
-    # client-1 行：设备视角 tx（iperf 发端）非 0（↑流量列）。
+    # client-1 row: device-view tx (iperf sender side) non-zero (↑ traffic column).
     local c1_row c2_row
     c1_row="$(printf '%s\n' "$tbl" | grep '(self)')"
     c2_row="$(printf '%s\n' "$tbl" | grep 'client-2')"
-    [ -n "$c1_row" ] || { ok=0; why="$why 无 self 行;"; }
-    [ -n "$c2_row" ] || { ok=0; why="$why 无 client-2 行;"; }
+    [ -n "$c1_row" ] || { ok=0; why="$why no self row;"; }
+    [ -n "$c2_row" ] || { ok=0; why="$why no client-2 row;"; }
     if [ -n "$c1_row" ]; then
         printf '%s' "$c1_row" | awk -F'|' '{gsub(/ /,"",$8); exit ($8+0<=0) ? 1 : 0}' || { ok=0; why="$why client-1 tx=0;"; }
     fi
@@ -275,50 +294,53 @@ p2() {
         printf '%s' "$c2_row" | awk -F'|' '{gsub(/ /,"",$7); exit ($7+0<=0) ? 1 : 0}' || { ok=0; why="$why client-2 rx=0;"; }
     fi
     if [ "$ok" -eq 1 ]; then
-        record PASS P2 "跑流后 client-1 tx 非 0 且 client-2 rx 非 0（设备视角计数）"
+        record PASS P2 "after the flow, client-1 tx non-zero and client-2 rx non-zero (device-view counters)"
     else
-        record FAIL P2 "流量断言失败：$why"
+        record FAIL P2 "traffic assertion failed: $why"
     fi
 }
 
 # ============================================================================
-# P3：--json 机读档（jq 解析 + 字段语义）
+# P3: --json machine-readable form (jq parsing + field semantics)
 # ============================================================================
 
 p3() {
-    log "P3 机读档：peers --json | jq（容器内）"
+    log "P3 machine-readable: peers --json | jq (inside the container)"
     local js
     js="$(flock_retry 1 peers --json)"; local rc=$?
     printf '%s\n' "$js" | head -12 | sed 's/^/    /'
     if [ $rc -ne 0 ]; then
-        record FAIL P3 "peers --json 失败（rc=$rc；含 re-login 窗重试后仍失败）"
+        record FAIL P3 "peers --json failed (rc=$rc; includes failure after re-login-window retries)"
         return
     fi
-    # jq 在容器内跑（宿主无 jq 依赖——镜像已装）；过滤值经 --arg 传（内层零双引号，
-    # 免 docker exec 跨 Windows 参数边界时被吃引号）。查询经 sh_retry：re-login 窗
-    # transient 有界重试（见文件头注），字段断言不降。
+    # jq runs inside the container (no jq dependency on the host —— the image
+    # has it installed); filter values are passed via --arg (zero double quotes
+    # inside, avoiding quote-eating when docker exec crosses the Windows
+    # argument boundary). Queries go through sh_retry: bounded retries for the
+    # re-login window transient (see the file header), field assertions not
+    # lowered.
     local ty n srv_online c2_lat
     ty="$(sh_retry "flock-client --config $CFG_1 peers --json | jq -r 'type'")" \
-        || { record FAIL P3 "jq 解析失败（含 re-login 窗重试后仍空）"; return; }
-    [ "$ty" = "array" ] || { record FAIL P3 "顶层非 array（$ty）"; return; }
+        || { record FAIL P3 "jq parsing failed (still empty after re-login-window retries)"; return; }
+    [ "$ty" = "array" ] || { record FAIL P3 "top level not an array ($ty)"; return; }
     n="$(sh_retry "flock-client --config $CFG_1 peers --json | jq 'length'")" \
-        || { record FAIL P3 "条目数查询空（含重试）"; return; }
-    [ "${n:-0}" -ge 3 ] || { record FAIL P3 "条目数 ${n:-?} < 3"; return; }
+        || { record FAIL P3 "entry count query empty (including retries)"; return; }
+    [ "${n:-0}" -ge 3 ] || { record FAIL P3 "entry count ${n:-?} < 3"; return; }
     srv_online="$(sh_retry "flock-client --config $CFG_1 peers --json | jq -r --arg v 100.64.0.1 '.[] | select(.vip==\$v) | .online'")"
-    [ "$srv_online" = "true" ] || { record FAIL P3 "server 条目 online != true（$srv_online）"; return; }
+    [ "$srv_online" = "true" ] || { record FAIL P3 "server entry online != true ($srv_online)"; return; }
     c2_lat="$(sh_retry "flock-client --config $CFG_1 peers --json | jq -r --arg h client-2 '.[] | select(.hostname==\$h) | .latency_ms'")"
     case "$c2_lat" in
-        ''|null) record FAIL P3 "client-2 latency_ms 为空/null（$c2_lat）" ;;
-        *) record PASS P3 "json 数组（$n 条）+ server online + client-2 latency=${c2_lat}ms" ;;
+        ''|null) record FAIL P3 "client-2 latency_ms empty/null ($c2_lat)" ;;
+        *) record PASS P3 "json array ($n entries) + server online + client-2 latency=${c2_lat}ms" ;;
     esac
 }
 
 # ============================================================================
-# 入口
+# Entry point
 # ============================================================================
 
 if ! docker info >/dev/null 2>&1; then
-    echo "docker 不可用（Docker Desktop 是否在跑？）" >&2
+    echo "docker unavailable (is Docker Desktop running?)" >&2
     exit 2
 fi
 topology_up=""
@@ -330,12 +352,12 @@ for _ in $(seq 1 30); do
     sleep 2
 done
 if [ -z "$topology_up" ]; then
-    echo "m7 拓扑未运行：先 docker compose -f $COMPOSE_FILE up -d --build" >&2
+    echo "m7 topology not running: first docker compose -f $COMPOSE_FILE up -d --build" >&2
     exit 2
 fi
 
 if ! bootstrap; then
-    echo "bootstrap 失败" >&2
+    echo "bootstrap failed" >&2
     exit 2
 fi
 
@@ -343,7 +365,7 @@ p1
 p2
 p3
 
-log "汇总"
+log "Summary"
 printf '%s\n' "${SUMMARY[@]}"
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

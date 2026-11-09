@@ -1,17 +1,21 @@
-# client.toml.example —— 多机实测客户端配置模板（LXD/Windows Docker 同形）。
+# client.toml.example —— the client config template for the multi-machine test
+# (same shape for LXD/Windows Docker).
 #
-# 编排（multinode_assert.sh / 手工）按节点渲染：
-#   state_dir：LXD=/var/lib/flock；Docker=卷内同路径
-#   endpoints：钉死接入端点（场景一 = jowency:9443；场景二按侧分布——
-#     Windows 侧指向 server-1 直连口，LXD 侧指向 frps 用户口 24000）
-#   [auth] username：device-add 开户名（login 入册 hostname/账户列）
+# The orchestration (multinode_assert.sh / manual) renders per node:
+#   state_dir: LXD=/var/lib/flock; Docker=same path inside the volume
+#   endpoints: the pinned access endpoint (scenario 1 = jowency:9443; scenario 2
+#     split by side —— the Windows side points at the server-1 direct port, the
+#     LXD side at the frps user port 24000)
+#   [auth] username: the device-add account name (login registers the hostname/
+#     account columns)
 
 state_dir = "/var/lib/flock"
 
 tun_name = "tun0"
 mtu = 1280
 
-# 端点覆盖（钉死接入端点；根签目录全端点轮询为缺省行为，见 §2.3）
+# Endpoint override (pinned access endpoint; rotating over all root-signed
+# directory endpoints is the default behavior, see §2.3)
 endpoints = ["@ENDPOINT@"]
 
 [auth]
