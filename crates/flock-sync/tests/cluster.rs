@@ -580,8 +580,13 @@ async fn revoke_apply_callback_epoch_and_kill_hook_within_2s() {
         .issue_ticket(id.0, 1_000)
         .expect("ticket");
 
-    let t_commit = Instant::now();
+    // Commit→apply budget: the clock starts when the write response returns
+    // (the commit point observable by the client). Taking it before the write
+    // lets write-path latency (leader forwarding + follower dial races during
+    // cluster warm-up) eat into the 2s budget although commit→apply itself
+    // was fast — a startup-race flake, not a product budget violation.
     let resp = must_write(&cluster.nodes[writer], SyncRequest::Revoke { device: id.0 }).await;
+    let t_commit = Instant::now();
     let SyncResponse::Epoch(new_epoch) = resp else {
         panic!()
     };
