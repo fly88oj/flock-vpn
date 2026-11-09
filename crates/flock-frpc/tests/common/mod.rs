@@ -1,15 +1,20 @@
-//! 集成测试共享工具。
+//! Shared utilities for the integration tests.
 
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-/// 桩二进制预热（每测试进程一次）。
+/// Prewarm the stub binary (once per test process).
 ///
-/// 本开发机（沙箱/AV 环境）对 frpc_stub.exe 的**首次** CreateProcess 在「argv 引用刚
-/// 写入的文件 + cwd 指向其目录」的组合下会被实时扫描同步阻塞（曾无限期挂起；诊断
-/// 实验：同参数 std 与 tokio spawn 同挂 ⇒ 环境层而非库层；预热一次后同组合 10ms 内
-/// 完成）。先用朴素参数 spawn 一发立即退出的 `version` 模式把扫描吸收掉，后续守护
-/// spawn 全部走热路径。生产托管不受影响（无本测试桩）。
+/// On this dev machine (sandbox/AV environment), the **first**
+/// CreateProcess on frpc_stub.exe — in the combination "argv referencing a
+/// freshly written file + cwd pointing at its directory" — is synchronously
+/// blocked by real-time scanning (it once hung indefinitely; diagnostic
+/// experiment: std and tokio spawns with the same arguments hang identically
+/// ⇒ environment layer, not library layer; after one warm-up the same
+/// combination completes within 10ms). First spawn a `version` mode run
+/// with plain arguments that exits immediately to absorb the scan; all later
+/// supervision spawns take the hot path. Production supervision is
+/// unaffected (no such test stub there).
 pub fn prewarm_stub() {
     static WARM: OnceLock<()> = OnceLock::new();
     WARM.get_or_init(|| {
@@ -21,6 +26,9 @@ pub fn prewarm_stub() {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(ok, "frpc_stub 预热失败（version 模式应立即成功退出）");
+        assert!(
+            ok,
+            "frpc_stub prewarm failed (version mode should exit successfully immediately)"
+        );
     });
 }

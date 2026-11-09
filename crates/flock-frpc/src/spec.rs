@@ -1,31 +1,41 @@
-//! `RelaySpec` 与 R9 版本矩阵锁（docs/design.md §3.9 / §5-4；frp-compat §1.3/§4-R9）。
+//! `RelaySpec` and the R9 version-matrix lock (docs/design.md §3.9 / §5-4;
+//! frp-compat §1.3/§4-R9).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// ChmlFrp 定版 frpc 版本串（`frpc --version` 输出形态；frp-compat §2.1：
-/// `pkg/util/version/version.go` = `"ChmlFrp-0.51.2_251023"`）。
+/// The pinned ChmlFrp frpc version string (the `frpc --version` output shape;
+/// frp-compat §2.1: `pkg/util/version/version.go` = `"ChmlFrp-0.51.2_251023"`).
 pub const CHMLFRP_PINNED_VERSION: &str = "ChmlFrp-0.51.2_251023";
 
-/// 原版定版 frpc 版本串（设计 §5 定版 v0.71.1；frp-compat §1：
-/// GitHub Releases `v0.71.1 / 2026-10-14`，`frps --version` 容器实测 `0.71.1`）。
+/// The pinned original frpc version string (design §5 pins v0.71.1;
+/// frp-compat §1: GitHub Releases `v0.71.1 / 2026-10-14`, `frps --version`
+/// verified in-container as `0.71.1`).
 pub const ORIGINAL_PINNED_VERSION: &str = "0.71.1";
 
-/// 中转栈代（节点风格 = frpc 变体，二者一一绑定）。
+/// The relay stack generation (node style = frpc variant, the two are bound
+/// one-to-one).
 ///
-/// R9 矩阵锁的「行/列」：两代控制面互不兼容（ChmlFrp 基线 v0.51.2 无控制面加密；
-/// 原版 ≥v0.53.0 登录后强制 AES-128-CFB token 派生加密——双向均不兼容，frp-compat §1.3），
-/// 因此栈代是节点与 frpc 二进制的**共同**标识，禁交叉配对。
+/// The "row/column" of the R9 matrix lock: the two control-plane generations
+/// are mutually incompatible (ChmlFrp baseline v0.51.2 has no control-plane
+/// encryption; the original ≥v0.53.0 enforces AES-128-CFB token-derived
+/// encryption after login — incompatible in both directions, frp-compat
+/// §1.3), so the stack generation is the **shared** identity of a node and
+/// its frpc binary; cross pairing is forbidden.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RelayFlavor {
-    /// ChmlFrp 节点（面板托管，CheckProxy 白名单、套餐限速 8–32Mbps，frp-compat §2.3）。
+    /// A ChmlFrp node (panel-hosted, CheckProxy whitelist, plan rate limits
+    /// 8–32Mbps, frp-compat §2.3).
     ChmlFrp,
-    /// 自建原版节点（frps 由运维部署，frpc 与 frps 同代原版，frp-compat §1）。
+    /// A self-hosted original node (frps deployed by operations; frpc and
+    /// frps are the same original generation, frp-compat §1).
     Original,
 }
 
 impl RelayFlavor {
-    /// 该栈代允许的 frpc 定版版本串（§5 双栈定版；换版 = 改此表 + 过 golden/矩阵测试）。
+    /// The pinned frpc version string allowed for this stack generation
+    /// (§5 dual-stack pinning; changing a version = edit this table + pass
+    /// the golden/matrix tests).
     pub fn pinned_version(self) -> &'static str {
         match self {
             RelayFlavor::ChmlFrp => CHMLFRP_PINNED_VERSION,
@@ -43,24 +53,26 @@ impl fmt::Display for RelayFlavor {
     }
 }
 
-/// 中继接入规格：`Supervisor::start` 的输入（§3.9 接口）。
+/// Relay access spec: the input of `Supervisor::start` (§3.9 interface).
 #[derive(Clone, Debug)]
 pub enum RelaySpec {
-    /// ChmlFrp 节点 ⇔ ChmlFrp frpc（`ChmlFrp-0.51.2_251023` 定版）。
+    /// A ChmlFrp node ⇔ ChmlFrp frpc (`ChmlFrp-0.51.2_251023` pinned).
     ChmlFrp {
-        /// 接入模式：默认 [`ChmlFrpMode::ConfigFile`]（`-c`），`UserTokenAuto` 显式 opt-in。
+        /// Access mode: the default [`ChmlFrpMode::ConfigFile`] (`-c`);
+        /// `UserTokenAuto` requires explicit opt-in.
         mode: ChmlFrpMode,
     },
-    /// 自建原版节点 ⇔ 原版 frpc（v0.71.1 定版）。
+    /// A self-hosted original node ⇔ original frpc (v0.71.1 pinned).
     ///
-    /// `toml` = 原版 frpc TOML 配置文件路径（v0.71.1 方言：`serverAddr`/`serverPort`/
-    /// `[[proxies]]` camelCase，样本见 `.tmp/frp_0.71.1_linux_amd64/frpc.toml`）。
-    /// 托管层**只读**该文件（推导探活目标），绝不改写。
+    /// `toml` = the path of the original frpc TOML config file (v0.71.1
+    /// dialect: `serverAddr`/`serverPort`/`[[proxies]]` camelCase; a sample
+    /// is at `.tmp/frp_0.71.1_linux_amd64/frpc.toml`). The supervision layer
+    /// only **reads** this file (deriving probe targets), never rewrites it.
     Original { toml: PathBuf },
 }
 
 impl RelaySpec {
-    /// 栈代（R9 矩阵的 spec 侧标识）。
+    /// The stack generation (the spec-side identity of the R9 matrix).
     pub fn flavor(&self) -> RelayFlavor {
         match self {
             RelaySpec::ChmlFrp { .. } => RelayFlavor::ChmlFrp,
@@ -69,69 +81,90 @@ impl RelaySpec {
     }
 }
 
-/// ChmlFrp 接入模式（§3.9；frp-compat §2.2/§2.3）。
+/// ChmlFrp access mode (§3.9; frp-compat §2.2/§2.3).
 #[derive(Clone, Debug)]
 pub enum ChmlFrpMode {
-    /// **默认模式**：面板「隧道管理→配置文件」粘贴导出的 frpc.ini，frpc 以 `-c <ini>` 启动。
+    /// **The default mode**: the frpc.ini paste-exported from the panel's
+    /// "Tunnel Management → Config File"; frpc starts with `-c <ini>`.
     ///
-    /// 面板生成的 proxy 参数（类型/端口/名称等）由服务端 CheckProxy 与面板记录逐项比对，
-    /// 不一致即拒（"客户端代理参数错误"，frp-compat §2.3）⇒ 托管层对这些字段**字节级透传**
-    /// （见 [`crate::config`] 的 golden 守门），仅允许向 `[common]` 注入 admin 探测字段。
+    /// The panel-generated proxy parameters (type/ports/name etc.) are
+    /// compared item by item by the server-side CheckProxy against the
+    /// panel's records; any mismatch is rejected ("client proxy parameter
+    /// error", frp-compat §2.3) ⇒ the supervision layer passes those fields
+    /// through **byte for byte** (golden-guarded, see [`crate::config`]);
+    /// only admin probing fields may be injected into `[common]`.
     ConfigFile(
-        /// 面板导出的 frpc.ini 路径。
+        /// The panel-exported frpc.ini path.
         PathBuf,
     ),
-    /// **显式 opt-in**：`frpc -u <usertoken> -p <tunnel_id>` 自举（魔改 CLI，root.go:92-93）。
+    /// **Explicit opt-in**: bootstrap via `frpc -u <usertoken> -p
+    /// <tunnel_id>` (modded CLI, root.go:92-93).
     ///
-    /// 启动流程：frpc 自行 `GET https://cf-v2.uapis.cn/cfg?action=getcfg&token=<usertoken>
-    /// &id=<tunnel_id>` 拉取面板生成的 frpc.ini 全文 → 覆写本地 `./frpc.ini`（cwd 相对，
-    /// root.go:133-174）→ 按原版流程启动。
+    /// Startup flow: frpc itself fetches the panel-generated frpc.ini via
+    /// `GET https://cf-v2.uapis.cn/cfg?action=getcfg&token=<usertoken>
+    /// &id=<tunnel_id>` → overwrites the local `./frpc.ini` (cwd-relative,
+    /// root.go:133-174) → starts the original flow.
     ///
-    /// # 风险（R20，opt-in 前必读）
+    /// # Risks (R20, must-read before opting in)
     ///
-    /// - cfg API 走 **InsecureSkipVerify** 的 HTTPS（`chml/pkg/api/api.go:41-46`）：中间人
-    ///   可截获面板全权 usertoken（可建/删/改隧道的凭据）；
-    /// - usertoken 进入子进程命令行（`ps`/`/proc/<pid>/cmdline` 对同机其他用户可读）；
-    /// - 拉取的配置对托管层不透明（探活目标无法预推导，[`crate::probe`] 只剩进程状态面）。
+    /// - the cfg API uses HTTPS with **InsecureSkipVerify**
+    ///   (`chml/pkg/api/api.go:41-46`): a MITM can intercept the
+    ///   all-powerful panel usertoken (a credential that can
+    ///   create/delete/modify tunnels);
+    /// - the usertoken enters the subprocess command line (readable by other
+    ///   users on the same machine via `ps`/`/proc/<pid>/cmdline`);
+    /// - the fetched config is opaque to the supervision layer (probe
+    ///   targets cannot be pre-derived; [`crate::probe`] is left with only
+    ///   the process-state surface).
     ///
-    /// 组织/多用户机器不要启用；默认 [`ChmlFrpMode::ConfigFile`]（§8-R20 对策）。
+    /// Do not enable on organizational/multi-user machines; the default is
+    /// [`ChmlFrpMode::ConfigFile`] (the §8-R20 countermeasure).
     UserTokenAuto {
-        /// 面板 usertoken（**凭据**：面板全权；勿入日志）。
+        /// The panel usertoken (**a credential**: full panel authority; keep
+        /// out of logs).
         usertoken: String,
-        /// 隧道数字 ID（面板「隧道管理」可见；`-p/--id`）。
+        /// The numeric tunnel ID (visible in the panel's "Tunnel
+        /// Management"; `-p/--id`).
         tunnel_id: u64,
     },
 }
 
-/// 定版 frpc 二进制声明（R9 矩阵的二进制侧标识）。
+/// A pinned frpc binary declaration (the binary-side identity of the R9
+/// matrix).
 ///
-/// `decl_version` 是**运维声明**的版本（应与 `<bin> --version` 输出一致）。声明≠定版
-/// 即被 [`check_version_matrix`] 拒绝；「实测 `--version` ↔ 声明」的进程级核对是
-/// 测试面纪律（tests/matrix.rs 的测试内 helper 承担，不占生产启动路径——多一次
-/// 子进程往返，生产恒不开）。
+/// `decl_version` is the version **declared by operations** (should match the
+/// `<bin> --version` output). Declaration ≠ pin is rejected by
+/// [`check_version_matrix`]; the process-level cross-check of "measured
+/// `--version` ↔ declared" is a test-surface discipline (carried by an
+/// in-test helper in tests/matrix.rs, occupying no production startup path —
+/// one extra subprocess round trip, never enabled in production).
 #[derive(Clone, Debug)]
 pub struct FrpcBinary {
-    /// 二进制路径。
+    /// Binary path.
     pub path: PathBuf,
-    /// 栈代。
+    /// Stack generation.
     pub flavor: RelayFlavor,
-    /// 声明版本串（`--version` 输出形态）。
+    /// Declared version string (the `--version` output shape).
     pub decl_version: String,
 }
 
-/// R9 版本矩阵锁：spec 栈代 ⇔ frpc 二进制栈代 ⇔ 定版版本，禁交叉。
+/// The R9 version-matrix lock: spec stack generation ⇔ frpc binary stack
+/// generation ⇔ pinned version; cross pairing forbidden.
 ///
-/// 合法配对只有对角线：
+/// Only the diagonal pairings are legal:
 ///
-/// | spec \ bin | ChmlFrp          | Original           |
-/// |------------|------------------|--------------------|
-/// | ChmlFrp    | ✅ `ChmlFrp-0.51.2_251023` | ❌ 两代控制面互不兼容 |
-/// | Original   | ❌ 同上            | ✅ `0.71.1`          |
+/// | spec \ bin | ChmlFrp                    | Original                     |
+/// |------------|-----------------------------|------------------------------|
+/// | ChmlFrp    | ✅ `ChmlFrp-0.51.2_251023`  | ❌ the two control-plane generations are mutually incompatible |
+/// | Original   | ❌ same                     | ✅ `0.71.1`                   |
 ///
-/// 机理（frp-compat §1.3 源码级证实）：ChmlFrp frpc（v0.51.2 基线，无控制面加密）连原版
-/// frps ≥v0.53.0 会在对端开启 AES-128-CFB 后握手失败；原版 frpc ≥v0.53.0 连 ChmlFrp 节点
-/// 则对不加密控制面同样失败——**双向均挂**。CI 矩阵冒烟（4 组合断言只有对角线成功）在
-/// 本函数的单测中固化（`tests/matrix.rs`）。
+/// Mechanism (source-level confirmation in frp-compat §1.3): a ChmlFrp frpc
+/// (v0.51.2 baseline, no control-plane encryption) connecting to an original
+/// frps ≥v0.53.0 fails the handshake after the peer enables AES-128-CFB; an
+/// original frpc ≥v0.53.0 connecting to a ChmlFrp node likewise fails on the
+/// unencrypted control plane — **both directions break**. The CI matrix smoke
+/// test (asserting that only the diagonal succeeds across the 4 combinations)
+/// is pinned in this function's unit tests (`tests/matrix.rs`).
 pub fn check_version_matrix(
     spec_flavor: RelayFlavor,
     decl_version: &str,
@@ -139,7 +172,7 @@ pub fn check_version_matrix(
 ) -> Result<(), FrpcError> {
     if spec_flavor != bin.flavor {
         return Err(FrpcError::Matrix(format!(
-            "R9 版本矩阵禁止交叉：{} 规格 × {} frpc（{}）——两代控制面互不兼容（frp-compat §1.3）",
+            "R9 version matrix forbids cross pairing: {} spec × {} frpc ({}) — the two control-plane generations are mutually incompatible (frp-compat §1.3)",
             spec_flavor,
             bin.flavor,
             bin.path.display()
@@ -148,7 +181,7 @@ pub fn check_version_matrix(
     let pinned = spec_flavor.pinned_version();
     if decl_version != pinned {
         return Err(FrpcError::Matrix(format!(
-            "R9 定版校验失败：{} 栈代要求 frpc 版本 {pinned:?}，声明为 {decl_version:?}（{}）",
+            "R9 pin check failed: the {} stack requires frpc version {pinned:?}, declared {decl_version:?} ({})",
             spec_flavor,
             bin.path.display()
         )));
@@ -156,8 +189,9 @@ pub fn check_version_matrix(
     Ok(())
 }
 
-/// RelaySpec 结构校验（含 R9 矩阵）。文件级检查（存在性/可解析）在此层，
-/// 进程级失败留给 [`crate::supervisor::Supervisor::start`]。
+/// RelaySpec structural validation (including the R9 matrix). File-level
+/// checks (existence/parseability) live at this layer; process-level failures
+/// are left to [`crate::supervisor::Supervisor::start`].
 pub(crate) fn validate_spec(
     spec: &RelaySpec,
     bins: &FrpcBinaries,
@@ -169,17 +203,17 @@ pub(crate) fn validate_spec(
             check_version_matrix(flavor, &bin.decl_version, &bin)?;
             match mode {
                 ChmlFrpMode::ConfigFile(ini) => {
-                    ensure_readable_file(ini, "ChmlFrp 面板 frpc.ini")?;
+                    ensure_readable_file(ini, "ChmlFrp panel frpc.ini")?;
                 }
                 ChmlFrpMode::UserTokenAuto {
                     usertoken,
                     tunnel_id,
                 } => {
                     if usertoken.trim().is_empty() {
-                        return Err(FrpcError::Spec("UserTokenAuto: usertoken 为空".into()));
+                        return Err(FrpcError::Spec("UserTokenAuto: usertoken is empty".into()));
                     }
                     if *tunnel_id == 0 {
-                        return Err(FrpcError::Spec("UserTokenAuto: tunnel_id 为 0".into()));
+                        return Err(FrpcError::Spec("UserTokenAuto: tunnel_id is 0".into()));
                     }
                 }
             }
@@ -191,8 +225,10 @@ pub(crate) fn validate_spec(
         RelaySpec::Original { toml } => {
             let bin = bins.original.clone();
             check_version_matrix(flavor, &bin.decl_version, &bin)?;
-            ensure_readable_file(toml, "原版 frpc.toml")?;
-            // 早失败：TOML 解析不了就别等子进程退出码了（文件是调用方资产，只读）。
+            ensure_readable_file(toml, "original frpc.toml")?;
+            // Fail early: if the TOML won't parse, don't wait for the
+            // subprocess exit code (the file is the caller's asset,
+            // read-only).
             let _ = crate::config::parse_original_toml(toml)?;
             Ok(ValidatedSpec {
                 spec: spec.clone(),
@@ -202,18 +238,20 @@ pub(crate) fn validate_spec(
     }
 }
 
-/// 双栈定版二进制表（`Supervisor` 持有；两栈都常驻，按 spec 分派）。
+/// The dual-stack pinned binary table (held by `Supervisor`; both stacks are
+/// resident, dispatched by spec).
 #[derive(Clone, Debug)]
 pub struct FrpcBinaries {
-    /// ChmlFrp 节点栈（`ChmlFrp-0.51.2_251023` 定版）。
+    /// The ChmlFrp-node stack (`ChmlFrp-0.51.2_251023` pinned).
     pub chmlfrp: FrpcBinary,
-    /// 自建原版节点栈（`0.71.1` 定版）。
+    /// The self-hosted original-node stack (`0.71.1` pinned).
     pub original: FrpcBinary,
 }
 
 #[derive(Debug)]
 pub(crate) struct ValidatedSpec {
-    /// 已校验的 spec（后续以校验后的形态参与启动计划组装）。
+    /// The validated spec (participates in startup-plan assembly in its
+    /// validated form from here on).
     pub spec: RelaySpec,
     pub bin: FrpcBinary,
 }
@@ -221,35 +259,36 @@ pub(crate) struct ValidatedSpec {
 fn ensure_readable_file(p: &Path, what: &str) -> Result<(), FrpcError> {
     if !p.is_file() {
         return Err(FrpcError::Spec(format!(
-            "{what} 不存在或不是文件：{}",
+            "{what} does not exist or is not a file: {}",
             p.display()
         )));
     }
     Ok(())
 }
 
-/// 托管错误。
+/// Supervision errors.
 #[derive(Debug)]
 pub enum FrpcError {
-    /// RelaySpec 结构/文件校验失败。
+    /// RelaySpec structural/file validation failed.
     Spec(String),
-    /// R9 版本矩阵违例（交叉/非定版）。
+    /// R9 version-matrix violation (cross pairing / not pinned).
     Matrix(String),
-    /// 子进程 spawn 失败（二进制缺失/不可执行等）。
+    /// Subprocess spawn failed (binary missing / not executable etc.).
     Spawn(String),
-    /// 配置生成/解析失败（golden 守门对象，frp-compat §4-R8/R12）。
+    /// Config generation/parsing failure (the golden-guarded surface,
+    /// frp-compat §4-R8/R12).
     Config(String),
-    /// IO 错误。
+    /// IO error.
     Io(std::io::Error),
 }
 
 impl fmt::Display for FrpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FrpcError::Spec(m) => write!(f, "frpc spec 校验失败: {m}"),
-            FrpcError::Matrix(m) => write!(f, "frpc 版本矩阵: {m}"),
-            FrpcError::Spawn(m) => write!(f, "frpc 子进程: {m}"),
-            FrpcError::Config(m) => write!(f, "frpc 配置: {m}"),
+            FrpcError::Spec(m) => write!(f, "frpc spec validation failed: {m}"),
+            FrpcError::Matrix(m) => write!(f, "frpc version matrix: {m}"),
+            FrpcError::Spawn(m) => write!(f, "frpc subprocess: {m}"),
+            FrpcError::Config(m) => write!(f, "frpc config: {m}"),
             FrpcError::Io(e) => write!(f, "frpc IO: {e}"),
         }
     }

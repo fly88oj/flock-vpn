@@ -1,32 +1,46 @@
-//! frpc 假进程桩（测试专用二进制；§7-M2「用假进程（脚本桩）单测」的跨平台形态——
-//! Windows 主机上无 shell 脚本执行面，桩用 Rust 二进制承担同一角色）。
+//! Fake frpc process stub (a test-only binary; the cross-platform shape of
+//! §7-M2's "unit-test with a fake process (script stub)" — a Windows host
+//! has no shell-script execution surface, so a Rust binary fills the same
+//! role).
 //!
-//! 两种调用形态：
+//! Two invocation shapes:
 //!
-//! **1. 测试直调**（首参 = 模式）：
+//! **1. Direct test invocation** (first arg = mode):
 //! ```text
 //! frpc_stub crash  --marker <file> [--lifetime-ms N] [--exit-code C]
-//!     记录 start → 睡 N ms → 以码 C 退出（默认 50ms/1）——模拟 ChmlFrp frpc
-//!     「三次重连失败即退出进程」的魔改行为（frp-compat §2.3）供守护循环拉起。
+//!     Records start → sleeps N ms → exits with code C (default 50ms/1) —
+//!     simulates ChmlFrp frpc's modded "exit the process after three failed
+//!     reconnects" behavior (frp-compat §2.3) for the supervision loop to
+//!     pull back up.
 //! frpc_stub run   --marker <file>
-//!     记录 start → 长眠（被 kill 即死）——模拟健康长驻进程。
+//!     Records start → sleeps forever (dies when killed) — simulates a
+//!     healthy long-lived process.
 //! frpc_stub serve --marker <file> [--addr A]
-//!     记录 serve（含实际监听地址）→ 对任意 HTTP 请求回 200——模拟「本地隧道口 +
-//!     frpc admin」探测面。`--addr` 缺省 127.0.0.1:0（marker 里回报实际端口）。
+//!     Records serve (including the actually bound address) → answers 200
+//!     to any HTTP request — simulates the "local tunnel port + frpc admin"
+//!     probe surface. `--addr` defaults to 127.0.0.1:0 (the actual port is
+//!     reported in the marker).
 //! frpc_stub version --print <string> | --version | -v
-//!     打印版本串退出——模拟 `frpc --version`（`FrpcBinary::probe_version` 用）；
-//!     `--version` 形态打印环境变量 FRPC_STUB_VERSION（缺省 stub-0.0.0）。
+//!     Prints a version string and exits — simulates `frpc --version` (used
+//!     by `FrpcBinary::probe_version`); the `--version` form prints the
+//!     FRPC_STUB_VERSION environment variable (default stub-0.0.0).
 //! ```
 //!
-//! **2. frpc 形态**（首参 = `-c`/`-u` 等旗标——托管层 spawn 的真实形态）：
-//! 守护层只会以 `<bin> -c <file>`（ConfigFile/Original）或 `<bin> -u <tok> -p <id>`
-//! （UserTokenAuto）调起，桩无旗标可传 ⇒ 行为与 marker 落点按以下规则：
-//! - marker 默认 `./stub-marker.log`（cwd = 托管 run_dir，每路中继唯一，测试间零串扰）；
-//! - 有 `-c <file>` 时扫描其 `[stub]` 节取行为：`mode = crash|run`（TOML 引号容忍）、
-//!   `lifetime_ms = N`；缺省 mode=run（长驻）。
+//! **2. frpc shape** (first arg = a flag like `-c`/`-u` — the real shape the
+//! supervision layer spawns): the supervisor only ever invokes `<bin> -c
+//! <file>` (ConfigFile/Original) or `<bin> -u <tok> -p <id>`
+//! (UserTokenAuto); the stub receives no mode flag, so behavior and marker
+//! placement follow these rules:
+//! - the marker defaults to `./stub-marker.log` (cwd = the supervised
+//!   run_dir, unique per relay, zero cross-test interference);
+//! - when `-c <file>` is present, its `[stub]` section is scanned for
+//!   behavior: `mode = crash|run` (TOML quote tolerant), `lifetime_ms = N`;
+//!   default mode=run (long-lived).
 //!
-//! marker 每事件一行 `<kind> <unix_millis> [extra]`；start/serve 事件另起一行
-//! `argv <unix_millis> <全部参数空格连接>`（测试据此刻画托管层传给子进程的 CLI 形态）。
+//! The marker writes one line per event, `<kind> <unix_millis> [extra]`;
+//! start/serve events add a second line `argv <unix_millis> <all args joined
+//! by spaces>` (tests use it to characterize the CLI shape the supervision
+//! layer passes to the subprocess).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -45,7 +59,8 @@ fn main() {
         exit(2);
     };
 
-    // 形态 2：frpc 式旗标调用（托管层 spawn 形态）
+    // Shape 2: frpc-style flag invocation (the shape the supervision layer
+    // spawns).
     if first.starts_with('-') && first != "--version" && first != "-v" {
         let marker = args
             .iter()
@@ -78,7 +93,7 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(lifetime));
                 exit(1);
             }
-            // 缺省/`run`：长驻直到被托管层 kill
+            // Default/`run`: long-lived until the supervision layer kills it.
             _ => {
                 std::thread::sleep(Duration::from_secs(600));
                 exit(0);
@@ -86,7 +101,7 @@ fn main() {
         }
     }
 
-    // 形态 1：测试直调
+    // Shape 1: direct test invocation.
     let flags = Flags::parse(&args[1..]);
     match first.as_str() {
         "crash" => {
@@ -108,7 +123,7 @@ fn main() {
                 .get("addr")
                 .unwrap_or_else(|| "127.0.0.1:0".to_string());
             let ln = TcpListener::bind(&addr).unwrap_or_else(|e| {
-                eprintln!("frpc_stub serve bind {addr} 失败: {e}");
+                eprintln!("frpc_stub serve bind {addr} failed: {e}");
                 exit(3);
             });
             let bound = ln.local_addr().expect("local_addr");
@@ -117,7 +132,8 @@ fn main() {
             for stream in ln.incoming() {
                 let Ok(mut s) = stream else { continue };
                 std::thread::spawn(move || {
-                    // 读掉请求头（最多 4KiB / 1s），回最小 HTTP 200
+                    // Read off the request head (at most 4KiB / 1s), answer
+                    // with a minimal HTTP 200.
                     let mut buf = [0u8; 4096];
                     let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
                     let _ = s.read(&mut buf);
@@ -142,13 +158,14 @@ fn main() {
             exit(0);
         }
         _ => {
-            eprintln!("frpc_stub: 未知模式 {first:?}");
+            eprintln!("frpc_stub: unknown mode {first:?}");
             exit(2);
         }
     }
 }
 
-/// 从配置文件（INI 或 TOML 均可）扫描 `[stub]` 节的键值（TOML 值引号容忍）。
+/// Scan the `[stub]` section's key-values from a config file (INI or TOML
+/// both fine; TOML value quotes tolerated).
 fn read_stub_section(path: &str) -> Vec<(String, String)> {
     let Ok(mut f) = File::open(path) else {
         return Vec::new();
@@ -205,7 +222,8 @@ impl Flags {
         self.get(name).and_then(|v| v.parse().ok())
     }
 
-    /// marker 路径（缺省丢弃事件——桩不因测试布线问题而失真）。
+    /// Marker path (default discards events — the stub must not distort
+    /// because of test-wiring problems).
     fn marker(&self) -> PathBuf {
         self.get("marker")
             .map(PathBuf::from)

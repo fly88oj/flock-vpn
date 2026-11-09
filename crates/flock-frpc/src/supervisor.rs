@@ -1,13 +1,20 @@
-//! 进程守护（docs/design.md §3.9 实现要点 / §7-M2；frp-compat §2.3、§4-R6）。
+//! Process supervision (docs/design.md §3.9 implementation notes / §7-M2;
+//! frp-compat §2.3, §4-R6).
 //!
-//! ChmlFrp frpc 有「控制连接断开后按 5s/10s/20s 重连 3 次、仍失败即**退出进程**」的
-//! 魔改行为（原版为无限指数退避；frp-compat §2.3 diff 表）⇒ 托管层必须监控退出并拉起。
-//! 本模块 = 监控-重启循环（指数退避）+ 状态机（[`RelayPhase`]）+ 周期健康探测
-//! （[`crate::probe`]，目标从配置只读推导）。
+//! ChmlFrp frpc has a modded behavior of "after the control connection
+//! drops, reconnect 3 times at 5s/10s/20s, and if still failing, **exit the
+//! process**" (the original does infinite exponential backoff; the
+//! frp-compat §2.3 diff table) ⇒ the supervision layer must watch for exits
+//! and pull the process back up. This module = the monitor-restart loop
+//! (exponential backoff) + the state machine ([`RelayPhase`]) + periodic
+//! health probing ([`crate::probe`], targets derived read-only from the
+//! config).
 //!
-//! 深模块契约：调用方只见 `Supervisor::start(spec) -> ManagedRelay` 与
-//! `ManagedRelay::health()/stop()`；argv 组装、配置副本、admin 注入、日志环形缓冲
-//! 全部内藏。假进程桩（`src/bin/frpc_stub.rs`）支撑「3 退→3 拉」单测（§7-M2 完成标准）。
+//! Deep-module contract: callers see only `Supervisor::start(spec) ->
+//! ManagedRelay` and `ManagedRelay::health()/stop()`; argv assembly, the
+//! config copy, admin injection, and the log ring buffer are all kept inside.
+//! The fake process stub (`src/bin/frpc_stub.rs`) supports the "3 exits → 3
+//! restarts" unit tests (§7-M2 completion criteria).
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -28,14 +35,20 @@ use crate::spec::{
 
 const LOG_RING_CAP: usize = 512;
 
-/// 重启退避策略（指数：`initial × multiplier^(n-1)`，封顶 `max`）。
+/// Restart backoff policy (exponential: `initial × multiplier^(n-1)`, capped
+/// at `max`).
 ///
-/// ChmlFrp frpc 自身重连耗尽（5+10+20=35s）后才退出，故这里的 `initial`（默认 1s）
-/// 叠加在魔改等待之上；`max_restarts = None` = 永久守护（隧道是服务端生命线）。
+/// ChmlFrp frpc exits only after its own reconnect attempts are exhausted
+/// (5+10+20=35s), so the `initial` here (default 1s) stacks on top of the
+/// modded wait; `max_restarts = None` = supervise forever (the tunnel is the
+/// server's lifeline).
 ///
-/// `max` 兼任**稳定窗口**：子进程一次存活超过 `max` 即视为一个成功纪元，失败计数
-/// 归零（对照 flock-client connector 的 `Backoff::reset`「成功即归零」语义）——
-/// 否则长期服务端偶发数次 crash 后，每次重启都顶格 `max`（默认 60s）空窗。
+/// `max` doubles as the **stability window**: a subprocess that survives
+/// longer than `max` in one stretch counts as a successful epoch and the
+/// failure count resets (mirroring the flock-client connector's
+/// `Backoff::reset` "success resets" semantics) — otherwise, after a
+/// long-running server has a few sporadic crashes, every restart pays the
+/// capped `max` (default 60s) blackout.
 #[derive(Clone, Debug)]
 pub struct RestartPolicy {
     pub initial: Duration,
@@ -56,7 +69,7 @@ impl Default for RestartPolicy {
 }
 
 impl RestartPolicy {
-    /// 第 `restarts` 次退出后的退避时长（restarts ≥ 1）。
+    /// Backoff duration after the `restarts`-th exit (restarts ≥ 1).
     pub fn delay_for(&self, restarts: u32) -> Duration {
         let exp = (restarts.saturating_sub(1)) as f64;
         let factor = self.multiplier.powf(exp);
@@ -65,18 +78,20 @@ impl RestartPolicy {
     }
 }
 
-/// 健康探测策略。
+/// Health probing policy.
 #[derive(Clone, Debug)]
 pub struct HealthPolicy {
-    /// 探测周期（默认 5s）。
+    /// Probe interval (default 5s).
     pub probe_interval: Duration,
-    /// 单项探测超时（默认 2s）。
+    /// Single-probe timeout (default 2s).
     pub probe_timeout: Duration,
-    /// ChmlFrp `ConfigFile` 模式：向托管副本的 `[common]` 注入 admin 四键
-    /// （R12 红线内：proxy 节字节透传），使 admin 探测可用。
+    /// ChmlFrp `ConfigFile` mode: inject the four admin keys into the
+    /// supervised copy's `[common]` (within the R12 red line: proxy sections
+    /// pass through byte for byte), making the admin probe usable.
     pub inject_admin: Option<AdminCommon>,
-    /// 显式指定本地隧道口探测地址（覆盖从配置推导的结果；UserTokenAuto 模式配置对
-    /// 托管层不透明，只能显式给）。
+    /// Explicitly specify the local tunnel port probe address (overrides
+    /// what is derived from the config; in UserTokenAuto mode the config is
+    /// opaque to the supervision layer, so it can only be given explicitly).
     pub probe_local_tunnel: Option<SocketAddr>,
 }
 
@@ -91,16 +106,17 @@ impl Default for HealthPolicy {
     }
 }
 
-/// 托管器构造参数。
+/// Supervisor construction parameters.
 #[derive(Clone, Debug)]
 pub struct SupervisorConfig {
-    /// 双栈定版二进制表（R9 矩阵校验对象）。
+    /// The dual-stack pinned binary table (the R9 matrix check target).
     pub bins: FrpcBinaries,
-    /// 重启退避策略。
+    /// Restart backoff policy.
     pub restart: RestartPolicy,
-    /// 健康探测策略。
+    /// Health probing policy.
     pub health: HealthPolicy,
-    /// 每路中继的 run 目录基点（托管配置副本/日志落点；默认系统临时目录）。
+    /// Per-relay run-directory base (where the supervised config copy/logs
+    /// land; default is the system temp directory).
     pub run_base: PathBuf,
 }
 
@@ -115,31 +131,31 @@ impl SupervisorConfig {
     }
 }
 
-/// 中继生命周期阶段（`health()` 快照的主干）。
+/// Relay lifecycle phase (the backbone of the `health()` snapshot).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelayPhase {
-    /// 子进程已 spawn、尚未观测到运行稳定。
+    /// Subprocess spawned; stable running not yet observed.
     Starting,
-    /// 子进程在运行。
+    /// Subprocess running.
     Running { pid: u32 },
-    /// 子进程退出，退避等待下一次拉起。
+    /// Subprocess exited; backing off before the next restart.
     Backoff {
         restarts: u32,
         next_restart_in: Duration,
     },
-    /// 终止（手动停止 / 重启额度耗尽）。
+    /// Terminal (manual stop / restart budget exhausted).
     Stopped { reason: StopReason },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
-    /// `stop()` 调用（含 Drop 信号）。
+    /// `stop()` called (including the Drop signal).
     Manual,
-    /// `max_restarts` 耗尽。
+    /// `max_restarts` exhausted.
     RestartsExhausted,
 }
 
-/// 子进程一次退出的记录。
+/// A record of one subprocess exit.
 #[derive(Clone, Debug)]
 pub struct ExitRecord {
     pub code: Option<i32>,
@@ -147,21 +163,24 @@ pub struct ExitRecord {
     pub at: Instant,
 }
 
-/// `ManagedRelay::health()` 的完整返回。
+/// The full return of `ManagedRelay::health()`.
 #[derive(Clone, Debug)]
 pub struct RelayStatus {
     pub flavor: RelayFlavor,
     pub phase: RelayPhase,
-    /// 累计重启次数（= 拉起次数 - 1）。
+    /// Cumulative restart count (= restarts − 1).
     pub restarts: u32,
-    /// 当前退避指数输入（真实退出与拉起失败重试都计；稳定运行超过
-    /// [`RestartPolicy::max`] 后归零——诊断面，退避时长由它驱动）。
+    /// The current backoff-exponent input (both real exits and failed-restart
+    /// retries count; resets after running stably longer than
+    /// [`RestartPolicy::max`] — a diagnostics surface; backoff durations are
+    /// driven by it).
     pub failures: u32,
-    /// 最近一次子进程退出。
+    /// The most recent subprocess exit.
     pub last_exit: Option<ExitRecord>,
-    /// 最近一轮健康探测（未配置/首轮未完成时为 None）。
+    /// The most recent health probe round (None when unconfigured / before
+    /// the first round completes).
     pub probe: Option<ProbeReport>,
-    /// 本路中继的托管目录（配置副本）。
+    /// The supervised directory of this relay (the config copy).
     pub run_dir: PathBuf,
 }
 
@@ -196,7 +215,8 @@ impl Inner {
     }
 }
 
-/// 托管器：按 [`RelaySpec`] 拉起并守护一路 frpc（§3.9 接口）。
+/// The supervisor: pulls up and supervises one frpc per [`RelaySpec`] (the
+/// §3.9 interface).
 pub struct Supervisor {
     cfg: SupervisorConfig,
     relay_seq: AtomicU64,
@@ -210,15 +230,18 @@ impl Supervisor {
         }
     }
 
-    /// 校验 spec（含 R9 矩阵锁）→ 准备托管配置 → 首次 spawn → 启动守护/探测任务。
+    /// Validate the spec (including the R9 matrix lock) → prepare the
+    /// supervised config → first spawn → start the supervision/probe tasks.
     ///
-    /// 首次 spawn 失败（二进制缺失等）立即返回 `Err`；之后的退出由守护循环按退避策略拉起。
+    /// A first-spawn failure (binary missing etc.) returns `Err` immediately;
+    /// later exits are handled by the supervision loop per the backoff
+    /// policy.
     pub async fn start(&self, spec: RelaySpec) -> Result<ManagedRelay, FrpcError> {
         let validated = validate_spec(&spec, &self.cfg.bins)?;
 
         if !validated.bin.path.is_file() {
             return Err(FrpcError::Spawn(format!(
-                "frpc 二进制不存在: {}",
+                "frpc binary does not exist: {}",
                 validated.bin.path.display()
             )));
         }
@@ -238,7 +261,8 @@ impl Supervisor {
             shutdown_tx,
         });
 
-        // 首次 spawn（fail-fast；之后的退出走守护循环）
+        // First spawn (fail-fast; later exits go through the supervision
+        // loop).
         let mut child = spawn_child(&plan)?;
         inner.set_phase(RelayPhase::Running {
             pid: child.id().unwrap_or(0),
@@ -274,12 +298,16 @@ impl Supervisor {
         })
     }
 
-    /// 分配每路中继的 run 目录（flavor-pid-nanos-seq 唯一）。
+    /// Allocate the per-relay run directory (flavor-pid-nanos-seq unique).
     ///
-    /// 保留策略：`stop()` **不清理** run 目录——诊断面（托管配置副本/桩 marker/
-    /// 日志）在进程死后仍需可查；同一路中继的多次重启（退避重拉）复用同一
-    /// run_dir，frpc.ini 副本**覆盖写**（内容确定性，覆盖无信息损失）；跨中继
-    /// 目录名唯一、互不覆盖。积累的清理交给运维（run_base 属临时/托管分区）。
+    /// Retention policy: `stop()` does **not** clean up the run directory —
+    /// the diagnostics surface (supervised config copy / stub marker / logs)
+    /// must remain inspectable after the process dies; multiple restarts of
+    /// one relay (backoff re-spawns) reuse the same run_dir, and the
+    /// frpc.ini copy is **overwritten** (deterministic content, no
+    /// information lost by overwriting); directories are unique across
+    /// relays and never overwrite each other. Accumulated cleanup is left to
+    /// operations (run_base lives on a temp/supervised partition).
     fn alloc_run_dir(&self, flavor: RelayFlavor) -> PathBuf {
         let seq = self.relay_seq.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -291,7 +319,7 @@ impl Supervisor {
             .join(format!("{}-{}-{nanos}-{seq}", flavor, std::process::id()))
     }
 
-    /// 组装启动计划：argv/cwd + 探测目标。
+    /// Assemble the startup plan: argv/cwd + probe targets.
     fn prepare_plan(&self, spec: &RelaySpec, run_dir: &Path) -> Result<StartPlan, FrpcError> {
         let bin = match spec.flavor() {
             RelayFlavor::ChmlFrp => self.cfg.bins.chmlfrp.clone(),
@@ -301,10 +329,12 @@ impl Supervisor {
         match spec {
             RelaySpec::ChmlFrp { mode } => match mode {
                 ChmlFrpMode::ConfigFile(ini_path) => {
-                    // 托管副本：面板 proxy 参数字节透传；可选注入 admin（仅 [common]，R12 红线内）。
+                    // Supervised copy: panel proxy parameters pass through
+                    // byte for byte; optional admin injection ([common] only,
+                    // within the R12 red line).
                     let panel = std::fs::read_to_string(ini_path).map_err(|e| {
                         FrpcError::Config(format!(
-                            "读取面板 frpc.ini 失败 {}: {e}",
+                            "failed to read panel frpc.ini {}: {e}",
                             ini_path.display()
                         ))
                     })?;
@@ -314,8 +344,10 @@ impl Supervisor {
                     };
                     let managed_path = run_dir.join("frpc.ini");
                     std::fs::write(&managed_path, &managed)?;
-                    // 副本内嵌面板 token ⇒ 属主可读写即可（unix；umask 不可依赖——
-                    // 显式收紧 0644→0600。Windows 侧无该权限面，跳过）。
+                    // The copy embeds the panel token ⇒ owner read/write is
+                    // enough (unix; umask cannot be relied upon — explicitly
+                    // tightened 0644→0600. Windows has no such permission
+                    // surface; skipped).
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
@@ -325,7 +357,9 @@ impl Supervisor {
                         )?;
                     }
                     let parsed = config::parse_ini(&managed).map_err(|e| {
-                        FrpcError::Config(format!("托管副本不可解析（内部错误）: {e}"))
+                        FrpcError::Config(format!(
+                            "supervised copy unparseable (internal error): {e}"
+                        ))
                     })?;
                     let mut targets = config::chmlfrp_probe_targets(&parsed);
                     if let Some(explicit) = health.probe_local_tunnel {
@@ -342,9 +376,13 @@ impl Supervisor {
                     usertoken,
                     tunnel_id,
                 } => {
-                    // -u/-p 自举：frpc 自行经 cfg API 拉配置并覆写 ./frpc.ini（root.go:151-158
-                    // 写 cfgFile，默认 ./frpc.ini 相对 cwd）⇒ cwd 必须可写。
-                    // 配置对托管层不透明 ⇒ 探测只剩显式指定的本地隧道口（admin 无法预知）。
+                    // -u/-p bootstrap: frpc itself fetches the config via the
+                    // cfg API and overwrites ./frpc.ini (root.go:151-158
+                    // writes cfgFile, default ./frpc.ini relative to cwd) ⇒
+                    // the cwd must be writable. The config is opaque to the
+                    // supervision layer ⇒ probing is left with only the
+                    // explicitly specified local tunnel port (the admin
+                    // cannot be predicted).
                     Ok(StartPlan {
                         bin,
                         argv: vec![
@@ -362,7 +400,8 @@ impl Supervisor {
                 }
             },
             RelaySpec::Original { toml } => {
-                // 调用方 TOML 只读：argv 直指原文件，绝不改写。
+                // The caller's TOML is read-only: argv points at the original
+                // file directly, never rewritten.
                 let abs = absolute(toml);
                 let table = config::parse_original_toml(&abs)?;
                 let mut targets = config::original_probe_targets(&table);
@@ -380,7 +419,8 @@ impl Supervisor {
     }
 }
 
-/// 启动计划（argv/cwd 以 spawn 时刻快照固化；探测目标随之冻结）。
+/// The startup plan (argv/cwd frozen as a snapshot at spawn time; probe
+/// targets frozen with it).
 struct StartPlan {
     bin: FrpcBinary,
     argv: Vec<String>,
@@ -396,11 +436,15 @@ fn absolute(p: &Path) -> PathBuf {
     }
 }
 
-/// 路径 → argv 参数（本 crate 配置路径均来自 UTF-8 世界；非 UTF-8 在此显式失败）。
+/// Path → argv parameter (all config paths in this crate come from the UTF-8
+/// world; non-UTF-8 fails explicitly here).
 fn argv_path(p: &Path) -> Result<String, FrpcError> {
-    p.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| FrpcError::Config(format!("路径非 UTF-8，无法作为 argv: {}", p.display())))
+    p.to_str().map(str::to_string).ok_or_else(|| {
+        FrpcError::Config(format!(
+            "path is not UTF-8, cannot use as argv: {}",
+            p.display()
+        ))
+    })
 }
 
 fn spawn_child(plan: &StartPlan) -> Result<Child, FrpcError> {
@@ -412,7 +456,7 @@ fn spawn_child(plan: &StartPlan) -> Result<Child, FrpcError> {
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     cmd.spawn()
-        .map_err(|e| FrpcError::Spawn(format!("spawn {} 失败: {e}", plan.bin.path.display())))
+        .map_err(|e| FrpcError::Spawn(format!("spawn {} failed: {e}", plan.bin.path.display())))
 }
 
 struct ChildLogs {
@@ -420,7 +464,9 @@ struct ChildLogs {
     _stderr: tokio::task::JoinHandle<()>,
 }
 
-/// 子进程 stdout/stderr 逐行入环形缓冲（防管道塞满致死锁；诊断用，`logs()` 取阅）。
+/// Pipe the subprocess's stdout/stderr line by line into the ring buffer
+/// (prevents a full pipe from deadlocking; for diagnostics, read via
+/// `logs()`).
 fn child_pipes_to_ring(child: &mut Child, inner: &Arc<Inner>) -> ChildLogs {
     let out = {
         let inner = Arc::clone(inner);
@@ -460,25 +506,34 @@ async fn supervise_loop(
     policy: RestartPolicy,
     shutdown_rx: watch::Receiver<bool>,
 ) {
-    // restarts = 成功拉起次数（health() 呈现，与真实子进程一一对应）；
-    // failures = 退避指数输入（真实退出与「拉起失败重试」都计）——两者分离，
-    // 防止 spawn 失败把 restarts 顶高而无对应进程（也避免对已收割 Child 重复 wait）。
-    // failures 的稳定复位（对照 connector 的 Backoff::reset「成功即归零」）：子进程
-    // 一次存活超过最大退避时长（policy.max）即归零——偶发 crash 各自独立计退避，
-    // 不至于长期运行后每次重启都顶格 60s 空窗。
+    // restarts = successful spawn count (presented by health(), one-to-one
+    // with real subprocesses); failures = the backoff-exponent input (both
+    // real exits and "failed-restart retries" count) — the two are separated
+    // so a spawn failure cannot inflate restarts without a corresponding
+    // process (and to avoid double-waiting an already-reaped Child). The
+    // stable reset of failures (mirroring the connector's Backoff::reset
+    // "success resets"): once a subprocess survives longer than the maximum
+    // backoff (policy.max) it resets — sporadic crashes each get independent
+    // backoff, so a long-running server doesn't pay the capped 60s blackout
+    // on every restart.
     let mut restarts: u32 = 0;
     let mut failures: u32 = 0;
-    // 当前子进程的起跑时刻（稳定窗口计时基准；拉起失败重试期间无进程 ⇒ None）。
+    // The current subprocess's start moment (the stability-window clock
+    // base; None during failed-restart retries when there is no process).
     let mut stable_since: Option<Instant> = if child.is_some() {
         Some(Instant::now())
     } else {
         None
     };
     loop {
-        // 等待「子进程退出」「稳定窗口达标」或「停机」。wait() 只发生在活的、未收割的
-        // 子进程上（`child = None` = 上轮拉起失败，无进程可等，直接走退避重试）。
+        // Wait for "subprocess exit", "stability window reached", or
+        // "shutdown". wait() happens only on a live, unreaped subprocess
+        // (`child = None` = last spawn failed, no process to wait for; go
+        // straight to backoff retry).
         let exit = if let Some(c) = child.as_mut() {
-            // 稳定窗口剩余时长（failures>0 且有起跑时刻才有意义，否则该臂永久挂起）。
+            // Remaining stability-window duration (meaningful only when
+            // failures>0 and a start moment exists; otherwise this arm pends
+            // forever).
             let stable_in = match stable_since {
                 Some(t0) if failures > 0 => Some(policy.max.saturating_sub(t0.elapsed())),
                 _ => None,
@@ -492,7 +547,8 @@ async fn supervise_loop(
             tokio::select! {
                 status = c.wait() => Some(status.ok()),
                 _ = stability => {
-                    // 稳定达标：failures 归零（复位后该臂转永久挂起，回到等待退出）。
+                    // Stability reached: failures reset (this arm then pends
+                    // forever, back to waiting for exit).
                     failures = 0;
                     inner.state.lock().unwrap().failures = 0;
                     continue;
@@ -502,13 +558,13 @@ async fn supervise_loop(
         } else {
             let delay = policy.delay_for(failures.max(1));
             tokio::select! {
-                _ = tokio::time::sleep(delay) => Some(None), // 伪事件：重试拉起
+                _ = tokio::time::sleep(delay) => Some(None), // pseudo-event: retry the spawn
                 _ = shutdown_changed(&shutdown_rx) => None,
             }
         };
 
         let Some(exit) = exit else {
-            // 停机：杀进程、收尸、落 Stopped
+            // Shutdown: kill the process, reap it, land on Stopped.
             if let Some(mut c) = child.take() {
                 let _ = c.kill().await;
                 let _ = c.wait().await;
@@ -519,9 +575,12 @@ async fn supervise_loop(
             return;
         };
 
-        // 真退出才记 ExitRecord（伪事件不覆盖上一次真实退出记录）。
-        // exit = Some(status)：子进程真退出（select 臂已把 wait() 的 io 失败折叠为
-        // 伪事件 None——本循环从不对已收割 Child 重复 wait，该失败实际不可达）。
+        // Only real exits record an ExitRecord (pseudo-events do not
+        // overwrite the last real exit record). exit = Some(status): the
+        // subprocess really exited (the select arm already folded wait()'s
+        // io failure into the pseudo-event None — this loop never
+        // double-waits a reaped Child, so that failure is actually
+        // unreachable).
         if let Some(status) = exit {
             let mut st = inner.state.lock().unwrap();
             st.last_exit = Some(ExitRecord {
@@ -556,8 +615,9 @@ async fn supervise_loop(
             });
             return;
         }
-        // 重新拉起：成功 ⇒ restarts+1 并回到「有活进程」形态；
-        // 失败 ⇒ child=None，下一轮以同节奏退避后重试（守护不轻言放弃）。
+        // Re-spawn: success ⇒ restarts+1 and back to the "live process"
+        // shape; failure ⇒ child=None, and the next round retries after the
+        // same backoff cadence (supervision does not give up lightly).
         match spawn_child(&plan) {
             Ok(mut next) => {
                 restarts += 1;
@@ -573,13 +633,14 @@ async fn supervise_loop(
             Err(e) => {
                 child = None;
                 stable_since = None;
-                inner.push_log(format!("[supervisor] 重新拉起失败: {e}"));
+                inner.push_log(format!("[supervisor] re-spawn failed: {e}"));
             }
         }
     }
 }
 
-/// watch「已停机」信号的可等待 future（仅 false→true 边沿；初始 true 立即返回）。
+/// An awaitable future for the watch "shutdown requested" signal (only the
+/// false→true edge; an initial true returns immediately).
 async fn shutdown_changed(rx: &watch::Receiver<bool>) {
     let mut rx = rx.clone();
     if !*rx.borrow_and_update() {
@@ -603,7 +664,7 @@ async fn probe_loop(
     }
 }
 
-/// 一路被托管的中继（§3.9 接口的另一半）。
+/// One supervised relay (the other half of the §3.9 interface).
 pub struct ManagedRelay {
     inner: Arc<Inner>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -611,7 +672,8 @@ pub struct ManagedRelay {
 }
 
 impl ManagedRelay {
-    /// 健康快照：进程阶段 + 重启/失败计数 + 最近退出 + 最近探测（§3.9 `health()`）。
+    /// Health snapshot: process phase + restart/failure counters + last exit
+    /// + last probe (§3.9 `health()`).
     pub fn health(&self) -> RelayStatus {
         let st = self.inner.state.lock().unwrap();
         RelayStatus {
@@ -625,7 +687,7 @@ impl ManagedRelay {
         }
     }
 
-    /// 子进程输出环形缓冲快照（诊断）。
+    /// Snapshot of the subprocess output ring buffer (diagnostics).
     pub fn logs(&self) -> Vec<String> {
         self.inner
             .state
@@ -637,7 +699,9 @@ impl ManagedRelay {
             .collect()
     }
 
-    /// 手动停止：杀当前子进程（或在退避窗口内取消拉起）并等待任务收尾。
+    /// Manual stop: kill the current subprocess (or cancel the pending
+    /// restart inside the backoff window) and wait for the tasks to wind
+    /// down.
     pub async fn stop(mut self) -> Result<RelayStatus, FrpcError> {
         let _ = self.inner.shutdown_tx.send(true);
         if let Some(p) = self.prober.take() {
@@ -645,7 +709,9 @@ impl ManagedRelay {
         }
         if let Some(t) = self.task.take() {
             if t.await.is_err() {
-                return Err(FrpcError::Spawn("守护任务异常终止（panic）".into()));
+                return Err(FrpcError::Spawn(
+                    "supervision task terminated abnormally (panic)".into(),
+                ));
             }
         }
         Ok(self.health())
@@ -654,8 +720,9 @@ impl ManagedRelay {
 
 impl Drop for ManagedRelay {
     fn drop(&mut self) {
-        // Drop 即发停机信号（运行时存活期间守护任务自行杀进程收尾）；
-        // 需要确定性的停止语义请显式 `stop().await`。
+        // Drop sends the shutdown signal (while the runtime lives, the
+        // supervision task kills the process and cleans up on its own); for
+        // deterministic stop semantics, call `stop().await` explicitly.
         let _ = self.inner.shutdown_tx.send(true);
     }
 }

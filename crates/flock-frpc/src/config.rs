@@ -1,20 +1,28 @@
-//! 配置生成器接缝（docs/design.md §3.9；frp-compat §4-R8/R12）。
+//! Config generator seam (docs/design.md §3.9; frp-compat §4-R8/R12).
 //!
-//! 两栈配置方言不同，生成/解析各一套：
+//! The two stacks use different config dialects, each with its own
+//! generation/parsing:
 //!
-//! - **ChmlFrp INI**（v0.51.2 方言，`[common]` + `[<proxy>]` 小写下划线键）：
-//!   [`ChmlFrpIniConfig`] 结构化生成、[`parse_ini`] 解析、[`augment_chmlfrp_admin`]
-//!   `[common]`-only 的 admin 注入。**R12 红线**：面板生成的 proxy 参数逐字节透传
-//!   （服务端 CheckProxy 与面板记录比对，不一致即拒——frp-compat §2.3），
-//!   注入只碰 `[common]` 的 admin 字段，proxy 节按原始行原样保留。
-//! - **原版 TOML**（v0.71.1 方言，camelCase：`serverAddr`/`[[proxies]]`/`webServer`）：
-//!   [`OriginalTomlConfig`] 结构化生成、[`parse_original_toml`] 只读解析（调用方文件
-//!   绝不改写）。
+//! - **ChmlFrp INI** (v0.51.2 dialect, `[common]` + `[<proxy>]`
+//!   lowercase-underscore keys): structured generation by
+//!   [`ChmlFrpIniConfig`], parsing by [`parse_ini`], and `[common]`-only
+//!   admin injection by [`augment_chmlfrp_admin`]. **R12 red line**:
+//!   panel-generated proxy parameters pass through byte for byte (the
+//!   server-side CheckProxy compares them against the panel's records; any
+//!   mismatch is rejected — frp-compat §2.3); injection touches only the
+//!   admin fields of `[common]`, and proxy sections are preserved as the
+//!   original lines.
+//! - **Original TOML** (v0.71.1 dialect, camelCase: `serverAddr`/
+//!   `[[proxies]]`/`webServer`): structured generation by
+//!   [`OriginalTomlConfig`], read-only parsing by [`parse_original_toml`]
+//!   (the caller's file is never rewritten).
 //!
-//! golden 样本（`tests/golden/`）逐字节复制自官方发行包：
-//! `.tmp/chmlfrpc/ChmlFrp-0.51.2_251023_linux_amd64/frpc.ini` 与
-//! `.tmp/frp_0.71.1_linux_amd64/frpc.toml`（INI 样本磁盘形态为 CRLF——Windows 侧解包
-//! 所致，golden 对比按行尾归一化）。
+//! Golden samples (`tests/golden/`) copied byte for byte from the official
+//! release archives:
+//! `.tmp/chmlfrpc/ChmlFrp-0.51.2_251023_linux_amd64/frpc.ini` and
+//! `.tmp/frp_0.71.1_linux_amd64/frpc.toml` (the INI sample's on-disk shape is
+//! CRLF — an artifact of unpacking on Windows; golden comparison normalizes
+//! line endings).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -23,18 +31,20 @@ use crate::probe::{AdminEndpoint, ProbeTargets};
 use crate::spec::FrpcError;
 
 // ---------------------------------------------------------------------------
-// ChmlFrp INI（v0.51.2 方言）
+// ChmlFrp INI (v0.51.2 dialect)
 // ---------------------------------------------------------------------------
 
-/// 解析后的 INI 文档（保序；v0.51.2 `k = v` 方言，重复键后者覆盖前者）。
+/// A parsed INI document (order-preserving; the v0.51.2 `k = v` dialect,
+/// later duplicate keys override earlier ones).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParsedIni {
-    /// `(节名, 有序键值对)`；节名不含方括号（`common`、`ssh`、`range:tcp_port`…）。
+    /// `(section name, ordered key-value pairs)`; section names carry no
+    /// brackets (`common`, `ssh`, `range:tcp_port`…).
     pub sections: Vec<(String, Vec<(String, String)>)>,
 }
 
 impl ParsedIni {
-    /// 取节（首个匹配）。
+    /// Fetch a section (first match).
     pub fn section(&self, name: &str) -> Option<&[(String, String)]> {
         self.sections
             .iter()
@@ -42,7 +52,8 @@ impl ParsedIni {
             .map(|(_, kv)| kv.as_slice())
     }
 
-    /// 取节内字段值（大小写敏感键，v0.51.2 面板字段为全小写）。
+    /// Fetch a field's value inside a section (case-sensitive keys; the
+    /// v0.51.2 panel fields are all lowercase).
     pub fn get(&self, section: &str, key: &str) -> Option<&str> {
         self.section(section)?
             .iter()
@@ -51,7 +62,8 @@ impl ParsedIni {
     }
 }
 
-/// 解析 v0.51.2 INI（注释 `#`/`;`、空行、`[节]`、`k = v`；值不剥引号——面板不产引号）。
+/// Parse a v0.51.2 INI (comments `#`/`;`, blank lines, `[section]`, `k = v`;
+/// values keep their quotes — the panel produces none).
 pub fn parse_ini(text: &str) -> Result<ParsedIni, FrpcError> {
     let mut doc = ParsedIni::default();
     let mut cur: Option<(String, Vec<(String, String)>)> = None;
@@ -69,23 +81,26 @@ pub fn parse_ini(text: &str) -> Result<ParsedIni, FrpcError> {
         }
         let Some((k, v)) = line.split_once('=') else {
             return Err(FrpcError::Config(format!(
-                "INI 第 {} 行不是节头/键值对/注释: {line:?}",
+                "INI line {} is not a section header/key-value/comment: {line:?}",
                 ln + 1
             )));
         };
         let key = k.trim().to_string();
         if key.is_empty() {
-            return Err(FrpcError::Config(format!("INI 第 {} 行键为空", ln + 1)));
+            return Err(FrpcError::Config(format!(
+                "INI line {} has an empty key",
+                ln + 1
+            )));
         }
         let val = v.trim().to_string();
         let Some((_, entries)) = cur.as_mut() else {
             return Err(FrpcError::Config(format!(
-                "INI 第 {} 行的键值对出现在任何节头之前: {line:?}",
+                "INI line {} key-value appears before any section header: {line:?}",
                 ln + 1
             )));
         };
         match entries.iter_mut().find(|(ek, _)| *ek == key) {
-            Some((_, ev)) => *ev = val, // 重复键后者胜（go-ini 语义）
+            Some((_, ev)) => *ev = val, // later duplicate key wins (go-ini semantics)
             None => entries.push((key, val)),
         }
     }
@@ -95,12 +110,14 @@ pub fn parse_ini(text: &str) -> Result<ParsedIni, FrpcError> {
     Ok(doc)
 }
 
-/// ChmlFrp frpc.ini 的 admin 探测字段（v0.51.2 `[common]`：admin_addr/admin_port/
-/// admin_user/admin_pwd；admin_port=0/缺省即禁用 admin 监听）。
+/// Admin probing fields for the ChmlFrp frpc.ini (v0.51.2 `[common]`:
+/// admin_addr/admin_port/admin_user/admin_pwd; admin_port=0 or absent means
+/// the admin listener is disabled).
 ///
-/// `user`/`password` 将按 `k = v` 直拼进 `[common]`（见 [`augment_chmlfrp_admin`]），
-/// 须过 [`validate_ini_scalar`] 注入防御；`addr`/`port` 为 `IpAddr`/`u16`，Display
-/// 形态天然不含控制字符与方括号，无需校验。
+/// `user`/`password` are spliced directly into `[common]` as `k = v` (see
+/// [`augment_chmlfrp_admin`]) and must pass the [`validate_ini_scalar`]
+/// injection defense; `addr`/`port` are `IpAddr`/`u16`, whose Display forms
+/// naturally contain no control characters or brackets and need no check.
 #[derive(Clone, Debug)]
 pub struct AdminCommon {
     pub addr: IpAddr,
@@ -109,35 +126,51 @@ pub struct AdminCommon {
     pub password: String,
 }
 
-/// INI 键/值注入防御：拒绝控制字符（含换行/`\0`/`\t`）与 `[`/`]`。
+/// INI key/value injection defense: reject control characters (including
+/// newline/`\0`/`\t`) and `[`/`]`.
 ///
-/// v0.51.2 的 `k = v` 方言**没有引号/转义面**（值即到行尾的裸串）——对照原版 TOML 侧
-/// [`OriginalTomlConfig::render`] 经 [`toml_str`] 的转义纪律：TOML 有转义面可以承载
-/// 任意字符，INI 没有 ⇒ 能拼出 `[新节]` 行或额外键值行的字符一律**拒绝即错误**，
-/// 不静默改写（值含换行/`[`/`]` 即可往托管 frpc.ini 注入任意节）。
+/// The v0.51.2 `k = v` dialect has **no quoting/escaping surface** (a value
+/// is the bare string to end-of-line) — contrast the original-TOML side,
+/// where [`OriginalTomlConfig::render`] goes through [`toml_str`]'s escaping
+/// discipline: TOML has an escaping surface and can carry arbitrary
+/// characters, INI does not ⇒ any character that could splice out a
+/// `[new-section]` line or an extra key-value line is **rejected as an
+/// error**, never silently rewritten (a value containing newline/`[`/`]`
+/// could inject arbitrary sections into the supervised frpc.ini).
 fn validate_ini_scalar(what: &str, s: &str) -> Result<(), FrpcError> {
     if let Some(bad) = s.chars().find(|&c| c.is_control() || c == '[' || c == ']') {
         return Err(FrpcError::Config(format!(
-            "INI {what} 含禁止字符 {bad:?}（控制字符与 [ ] ——k = v 直拼方言无转义面，防节注入）"
+            "INI {what} contains forbidden character {bad:?} (control characters and [ ] — the k = v dialect splices with no escaping surface; section-injection defense)"
         )));
     }
     Ok(())
 }
 
-/// **R12 红线变换**：向面板 frpc.ini 的 `[common]` 注入/覆盖 admin 字段，其余一切逐字节保留。
+/// **The R12 red-line transform**: inject/overwrite the admin fields in the
+/// panel frpc.ini's `[common]`; everything else is preserved byte for byte.
 ///
-/// - 仅 `[common]` 节被重建，且只动 `admin_addr/admin_port/admin_user/admin_pwd` 四键
-///   （存在则原位覆盖，缺失则补在节尾）；`[common]` 内的注释/空行按原位保留；
-/// - **proxy 节（含其注释、空行、字段顺序、行尾风格）原样拷贝**——CheckProxy 逐项比对
-///   面板记录（frp-compat §2.3），任何 proxy 侧改写都可能被拒；
-/// - 无 `[common]` 节 → 拒绝（面板导出必含；宁可失败也不静默脱离托管）。
+/// - Only the `[common]` section is rebuilt, and only the four keys
+///   `admin_addr/admin_port/admin_user/admin_pwd` are touched (overwritten in
+///   place when present, appended to the section tail when missing);
+///   comments/blank lines inside `[common]` are kept in their original
+///   positions;
+/// - **Proxy sections (including their comments, blank lines, field order,
+///   and line-ending style) are copied verbatim** — CheckProxy compares item
+///   by item against the panel records (frp-compat §2.3); any proxy-side
+///   rewrite could get rejected;
+/// - no `[common]` section → refuse (a panel export always contains one;
+///   better to fail than to silently leave the supervised surface).
 ///
-/// 输出写到托管 run 目录的副本上执行；面板源文件本身不动。
+/// The output is produced on the copy in the supervised run directory; the
+/// panel source file itself is untouched.
 pub fn augment_chmlfrp_admin(src: &str, admin: &AdminCommon) -> Result<String, FrpcError> {
-    // 注入防御先行：admin 值按 `k = v` 直拼（含原位覆盖与节尾补齐两条路径），
-    // 带换行/`[`/`]`/控制字符的凭据可拼出新节——拒绝即错误，不落任何字节。
-    validate_ini_scalar("admin_user 值", &admin.user)?;
-    validate_ini_scalar("admin_pwd 值", &admin.password)?;
+    // Injection defense first: admin values are spliced into `[common]` as
+    // `k = v` (both the in-place overwrite and the section-tail append
+    // paths); credentials containing newline/`[`/`]`/control characters
+    // could splice out new sections — rejected as an error, not a single
+    // byte written.
+    validate_ini_scalar("admin_user value", &admin.user)?;
+    validate_ini_scalar("admin_pwd value", &admin.password)?;
     const ADMIN_KEYS: [&str; 4] = ["admin_addr", "admin_port", "admin_user", "admin_pwd"];
     let admin_vals = [
         admin.addr.to_string(),
@@ -148,9 +181,10 @@ pub fn augment_chmlfrp_admin(src: &str, admin: &AdminCommon) -> Result<String, F
 
     let mut lines: Vec<&str> = src.split('\n').collect();
     if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
-        lines.pop(); // 源以换行收尾时 split 的尾部空段不参与重建（防多出一空行）
+        lines.pop(); // when the source ends with a newline, split's trailing empty segment does not participate in the rebuild (avoids one extra blank line)
     }
-    // 行尾风格跟随源文件（split 已剥离 \r，CRLF 以重建方式等价保留）。
+    // Line-ending style follows the source file (split already peeled off
+    // \r; CRLF is preserved equivalently by reconstruction).
     let eol = if lines.first().map(|l| l.ends_with('\r')).unwrap_or(false) {
         "\r\n"
     } else {
@@ -167,7 +201,7 @@ pub fn augment_chmlfrp_admin(src: &str, admin: &AdminCommon) -> Result<String, F
         let trimmed = line.trim();
 
         if let Some(name) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            // 离开 [common]：补齐该节缺失的 admin 键
+            // Leaving [common]: append the section's missing admin keys.
             if in_common {
                 flush_admin_tail(&mut out, &seen, &admin_vals, eol);
                 in_common = false;
@@ -184,7 +218,9 @@ pub fn augment_chmlfrp_admin(src: &str, admin: &AdminCommon) -> Result<String, F
             && !trimmed.starts_with('#')
             && !trimmed.starts_with(';')
         {
-            // [common] 内的 admin 键：原位覆盖；其余（含注释/空行/其它字段）原样保留
+            // Admin keys inside [common]: overwritten in place; everything
+            // else (including comments/blank lines/other fields) preserved
+            // as-is.
             if let Some((k, _)) = trimmed.split_once('=') {
                 if let Some(idx) = ADMIN_KEYS
                     .iter()
@@ -204,13 +240,14 @@ pub fn augment_chmlfrp_admin(src: &str, admin: &AdminCommon) -> Result<String, F
     }
     if !has_common {
         return Err(FrpcError::Config(
-            "面板 frpc.ini 缺 [common] 节，拒绝注入 admin（托管面不完整的配置不出门）".into(),
+            "panel frpc.ini has no [common] section; refusing to inject admin (an incomplete supervised config does not ship)".into(),
         ));
     }
     Ok(out)
 }
 
-/// 在 `[common]` 节尾补齐源文件缺失的 admin 键。
+/// Append the admin keys missing from the source at the `[common]` section's
+/// tail.
 fn flush_admin_tail(out: &mut String, seen: &[bool; 4], vals: &[String; 4], eol: &str) {
     const KEYS: [&str; 4] = ["admin_addr", "admin_port", "admin_user", "admin_pwd"];
     for i in 0..4 {
@@ -220,7 +257,8 @@ fn flush_admin_tail(out: &mut String, seen: &[bool; 4], vals: &[String; 4], eol:
     }
 }
 
-/// ChmlFrp frpc.ini 结构化生成器（保序字段表；golden 输出与官方样本逐字节一致）。
+/// Structured ChmlFrp frpc.ini generator (order-preserving field table;
+/// golden output matches the official sample byte for byte).
 #[derive(Clone, Debug, Default)]
 pub struct ChmlFrpIniConfig {
     common: Vec<(String, String)>,
@@ -228,7 +266,8 @@ pub struct ChmlFrpIniConfig {
 }
 
 impl ChmlFrpIniConfig {
-    /// `[common]` 起步：server_addr/server_port（面板样本最小集，frpc.ini 样本:1-3）。
+    /// Start with `[common]`: server_addr/server_port (the panel sample's
+    /// minimal set, frpc.ini sample:1-3).
     pub fn new(server_addr: impl Into<String>, server_port: u16) -> Self {
         Self {
             common: vec![
@@ -239,15 +278,19 @@ impl ChmlFrpIniConfig {
         }
     }
 
-    /// 追加/覆盖 `[common]` 字段（如 `user`/`token`/`tls_enable`/admin 四键）。
+    /// Append/overwrite a `[common]` field (e.g. the `user`/`token`/
+    /// `tls_enable`/admin four keys).
     ///
-    /// key/value 须过 [`validate_ini_scalar`]：INI 直拼方言无转义面（对照 TOML 侧
-    /// [`OriginalTomlConfig::render`] 的 `toml_str` 纪律——那边转义、这边拒绝），
-    /// 含控制字符/换行/`[`/`]` 的输入可注入新节 ⇒ 返回错误。
+    /// key/value must pass [`validate_ini_scalar`]: the INI dialect splices
+    /// with no escaping surface (contrast the TOML side's
+    /// [`OriginalTomlConfig::render`] with its `toml_str` discipline — that
+    /// side escapes, this side rejects); input containing control
+    /// characters/newline/`[`/`]` could inject new sections ⇒ returns an
+    /// error.
     pub fn common(mut self, key: &str, value: impl Into<String>) -> Result<Self, FrpcError> {
         let value = value.into();
-        validate_ini_scalar("common 键", key)?;
-        validate_ini_scalar("common 值", &value)?;
+        validate_ini_scalar("common key", key)?;
+        validate_ini_scalar("common value", &value)?;
         match self.common.iter_mut().find(|(k, _)| k == key) {
             Some((_, v)) => *v = value,
             None => self.common.push((key.to_string(), value)),
@@ -255,7 +298,8 @@ impl ChmlFrpIniConfig {
         Ok(self)
     }
 
-    /// 追加 tcp proxy 节（字段序 = 面板样本形态：type/local_ip/local_port/remote_port）。
+    /// Append a tcp proxy section (field order = the panel sample's shape:
+    /// type/local_ip/local_port/remote_port).
     pub fn tcp_proxy(
         mut self,
         name: &str,
@@ -275,8 +319,10 @@ impl ChmlFrpIniConfig {
         self
     }
 
-    /// 生成 INI 文本（LF 行尾、`k = v` 定界、节间一空行、文件以换行收尾——与官方样本
-    /// 归一化后逐字节一致；见 `tests/golden_config.rs`）。
+    /// Render the INI text (LF line endings, `k = v` delimiting, one blank
+    /// line between sections, the file ending with a newline — byte-for-byte
+    /// identical to the official sample after normalization; see
+    /// `tests/golden_config.rs`).
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str("[common]\n");
@@ -294,11 +340,14 @@ impl ChmlFrpIniConfig {
     }
 }
 
-/// 从面板/托管 INI 推导探活目标（只读推导，不改配置）。
+/// Derive probe targets from the panel/supervised INI (read-only derivation,
+/// no config changes).
 ///
-/// - admin：`[common]` 的 `admin_port` 非 0 即启用（addr 缺省 127.0.0.1——v0.51.2 面板
-///   导出形态），携带 admin_user/admin_pwd（`/api/status` basic auth）；
-/// - 本地隧道口：首个 `type = tcp` 节的 `local_ip`（缺省 127.0.0.1）+ `local_port`。
+/// - admin: a non-zero `admin_port` in `[common]` means enabled (addr
+///   defaults to 127.0.0.1 — the v0.51.2 panel export shape), carrying
+///   admin_user/admin_pwd (`/api/status` basic auth);
+/// - local tunnel port: the first `type = tcp` section's `local_ip`
+///   (default 127.0.0.1) + `local_port`.
 pub fn chmlfrp_probe_targets(ini: &ParsedIni) -> ProbeTargets {
     let admin = ini
         .get("common", "admin_port")
@@ -337,10 +386,11 @@ pub fn chmlfrp_probe_targets(ini: &ParsedIni) -> ProbeTargets {
 }
 
 // ---------------------------------------------------------------------------
-// 原版 TOML（v0.71.1 方言）
+// Original TOML (v0.71.1 dialect)
 // ---------------------------------------------------------------------------
 
-/// 原版 frpc TOML 生成器（v0.71.1 camelCase 方言；golden 输出与官方样本逐字节一致）。
+/// Original frpc TOML generator (v0.71.1 camelCase dialect; golden output
+/// matches the official sample byte for byte).
 #[derive(Clone, Debug, Default)]
 pub struct OriginalTomlConfig {
     pub server_addr: String,
@@ -350,8 +400,8 @@ pub struct OriginalTomlConfig {
     pub proxies: Vec<TcpProxySection>,
 }
 
-/// `[webServer]` 节（admin API：`/healthz` 免认证 + `/api/status` basic auth，
-/// common.go:50-60；port=0 即不启动 admin）。
+/// The `[webServer]` section (admin API: `/healthz` unauthenticated +
+/// `/api/status` basic auth, common.go:50-60; port=0 means no admin).
 #[derive(Clone, Debug)]
 pub struct WebServerSection {
     pub addr: String,
@@ -360,7 +410,7 @@ pub struct WebServerSection {
     pub password: Option<String>,
 }
 
-/// `[[proxies]]` tcp 节。
+/// A `[[proxies]]` tcp section.
 #[derive(Clone, Debug)]
 pub struct TcpProxySection {
     pub name: String,
@@ -370,7 +420,8 @@ pub struct TcpProxySection {
 }
 
 impl OriginalTomlConfig {
-    /// 顶层起步：serverAddr/serverPort（官方 frpc.toml 样本:1-2）。
+    /// Top-level start: serverAddr/serverPort (official frpc.toml
+    /// sample:1-2).
     pub fn new(server_addr: impl Into<String>, server_port: u16) -> Self {
         Self {
             server_addr: server_addr.into(),
@@ -389,7 +440,8 @@ impl OriginalTomlConfig {
         self
     }
 
-    /// 追加 tcp proxy（字段序 = 官方样本：name/type/localIP/localPort/remotePort）。
+    /// Append a tcp proxy (field order = the official sample:
+    /// name/type/localIP/localPort/remotePort).
     pub fn tcp_proxy(
         mut self,
         name: &str,
@@ -406,7 +458,8 @@ impl OriginalTomlConfig {
         self
     }
 
-    /// 生成 TOML 文本（LF；表体在标量键之后，符合 TOML 语法序）。
+    /// Render the TOML text (LF; table bodies after the scalar keys,
+    /// conforming to TOML grammar order).
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("serverAddr = {}\n", toml_str(&self.server_addr)));
@@ -439,7 +492,8 @@ impl OriginalTomlConfig {
     }
 }
 
-/// TOML basic string 转义（`\` `"` 与控制字符；路径/凭据均可安全承载）。
+/// TOML basic-string escaping (`\` `"` and control characters; paths and
+/// credentials are all safely representable).
 fn toml_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -458,16 +512,25 @@ fn toml_str(s: &str) -> String {
     out
 }
 
-/// 只读解析调用方的原版 frpc TOML（**绝不改写**；解析失败早于 spawn 暴露）。
+/// Read-only parsing of the caller's original frpc TOML (**never rewritten**;
+/// parse failures surface before spawn).
 pub fn parse_original_toml(path: &Path) -> Result<toml::Table, FrpcError> {
     let text = std::fs::read_to_string(path).map_err(|e| {
-        FrpcError::Config(format!("读取原版 frpc.toml 失败 {}: {e}", path.display()))
+        FrpcError::Config(format!(
+            "failed to read original frpc.toml {}: {e}",
+            path.display()
+        ))
     })?;
-    text.parse::<toml::Table>()
-        .map_err(|e| FrpcError::Config(format!("解析原版 frpc.toml 失败 {}: {e}", path.display())))
+    text.parse::<toml::Table>().map_err(|e| {
+        FrpcError::Config(format!(
+            "failed to parse original frpc.toml {}: {e}",
+            path.display()
+        ))
+    })
 }
 
-/// 从原版 TOML 推导探活目标（webServer + 首个 tcp proxy 的本地隧道口）。
+/// Derive probe targets from the original TOML (webServer + the first tcp
+/// proxy's local tunnel port).
 pub fn original_probe_targets(root: &toml::Table) -> ProbeTargets {
     let admin = root
         .get("webServer")
@@ -535,7 +598,7 @@ mod tests {
         assert_eq!(doc.get("common", "server_addr"), Some("127.0.0.1"));
         assert_eq!(doc.get("ssh", "local_port"), Some("22"));
         assert_eq!(doc.section("missing"), None);
-        // 重复键后者胜
+        // Later duplicate key wins.
         let dup = parse_ini("[common]\na = 1\na = 2\n").unwrap();
         assert_eq!(dup.get("common", "a"), Some("2"));
         assert_eq!(dup.section("common").unwrap().len(), 1);
@@ -557,8 +620,10 @@ mod tests {
 
     #[test]
     fn augment_preserves_proxy_sections_byte_verbatim() {
-        // 注释放进 proxy 节内部（INI 语义：节头后的一切属该节；CheckProxy 比对的正是这块）
-        let panel = "[common]\nserver_addr = node.example\nserver_port = 7000\ntoken = tk\n\n[ssh]\n# proxy 注释也不许动\ntype = tcp\nlocal_ip = 127.0.0.1\nlocal_port = 22\nremote_port = 6000\n";
+        // A comment placed inside the proxy section (INI semantics:
+        // everything after a section header belongs to it; this is exactly
+        // what CheckProxy compares).
+        let panel = "[common]\nserver_addr = node.example\nserver_port = 7000\ntoken = tk\n\n[ssh]\n# proxy comments must not be touched either\ntype = tcp\nlocal_ip = 127.0.0.1\nlocal_port = 22\nremote_port = 6000\n";
         let admin = AdminCommon {
             addr: "127.0.0.1".parse().unwrap(),
             port: 7400,
@@ -566,18 +631,19 @@ mod tests {
             password: "pw".into(),
         };
         let out = augment_chmlfrp_admin(panel, &admin).unwrap();
-        // proxy 节逐字节保留（含节内注释行）
+        // The proxy section is preserved byte for byte (including in-section
+        // comment lines).
         let proxy_src = &panel[panel.find("[ssh]").unwrap()..];
         assert!(
             out.ends_with(proxy_src),
-            "proxy 节被改写:\n{out}\n期望尾部:\n{proxy_src}"
+            "proxy section was rewritten:\n{out}\nexpected tail:\n{proxy_src}"
         );
-        // common 得到 admin 四键
+        // [common] received the four admin keys.
         let parsed = parse_ini(&out).unwrap();
         assert_eq!(parsed.get("common", "admin_port"), Some("7400"));
         assert_eq!(parsed.get("common", "admin_user"), Some("admin"));
         assert_eq!(parsed.get("common", "admin_pwd"), Some("pw"));
-        // 原有字段不动
+        // Pre-existing fields untouched.
         assert_eq!(parsed.get("common", "token"), Some("tk"));
         assert_eq!(parsed.get("ssh", "remote_port"), Some("6000"));
     }
@@ -595,7 +661,8 @@ mod tests {
         let parsed = parse_ini(&out).unwrap();
         assert_eq!(parsed.get("common", "admin_port"), Some("7400"));
         assert_eq!(parsed.get("common", "admin_user"), Some("new"));
-        // 原位覆盖：admin_port 仍在 server_port 之后、[ssh] 之前
+        // In-place override: admin_port still after server_port, before
+        // [ssh].
         let common: Vec<&str> = out.lines().collect();
         let i_sp = common
             .iter()
@@ -637,9 +704,11 @@ mod tests {
         assert!(augment_chmlfrp_admin(panel, &admin).is_err());
     }
 
-    /// 注入企图必须被拒：admin 值按 `k = v` 直拼进 `[common]`，带换行/`[`/`]`/
-    /// 控制字符的凭据可拼出新节（对照 TOML 侧 toml_str 的转义纪律——INI 无转义面，
-    /// 只能拒绝）。
+    /// Injection attempts must be rejected: admin values are spliced into
+    /// `[common]` as `k = v`; credentials containing newline/`[`/`]`/control
+    /// characters could splice out new sections (contrast the TOML side's
+    /// toml_str escaping discipline — INI has no escaping surface, so only
+    /// rejection is possible).
     #[test]
     fn augment_rejects_admin_values_that_could_inject_sections() {
         let over = |user: &str, password: &str| AdminCommon {
@@ -648,7 +717,7 @@ mod tests {
             user: user.into(),
             password: password.into(),
         };
-        // 值伪造新节 + 键值行（换行注入）
+        // Values forging a new section + key-value lines (newline injection).
         assert!(
             augment_chmlfrp_admin(PANEL_SAMPLE, &over("u\n[shadow]\ntoken = pwned", "pw")).is_err()
         );
@@ -656,34 +725,36 @@ mod tests {
             augment_chmlfrp_admin(PANEL_SAMPLE, &over("admin", "p\n[shadow]\ntoken = pwned"))
                 .is_err()
         );
-        // 方括号（可扰动节头解析）
+        // Square brackets (can disturb section-header parsing).
         assert!(augment_chmlfrp_admin(PANEL_SAMPLE, &over("adm[in", "pw")).is_err());
         assert!(augment_chmlfrp_admin(PANEL_SAMPLE, &over("admin", "p]w")).is_err());
-        // 控制字符（\t/\0——换行的近亲，同拒）
+        // Control characters (\t/\0 — close kin of newline, likewise
+        // rejected).
         assert!(augment_chmlfrp_admin(PANEL_SAMPLE, &over("ad\tmin", "pw")).is_err());
         assert!(augment_chmlfrp_admin(PANEL_SAMPLE, &over("admin", "p\0w")).is_err());
-        // 合法凭据不受影响（回归）
+        // Legitimate credentials unaffected (regression).
         assert!(augment_chmlfrp_admin(PANEL_SAMPLE, &over("admin", "p@ss word-9!")).is_ok());
     }
 
-    /// 结构化生成器同纪律：`common()` 的 key/value 含换行/方括号/控制字符即错误
-    /// （render 直拼 `k = v`，无转义面）。
+    /// The structured generator follows the same discipline: `common()`'s
+    /// key/value containing newline/brackets/control characters is an error
+    /// (render splices `k = v` with no escaping surface).
     #[test]
     fn structured_common_rejects_injection_attempts() {
         let base = || ChmlFrpIniConfig::new("node.example", 7000);
-        // 键带换行 + 节头
+        // Key with a newline + section header.
         assert!(base().common("k\n[shadow]", "v").is_err());
-        // 值伪造新节 + 后续键值
+        // Value forging a new section + subsequent key-values.
         assert!(base()
             .common("token", "v\n[shadow]\nserver_addr = evil")
             .is_err());
-        // 方括号（键/值均拒）
+        // Square brackets (rejected in both key and value).
         assert!(base().common("[k]", "v").is_err());
         assert!(base().common("k", "a]b").is_err());
-        // 控制字符
+        // Control characters.
         assert!(base().common("k", "v\u{7}").is_err());
         assert!(base().common("k\u{b}", "v").is_err());
-        // 合法键值不受影响（回归）
+        // Legitimate key-values unaffected (regression).
         assert!(base().common("user", "token-6e447a2e28fdb4d0").is_ok());
         assert!(base().common("tls_enable", "true").is_ok());
     }
@@ -727,7 +798,7 @@ mod tests {
         assert_eq!(t.admin, None);
         assert_eq!(t.local_tunnel, Some("127.0.0.1:22".parse().unwrap()));
 
-        // auth/webServer 全量形态
+        // The full auth/webServer form.
         let full = OriginalTomlConfig::new("frps.example", 7000)
             .auth_token("sec\"ret\\path")
             .web_server(WebServerSection {

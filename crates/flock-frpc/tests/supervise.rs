@@ -1,18 +1,28 @@
-//! 进程守护测试（§7-M2 完成标准；frp-compat §2.3/§4-R6）。
+//! Process supervision tests (§7-M2 completion criteria; frp-compat
+//! §2.3/§4-R6).
 //!
-//! 用假进程桩（`src/bin/frpc_stub.rs`，经 `CARGO_BIN_EXE_frpc_stub` 调用）单测：
+//! Unit tests using the fake process stub (`src/bin/frpc_stub.rs`, invoked
+//! via `CARGO_BIN_EXE_frpc_stub`):
 //!
-//! - **3 退→3 拉**：ChmlFrp frpc「三次重连失败即退出进程」的魔改行为由守护循环兜住——
-//!   桩反复自退，断言拉起次数与指数退避下界（每轮退避 ≥ initial×2^n，调度只会更晚
-//!   不会更早 ⇒ 下界断言稳定）；
-//! - **停止语义**：`stop()` 杀当前子进程、落 `Stopped{Manual}`、此后不再拉起；
-//! - **重启额度**：`max_restarts` 耗尽 → `Stopped{RestartsExhausted}`；
-//! - **健康探测**：本地隧道口 + frpc admin（serve 桩的 HTTP 200 面）；
-//! - **argv 刻画**：`-c`（ConfigFile/Original）与 `-u/-p`（UserTokenAuto）到达子进程；
-//! - **R12 端到端**：托管副本的 proxy 节与面板输入逐字节一致、admin 只进 `[common]`。
+//! - **3 exits → 3 restarts**: ChmlFrp frpc's modded "exit the process after
+//!   three failed reconnects" behavior is held up by the supervision loop —
+//!   the stub exits repeatedly; assert the restart count and the exponential
+//!   backoff lower bounds (each round's backoff ≥ initial×2^n; scheduling
+//!   only delays, never advances ⇒ the lower-bound assertions are stable);
+//! - **stop semantics**: `stop()` kills the current subprocess, lands on
+//!   `Stopped{Manual}`, and nothing is re-spawned afterwards;
+//! - **restart budget**: `max_restarts` exhausted → `Stopped{
+//!   RestartsExhausted}`;
+//! - **health probing**: local tunnel port + frpc admin (the serve stub's
+//!   HTTP 200 surface);
+//! - **argv characterization**: `-c` (ConfigFile/Original) and `-u/-p`
+//!   (UserTokenAuto) reach the subprocess;
+//! - **R12 end-to-end**: the supervised copy's proxy section is byte-for-byte
+//!   identical to the panel input; admin enters `[common]` only.
 //!
-//! 桩行为由测试配置文件尾部的 `[stub]` 节选择（`mode`/`lifetime_ms`），marker 落
-//! 托管 run_dir（每路中继唯一）。
+//! The stub's behavior is selected by the `[stub]` section appended to the
+//! test config file (`mode`/`lifetime_ms`); the marker lands in the
+//! supervised run_dir (unique per relay).
 
 mod common;
 
@@ -37,7 +47,9 @@ const GOLDEN_TOML: &str = concat!(
     "/tests/golden/original.frpc.toml"
 );
 
-// 退避节奏（毫秒级，压总时长；断言只依赖下界——调度延迟只会放大间隔不会缩小）
+// Backoff cadence (millisecond scale, compressing total runtime; assertions
+// rely only on lower bounds — scheduling delay only widens intervals, never
+// narrows them).
 const INITIAL_MS: u64 = 80;
 const MULTIPLIER: u64 = 2;
 const STUB_LIFETIME_MS: u64 = 20;
@@ -54,7 +66,8 @@ fn test_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// 面板 ini 样本 + `[stub]` 行为节（追加在新节里，proxy 节本身不动）。
+/// The panel ini sample + a `[stub]` behavior section (appended as a new
+/// section; the proxy section itself untouched).
 fn panel_ini_with_stub(dir: &Path, stub: &str) -> PathBuf {
     let ini = dir.join("frpc.ini");
     let golden = std::fs::read_to_string(GOLDEN_INI)
@@ -96,8 +109,9 @@ fn supervisor(tag: &str, restart: RestartPolicy, health: HealthPolicy) -> Superv
     Supervisor::new(cfg)
 }
 
-/// marker 事件行：`(kind, unix_ms, extra)`——extra 为该行剩余全部
-/// （argv 行的参数串、serve 行的监听地址）。
+/// Marker event lines: `(kind, unix_ms, extra)` — extra is the remainder of
+/// the line (the argument string on argv lines, the listen address on serve
+/// lines).
 fn read_marker(path: &Path) -> Vec<(String, u128, String)> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     text.lines()
@@ -114,20 +128,24 @@ fn read_marker(path: &Path) -> Vec<(String, u128, String)> {
         .collect()
 }
 
-/// 轮询直到累计重启 ≥ want，返回 run_dir（marker 落点）。
+/// Poll until cumulative restarts ≥ want; returns the run_dir (where the
+/// marker lands).
 async fn wait_until_restarts(relay: &ManagedRelay, want: u32, timeout: Duration) -> PathBuf {
     let deadline = Instant::now() + timeout;
     loop {
         let status = relay.health();
         if let RelayPhase::Stopped { reason } = &status.phase {
-            panic!("中继提前停止: {reason:?}（restarts={}）", status.restarts);
+            panic!(
+                "relay stopped prematurely: {reason:?} (restarts={})",
+                status.restarts
+            );
         }
         if status.restarts >= want {
             return status.run_dir;
         }
         if Instant::now() > deadline {
             panic!(
-                "等待 restarts>={want} 超时（当前 {:?}, restarts={}）；logs: {:?}",
+                "timed out waiting for restarts>={want} (now {:?}, restarts={}); logs: {:?}",
                 status.phase,
                 status.restarts,
                 relay.logs()
@@ -137,12 +155,16 @@ async fn wait_until_restarts(relay: &ManagedRelay, want: u32, timeout: Duration)
     }
 }
 
-/// **核心用例：3 退 → 3 拉 + 指数退避下界**。
+/// **Core case: 3 exits → 3 restarts + exponential-backoff lower bounds**.
 ///
-/// ChmlFrp frpc 三次重连退出（魔改）后由守护拉起：桩崩 3 次以上，marker 记录 4+ 次
-/// start；连续 start 间隔分别 ≥ lifetime+initial、lifetime+initial×2、lifetime+initial×4
-/// （退避 sleep 是下界，进程调度只增不减 ⇒ 下界断言稳定），且末轮间隔显著大于首轮
-/// （指数增长的直接证据）。
+/// After ChmlFrp frpc's three-reconnect exit (the modded behavior), the
+/// supervision loop pulls it back up: the stub crashes 3+ times, the marker
+/// records 4+ starts; consecutive start intervals are respectively ≥
+/// lifetime+initial, lifetime+initial×2, lifetime+initial×4 (the backoff
+/// sleep is a lower bound; process scheduling only adds, never subtracts ⇒
+/// the lower-bound assertions are stable), and the final interval is
+/// significantly larger than the first (direct evidence of exponential
+/// growth).
 #[tokio::test]
 async fn three_crashes_pull_three_restarts_with_exponential_backoff() {
     common::prewarm_stub();
@@ -154,24 +176,27 @@ async fn three_crashes_pull_three_restarts_with_exponential_backoff() {
             mode: ChmlFrpMode::ConfigFile(ini),
         })
         .await
-        .expect("假桩规格应可启动");
+        .expect("the stub spec should start");
     let run_dir = wait_until_restarts(&relay, 3, Duration::from_secs(20)).await;
-    // 宽限窗：restarts 在 spawn 返回瞬间记账，而第 4 个桩进程写 marker 需几毫秒——
-    // 立即 stop() 会把它杀在落笔前。200ms 足够留痕，又短于第 4 次退出后的下一轮
-    // 退避（80×2³=640ms），不会引入第 5 次 start。
+    // Grace window: restarts are booked the instant spawn returns, while the
+    // 4th stub process needs a few milliseconds to write its marker —
+    // stopping immediately would kill it before it puts pen to paper. 200ms
+    // is enough to leave a trace, yet shorter than the next backoff round
+    // after the 4th exit (80×2³=640ms), so it introduces no 5th start.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let status = relay.stop().await.expect("stop 收尾");
+    let status = relay.stop().await.expect("stop winds down");
     assert_eq!(
         status.phase,
         RelayPhase::Stopped {
             reason: StopReason::Manual
         }
     );
-    // 魔改退出形态：非零退出码（ChmlFrp 三次重连后 os.Exit(1) 的模拟面）
+    // The modded exit shape: non-zero exit code (simulating ChmlFrp's
+    // os.Exit(1) after three reconnects).
     assert!(matches!(&status.last_exit, Some(e) if !e.success));
 
     let marker = run_dir.join("stub-marker.log");
-    // 拉起计数：start 事件 = 首次 + ≥3 次重启
+    // Restart count: start events = initial + ≥3 restarts.
     let starts: Vec<u128> = read_marker(&marker)
         .into_iter()
         .filter(|(kind, _, _)| kind == "start")
@@ -179,29 +204,35 @@ async fn three_crashes_pull_three_restarts_with_exponential_backoff() {
         .collect();
     assert!(
         starts.len() >= 4,
-        "3 退应至少 3 拉起（共 4 次 start），实际 {}",
+        "3 crashes should pull at least 3 restarts (4 starts total), got {}",
         starts.len()
     );
 
-    // 指数退避下界：间隔_i ≥ stub 存活 + initial × multiplier^i
+    // Exponential-backoff lower bounds: interval_i ≥ stub lifetime + initial
+    // × multiplier^i.
     let mut prev = starts[0];
     for (i, &t) in starts.iter().skip(1).take(3).enumerate() {
         let lower = STUB_LIFETIME_MS + INITIAL_MS * MULTIPLIER.pow(i as u32);
         let interval = (t - prev) as u64;
         assert!(
             interval >= lower,
-            "第 {} 次重启间隔 {interval}ms 低于退避下界 {lower}ms",
+            "restart #{} interval {interval}ms is below the backoff lower bound {lower}ms",
             i + 1
         );
         prev = t;
     }
-    // 增长证据：第 3 间隔 ≈ 4×第 1 间隔（容 25% 调度松弛仍应显著更大）
+    // Growth evidence: the 3rd interval ≈ 4× the 1st (with 25% scheduling
+    // slack tolerated it should still be significantly larger).
     let i1 = (starts[1] - starts[0]) as u64;
     let i3 = (starts[3] - starts[2]) as u64;
-    assert!(i3 * 4 >= i1 * 10, "退避未见指数增长: i1={i1}ms i3={i3}ms");
+    assert!(
+        i3 * 4 >= i1 * 10,
+        "backoff did not grow exponentially: i1={i1}ms i3={i3}ms"
+    );
 }
 
-/// 停止语义：运行中的子进程被杀、落 `Stopped{Manual}`、之后不再有 start 事件。
+/// Stop semantics: the running subprocess is killed, lands on
+/// `Stopped{Manual}`, and there are no further start events afterwards.
 #[tokio::test]
 async fn stop_kills_running_child_and_no_respawn() {
     common::prewarm_stub();
@@ -217,9 +248,9 @@ async fn stop_kills_running_child_and_no_respawn() {
             },
         })
         .await
-        .expect("run 桩应可启动");
+        .expect("the run stub should start");
 
-    // 等 Running（stub 长驻），确认仅 1 次 start
+    // Wait for Running (the stub lives forever), confirm exactly 1 start.
     let run_dir = {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -227,7 +258,11 @@ async fn stop_kills_running_child_and_no_respawn() {
             if matches!(s.phase, RelayPhase::Running { .. }) {
                 break s.run_dir;
             }
-            assert!(Instant::now() < deadline, "未进入 Running: {:?}", s.phase);
+            assert!(
+                Instant::now() < deadline,
+                "did not enter Running: {:?}",
+                s.phase
+            );
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
     };
@@ -241,7 +276,7 @@ async fn stop_kills_running_child_and_no_respawn() {
     };
     assert_eq!(starts(), 1);
 
-    let status = relay.stop().await.expect("stop 收尾");
+    let status = relay.stop().await.expect("stop winds down");
     assert_eq!(
         status.phase,
         RelayPhase::Stopped {
@@ -249,12 +284,13 @@ async fn stop_kills_running_child_and_no_respawn() {
         }
     );
 
-    // 停止后不再拉起（等待窗 > 退避 initial）
+    // No respawn after stop (wait window > backoff initial).
     tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(starts(), 1, "stop 后不得再拉起");
+    assert_eq!(starts(), 1, "no further spawns after stop");
 }
 
-/// 重启额度：`max_restarts=2` → 首 + 2 拉后停 `Stopped{RestartsExhausted}`。
+/// Restart budget: `max_restarts=2` → initial + 2 restarts, then
+/// `Stopped{RestartsExhausted}`.
 #[tokio::test]
 async fn max_restarts_exhaustion_stops_relay() {
     common::prewarm_stub();
@@ -270,7 +306,7 @@ async fn max_restarts_exhaustion_stops_relay() {
             mode: ChmlFrpMode::ConfigFile(ini),
         })
         .await
-        .expect("启动");
+        .expect("start");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let run_dir = loop {
@@ -281,22 +317,32 @@ async fn max_restarts_exhaustion_stops_relay() {
         {
             break s.run_dir;
         }
-        assert!(Instant::now() < deadline, "未在额度内停机: {:?}", s.phase);
+        assert!(
+            Instant::now() < deadline,
+            "did not stop within the budget: {:?}",
+            s.phase
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    // 恰好 3 次 start（首 + 2 拉起），等待窗内不再增
+    // Exactly 3 starts (initial + 2 restarts); no further growth inside the
+    // wait window.
     tokio::time::sleep(Duration::from_millis(250)).await;
     let marker = run_dir.join("stub-marker.log");
     let starts = read_marker(&marker)
         .into_iter()
         .filter(|(k, _, _)| k == "start")
         .count();
-    assert_eq!(starts, 3, "max_restarts=2 应恰好拉起 2 次");
-    relay.stop().await.expect("已停的 relay stop 仍应幂等收尾");
+    assert_eq!(starts, 3, "max_restarts=2 should pull exactly 2 restarts");
+    relay
+        .stop()
+        .await
+        .expect("stop on an already-stopped relay should still wind down idempotently");
 }
 
-/// 健康探测：admin（serve 桩 200）+ 本地隧道口（显式不可达口）双路报告；
-/// 同时验证 R12 端到端：托管副本 proxy 节与面板输入逐字节一致、admin 只进 `[common]`。
+/// Health probing: dual-path report of admin (serve stub 200) + local tunnel
+/// port (an explicitly unreachable port); also verifies R12 end-to-end: the
+/// supervised copy's proxy section is byte-for-byte identical to the panel
+/// input, admin enters `[common]` only.
 #[tokio::test]
 async fn health_probe_admin_ok_local_tunnel_err_and_r12_managed_copy() {
     common::prewarm_stub();
@@ -304,7 +350,8 @@ async fn health_probe_admin_ok_local_tunnel_err_and_r12_managed_copy() {
     let serve_marker = dir.join("serve-marker.log");
     let ini = panel_ini_with_stub(&dir, "mode = run");
 
-    // serve 桩：模拟「frpc admin 监听」（HTTP 200），先起、从 marker 读实际端口
+    // Serve stub: simulates the "frpc admin listener" (HTTP 200); start it
+    // first, read the actual port from the marker.
     let mut serve = tokio::process::Command::new(STUB)
         .args([
             "serve",
@@ -318,7 +365,7 @@ async fn health_probe_admin_ok_local_tunnel_err_and_r12_managed_copy() {
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .expect("serve 桩启动");
+        .expect("serve stub starts");
     let admin_port = wait_for_serve_port(&serve_marker);
 
     let health = HealthPolicy {
@@ -330,8 +377,10 @@ async fn health_probe_admin_ok_local_tunnel_err_and_r12_managed_copy() {
             user: "probe".into(),
             password: "probe-pw".into(),
         }),
-        // 本地隧道口显式指向必然拒绝的口（golden 样本的 local 22 在部分机器真有 sshd，
-        // 显式不可达口保断言确定性）；admin 走注入的 serve 桩。
+        // The local tunnel port is explicitly pointed at a port that is
+        // guaranteed to refuse (the golden sample's local 22 is a real sshd
+        // on some machines; an explicitly unreachable port keeps the
+        // assertion deterministic); admin goes to the injected serve stub.
         probe_local_tunnel: Some("127.0.0.1:1".parse().unwrap()),
     };
 
@@ -341,9 +390,9 @@ async fn health_probe_admin_ok_local_tunnel_err_and_r12_managed_copy() {
             mode: ChmlFrpMode::ConfigFile(ini.clone()),
         })
         .await
-        .expect("run 桩应可启动");
+        .expect("the run stub should start");
 
-    // 探测报告：admin Ok、local_tunnel Err
+    // Probe report: admin Ok, local_tunnel Err.
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         let s = relay.health();
@@ -354,33 +403,39 @@ async fn health_probe_admin_ok_local_tunnel_err_and_r12_managed_copy() {
         }
         assert!(
             Instant::now() < deadline,
-            "探测报告未就绪: {:?} logs={:?}",
+            "probe report not ready: {:?} logs={:?}",
             s.probe,
             relay.logs()
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
     };
-    let rep = status.probe.expect("已确认就绪");
-    assert_eq!(rep.admin, Some(ProbeResult::Ok), "admin 应探测到 serve 桩");
+    let rep = status.probe.expect("readiness already confirmed");
+    assert_eq!(
+        rep.admin,
+        Some(ProbeResult::Ok),
+        "admin should probe the serve stub as Ok"
+    );
     assert!(
         matches!(rep.local_tunnel, Some(ProbeResult::Err(_))),
-        "本地隧道口（127.0.0.1:1）应失败: {:?}",
+        "local tunnel port (127.0.0.1:1) should fail: {:?}",
         rep.local_tunnel
     );
-    assert!(!rep.all_ok(), "存在失败路时 all_ok 应为 false");
+    assert!(!rep.all_ok(), "all_ok should be false when a path fails");
 
-    // —— R12 端到端：托管副本 ——
+    // —— R12 end-to-end: the supervised copy ——
     let run_dir = status.run_dir;
-    let managed = std::fs::read_to_string(run_dir.join("frpc.ini")).expect("托管副本在位");
+    let managed =
+        std::fs::read_to_string(run_dir.join("frpc.ini")).expect("supervised copy in place");
     let panel = std::fs::read_to_string(&ini).unwrap();
     let norm = |s: String| s.replace("\r\n", "\n");
     let (managed, panel) = (norm(managed), norm(panel));
-    // proxy 节（[ssh] 起至尾，含 [stub] 行为节）逐字节一致
+    // The proxy section ([ssh] to the end, including the [stub] behavior
+    // section) is byte-for-byte identical.
     let tail_panel = &panel[panel.find("[ssh]").unwrap()..];
     let tail_managed = &managed[managed.find("[ssh]").unwrap()..];
     assert_eq!(
         tail_panel, tail_managed,
-        "R12：托管副本 proxy 节必须与面板输入逐字节一致"
+        "R12: the supervised copy's proxy section must be byte-for-byte identical to the panel input"
     );
     let parsed = parse_ini(&managed).unwrap();
     assert_eq!(
@@ -388,23 +443,25 @@ async fn health_probe_admin_ok_local_tunnel_err_and_r12_managed_copy() {
         Some(admin_port.to_string().as_str())
     );
     assert_eq!(parsed.get("common", "admin_user"), Some("probe"));
-    // 面板原字段不动
+    // The panel's original fields are untouched.
     assert_eq!(parsed.get("common", "server_port"), Some("7000"));
 
-    // argv：ConfigFile 模式 = -c <run_dir>/frpc.ini（托管副本）
+    // argv: ConfigFile mode = -c <run_dir>/frpc.ini (the supervised copy).
     let argv = argv_lines(&run_dir.join("stub-marker.log"));
     let managed_path = run_dir.join("frpc.ini");
     assert!(
         argv.iter()
             .any(|a| a.contains("-c") && a.contains(managed_path.to_str().unwrap())),
-        "-c 应指向托管副本: {argv:?}"
+        "-c should point at the supervised copy: {argv:?}"
     );
 
-    relay.stop().await.expect("stop 收尾");
+    relay.stop().await.expect("stop winds down");
     let _ = serve.kill().await;
 }
 
-/// UserTokenAuto：argv 到达形态 = `-u <usertoken> -p <tunnel_id>`（魔改 CLI 契约）。
+/// UserTokenAuto: the argv arrival shape = `-u <usertoken> -p <tunnel_id>`
+/// (the modded CLI contract). The usertoken deliberately contains non-ASCII
+/// characters to prove non-ASCII argv pass-through.
 #[tokio::test]
 async fn user_token_auto_argv_shape() {
     common::prewarm_stub();
@@ -420,19 +477,20 @@ async fn user_token_auto_argv_shape() {
             },
         })
         .await
-        .expect("启动");
+        .expect("start");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let run_dir = relay.health().run_dir;
     let argv = argv_lines(&run_dir.join("stub-marker.log"));
     assert!(
         argv.iter().any(|a| a.contains("-u ut-测试-token -p 77")),
-        "-u/-p 应按魔改 CLI 契约下发: {argv:?}"
+        "-u/-p should be dispatched per the modded CLI contract: {argv:?}"
     );
-    relay.stop().await.expect("stop 收尾");
+    relay.stop().await.expect("stop winds down");
 }
 
-/// Original 栈：`-c <调用方 TOML>` 且**不改写**原文件（内容逐字节不变）。
+/// Original stack: `-c <caller TOML>` and the original file is **never
+/// rewritten** (content byte-for-byte unchanged).
 #[tokio::test]
 async fn original_spec_uses_caller_toml_verbatim() {
     common::prewarm_stub();
@@ -448,7 +506,7 @@ async fn original_spec_uses_caller_toml_verbatim() {
     let relay = sup
         .start(RelaySpec::Original { toml: toml.clone() })
         .await
-        .expect("启动");
+        .expect("start");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let run_dir = relay.health().run_dir;
@@ -456,18 +514,21 @@ async fn original_spec_uses_caller_toml_verbatim() {
     assert!(
         argv.iter()
             .any(|a| a.contains("-c") && a.contains(toml.to_str().unwrap())),
-        "-c 应指向调用方 TOML: {argv:?}"
+        "-c should point at the caller's TOML: {argv:?}"
     );
     let after = std::fs::read(&toml).unwrap();
-    assert_eq!(before, after, "调用方 TOML 绝不改写");
-    relay.stop().await.expect("stop 收尾");
+    assert_eq!(before, after, "the caller's TOML is never rewritten");
+    relay.stop().await.expect("stop winds down");
 }
 
-/// failures 稳定复位（对照 connector 的 `Backoff::reset`「成功即归零」语义）：
-/// 子进程一次存活超过最大退避时长（`RestartPolicy::max` 兼任稳定窗口）⇒ failures
-/// 归零。桩 lifetime(500ms) > max(150ms)：第一次退出后 failures=1，第二段运行稳定
-/// 超过 max 后必须**可见归零**——否则长期服务端偶发数次 crash 后，每次重启都会
-/// 顶格 max（生产默认 60s）空窗。
+/// Stable reset of failures (mirroring the connector's `Backoff::reset`
+/// "success resets" semantics): a subprocess surviving one stretch longer
+/// than the maximum backoff (`RestartPolicy::max` doubles as the stability
+/// window) ⇒ failures resets to zero. Stub lifetime(500ms) > max(150ms):
+/// after the first exit failures=1; after the second run stays stable past
+/// max, it must **visibly reset to zero** — otherwise, after a long-running
+/// server has a few sporadic crashes, every restart pays the capped max (60s
+/// by default in production) blackout.
 #[tokio::test]
 async fn failures_reset_after_stable_run_exceeds_max_backoff() {
     common::prewarm_stub();
@@ -476,17 +537,18 @@ async fn failures_reset_after_stable_run_exceeds_max_backoff() {
 
     let mut policy = fast_restart_policy();
     policy.initial = Duration::from_millis(40);
-    policy.max = Duration::from_millis(150); // 稳定窗口（< lifetime ⇒ 每轮都可复位）
+    policy.max = Duration::from_millis(150); // stability window (< lifetime ⇒ every round can reset)
     let sup = supervisor("stablereset", policy, HealthPolicy::default());
     let relay = sup
         .start(RelaySpec::ChmlFrp {
             mode: ChmlFrpMode::ConfigFile(ini),
         })
         .await
-        .expect("假桩规格应可启动");
+        .expect("the stub spec should start");
 
-    // 先证明确实进过失败纪元（failures ≥ 1），再见 Running 中归零——「归零」才是
-    // 复位而非「从未计数」。
+    // First prove it really entered a failure epoch (failures ≥ 1), then see
+    // it reset to zero while Running — "reset to zero" is what makes it a
+    // reset rather than "never counted".
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut saw_failure_episode = false;
     loop {
@@ -499,11 +561,11 @@ async fn failures_reset_after_stable_run_exceeds_max_backoff() {
             && matches!(s.phase, RelayPhase::Running { .. })
             && s.failures == 0
         {
-            break; // 稳定运行超过 max ⇒ failures 已归零
+            break; // stable run exceeded max ⇒ failures has reset to zero
         }
         assert!(
             Instant::now() < deadline,
-            "稳定运行超过 max 后 failures 未归零: restarts={} failures={} phase={:?}",
+            "failures did not reset after a stable run past max: restarts={} failures={} phase={:?}",
             s.restarts,
             s.failures,
             s.phase
@@ -511,7 +573,7 @@ async fn failures_reset_after_stable_run_exceeds_max_backoff() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let status = relay.stop().await.expect("stop 收尾");
+    let status = relay.stop().await.expect("stop winds down");
     assert_eq!(
         status.phase,
         RelayPhase::Stopped {
@@ -520,7 +582,8 @@ async fn failures_reset_after_stable_run_exceeds_max_backoff() {
     );
 }
 
-/// `RestartPolicy::delay_for` 的纯函数面：指数增长 + 封顶。
+/// The pure-function surface of `RestartPolicy::delay_for`: exponential
+/// growth + the cap.
 #[test]
 fn restart_policy_delay_curve() {
     let p = RestartPolicy {
@@ -534,7 +597,7 @@ fn restart_policy_delay_curve() {
     assert_eq!(
         p.delay_for(3),
         Duration::from_millis(350),
-        "封顶生效（400→350）"
+        "cap in effect (400→350)"
     );
     assert_eq!(p.delay_for(9), Duration::from_millis(350));
 }
@@ -548,7 +611,10 @@ fn wait_for_serve_port(marker: &Path) -> u16 {
         if let Some((_, _, addr)) = events.iter().find(|(k, _, _)| k == "serve") {
             return addr.rsplit(':').next().unwrap().parse().unwrap();
         }
-        assert!(Instant::now() < deadline, "serve 桩未上报监听地址");
+        assert!(
+            Instant::now() < deadline,
+            "the serve stub did not report its listen address"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }

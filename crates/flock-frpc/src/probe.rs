@@ -1,16 +1,21 @@
-//! 健康探测（docs/design.md §3.9 实现要点：本地隧道口 + frpc admin）。
+//! Health probing (docs/design.md §3.9 implementation notes: local tunnel
+//! port + frpc admin).
 //!
-//! 两条探测路径，互补覆盖「frpc 活着」与「链路真的通」：
+//! Two probe paths, complementarily covering "frpc is alive" and "the link
+//! actually works":
 //!
-//! - **本地隧道口**：TCP 直连 frpc 转发的本地服务口（`local_ip:local_port`）——证明
-//!   本地服务在；不证明 frpc↔frps 注册成功；
-//! - **frpc admin**：HTTP GET `/healthz`（免认证端点，两代同有：原版 v0.71.1
-//!   `client/api_router.go:32`、ChmlFrp v0.51.2 `client/admin.go:38`）——证明 frpc 进程
-//!   的 admin 监听在工作；配置了凭据时附带 basic auth 头（对 `/api/status` 语义成立，
-//!   对 `/healthz` 无害）。
+//! - **Local tunnel port**: a direct TCP connection to the local service port
+//!   frpc forwards to (`local_ip:local_port`) — proves the local service is
+//!   up; does not prove frpc↔frps registration succeeded;
+//! - **frpc admin**: HTTP GET `/healthz` (an unauthenticated endpoint present
+//!   in both generations: original v0.71.1 `client/api_router.go:32`,
+//!   ChmlFrp v0.51.2 `client/admin.go:38`) — proves the frpc process's admin
+//!   listener works; when credentials are configured a basic auth header is
+//!   attached (meaningful for `/api/status` semantics, harmless for
+//!   `/healthz`).
 //!
-//! 进程存活本身由 [`crate::supervisor`] 的状态机跟踪（Running/Backoff/Stopped），
-//! 三者合成 `RelayStatus`。
+//! Process liveness itself is tracked by [`crate::supervisor`]'s state
+//! machine (Running/Backoff/Stopped); the three combine into `RelayStatus`.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -19,32 +24,35 @@ use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// frpc admin 探测目标。
+/// frpc admin probe target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdminEndpoint {
-    /// admin 监听地址（`admin_addr:admin_port` / `webServer.addr:webServer.port`）。
+    /// Admin listen address (`admin_addr:admin_port` /
+    /// `webServer.addr:webServer.port`).
     pub addr: SocketAddr,
-    /// basic auth 用户（v0.51.2 `admin_user` / v0.71.1 `webServer.user`）。
+    /// basic auth user (v0.51.2 `admin_user` / v0.71.1 `webServer.user`).
     pub user: Option<String>,
-    /// basic auth 密码。
+    /// basic auth password.
     pub password: Option<String>,
 }
 
-/// 一路中继的探测目标集（都可选——配置里没有就探不了，如实呈现）。
+/// The probe-target set of one relay (both optional — if not configured,
+/// there is nothing to probe; report honestly).
 #[derive(Clone, Debug, Default)]
 pub struct ProbeTargets {
     pub admin: Option<AdminEndpoint>,
     pub local_tunnel: Option<SocketAddr>,
 }
 
-/// 单项探测结果。
+/// A single probe result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProbeResult {
     Ok,
     Err(String),
 }
 
-/// 一次探测的报告快照（由 [`crate::supervisor`] 周期任务写入 `RelayStatus`）。
+/// A snapshot of one probe round (written into `RelayStatus` by
+/// [`crate::supervisor`]'s periodic task).
 #[derive(Clone, Debug)]
 pub struct ProbeReport {
     pub at: Instant,
@@ -53,7 +61,8 @@ pub struct ProbeReport {
 }
 
 impl ProbeReport {
-    /// 两路都 Ok（或未配置的路视为不适用，不算失败——探不了 ≠ 不健康）。
+    /// Both paths Ok (unconfigured paths count as not applicable, not
+    /// failure — cannot probe ≠ unhealthy).
     pub fn all_ok(&self) -> bool {
         self.admin
             .as_ref()
@@ -67,7 +76,8 @@ impl ProbeReport {
     }
 }
 
-/// 执行一轮探测（每项独立超时；单项失败不影响另一项）。
+/// Run one round of probes (each item with its own timeout; one item failing
+/// does not affect the other).
 pub async fn run_probes(targets: &ProbeTargets, timeout: Duration) -> ProbeReport {
     let admin = match &targets.admin {
         Some(ep) => Some(probe_admin(ep, timeout).await),
@@ -84,19 +94,20 @@ pub async fn run_probes(targets: &ProbeTargets, timeout: Duration) -> ProbeRepor
     }
 }
 
-/// TCP 直连探测。
+/// Direct TCP connection probe.
 pub async fn probe_tcp(addr: SocketAddr, timeout: Duration) -> ProbeResult {
     match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
         Ok(Ok(_)) => ProbeResult::Ok,
         Ok(Err(e)) => ProbeResult::Err(format!("connect {addr}: {e}")),
-        Err(_) => ProbeResult::Err(format!("connect {addr}: 超时 {timeout:?}")),
+        Err(_) => ProbeResult::Err(format!("connect {addr}: timed out {timeout:?}")),
     }
 }
 
-/// frpc admin 探测：HTTP/1.0 GET `/healthz`，期待 `200` 状态行。
+/// frpc admin probe: HTTP/1.0 GET `/healthz`, expecting a `200` status line.
 ///
-/// 不引入 HTTP 客户端依赖——admin API 是本机回环上的单端点，手写最小请求即可
-/// （真 HTTP 客户端的代理/环境变量嗅探反而是这里的干扰面）。
+/// No HTTP client dependency — the admin API is a single endpoint on the
+/// machine's loopback; a hand-written minimal request suffices (a real HTTP
+/// client's proxy/environment sniffing is an interference surface here).
 pub async fn probe_admin(ep: &AdminEndpoint, timeout: Duration) -> ProbeResult {
     let fut = async {
         let mut stream = TcpStream::connect(ep.addr)
@@ -122,7 +133,7 @@ pub async fn probe_admin(ep: &AdminEndpoint, timeout: Duration) -> ProbeResult {
             .map_err(|e| e.to_string())?;
         let head = String::from_utf8_lossy(&buf);
         let status = head.lines().next().unwrap_or_default();
-        // "HTTP/1.x 200 ..." → 2xx 即健康
+        // "HTTP/1.x 200 ..." → any 2xx is healthy
         if status
             .split_whitespace()
             .nth(1)
@@ -131,13 +142,16 @@ pub async fn probe_admin(ep: &AdminEndpoint, timeout: Duration) -> ProbeResult {
         {
             Ok(())
         } else {
-            Err(format!("admin {}/healthz 应答非 2xx: {status:?}", ep.addr))
+            Err(format!(
+                "admin {}/healthz non-2xx response: {status:?}",
+                ep.addr
+            ))
         }
     };
     match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(())) => ProbeResult::Ok,
         Ok(Err(e)) => ProbeResult::Err(e),
-        Err(_) => ProbeResult::Err(format!("admin {}: 超时 {timeout:?}", ep.addr)),
+        Err(_) => ProbeResult::Err(format!("admin {}: timed out {timeout:?}", ep.addr)),
     }
 }
 
@@ -172,7 +186,7 @@ mod tests {
             probe_tcp(addr, Duration::from_secs(2)).await,
             ProbeResult::Ok
         );
-        // 关闭的端口：找一个几乎必然未监听的口
+        // A closed port: find one almost certainly not listening.
         let probe = probe_tcp("127.0.0.1:1".parse().unwrap(), Duration::from_secs(2)).await;
         assert!(matches!(probe, ProbeResult::Err(_)));
     }
@@ -204,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_admin_timeout() {
-        // 建连后不回应 → 超时
+        // Accepts the connection but never answers → timeout.
         let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = ln.local_addr().unwrap();
         tokio::spawn(async move {
@@ -217,6 +231,6 @@ mod tests {
             password: None,
         };
         let r = probe_admin(&ep, Duration::from_millis(300)).await;
-        assert!(matches!(r, ProbeResult::Err(m) if m.contains("超时")));
+        assert!(matches!(r, ProbeResult::Err(m) if m.contains("timed out")));
     }
 }
