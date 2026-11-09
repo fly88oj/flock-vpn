@@ -1,38 +1,52 @@
-//! 名册组装与渲染（M7 §7-M7.7）：`PeerRow = PeerInfo + latency + self` → 表格/--json。
+//! Roster assembly and rendering (M7 §7-M7.7): `PeerRow = PeerInfo +
+//! latency + self` → table/--json.
 //!
-//! 状态列三态：`在线`（roster `online`）/ `离线`（Device 型）/ `服务未运行`
-//!（Server 型离线——中继/服务器本体不在，与设备「离线」可区分）。离线行延迟列
-//! `—`（不探测——离线无探测语义；online 非自身行探测失败也是 `—`）。
+//! Status column has three states: `online` (roster `online`) / `offline`
+//! (Device kind) / `service not running` (Server kind offline — the
+//! relay/server itself is absent, distinguishable from a device being
+//! "offline"). Offline rows show `—` in the latency column (not probed — no
+//! probing semantics while offline; online non-self rows that fail probing
+//! also show `—`).
+//!
+//! The table renders through the [`crate::lang`] pack (interactive CLI
+//! copy); the `--json` output is a fixed English machine format.
 
 use std::net::Ipv4Addr;
 
 use flock_protocol::roster::{PeerInfo, PeerKind};
 
+use crate::lang::{Key, Lang};
 use crate::ping::{probe_latency, Pinger};
 
-/// 增强名册行（IPC `Peers` 响应载荷）。
+/// Enhanced roster row (IPC `Peers` response payload).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerRow {
     pub info: PeerInfo,
-    /// 中位 RTT（ms）；离线/探测失败 ⇒ None。
+    /// Median RTT (ms); offline/probe failure ⇒ None.
     pub latency_ms: Option<u32>,
-    /// 本机行（名册含自身——CLI 以 `(self)` 标注、不探测）。
+    /// This-machine row (the roster includes self — the CLI marks it with
+    /// `(self)` and does not probe it).
     pub self_flag: bool,
 }
 
-/// 组装增强名册：self 标注（VIP 比对）+ 对 online 非自身行**并发**探测。
+/// Assemble the enhanced roster: self marking (VIP comparison) + concurrent
+/// probing of online non-self rows.
 ///
-/// `self_vip: None` 降级档（评审项 8 说明）：服务装配恒 `Some`（daemon 启动即
-/// resolve_vip），None 仅测试/异常注入面可达——无 VIP 可比对 ⇒ **无行可标
-/// `(self)`，本机行按普通 online 行被探测**：本机 VIP 是本机本地地址，ICMP echo
-/// 由本机协议栈本地应答（不经 tun），延迟列显示 ~0ms——显示语义降级（自身行不
-/// 标注、延迟列失真为 ~0）而非功能错误，CLI 仍可用。
+/// `self_vip: None` degraded mode (review item 8 note): the service assembly
+/// is always `Some` (the daemon resolves the VIP at startup); None is
+/// reachable only via test/abnormal injection — with no VIP to compare, **no
+/// row can be marked `(self)` and the local row gets probed as an ordinary
+/// online row**: the local VIP is a local address of this machine, so the
+/// ICMP echo is answered locally by the machine's own stack (not through
+/// tun), and the latency column shows ~0ms — a display-semantics degradation
+/// (self row unmarked, latency column distorted to ~0) rather than a
+/// functional error; the CLI remains usable.
 pub async fn assemble_rows(
     peers: Vec<PeerInfo>,
     self_vip: Option<Ipv4Addr>,
     pinger: Option<&dyn Pinger>,
 ) -> Vec<PeerRow> {
-    // 行标注先行（探测目标收集）。
+    // Row marking first (probe-target collection).
     let mut rows: Vec<PeerRow> = peers
         .into_iter()
         .map(|info| {
@@ -45,9 +59,10 @@ pub async fn assemble_rows(
         })
         .collect();
     let Some(pinger) = pinger else {
-        return rows; // 无探测权限/未装配——延迟列全 None（CLI 照常渲染）
+        return rows; // no probe privilege / not assembled — latency column all None (CLI renders as usual)
     };
-    // 并发探测（每目标内部 3 探针顺序——§7-M7.7「对 online 且非自身的 VIP 并发」）。
+    // Concurrent probing (3 sequential probes per target internally —
+    // §7-M7.7 "concurrent against online, non-self VIPs").
     let mut probes = Vec::with_capacity(rows.len());
     for r in &rows {
         if r.info.online && !r.self_flag {
@@ -68,15 +83,16 @@ pub async fn assemble_rows(
 }
 
 // ============================================================================
-// 表格渲染（对齐列；char 计宽——CJK 主机名列不严格对齐，OS 主机名常态 ASCII）
+// Table rendering (aligned columns; char-counted widths — a CJK hostname
+// column will not be strictly aligned, but OS hostnames are usually ASCII)
 // ============================================================================
 
-/// 状态列文本（三态）。
-fn status_text(info: &PeerInfo) -> &'static str {
+/// Status-column text (three states), localized.
+fn status_text(info: &PeerInfo, lang: Lang) -> &'static str {
     match (info.kind, info.online) {
-        (_, true) => "在线",
-        (PeerKind::Device, false) => "离线",
-        (PeerKind::Server, false) => "服务未运行",
+        (_, true) => lang.tr(Key::PeersStatusOnline),
+        (PeerKind::Device, false) => lang.tr(Key::PeersStatusOffline),
+        (PeerKind::Server, false) => lang.tr(Key::PeersStatusServerDown),
     }
 }
 
@@ -87,20 +103,21 @@ fn type_text(kind: PeerKind) -> &'static str {
     }
 }
 
-/// 表格渲染：`VIP｜主机名｜账户｜类型｜状态｜延迟(ms)｜↓流量(B/s)｜↑流量(B/s)`；
-/// 离线延迟 `—`；自身行主机名后缀 `(self)`。
-pub fn render_table(rows: &[PeerRow]) -> String {
+/// Table rendering: `VIP | Hostname | Account | Type | Status | Latency(ms)
+/// | Down(B/s) | Up(B/s)`; offline latency `—`; self rows get a `(self)`
+/// hostname suffix. Interactive copy goes through the language pack.
+pub fn render_table(rows: &[PeerRow], lang: Lang) -> String {
     let headers = [
         "VIP",
-        "主机名",
-        "账户",
-        "类型",
-        "状态",
-        "延迟(ms)",
-        "↓流量(B/s)",
-        "↑流量(B/s)",
+        lang.tr(Key::PeersHdrHostname),
+        lang.tr(Key::PeersHdrAccount),
+        lang.tr(Key::PeersHdrType),
+        lang.tr(Key::PeersHdrStatus),
+        lang.tr(Key::PeersHdrLatency),
+        lang.tr(Key::PeersHdrDown),
+        lang.tr(Key::PeersHdrUp),
     ];
-    // 每行单元格（char 计宽）。
+    // Per-row cells (char-counted widths).
     let cells: Vec<Vec<String>> = rows
         .iter()
         .map(|r| {
@@ -113,7 +130,7 @@ pub fn render_table(rows: &[PeerRow]) -> String {
                 },
                 r.info.owner.clone(),
                 type_text(r.info.kind).to_string(),
-                status_text(&r.info).to_string(),
+                status_text(&r.info, lang).to_string(),
                 match r.latency_ms {
                     Some(ms) => ms.to_string(),
                     None => "—".into(),
@@ -154,17 +171,18 @@ fn push_padded(out: &mut String, cells: &[&str], widths: &[usize]) {
             out.push(' ');
         }
     }
-    // 去行尾填充空格。
+    // Trim trailing padding spaces on the line.
     while out.ends_with(' ') {
         out.pop();
     }
 }
 
 // ============================================================================
-// --json 机读档（字段全集 + 原始值；消费方：编排/面板）
+// --json machine-readable form (full field set + raw values; consumers:
+// orchestration/panels)
 // ============================================================================
 
-/// JSON 行形状（snake_case；延迟 null = 离线/未探测）。
+/// JSON row shape (snake_case; latency null = offline/not probed).
 #[derive(serde::Serialize)]
 pub struct PeerJson<'a> {
     pub vip: String,
@@ -179,7 +197,8 @@ pub struct PeerJson<'a> {
     pub is_self: bool,
 }
 
-/// `--json` 输出（数组；解析失败即 CLI 错误）。
+/// `--json` output (array; a parse failure becomes a CLI error). Fixed
+/// English machine format — deliberately not localized.
 pub fn render_json(rows: &[PeerRow]) -> Result<String, String> {
     let arr: Vec<PeerJson> = rows
         .iter()
@@ -200,7 +219,8 @@ pub fn render_json(rows: &[PeerRow]) -> Result<String, String> {
 }
 
 // ============================================================================
-// 单元测试：表格渲染全分支 + 组装（mock pinger）+ JSON 可解析
+// Unit tests: all table-rendering branches + assembly (mock pinger) + JSON
+// parseability
 // ============================================================================
 
 #[cfg(test)]
@@ -220,8 +240,9 @@ mod tests {
         }
     }
 
-    /// 三态 + 延迟/自身全分支：在线有延迟、离线 `—`、Server 离线 = 服务未运行、
-    /// 自身标注、列对齐（各列宽 ≥ 表头）。
+    /// Three states + all latency/self branches: online with latency,
+    /// offline `—`, Server offline = service not running, self marking,
+    /// column alignment (each column width ≥ header). Default (en) copy.
     #[test]
     fn render_table_all_status_branches() {
         let rows = vec![
@@ -232,7 +253,7 @@ mod tests {
             },
             PeerRow {
                 info: row([100, 64, 0, 11], "box-a", "alice", PeerKind::Device, true),
-                latency_ms: None, // 在线但探测失败（容错档）
+                latency_ms: None, // online but probing failed (tolerant mode)
                 self_flag: true,
             },
             PeerRow {
@@ -246,38 +267,83 @@ mod tests {
                 self_flag: false,
             },
         ];
-        let table = render_table(&rows);
+        let table = render_table(&rows, Lang::En);
         let lines: Vec<&str> = table.lines().collect();
-        assert_eq!(lines.len(), 6, "表头 + 分隔线 + 4 行");
+        assert_eq!(lines.len(), 6, "header + separator + 4 rows");
         assert!(
             lines[0].contains("VIP")
-                && lines[0].contains("主机名")
-                && lines[0].contains("↓流量(B/s)")
+                && lines[0].contains("Hostname")
+                && lines[0].contains("Down(B/s)")
         );
-        // 分支断言。
+        // Branch assertions.
         assert!(
-            lines[2].contains("在线") && lines[2].contains("3"),
-            "在线 server + 延迟 3"
+            lines[2].contains("online") && lines[2].contains("3"),
+            "online server + latency 3"
         );
-        assert!(lines[3].contains("box-a(self)"), "自身标注");
+        assert!(lines[3].contains("box-a(self)"), "self marking");
         assert!(
-            lines[3].contains("在线") && lines[3].contains("—"),
-            "在线但未探测 ⇒ 延迟 —"
+            lines[3].contains("online") && lines[3].contains("—"),
+            "online but not probed ⇒ latency —"
         );
         assert!(
-            lines[4].contains("离线") && lines[4].contains("—"),
-            "离线设备 ⇒ 离线 + —"
+            lines[4].contains("offline") && lines[4].contains("—"),
+            "offline device ⇒ offline + —"
         );
-        assert!(lines[5].contains("服务未运行"), "Server 离线 ⇒ 服务未运行");
-        // 对齐：数据行同列起止一致（char 计宽下的定长列）。
+        assert!(
+            lines[5].contains("service not running"),
+            "offline Server ⇒ service not running"
+        );
+        // Alignment: data rows share the same column start (fixed-width
+        // columns under char counting).
         let vip_starts: Vec<usize> = lines[2..]
             .iter()
             .map(|l| l.find("100.64").unwrap())
             .collect();
-        assert!(vip_starts.windows(2).all(|w| w[0] == w[1]), "VIP 列对齐");
+        assert!(
+            vip_starts.windows(2).all(|w| w[0] == w[1]),
+            "VIP column aligned"
+        );
     }
 
-    /// 组装：并发探测仅作用于 online 非自身行（mock 全 42ms）；离线行不探测。
+    /// zh pack renders the same table shape with Chinese headers/status
+    /// (interactive copy follows `[general] language`). Asserted against the
+    /// pack entries themselves — the pack's own content lives (and is
+    /// literal-checked) in `lang::tests`; no Chinese literals here.
+    #[test]
+    fn render_table_zh_pack_headers_and_status() {
+        let zh = Lang::Zh;
+        let rows = vec![
+            PeerRow {
+                info: row([100, 64, 0, 1], "frps:27500", "1", PeerKind::Server, true),
+                latency_ms: Some(3),
+                self_flag: false,
+            },
+            PeerRow {
+                info: row([100, 64, 0, 2], "frps-b", "2", PeerKind::Server, false),
+                latency_ms: None,
+                self_flag: false,
+            },
+        ];
+        let table = render_table(&rows, zh);
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(
+            lines[0].contains(zh.tr(Key::PeersHdrHostname))
+                && lines[0].contains(zh.tr(Key::PeersHdrDown))
+        );
+        assert!(
+            lines[2].contains(zh.tr(Key::PeersStatusOnline)),
+            "online server"
+        );
+        assert!(
+            lines[3].contains(zh.tr(Key::PeersStatusServerDown)),
+            "offline Server ⇒ service-not-running status text"
+        );
+        // Localization actually switched (en and zh tables differ).
+        assert_ne!(table, render_table(&rows, Lang::En));
+    }
+
+    /// Assembly: concurrent probing applies only to online non-self rows
+    /// (mock returns 42ms for all); offline rows are not probed.
     struct FixedPinger(Option<u32>);
     impl Pinger for FixedPinger {
         fn rtt(
@@ -304,11 +370,15 @@ mod tests {
         ];
         let pinger = FixedPinger(Some(42));
         let rows = assemble_rows(peers, Some("100.64.0.11".parse().unwrap()), Some(&pinger)).await;
-        assert_eq!(rows[0].latency_ms, Some(42), "online 非自身 ⇒ 探测值");
-        assert!(rows[1].self_flag, "VIP 比对 ⇒ self");
-        assert_eq!(rows[1].latency_ms, None, "自身不探测");
-        assert_eq!(rows[2].latency_ms, None, "离线不探测");
-        // 无 pinger（无特权档）⇒ 全 None 但行完整。
+        assert_eq!(
+            rows[0].latency_ms,
+            Some(42),
+            "online non-self ⇒ probed value"
+        );
+        assert!(rows[1].self_flag, "VIP comparison ⇒ self");
+        assert_eq!(rows[1].latency_ms, None, "self not probed");
+        assert_eq!(rows[2].latency_ms, None, "offline not probed");
+        // No pinger (unprivileged mode) ⇒ all None but rows complete.
         let rows2 = assemble_rows(
             vec![row([100, 64, 0, 1], "srv", "1", PeerKind::Server, true)],
             None,
@@ -318,7 +388,7 @@ mod tests {
         assert_eq!(rows2[0].latency_ms, None);
     }
 
-    /// JSON 可解析 + 字段语义（离线延迟 null）。
+    /// JSON parseable + field semantics (offline latency null).
     #[test]
     fn render_json_parses_with_null_latency() {
         let rows = vec![

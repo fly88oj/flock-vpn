@@ -1,18 +1,27 @@
-//! 接入器（docs/design.md §2.3 / §3.12）：端点列表 → TCP 拨号 → `session::initiate`
-//! （带 [`ServerPin`]）；断线指数退避（5s 起 + 抖动，wireguard-go RekeyTimeout 节奏，
-//! crypto-2026 §6）+ 端点轮询切换。
+//! Connector (docs/design.md §2.3 / §3.12): endpoint list → TCP dial →
+//! `session::initiate` (with [`ServerPin`]); disconnect backoff is exponential
+//! (5s base + jitter, wireguard-go RekeyTimeout cadence, crypto-2026 §6) with
+//! endpoint rotation.
 //!
-//! - 身份三件套（state 目录常驻）：设备静态密钥 `device.keys`（0600）、钉扎
-//!   `pins.bin`（[`PinStore`]，cluster_id → 集群根公钥）、根签目录 `directory.bin`
-//!   （[`ClusterDirectory`]——端点列表与凭证同签一份，§1.3.3f 方案②）。
-//! - 邀请文件（`invite` 子命令）：v3 结构校验（根签）→ 过期检查 → 钉扎比对
-//!   （变更 ⇒ 显式告警错误，**不静默**）→ `record_directory`（版本回退拒收）。
-//! - 端点轮询：每次连接尝试取目录下一端点（Direct 直连地址或 Frp 中转用户口，
-//!   对客户端无感知差异，§2.1）；任意端点均 1-RTT（钉扎材料齐全，§1.3.3c）。
+//! - Identity trio (resident in the state directory): device static keys
+//!   `device.keys` (0600), pins `pins.bin` ([`PinStore`], cluster_id →
+//!   cluster root public key), root-signed directory `directory.bin`
+//!   ([`ClusterDirectory`] — endpoint list and credentials signed as one,
+//!   §1.3.3f option ②).
+//! - Invite file (the `invite` subcommand): v3 structural verification (root
+//!   signature) → expiry check → pin comparison (change ⇒ explicit warning
+//!   error, **never silent**) → `record_directory` (version rollback
+//!   rejected).
+//! - Endpoint rotation: each connection attempt takes the next endpoint from
+//!   the directory (a Direct connect address or an Frp relay user port —
+//!   indistinguishable to the client, §2.1); any endpoint is 1-RTT (pinning
+//!   material complete, §1.3.3c).
 //!
-//! 控制流业务（OPAQUE 登录/票据/dir_pull 定期刷新）沿 M2 控制协议（§2.2），属
-//! 后续里程碑装配；M3 数据面会话保持「首流 = 控制流」的排序契约（见
-//! [`lib`]/server 分派），为该业务留位。
+//! Control-stream business (OPAQUE login/tickets/dir_pull periodic refresh)
+//! follows the M2 control protocol (§2.2) and is assembled in later
+//! milestones; the M3 data plane keeps the "first stream = control stream"
+//! ordering contract (see [`lib`]/server dispatch), reserving room for that
+//! business.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -31,29 +40,32 @@ use crate::ctrl::ControlPlane;
 use crate::dataplane;
 use crate::tun::TunIo;
 
-/// 断线重连退避：5s 起步（§2.3），倍增，封顶 60s。
+/// Disconnect-reconnect backoff: 5s base (§2.3), doubling, capped at 60s.
 pub const BACKOFF_BASE: Duration = Duration::from_secs(5);
-/// 退避封顶。
+/// Backoff cap.
 pub const BACKOFF_CAP: Duration = Duration::from_secs(60);
-/// 抖动上限比例（+0..25%：避开多客户端同频重连风暴）。
+/// Jitter ceiling fraction (+0..25%: avoids synchronized reconnect storms
+/// across clients).
 pub const BACKOFF_JITTER: f64 = 0.25;
-/// 单端点拨号超时（TCP connect + 握手整体；超时即换下一端点轮询）。
+/// Per-endpoint dial timeout (TCP connect + handshake as a whole; on timeout
+/// rotate to the next endpoint).
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 
 // ============================================================================
-// 错误
+// Errors
 // ============================================================================
 
-/// 客户端装配/接入错误。
+/// Client assembly/connection error.
 #[derive(Debug)]
 pub enum ClientError {
     Io(io::Error),
     Session(flock_protocol::session::SessionError),
     Trust(TrustError),
-    /// 拨号超时（TCP connect + 握手整体超出 [`DIAL_TIMEOUT`]；R1 黑洞等静默对端）。
-    /// 携带目标端点。
+    /// Dial timeout (TCP connect + handshake together exceeded
+    /// [`DIAL_TIMEOUT`]; R1 black hole and other silent peers). Carries the
+    /// target endpoint.
     DialTimeout(String),
-    /// 状态目录/配置问题（消息自带上下文）。
+    /// State-directory/config problem (message carries its own context).
     State(String),
 }
 
@@ -66,7 +78,7 @@ impl std::fmt::Display for ClientError {
             ClientError::DialTimeout(ep) => {
                 write!(
                     f,
-                    "client: 拨号超时（connect+握手 > {DIAL_TIMEOUT:?}）: {ep}"
+                    "client: dial timeout (connect+handshake > {DIAL_TIMEOUT:?}): {ep}"
                 )
             }
             ClientError::State(m) => write!(f, "client: {m}"),
@@ -104,36 +116,39 @@ impl From<flock_protocol::session::SessionError> for ClientError {
 }
 
 // ============================================================================
-// 状态目录（身份三件套）
+// State directory (identity trio)
 // ============================================================================
 
-/// 客户端本地状态（state 目录三件套）。
+/// Client local state (the state-directory trio).
 #[derive(Debug)]
 pub struct ClientState {
-    /// 设备静态密钥（生成后永不出机，§2.4）。
+    /// Device static keys (never leave the machine once generated, §2.4).
     pub device: DeviceStaticKeys,
-    /// 钉扎存储（cluster_id → 集群根公钥）。
+    /// Pin store (cluster_id → cluster root public key).
     pub pins: PinStore,
-    /// 根签集群目录（端点列表 + 全套接入材料）。
+    /// Root-signed cluster directory (endpoint list + the full set of
+    /// connection material).
     pub directory: ClusterDirectory,
 }
 
 const DEVICE_KEYS: &str = "device.keys";
 const PINS: &str = "pins.bin";
 const DIRECTORY: &str = "directory.bin";
-/// VIP 文件（部署编排写入；config.vip 为空时读它）。
+/// VIP file (written by deployment orchestration; read when config.vip is
+/// absent).
 pub const VIP_FILE: &str = "vip";
 
 impl ClientState {
-    /// 载入设备密钥；`create = true` 时缺失即生成并落盘（0600，unix）。
-    /// （`gen-keys` 先于 `invite` 运行的部署序：密钥不依赖目录存在。）
+    /// Load the device keys; with `create = true`, generate and persist them
+    /// when missing (0600, unix). (The deployment order runs `gen-keys`
+    /// before `invite`: keys do not depend on the directory existing.)
     pub fn load_keys(state_dir: &Path, create: bool) -> Result<DeviceStaticKeys, ClientError> {
         let keys_path = state_dir.join(DEVICE_KEYS);
         match std::fs::read(&keys_path) {
             Ok(b) => {
                 let arr: [u8; 64] = b
                     .try_into()
-                    .map_err(|_| ClientError::State("device.keys 期望 64B".into()))?;
+                    .map_err(|_| ClientError::State("device.keys: expected 64B".into()))?;
                 Ok(DeviceStaticKeys::from_bytes(&arr))
             }
             Err(_) if create => {
@@ -145,34 +160,39 @@ impl ClientState {
                 Ok(d)
             }
             Err(e) => Err(ClientError::State(format!(
-                "读 {}: {e}（先运行 gen-keys/invite 引导）",
+                "read {}: {e} (run gen-keys/invite bootstrap first)",
                 keys_path.display()
             ))),
         }
     }
 
-    /// 载入完整状态（设备密钥 + 钉扎 + 目录；`create` 同 [`Self::load_keys`]）。
+    /// Load the full state (device keys + pins + directory; `create` as in
+    /// [`Self::load_keys`]).
     pub fn load(state_dir: &Path, create: bool) -> Result<Self, ClientError> {
         let device = Self::load_keys(state_dir, create)?;
         let pins = match std::fs::read(state_dir.join(PINS)) {
             Ok(b) => PinStore::from_bytes(&b)
-                .map_err(|e| ClientError::State(format!("pins.bin 解析: {e}")))?,
+                .map_err(|e| ClientError::State(format!("pins.bin parse: {e}")))?,
             Err(_) => PinStore::new(),
         };
-        let directory = match std::fs::read(state_dir.join(DIRECTORY)) {
-            Ok(b) => ClusterDirectory::from_bytes(&b)
-                .map_err(|e| ClientError::State(format!("directory.bin 解析: {e}")))?,
-            Err(_) => {
-                return Err(ClientError::State(
-                    "无根签目录（先运行 `flock-client invite <file>` 引导，§1.3.3f）".into(),
-                ))
-            }
-        };
-        // 状态一致性告警（显式，不静默）：有 directory.bin 但该集群的 pins 丢失
-        //（pins.bin 残缺/未随目录同步）⇒ pin_for 恒 None，supervise 全端点退避空转。
+        let directory =
+            match std::fs::read(state_dir.join(DIRECTORY)) {
+                Ok(b) => ClusterDirectory::from_bytes(&b)
+                    .map_err(|e| ClientError::State(format!("directory.bin parse: {e}")))?,
+                Err(_) => return Err(ClientError::State(
+                    "no root-signed directory (run `flock-client invite <file>` bootstrap first, \
+                     §1.3.3f)"
+                        .into(),
+                )),
+            };
+        // State-consistency warning (explicit, not silent): directory.bin
+        // present but the pins for its cluster are missing (pins.bin
+        // incomplete/not synced with the directory) ⇒ pin_for always None and
+        // supervise spins in backoff across all endpoints.
         if pins.pinned_root(&directory.cluster_id).is_none() {
             eprintln!(
-                "flock-client: 告警：directory.bin 存在但集群 {} 无钉扎（pins.bin 丢失或未同步）——重跑 `flock-client invite <file>` 修复",
+                "flock-client: warning: directory.bin exists but cluster {} has no pin \
+                 (pins.bin missing or out of sync) — re-run `flock-client invite <file>` to repair",
                 hex::encode(directory.cluster_id.0)
             );
         }
@@ -183,20 +203,20 @@ impl ClientState {
         })
     }
 
-    /// 落盘三件套。
+    /// Persist the trio.
     pub fn save(&self, state_dir: &Path) -> Result<(), ClientError> {
         std::fs::create_dir_all(state_dir)
             .map_err(|e| ClientError::State(format!("mkdir {}: {e}", state_dir.display())))?;
         write_keys(state_dir, &self.device)?;
         self.pins
             .save(&state_dir.join(PINS))
-            .map_err(|e| ClientError::State(format!("写 pins.bin: {e}")))?;
+            .map_err(|e| ClientError::State(format!("write pins.bin: {e}")))?;
         std::fs::write(state_dir.join(DIRECTORY), self.directory.to_bytes())
-            .map_err(|e| ClientError::State(format!("写 directory.bin: {e}")))?;
+            .map_err(|e| ClientError::State(format!("write directory.bin: {e}")))?;
         Ok(())
     }
 
-    /// 端点列表（目录序，去重）。
+    /// Endpoint list (directory order, deduplicated).
     pub fn endpoints(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for e in &self.directory.servers {
@@ -207,7 +227,8 @@ impl ClientState {
         out
     }
 
-    /// 目标端点的接入 pin（集群根 = 钉扎；未钉扎 ⇒ None，调用方先引导）。
+    /// Connection pin for a target endpoint (cluster root = the pin; not
+    /// pinned ⇒ None, the caller bootstraps first).
     pub fn pin_for(&self, endpoint: &str) -> Option<ServerPin> {
         let root = self.pins.pinned_root(&self.directory.cluster_id)?;
         let entry = self
@@ -222,7 +243,7 @@ impl ClientState {
         })
     }
 
-    /// 本端 VIP（config 覆盖或 state 目录 `vip` 文件）。
+    /// Local VIP (config override or the state directory's `vip` file).
     pub fn resolve_vip(
         &self,
         state_dir: &Path,
@@ -231,18 +252,21 @@ impl ClientState {
         if let Some(v) = cfg_vip {
             return Ok(v);
         }
-        let text = std::fs::read_to_string(state_dir.join(VIP_FILE))
-            .map_err(|e| ClientError::State(format!("读 {} : {e}（部署须写入 VIP）", VIP_FILE)))?;
+        let text = std::fs::read_to_string(state_dir.join(VIP_FILE)).map_err(|e| {
+            ClientError::State(format!(
+                "read {VIP_FILE}: {e} (deployment must write the VIP)"
+            ))
+        })?;
         text.trim()
             .parse()
-            .map_err(|e| ClientError::State(format!("{VIP_FILE} 内容非 IPv4：{e}")))
+            .map_err(|e| ClientError::State(format!("{VIP_FILE} is not an IPv4: {e}")))
     }
 }
 
-/// 设备密钥落盘（0600，unix）。
+/// Persist the device keys (0600, unix).
 fn write_keys(state_dir: &Path, device: &DeviceStaticKeys) -> Result<(), ClientError> {
     std::fs::write(state_dir.join(DEVICE_KEYS), device.to_bytes())
-        .map_err(|e| ClientError::State(format!("写 device.keys: {e}")))?;
+        .map_err(|e| ClientError::State(format!("write device.keys: {e}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -254,8 +278,10 @@ fn write_keys(state_dir: &Path, device: &DeviceStaticKeys) -> Result<(), ClientE
     Ok(())
 }
 
-/// 邀请文件落地（§1.3.3f）：结构验签 → 过期检查 → 钉扎（NotPinned 首钉 / Match 放行 /
-/// Mismatch **显式告警拒绝**）→ `record_directory`（版本回退拒收）→ 落盘三件套。
+/// Invite file ingestion (§1.3.3f): structural signature verification →
+/// expiry check → pinning (NotPinned = first pin / Match = pass / Mismatch =
+/// **explicit warning rejection**) → `record_directory` (version rollback
+/// rejected) → persist the trio.
 pub fn ingest_invite(state_dir: &Path, invite: &InviteFile) -> Result<ClientState, ClientError> {
     invite
         .check(flock_protocol::trust::now_unix())
@@ -263,7 +289,7 @@ pub fn ingest_invite(state_dir: &Path, invite: &InviteFile) -> Result<ClientStat
     let device = ClientState::load_keys(state_dir, true)?;
     let mut pins = match std::fs::read(state_dir.join(PINS)) {
         Ok(b) => PinStore::from_bytes(&b)
-            .map_err(|e| ClientError::State(format!("pins.bin 解析: {e}")))?,
+            .map_err(|e| ClientError::State(format!("pins.bin parse: {e}")))?,
         Err(_) => PinStore::new(),
     };
     match pins.verify_pinned(&invite.directory.cluster_id, &invite.cluster_root_pub) {
@@ -277,7 +303,7 @@ pub fn ingest_invite(state_dir: &Path, invite: &InviteFile) -> Result<ClientStat
                 pinned: Box::new(
                     pins.pinned_root(&invite.directory.cluster_id)
                         .copied()
-                        .expect("Mismatch ⇒ 必有旧值"),
+                        .expect("Mismatch ⇒ an old value exists"),
                 ),
                 presented: Box::new(invite.cluster_root_pub),
             }))
@@ -294,20 +320,26 @@ pub fn ingest_invite(state_dir: &Path, invite: &InviteFile) -> Result<ClientStat
     Ok(state)
 }
 
-/// 端点覆盖（§3.12 配置面；run/service 共用）：仅接受目录内端点（材料必须匹配，
-/// §1.3.3f 端点↔材料同签）；重复项告警并去重（保首次出现序——不去重会让
-/// [`EndpointRing`] 轮询重复拨同一端点）。
+/// Endpoint override (§3.12 config surface; shared by run/service): only
+/// endpoints inside the directory are accepted (material must match —
+/// §1.3.3f endpoint↔material signed together); duplicates warn and are
+/// deduplicated (first-occurrence order preserved — without dedup
+/// [`EndpointRing`] would dial the same endpoint repeatedly).
 pub fn override_endpoints(mut state: ClientState, eps: &[String]) -> Result<ClientState, String> {
     let known = state.endpoints();
     let mut seen: Vec<String> = Vec::new();
     for ep in eps {
         if !known.contains(ep) {
             return Err(format!(
-                "覆盖端点 {ep} 不在根签目录内（端点↔材料同签，拒绝未签名端点）"
+                "override endpoint {ep} is not in the root-signed directory (endpoint↔material \
+                 signed together; unsigned endpoints rejected)"
             ));
         }
         if seen.contains(ep) {
-            eprintln!("flock-client: 配置告警：覆盖端点列表重复项 {ep}（已去重，保留首次出现序）");
+            eprintln!(
+                "flock-client: config warning: duplicate override endpoint {ep} (deduplicated, \
+                 first-occurrence order kept)"
+            );
         } else {
             seen.push(ep.clone());
         }
@@ -328,10 +360,11 @@ pub fn override_endpoints(mut state: ClientState, eps: &[String]) -> Result<Clie
 }
 
 // ============================================================================
-// 退避与端点轮询
+// Backoff and endpoint rotation
 // ============================================================================
 
-/// 指数退避（纯函数可测）：`min(cap, base · 2^attempt)`，叠加 `[0, 25%)` 抖动。
+/// Exponential backoff (pure function, testable): `min(cap, base · 2^attempt)`
+/// plus `[0, 25%)` jitter.
 #[derive(Debug, Clone)]
 pub struct Backoff {
     base: Duration,
@@ -358,12 +391,13 @@ impl Backoff {
         }
     }
 
-    /// 成功后归零。
+    /// Reset after success.
     pub fn reset(&mut self) {
         self.attempt = 0;
     }
 
-    /// 下一次等待（`rnd ∈ [0,1)`；抖动比例 [`BACKOFF_JITTER`]）。返回未抖动的基数步长。
+    /// Next wait (`rnd ∈ [0,1)`; jitter fraction [`BACKOFF_JITTER`]).
+    /// Returns the un-jittered base step.
     pub fn next_jitter(&mut self, rnd: f64) -> Duration {
         let n = self.attempt.min(16);
         self.attempt += 1;
@@ -374,7 +408,8 @@ impl Backoff {
     }
 }
 
-/// 端点轮询（round-robin）：每次连接尝试取下一个端点（§2.3 端点轮询切换）。
+/// Endpoint rotation (round-robin): each connection attempt takes the next
+/// endpoint (§2.3 endpoint rotation).
 #[derive(Debug, Clone)]
 pub struct EndpointRing {
     endpoints: Vec<String>,
@@ -394,7 +429,7 @@ impl EndpointRing {
         self.endpoints.is_empty()
     }
 
-    /// 取下一端点并前进（空 ⇒ None）。
+    /// Take the next endpoint and advance (empty ⇒ None).
     pub fn next_endpoint(&mut self) -> Option<String> {
         if self.endpoints.is_empty() {
             return None;
@@ -406,12 +441,13 @@ impl EndpointRing {
 }
 
 // ============================================================================
-// 拨号与守护循环
+// Dialing and the supervise loop
 // ============================================================================
 
-/// 单次拨号：TCP connect + `session::initiate`（1-RTT，已钉扎形态）**整体**受
-/// [`DIAL_TIMEOUT`] 约束——R1 黑洞（TCP 通、握手不答）时超时换下一端点轮询，
-/// supervise 不因无超时的 `initiate` 永久挂死。
+/// One dial: TCP connect + `session::initiate` (1-RTT, pinned form) bounded
+/// **as a whole** by [`DIAL_TIMEOUT`] — with an R1 black hole (TCP up,
+/// handshake silent) the timeout rotates to the next endpoint, and supervise
+/// cannot hang forever on an un-timed `initiate`.
 pub async fn dial(
     pin: &ServerPin,
     device: &DeviceStaticKeys,
@@ -420,7 +456,8 @@ pub async fn dial(
     dial_with_timeout(pin, device, cfg, DIAL_TIMEOUT).await
 }
 
-/// [`dial`] 的可注入超时档（测试用短超时复现「TCP 通、R1 永不到达」的黑洞形态）。
+/// Timeout-injectable form of [`dial`] (tests reproduce the "TCP up, R1
+/// never arrives" black-hole shape with a short timeout).
 pub async fn dial_with_timeout(
     pin: &ServerPin,
     device: &DeviceStaticKeys,
@@ -437,30 +474,36 @@ pub async fn dial_with_timeout(
     .map_err(|_| ClientError::DialTimeout(pin.entry.relay_endpoint.clone()))?
 }
 
-/// 守护循环事件（日志/断言面：A9 的「检测进入重连」由 [`ConnEvent::SessionEnded`] 携
-/// `dead-link` 原因 + 下一跳时间构成可 grep 的记录；A10 的 rekey 无感由 supervise 内
-/// 纪元观察任务直接打 `flock-client: rekey epoch=N` 日志——`events` 回调非 Send 进
-/// 不了 spawn，纪元行不占事件枚举）。
+/// Supervise-loop event (log/assertion surface: A9's "detected and
+/// reconnecting" is a grep-able record built from [`ConnEvent::SessionEnded`]
+/// carrying the `dead-link` reason + the next-attempt timing; A10's seamless
+/// rekey is logged directly as `flock-client: rekey epoch=N` by the epoch
+/// watcher task inside supervise — the `events` callback is not Send and
+/// cannot enter the spawn, so the epoch line does not occupy the event enum).
 #[derive(Debug)]
 pub enum ConnEvent {
-    /// 正在尝试某端点（attempt 从 1 起）。
+    /// Attempting an endpoint (attempt starts at 1).
     Dialing { endpoint: String, attempt: u32 },
-    /// 隧道建立（server = 对端服务器标识）。
+    /// Tunnel established (server = the peer server identity).
     Connected {
         endpoint: String,
         server: flock_protocol::session::ServerId,
     },
-    /// 数据面结束（reason = 会话层终止原因；None = 通道 IO 错误先于会话判定）。
+    /// Data plane ended (reason = session-layer close reason; None = channel
+    /// IO error ahead of any session verdict).
     SessionEnded {
         endpoint: String,
         reason: Option<CloseReason>,
     },
 }
 
-/// 守护循环：拨号 → 隧道 → tun ↔ PacketChannel 数据面 → 结束即退避重连。
+/// Supervise loop: dial → tunnel → tun ↔ PacketChannel data plane → on end,
+/// backoff and reconnect.
 ///
-/// 永不正常返回（进程生命周期循环）；测试以 `tokio::select!`/abort 终止。
-/// `backoff` 供测试注入小步长；`events` 回调承接 [`ConnEvent`]（进程入口转 eprintln）。
+/// Never returns normally (a process-lifetime loop); tests terminate it via
+/// `tokio::select!`/abort. `backoff` lets tests inject small steps; the
+/// `events` callback receives [`ConnEvent`] (the process entry point turns it
+/// into eprintln).
 pub async fn supervise(
     state: &ClientState,
     tun: &TunIo,
@@ -471,8 +514,10 @@ pub async fn supervise(
     supervise_inner(state, tun, tunnel_cfg, backoff, events, None, None).await
 }
 
-/// [`supervise`] + 纪元观测（§7-M6 service 装配）：连接建立发当前纪元初值，此后每次
-/// rekey 推进都写入 `epoch_tx`（IPC Status 快照的 epoch 源；接收端失联仅忽略）。
+/// [`supervise`] + epoch observation (§7-M6 service assembly): on connection
+/// establishment publish the current epoch's initial value, then forward
+/// every rekey bump into `epoch_tx` (the epoch source of the IPC Status
+/// snapshot; a lost receiver is just ignored).
 pub async fn supervise_with_epoch(
     state: &ClientState,
     tun: &TunIo,
@@ -493,9 +538,12 @@ pub async fn supervise_with_epoch(
     .await
 }
 
-/// [`supervise_with_epoch`] + 控制流共享槽（M7 §7-M7.7 service 装配）：会话建立把控制流
-/// 装入 `plane`（登录保持/名册拉取业务消费），会话结束/毒化即取出；`plane` 的毒化信号
-/// （请求超时——流可能错位）会提前结束数据面进入重连（换新流，不带错位继续）。
+/// [`supervise_with_epoch`] + the control-stream shared slot (M7 §7-M7.7
+/// service assembly): on session establishment the control stream goes into
+/// `plane` (consumed by login keepalive/roster pulls), and comes out on
+/// session end/poisoning; the plane's poison signal (request timeout — the
+/// stream may be misaligned) ends the data plane early and reconnects (a
+/// fresh stream, never continuing misaligned).
 pub async fn supervise_with_control(
     state: &ClientState,
     tun: &TunIo,
@@ -529,14 +577,20 @@ async fn supervise_inner(
     let mut ring = EndpointRing::new(state.endpoints());
     loop {
         let Some(endpoint) = ring.next_endpoint() else {
-            eprintln!("flock-client: 目录无端点，5s 后重查");
+            eprintln!("flock-client: directory has no endpoints, rechecking in 5s");
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         };
         let Some(pin) = state.pin_for(&endpoint) else {
-            // 退避而非忙转（原形态 100% CPU 空转）：无钉扎是持续态（目录在、pins 缺——
-            // 见 ClientState::load 的一致性告警），按端点重查节律 5s 后再试。
-            eprintln!("flock-client: 端点 {endpoint} 无接入材料/未钉扎，5s 后重查");
+            // Back off instead of busy-spinning (the original shape was a
+            // 100% CPU spin): no pin is a persistent state (directory
+            // present, pins missing — see the consistency warning in
+            // ClientState::load); retry after the 5s endpoint-recheck
+            // cadence.
+            eprintln!(
+                "flock-client: endpoint {endpoint} has no connection material / not pinned, \
+                 rechecking in 5s"
+            );
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         };
@@ -547,10 +601,15 @@ async fn supervise_inner(
         });
         match dial(&pin, &state.device, tunnel_cfg.clone()).await {
             Ok(tunnel) => {
-                // 首流 = 控制流（排序契约，见模块文档）：占位并**持有到会话结束**（保序
-                // + 防止过早 Drop 引入的流生命周期变量）；M7 起 service 形态把流装入
-                // ControlPlane 共享槽供登录/名册业务复用（毒化信号 ⇒ 提前重连）。
-                // 控制流打不开 ⇒ 会话已坏，直接走退避（不得让包通道变成首流破坏分派）。
+                // First stream = control stream (ordering contract, see the
+                // module docs): open the placeholder and **hold it until the
+                // session ends** (ordering + avoids a premature-Drop stream
+                // lifetime variable); since M7 the service form installs the
+                // stream into the ControlPlane shared slot for login/roster
+                // business reuse (poison signal ⇒ early reconnect). Control
+                // stream unopenable ⇒ the session is already bad; go
+                // straight to backoff (the packet channel must not become
+                // the first stream and break dispatch).
                 let control = match tunnel.open_stream(flock_protocol::mux::Prio::Control).await {
                     Ok(s) => {
                         let shared = Arc::new(tokio::sync::Mutex::new(s));
@@ -566,7 +625,9 @@ async fn supervise_inner(
                         });
                         tunnel.shutdown().await;
                         let d = backoff.next_jitter(rand::random::<f64>());
-                        eprintln!("flock-client: {d:?} 后重连（控制流开失败）");
+                        eprintln!(
+                            "flock-client: reconnecting in {d:?} (control stream open failed)"
+                        );
                         tokio::time::sleep(d).await;
                         continue;
                     }
@@ -580,8 +641,11 @@ async fn supervise_inner(
                                 server,
                             });
                         }
-                        // rekey 观测（A10）：订阅纪元 watch，每次推进上报（对数据面无感——
-                        // bridge 与本任务并行）。epoch_tx 存在时同步外发（service 快照源）。
+                        // Rekey observation (A10): subscribe to the epoch
+                        // watch, report every bump (invisible to the data
+                        // plane — the bridge runs in parallel with this
+                        // task). When epoch_tx exists, also forward outward
+                        // (the service snapshot source).
                         let mut epoch_rx = tunnel.epoch_watch();
                         if let Some(tx) = &epoch_tx {
                             let _ = tx.send(*epoch_rx.borrow());
@@ -593,7 +657,8 @@ async fn supervise_inner(
                                 if epoch_rx.changed().await.is_err() {
                                     return;
                                 }
-                                // 回调侧只打日志——事件序由 watch 保序。
+                                // The callback side only logs — event order
+                                // is preserved by the watch.
                                 eprintln!(
                                     "flock-client: rekey epoch={} endpoint={ep_for_rekey}",
                                     *epoch_rx.borrow_and_update()
@@ -604,8 +669,10 @@ async fn supervise_inner(
                             }
                         });
                         let mut sess = tun.session();
-                        // M7：控制流毒化（业务请求超时——流错位风险）⇒ 提前结束数据面
-                        // 进入重连（无 plane 形态 select 永不就绪，行为不变）。
+                        // M7: control-stream poisoning (business request
+                        // timeout — misalignment risk) ⇒ end this session's
+                        // data plane early and reconnect (without a plane,
+                        // the select arm never fires; behavior unchanged).
                         let bridge_fut = dataplane::bridge(&mut sess, ch);
                         let bridge_err = tokio::select! {
                             r = bridge_fut => r.err(),
@@ -615,7 +682,7 @@ async fn supervise_inner(
                                     None => std::future::pending::<()>().await,
                                 }
                             } => {
-                                eprintln!("flock-client: 控制流毒化 ⇒ 结束本会话重连");
+                                eprintln!("flock-client: control stream poisoned => ending this session, reconnecting");
                                 None
                             }
                         };
@@ -628,7 +695,7 @@ async fn supervise_inner(
                         if let Some(p) = &plane {
                             p.remove();
                         }
-                        drop(control); // 控制流随会话结束（显式：先于 shutdown 的 FIN 次序）
+                        drop(control); // control stream ends with the session (explicit: FIN order ahead of shutdown)
                         events(ConnEvent::SessionEnded {
                             endpoint: endpoint.clone(),
                             reason,
@@ -636,23 +703,23 @@ async fn supervise_inner(
                         tunnel.shutdown().await;
                     }
                     Err(e) => {
-                        eprintln!("flock-client: 打开包通道失败: {e}");
+                        eprintln!("flock-client: open packet channel failed: {e}");
                         tunnel.shutdown().await;
                     }
                 }
             }
             Err(e) => {
-                eprintln!("flock-client: 拨号失败（attempt {attempt}）: {e}");
+                eprintln!("flock-client: dial failed (attempt {attempt}): {e}");
             }
         }
         let d = backoff.next_jitter(rand::random::<f64>());
-        eprintln!("flock-client: {:?} 后重连（下一端点轮询）", d);
+        eprintln!("flock-client: reconnecting in {d:?} (rotating to the next endpoint)");
         tokio::time::sleep(d).await;
     }
 }
 
 // ============================================================================
-// 单元测试
+// Unit tests
 // ============================================================================
 
 #[cfg(test)]
@@ -692,25 +759,27 @@ mod tests {
         }
     }
 
-    /// 覆盖端点去重（保序）+ 未签名端点拒绝（§1.3.3f 原语义不回归；M6 起
-    /// run/service 共用）。
+    /// Override endpoints: dedup (order-preserving) + unsigned-endpoint
+    /// rejection (§1.3.3f original semantics must not regress; shared by
+    /// run/service since M6).
     #[test]
     fn override_endpoints_dedups_repeats_and_keeps_gate() {
         let state = state_with(&["a:1", "b:2", "c:3"]);
-        // 重复项：去重保首现序。
+        // Duplicates: dedup, first occurrence order kept.
         let eps = vec!["b:2".to_string(), "a:1".to_string(), "b:2".to_string()];
-        let out = override_endpoints(state, &eps).expect("合法覆盖");
+        let out = override_endpoints(state, &eps).expect("valid override");
         assert_eq!(out.endpoints(), vec!["b:2".to_string(), "a:1".to_string()]);
-        // 未签名端点仍拒。
+        // Unsigned endpoints still rejected.
         let state2 = state_with(&["a:1"]);
         let bad = vec!["evil:9".to_string()];
         assert!(
             override_endpoints(state2, &bad).is_err(),
-            "未签名端点必须拒绝"
+            "unsigned endpoints must be rejected"
         );
     }
 
-    /// supervise_with_epoch：连接建立即发纪元初值（IPC Status 快照源语义，§7-M6.2）。
+    /// supervise_with_epoch: publishes the initial epoch on connection
+    /// (IPC Status snapshot-source semantics, §7-M6.2).
     #[tokio::test]
     async fn supervise_with_epoch_publishes_initial_epoch_on_connect() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -746,13 +815,14 @@ mod tests {
             .await;
         });
 
-        // 连接建立 ⇒ 纪元被会话真值覆盖（不再是构造初值 99）。
+        // Connection established ⇒ the epoch is overwritten with the
+        // session's real value (no longer the construction-time 99).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let v = *epoch_rx.borrow();
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "15s 内未见连接纪元（仍 {v}）"
+                "connection epoch not seen within 15s (still {v})"
             );
             if v != 99 {
                 break;
@@ -763,9 +833,12 @@ mod tests {
         tun.shutdown();
     }
 
-    /// 守护循环集成：连接 → 数据面 → 对端拆链 → SessionEnded → 退避 → 重连成功
-    /// （A9 客户端语义「检测进入重连」的宿主可跑对应物；静默死链计时在会话层 M1
-    /// 已由 timer_deadlink_after_3x_keepalive_silence 覆盖，容器 A9 走真实 30s）。
+    /// Supervise-loop integration: connect → data plane → peer kills the
+    /// link → SessionEnded → backoff → successful reconnect (the
+    /// host-runnable counterpart of A9's "detected and reconnecting" client
+    /// semantics; the silent-dead-link timer was already covered at the
+    /// session layer in M1 by timer_deadlink_after_3x_keepalive_silence, the
+    /// container A9 exercises the real 30s).
     #[tokio::test]
     async fn supervise_reconnects_after_session_death() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -813,18 +886,19 @@ mod tests {
             .await;
         });
 
-        // ① 首连 + 数据面回显。
+        // (1) First connection + data-plane echo.
         wait_event(&mut ev_rx, "connected").await;
         mock.inject(b"\x45\x00\x00\x14first");
         wait_written(&mock, 1).await;
         assert_eq!(mock.written()[0], b"\x45\x00\x00\x14first");
 
-        // ② 对端拆全部会话 ⇒ SessionEnded ⇒ 退避 ⇒ 重连。
+        // (2) Peer kills all sessions ⇒ SessionEnded ⇒ backoff ⇒ reconnect.
         peer.kill_sessions();
         wait_event(&mut ev_rx, "ended").await;
         wait_event(&mut ev_rx, "connected").await;
 
-        // ③ 重连后数据面照常（tun 设备常驻复用）。
+        // (3) Data plane works after reconnect (tun device resident and
+        //     reused).
         let base = mock.written().len();
         mock.inject(b"\x45\x00\x00\x14again");
         wait_written(&mock, base + 1).await;
@@ -843,7 +917,7 @@ mod tests {
                         return;
                     }
                 }
-                _ => panic!("15s 内未见事件 {needle:?}"),
+                _ => panic!("event {needle:?} not seen within 15s"),
             }
         }
     }
@@ -855,19 +929,22 @@ mod tests {
         }
         assert!(
             mock.written().len() >= n,
-            "写侧未达 {n}（现 {}）",
+            "write side did not reach {n} (now {})",
             mock.written().len()
         );
     }
 
-    /// 回归（评审确认缺陷）：TCP 通、R1 永不到达（黑洞对端）时 dial 不得永久挂死——
-    /// connect + initiate 整体受超时约束，返回 [`ClientError::DialTimeout`]（旧形态
-    /// DIAL_TIMEOUT 只包 connect，`initiate` 无超时 ⇒ supervise 挂死）。
+    /// Regression (review-confirmed defect): when TCP connects but R1 never
+    /// arrives (black-hole peer), dial must not hang forever — connect +
+    /// initiate are bounded as a whole and return
+    /// [`ClientError::DialTimeout`] (the old shape wrapped only connect in
+    /// DIAL_TIMEOUT, `initiate` had no timeout ⇒ supervise hung).
     #[tokio::test]
     async fn dial_times_out_when_r1_never_arrives() {
         use flock_protocol::session::{ClusterId, ServerEntry, ServerId};
 
-        // 黑洞对端：accept 后持有连接但零字节（R1 永不到达）。
+        // Black-hole peer: accepts and holds the connection but sends zero
+        // bytes (R1 never arrives).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ep = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -903,17 +980,17 @@ mod tests {
             ),
         )
         .await
-        .expect("dial 必须按时返回（黑洞对端也不得挂死）");
+        .expect("dial must return on time (never hang on a black-hole peer)");
         match res {
             Err(ClientError::DialTimeout(ep_got)) => assert_eq!(ep_got, ep),
-            other => panic!("期望 DialTimeout，得 {other:?}"),
+            other => panic!("expected DialTimeout, got {other:?}"),
         }
     }
 
     #[test]
     fn backoff_sequence_and_jitter_bounds() {
         let mut b = Backoff::new(Duration::from_secs(5), Duration::from_secs(60));
-        // 无抖动：5,10,20,40,60（封顶）,60…
+        // No jitter: 5,10,20,40,60 (capped),60…
         let seq: Vec<Duration> = (0..6).map(|_| b.next_jitter(0.0)).collect();
         assert_eq!(
             seq,
@@ -925,9 +1002,10 @@ mod tests {
                 Duration::from_secs(60),
                 Duration::from_secs(60),
             ],
-            "5s 起步倍增封顶 60s（§2.3）"
+            "5s base, doubling, capped at 60s (§2.3)"
         );
-        // 抖动界：每一步 d ∈ [step, step·1.25]（step = 当步未抖动基数）。
+        // Jitter bounds: each step d ∈ [step, step·1.25] (step = that step's
+        // un-jittered base).
         let mut b2 = Backoff::new(Duration::from_secs(5), Duration::from_secs(60));
         for k in 0..8u32 {
             let step = Duration::from_secs(5u64.saturating_mul(1 << k.min(4)))
@@ -935,11 +1013,11 @@ mod tests {
             let d = b2.next_jitter(0.999);
             assert!(
                 d >= step && d <= step.mul_f64(1.25 + 1e-9),
-                "attempt {k}: {d:?} 不在 [{step:?}, {:.2?}] 内",
+                "attempt {k}: {d:?} not within [{step:?}, {:.2?}]",
                 step.mul_f64(1.25)
             );
         }
-        // 成功归零。
+        // Reset after success.
         let mut b3 = Backoff::default();
         let _ = b3.next_jitter(0.0);
         let _ = b3.next_jitter(0.0);
@@ -947,27 +1025,29 @@ mod tests {
         assert_eq!(
             b3.next_jitter(0.0),
             Duration::from_secs(5),
-            "reset 后回到 5s 起步"
+            "back to the 5s base after reset"
         );
     }
 
     #[test]
     fn endpoint_ring_rotates() {
         let mut r = EndpointRing::new(vec!["a:1".into(), "b:2".into(), "a:1".into(), "c:3".into()]);
-        assert_eq!(r.len(), 4); // 轮询不在此去重（目录端点集在 endpoints() 已去重）
+        assert_eq!(r.len(), 4); // rotation does not dedup here (the directory endpoint set is deduped in endpoints())
         let got: Vec<String> = (0..5).map(|_| r.next_endpoint().unwrap()).collect();
         assert_eq!(
             got,
             ["a:1", "b:2", "a:1", "c:3", "a:1"],
-            "round-robin 轮询切换"
+            "round-robin rotation"
         );
         let mut empty = EndpointRing::new(vec![]);
         assert!(empty.next_endpoint().is_none());
     }
 
-    /// M7 控制流共享槽 × supervise：静默对端（真会话、控制流不答）⇒ ① 连接后
-    /// plane 在位；② 短超时请求 ⇒ 超时 + **毒化**（plane 失位）+ killed 信号 ⇒
-    /// supervise 提前结束本会话 → 退避 → 重连后 plane 恢复在位（新流）。
+    /// M7 control-stream shared slot × supervise: silent peer (real session,
+    /// control stream never answers) ⇒ (1) plane in place after connecting;
+    /// (2) a short-timeout request ⇒ timeout + **poisoning** (plane down) +
+    /// killed signal ⇒ supervise ends this session early → backoff → after
+    /// reconnecting the plane is back in place (fresh stream).
     #[tokio::test]
     async fn supervise_with_control_poisons_and_reconnects_on_timeout() {
         use flock_protocol::session::{
@@ -975,7 +1055,8 @@ mod tests {
         };
         use flock_protocol::trust::ClusterDirectory;
 
-        // 静默对端：真 respond 会话 + 控制流持有不答（复刻 R1 黑洞形态的控制面版本）。
+        // Silent peer: real respond session + control stream held and never
+        // answered (the control-plane replica of the R1 black-hole shape).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ep = listener.local_addr().unwrap().to_string();
         let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
@@ -1002,7 +1083,8 @@ mod tests {
                 let dir = (*dev_dir).clone();
                 let identity = identity.clone();
                 held.push(tokio::spawn(async move {
-                    // 会话建立后持有全部流不答（静默——控制流黑洞）。
+                    // After the session is established, hold every stream and
+                    // never answer (silent — control-stream black hole).
                     if let Ok(tunnel) = respond(io, &identity, dir, TunnelConfig::default()).await {
                         let _streams: Vec<_> = {
                             let mut v = Vec::new();
@@ -1044,13 +1126,17 @@ mod tests {
             .await;
         });
 
-        // ① 连接建立 ⇒ plane 在位。
+        // (1) Connection established ⇒ plane in place.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while !plane.is_up() {
-            assert!(tokio::time::Instant::now() < deadline, "15s 内未连接");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "not connected within 15s"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // ② 短超时请求（静默对端）⇒ TimedOut + 毒化（plane 失位）。
+        // (2) Short-timeout request (silent peer) ⇒ TimedOut + poisoning
+        //     (plane down).
         let r = plane
             .request_timeout(
                 flock_protocol::roster::CtrlRequest::Hello { ver: 1 },
@@ -1058,16 +1144,20 @@ mod tests {
             )
             .await;
         assert!(r.is_err() && r.unwrap_err().kind() == std::io::ErrorKind::TimedOut);
-        assert!(!plane.is_up(), "毒化 ⇒ 失位");
-        // 无会话时的请求 ⇒ 立即「未就绪」错误。
+        assert!(!plane.is_up(), "poisoned ⇒ down");
+        // Request with no session ⇒ immediate "not ready" error.
         assert!(plane
             .request(flock_protocol::roster::CtrlRequest::Hello { ver: 1 })
             .await
             .is_err());
-        // ③ killed ⇒ supervise 拆会话 → 退避 → 重连 ⇒ plane 恢复在位（新流）。
+        // (3) killed ⇒ supervise tears the session down → backoff →
+        //     reconnect ⇒ plane back in place (fresh stream).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while !plane.is_up() {
-            assert!(tokio::time::Instant::now() < deadline, "15s 内未重连");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "not reconnected within 15s"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         sup.abort();
@@ -1103,20 +1193,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
         let inv = invite_fixture(&root, 3600);
-        let state = ingest_invite(dir.path(), &inv).expect("落地");
+        let state = ingest_invite(dir.path(), &inv).expect("ingest");
         assert_eq!(state.endpoints(), vec!["frps.test:27500".to_string()]);
-        // 重读（三件套落盘；gen-keys 先行生成的密钥保持同一把）。
+        // Reload (trio persisted; the keys generated by gen-keys first stay
+        // the same).
         let re = ClientState::load(dir.path(), false).expect("reload");
         assert_eq!(
             re.device.to_bytes(),
             state.device.to_bytes(),
-            "设备密钥跨 invite/load 稳定（永不出机）"
+            "device keys stable across invite/load (never leave the machine)"
         );
         assert_eq!(re.directory.dir_version, 1);
-        // pin_for 产出可拨号材料（根 = 钉扎值）。
+        // pin_for yields dialable material (root = the pinned value).
         let pin = re.pin_for("frps.test:27500").expect("pin");
         assert_eq!(pin.cluster_root_pub, root.verifying_key());
-        // 未知端点 ⇒ None（端点↔材料同签）。
+        // Unknown endpoint ⇒ None (endpoint↔material signed together).
         assert!(re.pin_for("evil:1").is_none());
     }
 
@@ -1124,7 +1215,7 @@ mod tests {
     fn ingest_invite_rejects_expired_and_root_change() {
         let dir = tempfile::tempdir().unwrap();
         let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
-        // 过期拒。
+        // Expired: rejected.
         let expired = flock_protocol::trust::InviteFile {
             expiry_unix: 1,
             ..invite_fixture(&root, 3600)
@@ -1134,27 +1225,29 @@ mod tests {
                 ingest_invite(dir.path(), &expired),
                 Err(ClientError::Trust(_))
             ),
-            "过期邀请拒载"
+            "expired invite rejected"
         );
-        // 根变更：先钉 A，再拿 B 签的邀请 ⇒ RootChanged（显式告警，不静默）。
-        ingest_invite(dir.path(), &invite_fixture(&root, 3600)).expect("首钉");
+        // Root change: pin A first, then an invite signed by B ⇒ RootChanged
+        // (explicit warning, not silent).
+        ingest_invite(dir.path(), &invite_fixture(&root, 3600)).expect("first pin");
         let other = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
         match ingest_invite(dir.path(), &invite_fixture(&other, 3600)) {
             Err(ClientError::Trust(flock_protocol::trust::TrustError::RootChanged { .. })) => {}
-            other_res => panic!("期望 RootChanged，得 {other_res:?}"),
+            other_res => panic!("expected RootChanged, got {other_res:?}"),
         }
     }
 
     #[test]
     fn load_requires_directory_and_vip_resolution() {
         let dir = tempfile::tempdir().unwrap();
-        // 只有密钥、无目录 ⇒ run 路径拒（提示 invite）。
+        // Keys only, no directory ⇒ the run path rejects (with an invite
+        // hint).
         let _ = ClientState::load_keys(dir.path(), true).unwrap();
         assert!(matches!(
             ClientState::load(dir.path(), false),
             Err(ClientError::State(_))
         ));
-        // VIP 解析：config 覆盖优先；缺省读 vip 文件。
+        // VIP resolution: config override wins; default reads the vip file.
         let state = {
             let root = flock_protocol::ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
             ingest_invite(dir.path(), &invite_fixture(&root, 3600)).unwrap()

@@ -1,21 +1,32 @@
-//! 客户端控制流半边（M7，docs/design.md §7-M7.7 / §2.2 / §3.4）。
+//! Client half of the control stream (M7, docs/design.md §7-M7.7 / §2.2 / §3.4).
 //!
-//! 服务端控制面（登录/票据/key-bind/名册）此前只有 server 测试代偿的客户端角色；本模块
-//! 补齐正式客户端半边，全部线类型复用 [`flock_protocol::roster`]（M7 上收——两端同类型）：
+//! The server control plane (login/tickets/key-bind/roster) previously had
+//! only the client role compensated by server tests; this module adds the
+//! production client half, reusing the [`flock_protocol::roster`] wire types
+//! throughout (M7 uplift — same types on both ends):
 //!
-//! - [`ControlPlane`]：当前会话控制流的**共享槽**——supervise 每会话 install/remove，
-//!   业务任务（登录保持/名册拉取）经 [`ControlPlane::request`] 串行复用。请求超时 ⇒ 槽
-//!   毒化 + 主动杀会话重连（yamux 流在超时后可能错位，宁可重连也不带错位继续——
-//!   「不静默容错」纪律）。
-//! - [`login_and_bind`]：Hello → OPAQUE 登录（anchor 验签：以钉扎目录条目身份为锚，
-//!   §1.3.3f/§3.4）→ 票据（**只存内存**）→ key-bind（设备签名携带 hostname——re-register
-//!   更新链路，§7-M7.1）。
-//! - [`set_password_once`]：PwBegin/PwCommit（授权 = 会话设备 owner；`login` 子命令首次
-//!   配置用——admin 面无开户口令操作，口令设置本就走控制流，§2.2）。
-//! - 凭据文件（0600，一行口令）与 SR-SIG1 用户密钥的落位。
+//! - [`ControlPlane`]: the **shared slot** for the current session's control
+//!   stream — supervise installs/removes it per session; business tasks
+//!   (login keepalive/roster pull) reuse it serially via
+//!   [`ControlPlane::request`]. A request timeout ⇒ the slot is poisoned +
+//!   the session is killed proactively to reconnect (a yamux stream may be
+//!   misaligned after a timeout — reconnect rather than continue misaligned:
+//!   the "no silent fault tolerance" discipline).
+//! - [`login_and_bind`]: Hello → OPAQUE login (anchor verification: anchored
+//!   on the pinned-directory entry identity, §1.3.3f/§3.4) → ticket (**memory
+//!   only**) → key-bind (device signature carries the hostname — the
+//!   re-register update path, §7-M7.1).
+//! - [`set_password_once`]: PwBegin/PwCommit (authorization = session device
+//!   owner; used by the `login` subcommand for first-time setup — the admin
+//!   plane has no account-password operation, password setting goes over the
+//!   control stream by design, §2.2).
+//! - The credentials file (0600, one password line) and the SR-SIG1 user
+//!   key placement.
 //!
-//! 可测性：业务流经 [`CtrlTransport`] 抽象——生产 = 隧道内 yamux 控制流；单测 = mock
-//! 传输 + `flock-protocol` pake **双端函数**内存走通（真 anchor 签名/验签、真 ke3 校验）。
+//! Testability: business flows go through the [`CtrlTransport`] abstraction —
+//! production = the yamux control stream inside the tunnel; unit tests = a
+//! mock transport + the `flock-protocol` pake **both-sides** functions run
+//! in memory (real anchor signing/verification, real ke3 checks).
 
 use std::future::Future;
 use std::io;
@@ -36,20 +47,25 @@ use flock_protocol::session::{ClusterId, DeviceStaticKeys, ServerId};
 use flock_protocol::sig::UserKey;
 use flock_protocol::trust::ClusterDirectory;
 
-/// 控制流单请求超时（登录含客户端侧 argon2 派生，放宽到 10s）。
+/// Control-stream single-request timeout (login includes the client-side
+/// argon2 derivation, relaxed to 10s).
 pub const CTRL_REQ_TIMEOUT: Duration = Duration::from_secs(10);
-/// 登录失败（拒绝类——口令错/无票据权）后的重试退避。
+/// Retry backoff after a login failure (rejection class — wrong password / no
+/// ticket privilege).
 pub const LOGIN_RETRY_BACKOFF: Duration = Duration::from_secs(5);
-/// state 目录内凭据文件名（`[auth] credentials_file` 可覆盖路径）。
+/// Credentials file name inside the state directory (path overridable via
+/// `[auth] credentials_file`).
 pub const CREDENTIALS_FILE: &str = "credentials";
-/// state 目录内 SR-SIG1 用户密钥种子文件名（key-bind 登记；0600）。
+/// SR-SIG1 user key seed file name inside the state directory (key-bind
+/// registration; 0600).
 pub const SR_SIG_KEY_FILE: &str = "sr-sig.key";
 
 // ============================================================================
-// 控制流传输抽象（生产/测试同一业务流）
+// Control-stream transport abstraction (same business flow in prod and tests)
 // ============================================================================
 
-/// 控制流传输（一请求一响应，串行——与线协议「请求→响应」步进一致）。
+/// Control-stream transport (one request, one response, serial — aligned with
+/// the "request → response" stepping of the wire protocol).
 pub trait CtrlTransport {
     fn request(
         &self,
@@ -57,14 +73,17 @@ pub trait CtrlTransport {
     ) -> Pin<Box<dyn Future<Output = io::Result<CtrlResponse>> + Send + '_>>;
 }
 
-/// 共享 yamux 控制流（会话内在位）。
+/// Shared yamux control stream (in place for the session's lifetime).
 type SharedStream = std::sync::Arc<tokio::sync::Mutex<mux::Stream>>;
 
-/// 当前会话控制流的共享槽（supervise ↔ 业务任务）。
+/// Shared slot for the current session's control stream (supervise ↔
+/// business tasks).
 ///
-/// 生命周期：supervise 每次会话建立即 [`install`](Self::install)，数据面结束/毒化即
-/// [`remove`](Self::remove)；业务任务 [`request`](Self::request) 拿当前流串行收发。
-/// 会话在位性经 watch 通道观察（登录保持任务等待「会话在位」再登录）。
+/// Lifecycle: supervise [`install`](Self::install)s on every session
+/// establishment, [`remove`](Self::remove)s on data-plane end/poisoning;
+/// business tasks [`request`](Self::request) against the current stream,
+/// serially. Session presence is observed via a watch channel (the login
+/// keepalive task waits for "session up" before logging in).
 #[derive(Clone)]
 pub struct ControlPlane {
     inner: std::sync::Arc<PlaneInner>,
@@ -73,10 +92,12 @@ pub struct ControlPlane {
 struct PlaneInner {
     stream: std::sync::Mutex<Option<SharedStream>>,
     up_tx: tokio::sync::watch::Sender<bool>,
-    /// 常驻接收端（watch 的 send 在「零接收端」时关闭丢值——瞬时订阅的 is_up 会制造
-    /// 该窗口；持有常驻接收端杜绝）。
+    /// Resident receiver (a watch `send` drops the value when there are "zero
+    /// receivers" — a transient subscriber's is_up would open that window;
+    /// holding a resident receiver eliminates it).
     up_rx: tokio::sync::watch::Receiver<bool>,
-    /// 会话毒化（请求超时）⇒ 主动杀会话（supervise select 该信号提前结束数据面）。
+    /// Session poisoned (request timeout) ⇒ kill the session proactively
+    /// (supervise selects on this signal to end the data plane early).
     kill: tokio::sync::Notify,
 }
 
@@ -99,29 +120,32 @@ impl ControlPlane {
         }
     }
 
-    /// 会话建立：装入控制流（supervise 调用）。
+    /// Session established: install the control stream (called by supervise).
     pub fn install(&self, stream: mux::Stream) {
         self.install_arc(std::sync::Arc::new(tokio::sync::Mutex::new(stream)));
     }
 
-    /// [`install`](Self::install) 的共享句柄形态（supervise 侧同持——会话结束先于 Drop）。
+    /// Shared-handle form of [`install`](Self::install) (supervise holds the
+    /// same handle — session end can precede Drop).
     pub fn install_arc(&self, shared: SharedStream) {
         *self.inner.stream.lock().expect("plane poisoned") = Some(shared);
         let _ = self.inner.up_tx.send(true);
     }
 
-    /// 会话结束：取出并丢弃（supervise 调用；在途请求持克隆的将继续到 IO 失败为止）。
+    /// Session ended: take out and drop (called by supervise; in-flight
+    /// requests hold clones and continue until IO failure).
     pub fn remove(&self) {
         *self.inner.stream.lock().expect("plane poisoned") = None;
         let _ = self.inner.up_tx.send(false);
     }
 
-    /// 会话是否在位（快照值）。
+    /// Whether a session is in place (snapshot value).
     pub fn is_up(&self) -> bool {
         *self.inner.up_rx.borrow()
     }
 
-    /// 等待会话在位（已 true 立即返回；false→true 边缘经 watch 感知）。
+    /// Wait for a session to be in place (returns immediately when already
+    /// true; false→true edges observed via the watch).
     pub async fn wait_up(&self) {
         let mut rx = self.inner.up_rx.clone();
         loop {
@@ -129,13 +153,16 @@ impl ControlPlane {
                 return;
             }
             if rx.changed().await.is_err() {
-                // 发送端与 plane 同生命周期——不可达；防御性挂起而非自旋。
+                // The sender lives as long as the plane — unreachable;
+                // defensive suspend instead of spinning.
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }
 
-    /// 等会话失位（登录保持任务在票据有效期内监听断链；已 false 立即返回）。
+    /// Wait for the session to be gone (the login keepalive task watches for
+    /// disconnection while the ticket is valid; returns immediately when
+    /// already false).
     pub async fn wait_down(&self) {
         let mut rx = self.inner.up_rx.clone();
         loop {
@@ -148,30 +175,35 @@ impl ControlPlane {
         }
     }
 
-    /// 会话毒化信号（请求超时后由 [`Self::request`] 触发；supervise select 提前重连）。
+    /// Session-poisoned signal (raised by [`Self::request`] after a request
+    /// timeout; supervise selects on it to reconnect early).
     pub async fn killed(&self) {
         self.inner.kill.notified().await
     }
 
-    /// 当前流（None = 无会话）。
+    /// The current stream (None = no session).
     fn current(&self) -> Option<SharedStream> {
         self.inner.stream.lock().expect("plane poisoned").clone()
     }
 
-    /// 毒化：清槽 + 杀会话（超时后流可能错位——不带错位继续，重连换新流）。
+    /// Poison: clear the slot + kill the session (the stream may be
+    /// misaligned after a timeout — do not continue misaligned; reconnect
+    /// for a fresh stream).
     fn poison(&self, why: &str) {
-        eprintln!("flock-client: 控制流毒化（{why}）⇒ 主动重连");
+        eprintln!("flock-client: control stream poisoned ({why}) => proactive reconnect");
         *self.inner.stream.lock().expect("plane poisoned") = None;
         let _ = self.inner.up_tx.send(false);
         self.inner.kill.notify_one();
     }
 
-    /// 在当前会话控制流上发一请求收一响应（会话内在途互斥 ⇒ 串行）。
+    /// Send one request and receive one response on the current session's
+    /// control stream (in-flight mutex within the session ⇒ serial).
     pub async fn request(&self, req: CtrlRequest) -> io::Result<CtrlResponse> {
         self.request_timeout(req, CTRL_REQ_TIMEOUT).await
     }
 
-    /// [`request`](Self::request) 的超时注入档（测试用短超时复现毒化路径）。
+    /// Timeout-injectable form of [`request`](Self::request) (tests use a
+    /// short timeout to reproduce the poisoning path).
     pub async fn request_timeout(
         &self,
         req: CtrlRequest,
@@ -179,7 +211,7 @@ impl ControlPlane {
     ) -> io::Result<CtrlResponse> {
         let stream = self
             .current()
-            .ok_or_else(|| io::Error::other("控制流未就绪（隧道未连接）"))?;
+            .ok_or_else(|| io::Error::other("control stream not ready (tunnel not connected)"))?;
         let mut g = stream.lock().await;
         let r = tokio::time::timeout(timeout, async {
             send_ctrl_msg(&mut *g, &req).await?;
@@ -189,10 +221,14 @@ impl ControlPlane {
         match r {
             Ok(res) => res,
             Err(_) => {
-                // 超时：响应可能迟到 ⇒ 流错位风险。毒化并杀会话，重连后重试。
+                // Timeout: the response may arrive late ⇒ misalignment risk.
+                // Poison and kill the session; retry after reconnecting.
                 drop(g);
-                self.poison("请求超时");
-                Err(io::Error::new(io::ErrorKind::TimedOut, "控制流请求超时"))
+                self.poison("request timeout");
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "control stream request timed out",
+                ))
             }
         }
     }
@@ -207,8 +243,9 @@ impl CtrlTransport for ControlPlane {
     }
 }
 
-/// 独占控制流传输（`login` 一次性命令用——不经 daemon/共享槽；超时直接报错不毒化，
-/// 命令进程随即退出、会话由 Drop 拆除）。
+/// Exclusive control-stream transport (for the one-shot `login` command — no
+/// daemon/shared slot; a timeout is a plain error, no poisoning: the command
+/// process exits right after and Drop tears the session down).
 pub struct StreamTransport(pub std::sync::Arc<tokio::sync::Mutex<mux::Stream>>);
 
 impl CtrlTransport for StreamTransport {
@@ -224,29 +261,35 @@ impl CtrlTransport for StreamTransport {
                 recv_ctrl_msg(&mut *g).await
             })
             .await;
-            r.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "控制流请求超时"))?
+            r.map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "control stream request timed out")
+            })?
         })
     }
 }
 
 // ============================================================================
-// 登录参数与结果
+// Login parameters and outcome
 // ============================================================================
 
-/// 一次登录的全部入参（daemon 保持任务与 `login` 子命令共用）。
+/// Full inputs for one login (shared by the daemon keepalive task and the
+/// `login` subcommand).
 pub struct AuthParams {
     pub username: String,
     pub password: String,
-    /// 上报 hostname（已经 [`normalize_hostname`] 对齐服务端语义）。
+    /// Reported hostname (already aligned with server semantics via
+    /// [`normalize_hostname`]).
     pub hostname: String,
     pub device: DeviceStaticKeys,
     pub cluster_id: ClusterId,
     pub directory: ClusterDirectory,
-    /// SR-SIG1 用户密钥（key-bind 登记；`login_and_bind` 只用公钥面）。
+    /// SR-SIG1 user key (key-bind registration; `login_and_bind` uses only
+    /// its public side).
     pub sr_key: UserKey,
 }
 
-/// 登录成功产物（票据**只存内存**——进程退出即失效，§2.2）。
+/// Login success artifact (ticket **memory only** — invalid once the process
+/// exits, §2.2).
 #[derive(Debug, Clone)]
 pub struct LoginOutcome {
     pub ticket: TicketWire,
@@ -254,11 +297,14 @@ pub struct LoginOutcome {
     pub device_id: [u8; 32],
     pub vip: [u8; 4],
     pub server_id: [u8; 16],
-    /// 建议的下次重登等待（TTL 的 2/3——用 TTL 而非绝对 exp 排程，免疫两端时钟偏移）。
+    /// Suggested wait until the next re-login (2/3 of the TTL — scheduling on
+    /// the TTL rather than the absolute exp is immune to clock skew on either
+    /// end).
     pub refresh_after: Duration,
 }
 
-/// 登录失败（Io = 会话/传输层；Refused = 服务端拒绝或本地 OPAQUE 失败）。
+/// Login failure (Io = session/transport layer; Refused = server rejection or
+/// local OPAQUE failure).
 #[derive(Debug)]
 pub enum LoginError {
     Io(io::Error),
@@ -268,8 +314,8 @@ pub enum LoginError {
 impl std::fmt::Display for LoginError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoginError::Io(e) => write!(f, "控制流 IO: {e}"),
-            LoginError::Refused(m) => write!(f, "登录被拒: {m}"),
+            LoginError::Io(e) => write!(f, "control stream IO: {e}"),
+            LoginError::Refused(m) => write!(f, "login refused: {m}"),
         }
     }
 }
@@ -278,19 +324,21 @@ fn refused<M: Into<String>>(m: M) -> LoginError {
     LoginError::Refused(m.into())
 }
 
-/// 从 [`CtrlResponse::Err`] 提取可读描述。
+/// Extract a readable description from [`CtrlResponse::Err`].
 ///
-/// 意外响应分支只打**变体名**（评审项 8）：`{other:?}` 会把整载荷拖进错误串/日志
-/// ——`LoginOk`/`TicketRenewed` 携带的票据（TicketWire）、`LoginChallenge` 的 ke2、
-/// `Directory` 的目录字节等敏感载荷不应出现在日志面。
+/// The unexpected-response branch prints only the **variant name** (review
+/// item 8): `{other:?}` would drag the whole payload into error strings/logs
+/// — the ticket (TicketWire) carried by `LoginOk`/`TicketRenewed`, the ke2 of
+/// `LoginChallenge`, the directory bytes of `Directory` and other sensitive
+/// payloads must not appear in log output.
 fn describe_err(resp: CtrlResponse) -> String {
     match resp {
         CtrlResponse::Err { code, msg } => format!("{code:?}: {msg}"),
-        other => format!("意外响应: {}", ctrl_response_variant(&other)),
+        other => format!("unexpected response: {}", ctrl_response_variant(&other)),
     }
 }
 
-/// 意外响应的变体名（日志面零载荷）。
+/// Variant name of an unexpected response (zero payload in logs).
 fn ctrl_response_variant(r: &CtrlResponse) -> &'static str {
     match r {
         CtrlResponse::Hello { .. } => "Hello",
@@ -309,23 +357,26 @@ fn ctrl_response_variant(r: &CtrlResponse) -> &'static str {
 }
 
 // ============================================================================
-// 登录 → key-bind（携带 hostname）
+// Login → key-bind (carrying the hostname)
 // ============================================================================
 
-/// OPAQUE 登录（anchor 验签）+ key-bind（hostname 上报）。
+/// OPAQUE login (anchor verification) + key-bind (hostname reporting).
 ///
-/// 步骤（§2.2/§3.4/§7-M7.1）：
-/// 1. Hello——校验 cluster_id 与钉扎目录一致（防串群）；
-/// 2. LoginBegin/LoginFinish——anchor 签名以**钉扎目录内该 server 的身份公钥**验证
-///    （`Hello.server_id` → 目录条目；未在册 ⇒ 拒）；
-/// 3. LoginOk——票据入内存；
-/// 4. KeyBind——设备签名覆盖 cluster‖user‖bind_token‖公钥‖hostname‖SR-SIG1 公钥
-///    （同设备 re-register ⇒ 服务端更新 hostname，VIP 不变）。
+/// Steps (§2.2/§3.4/§7-M7.1):
+/// 1. Hello — verify cluster_id matches the pinned directory (anti
+///    cross-cluster);
+/// 2. LoginBegin/LoginFinish — the anchor signature is verified against the
+///    **identity public key of that server inside the pinned directory**
+///    (`Hello.server_id` → directory entry; not registered ⇒ reject);
+/// 3. LoginOk — ticket into memory;
+/// 4. KeyBind — device signature covers cluster‖user‖bind_token‖pubkeys‖
+///    hostname‖SR-SIG1 public key (same-device re-register ⇒ the server
+///    updates the hostname, VIP unchanged).
 pub async fn login_and_bind<T: CtrlTransport + ?Sized>(
     t: &T,
     p: &AuthParams,
 ) -> Result<LoginOutcome, LoginError> {
-    // ① Hello + 集群一致性。
+    // (1) Hello + cluster consistency.
     let (cluster_id, server_id) = match t
         .request(CtrlRequest::Hello {
             ver: CTRL_PROTO_VERSION,
@@ -342,18 +393,25 @@ pub async fn login_and_bind<T: CtrlTransport + ?Sized>(
     };
     if cluster_id != p.cluster_id.0 {
         return Err(refused(format!(
-            "server cluster {cluster_id:02x?} ≠ 钉扎目录 {}",
+            "server cluster {cluster_id:02x?} != pinned directory {}",
             hex::encode(p.cluster_id.0)
         )));
     }
-    // anchor 锚 = 钉扎目录内该服务器的身份公钥（端点轮询换服后仍取到正确锚）。
+    // Anchor = the identity public key of this server inside the pinned
+    // directory (after endpoint rotation switches servers, the right anchor is
+    // still resolved).
     let entry = p
         .directory
         .find(&ServerId(server_id))
-        .ok_or_else(|| refused(format!("server {:02x?} 不在钉扎目录内", server_id)))?
+        .ok_or_else(|| {
+            refused(format!(
+                "server {:02x?} not in the pinned directory",
+                server_id
+            ))
+        })?
         .clone();
 
-    // ② OPAQUE 登录（ke1 → ke2[anchor 签名] → ke3）。
+    // (2) OPAQUE login (ke1 → ke2[anchor signature] → ke3).
     let mut rng = flock_protocol::rand::rngs::OsRng;
     let (state, ke1) =
         login_start(&mut rng, &p.password, &p.username).map_err(|e| refused(e.to_string()))?;
@@ -374,10 +432,11 @@ pub async fn login_and_bind<T: CtrlTransport + ?Sized>(
     };
     let mut sig = [0u8; 64];
     if anchor_sig.len() != 64 {
-        return Err(refused("anchor 签名长度非法"));
+        return Err(refused("invalid anchor signature length"));
     }
     sig.copy_from_slice(&anchor_sig);
-    // anchor 验签失败/口令错都在此 Err（口令错 = OPAQUE 本地 finish 失败，§3.4）。
+    // Anchor verification failure and wrong password both surface as this
+    // Err (wrong password = local OPAQUE finish failure, §3.4).
     let ke3 = login_finish_anchored(
         state,
         &p.password,
@@ -398,7 +457,8 @@ pub async fn login_and_bind<T: CtrlTransport + ?Sized>(
         Err(e) => return Err(LoginError::Io(e)),
     };
 
-    // ③ key-bind（设备签名携带 hostname + SR-SIG1 公钥）。
+    // (3) key-bind (device signature carries the hostname + SR-SIG1 public
+    //     key).
     let device = DevicePubs {
         x25519: p.device.x25519_public().to_bytes(),
         ed25519: *p.device.ed25519_public().as_bytes(),
@@ -406,7 +466,7 @@ pub async fn login_and_bind<T: CtrlTransport + ?Sized>(
     };
     let sr_pub = match flock_protocol::sig::UserKey::from_pub_string(&p.sr_key.pub_string()) {
         Ok(vk) => *vk.as_bytes(),
-        Err(_) => unreachable!("自产公钥编码必回解"),
+        Err(_) => unreachable!("self-produced public key encoding always round-trips"),
     };
     let canonical = keybind_canonical(&p.cluster_id.0, &p.username, &bind_token, &device, &sr_pub);
     let seed = p.device.to_bytes();
@@ -429,10 +489,13 @@ pub async fn login_and_bind<T: CtrlTransport + ?Sized>(
         Err(e) => return Err(LoginError::Io(e)),
     };
 
-    // ④ 重登节奏：TTL 的 2/3（相对量——免疫两端时钟偏移；下限 2s、**上限 25s**——
-    // 服务端控制流空闲超时 = 3×keepalive = 30s（§2.2 评审项 8），重登即保活；超 25s
-    // 会让流先于票据过期被空闲关闭，届时本会话控制面不可再开（首流契约：一条会话
-    // 恰一条控制流）⇒ 只能杀会话重连——封顶避免该形态成为常态）。
+    // (4) Re-login cadence: 2/3 of the TTL (a relative amount — immune to
+    //     clock skew; floor 2s, **ceiling 25s** — the server-side control
+    //     stream idle timeout = 3×keepalive = 30s (§2.2 review item 8), so a
+    //     re-login doubles as keepalive; beyond 25s the stream would be
+    //     idle-closed before the ticket expires, and under the first-stream
+    //     contract (exactly one control stream per session) the control plane
+    //     could not be reopened — the cap keeps that from becoming routine).
     let ttl = ticket.ttl_hint_secs().max(2);
     let refresh_after = Duration::from_secs((ttl * 2 / 3).clamp(2, 25));
     Ok(LoginOutcome {
@@ -446,12 +509,15 @@ pub async fn login_and_bind<T: CtrlTransport + ?Sized>(
 }
 
 // ============================================================================
-// 首次配置：口令设置（PwBegin/PwCommit）+ 凭据/密钥落位
+// First-time setup: password setting (PwBegin/PwCommit) + credentials/key
+// placement
 // ============================================================================
 
-/// 服务端口令设置（一次性；授权 = 会话设备 owner == user）。
+/// Service password setting (one-time; authorization = session device owner
+/// == user).
 ///
-/// `PasswordExists` 视为已配置（返回 Ok(false)——沿用既有口令，登录验证兜底）。
+/// `PasswordExists` counts as already configured (returns Ok(false) — keep
+/// the existing password, login verification is the fallback check).
 pub async fn set_password_once<T: CtrlTransport + ?Sized>(
     t: &T,
     user: &str,
@@ -488,27 +554,32 @@ pub async fn set_password_once<T: CtrlTransport + ?Sized>(
     }
 }
 
-/// 凭据文件路径（`[auth] credentials_file` 覆盖；缺省 state 目录 `credentials`）。
+/// Credentials file path (`[auth] credentials_file` override; default
+/// `credentials` in the state directory).
 pub fn credentials_path(state_dir: &Path, cfg_override: Option<&Path>) -> PathBuf {
     cfg_override
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| state_dir.join(CREDENTIALS_FILE))
 }
 
-/// 写凭据文件：单行口令；**0600**（unix）/ 管理员+SYSTEM 全权（Windows 显式 DACL）。
+/// Write the credentials file: single password line; **0600** (unix) /
+/// Administrators+SYSTEM full access (explicit DACL on Windows).
 ///
-/// 静止风险如实声明（§7-M7.7）：OPAQUE 保证口令不上线；本地静止 = 本地信任域——
-/// 文件属主外不可读（0600 / 受限 DACL），但属主侧（root/管理员/本用户）明文可读。
+/// At-rest risk, stated honestly (§7-M7.7): OPAQUE keeps the password off
+/// the wire; at rest locally = local trust domain — unreadable outside the
+/// file owner (0600 / restricted DACL), but plaintext-readable on the owner
+/// side (root/administrator/the user).
 pub fn save_credentials(path: &Path, password: &str) -> io::Result<()> {
     write_secret_file(path, password.as_bytes())?;
-    // 二次写（换口令）时权限不回退。
+    // No permission regression on a second write (password change).
     Ok(())
 }
 
-/// 读凭据文件（剥单个行尾——保留口令内空白）。
+/// Read the credentials file (strips a single trailing newline — whitespace
+/// inside the password is preserved).
 pub fn load_credentials(path: &Path) -> io::Result<String> {
     let mut text = std::fs::read_to_string(path)
-        .map_err(|e| io::Error::other(format!("读 {}: {e}", path.display())))?;
+        .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?;
     if text.ends_with('\n') {
         text.pop();
     }
@@ -517,14 +588,15 @@ pub fn load_credentials(path: &Path) -> io::Result<String> {
     }
     if text.is_empty() {
         return Err(io::Error::other(format!(
-            "{} 口令为空（重跑 `flock-client login` 配置）",
+            "{}: password is empty (re-run `flock-client login` to configure)",
             path.display()
         )));
     }
     Ok(text)
 }
 
-/// SR-SIG1 用户密钥落位（缺失生成；存在复用——与设备密钥同一「永不出机」纪律）。
+/// SR-SIG1 user key placement (generate when missing; reuse when present —
+/// the same "never leaves the machine" discipline as the device keys).
 pub fn load_or_create_sr_key(state_dir: &Path) -> io::Result<UserKey> {
     let path = state_dir.join(SR_SIG_KEY_FILE);
     if let Ok(k) = UserKey::from_seed_file(&path) {
@@ -536,7 +608,7 @@ pub fn load_or_create_sr_key(state_dir: &Path) -> io::Result<UserKey> {
             return Ok(UserKey::from_seed(&seed));
         }
         return Err(io::Error::other(format!(
-            "{} 期望 32B 种子",
+            "{}: expected a 32-byte seed",
             path.display()
         )));
     }
@@ -545,11 +617,14 @@ pub fn load_or_create_sr_key(state_dir: &Path) -> io::Result<UserKey> {
     Ok(k)
 }
 
-/// 机密文件写盘：0600（unix）/ SYSTEM+Administrators 全权（Windows 显式 DACL，无 Users）。
+/// Secret file write: 0600 (unix) / SYSTEM+Administrators full access
+/// (explicit Windows DACL, no Users).
 ///
-/// Unix 走 [`crate::ipc::write_file_private`]（评审项 3：`create_new(0o600)` 出生即
-/// 目标权限、换写 tempfile+rename 原子替换——消除「fs::write 默认权限 → 补 chmod
-/// 0600」的间窗；选型注释见该函数文档）。
+/// Unix goes through [`crate::ipc::write_file_private`] (review item 3:
+/// `create_new(0o600)` is born with the target permissions, and rewrites use
+/// tempfile+rename atomic replacement — eliminating the "fs::write default
+/// permissions → chmod 0600 afterwards" window; selection notes in that
+/// function's docs).
 fn write_secret_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -559,11 +634,14 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(windows)]
     {
         std::fs::write(path, bytes)?;
-        // Windows：写后立即显式收紧 DACL（SYSTEM+管理员；短暂窗口 = 创建到收紧之间，
-        // 继承 ACL 默认——如实声明，非 0600 等价瞬时）。失败仅告警（继承 ACL 兜底可读）。
+        // Windows: tighten the DACL explicitly right after the write
+        // (SYSTEM+administrators; the brief window is creation-to-tightening
+        // with the inherited default ACL — stated honestly, not an
+        // instantaneous 0600 equivalent). Failure is a warning only (the
+        // inherited ACL still limits reads).
         if let Err(e) = crate::ipc_windows::set_file_acl_admins_only(path) {
             eprintln!(
-                "flock-client: 告警：机密文件 ACL 收紧失败（{e}）: {}",
+                "flock-client: warning: failed to tighten secret-file ACL ({e}): {}",
                 path.display()
             );
         }
@@ -573,8 +651,10 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// 上报 hostname：config 覆盖 → OS 主机名（hostname crate）→ 空串（服务端落 "(unknown)"）；
-/// 统一 [`normalize_hostname`]（trim/64B 截断——与服务端落库语义对齐，§7-M7.1）。
+/// Reported hostname: config override → OS hostname (hostname crate) → empty
+/// string (the server stores "(unknown)"); normalized uniformly via
+/// [`normalize_hostname`] (trim/64B truncation — aligned with the server's
+/// storage semantics, §7-M7.1).
 pub fn resolve_hostname(cfg_override: Option<&str>) -> String {
     let raw = cfg_override
         .map(str::to_string)
@@ -584,15 +664,16 @@ pub fn resolve_hostname(cfg_override: Option<&str>) -> String {
 }
 
 // ============================================================================
-// 登录保持任务 + 名册缓存（daemon 装配面，§7-M7.7）
+// Login keepalive task + roster cache (daemon assembly side, §7-M7.7)
 // ============================================================================
 
-/// 登录阶段快照（IPC 错误文案/可观测面）。
+/// Login-phase snapshot (IPC error text / observability surface).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthPhase {
-    /// 未配置 `[auth]`（daemon 不登录——名册功能不可用）。
+    /// No `[auth]` configured (the daemon does not log in — roster features
+    /// unavailable).
     Unconfigured,
-    /// 隧道未连接，等待会话。
+    /// Tunnel not connected, waiting for a session.
     WaitingSession,
     LoggingIn,
     LoggedIn {
@@ -604,25 +685,31 @@ pub enum AuthPhase {
 }
 
 impl AuthPhase {
-    /// 名册（IPC `Peers`）前置检查文案：`None` = 阶段就绪继续拉取。
+    /// Pre-check text for the roster (IPC `Peers`): `None` = phase ready,
+    /// proceed with the pull.
     ///
-    /// 评审项 5：`phase()==None` = 登录保持任务未装配（client.toml 无 `[auth]`）——
-    /// 返回 **login 引导**文案而非「稍候重试」（未配置不会随时间自愈；此前该形态
-    /// 落进「尚无登录票据（稍候重试）」误导文案，`Unconfigured` 分支为死代码）。
+    /// Review item 5: `phase()==None` = login keepalive task not assembled
+    /// (client.toml without `[auth]`) — return the **login bootstrap**
+    /// message, not "retry later" (unconfigured never self-heals with time;
+    /// previously this shape fell into the misleading "no login ticket yet
+    /// (retry shortly)" message and the `Unconfigured` branch was dead code).
     pub fn peers_block_reason(phase: Option<AuthPhase>) -> Option<String> {
         match phase.unwrap_or(AuthPhase::Unconfigured) {
-            AuthPhase::Unconfigured => {
-                Some("client.toml 未配置 [auth]（flock-client login 引导）".into())
+            AuthPhase::Unconfigured => Some(
+                "client.toml has no [auth] configured (bootstrap via `flock-client login`)".into(),
+            ),
+            AuthPhase::WaitingSession => {
+                Some("tunnel not connected (logs in automatically once the session is up)".into())
             }
-            AuthPhase::WaitingSession => Some("隧道未连接（等待会话建立后自动登录）".into()),
-            AuthPhase::LoggingIn => Some("登录进行中（稍候重试）".into()),
+            AuthPhase::LoggingIn => Some("login in progress (retry shortly)".into()),
             AuthPhase::Failed { reason } => Some(reason),
             AuthPhase::LoggedIn { .. } => None,
         }
     }
 }
 
-/// 登录态 + 当前票据（票据**只存内存**——daemon 生命周期内有效，§2.2）。
+/// Login state + current ticket (ticket **memory only** — valid for the
+/// daemon's lifetime, §2.2).
 #[derive(Debug, Default)]
 pub struct AuthShared {
     inner: std::sync::Mutex<AuthInner>,
@@ -639,7 +726,7 @@ impl AuthShared {
         Self::default()
     }
 
-    /// 阶段快照（未上报过 ⇒ None——装配前态）。
+    /// Phase snapshot (None = never reported — pre-assembly state).
     pub fn phase(&self) -> Option<AuthPhase> {
         self.inner
             .lock()
@@ -656,7 +743,7 @@ impl AuthShared {
         self.inner.lock().expect("auth shared poisoned").ticket = t;
     }
 
-    /// 当前票据克隆（IPC Peers 拉取用；无 ⇒ None）。
+    /// Clone of the current ticket (for IPC Peers pulls; None when absent).
     pub fn ticket(&self) -> Option<TicketWire> {
         self.inner
             .lock()
@@ -666,20 +753,22 @@ impl AuthShared {
     }
 }
 
-/// 最近一次名册拉取的缓存（IPC `Peers` 的 ≤5s 新鲜窗数据源）。
+/// Cache of the most recent roster pull (data source for the ≤5s freshness
+/// window of IPC `Peers`).
 #[derive(Debug, Default)]
 pub struct RosterCache {
     inner: std::sync::Mutex<Option<RosterSnapshot>>,
 }
 
-/// 缓存条目：拉取时刻 + 名册。
+/// Cache entry: pull instant + roster.
 #[derive(Debug, Clone)]
 pub struct RosterSnapshot {
     pub at: std::time::Instant,
     pub peers: Vec<flock_protocol::roster::PeerInfo>,
 }
 
-/// 名册缓存新鲜窗（IPC Peers：≤5s 内直接用缓存，否则重拉）。
+/// Roster cache freshness window (IPC Peers: within ≤5s use the cache,
+/// otherwise re-pull).
 pub const ROSTER_FRESH_WINDOW: Duration = Duration::from_secs(5);
 
 impl RosterCache {
@@ -687,7 +776,7 @@ impl RosterCache {
         Self::default()
     }
 
-    /// 新鲜窗内的缓存命中（None = 无缓存或已过期）。
+    /// Fresh cache hit (None = no cache or expired).
     pub fn fresh(&self) -> Option<Vec<flock_protocol::roster::PeerInfo>> {
         let g = self.inner.lock().expect("roster cache poisoned");
         g.as_ref()
@@ -695,7 +784,7 @@ impl RosterCache {
             .map(|s| s.peers.clone())
     }
 
-    /// 覆盖缓存（成功拉取后写）。
+    /// Overwrite the cache (written after a successful pull).
     pub fn store(&self, peers: Vec<flock_protocol::roster::PeerInfo>) {
         *self.inner.lock().expect("roster cache poisoned") = Some(RosterSnapshot {
             at: std::time::Instant::now(),
@@ -704,8 +793,9 @@ impl RosterCache {
     }
 }
 
-/// 登录保持任务的静态入参（口令外全部——口令每次登录前**重读**凭据文件，
-/// `flock-client login` 换口令后无需重启 daemon）。
+/// Static inputs of the login keepalive task (everything but the password —
+/// the credentials file is **re-read** before every login, so `flock-client
+/// login` can change the password without a daemon restart).
 pub struct AuthCtx {
     pub username: String,
     pub credentials_path: PathBuf,
@@ -717,10 +807,11 @@ pub struct AuthCtx {
 }
 
 impl AuthCtx {
-    /// 组装本次登录参数（口令现读）。
+    /// Assemble the login parameters for this attempt (password read fresh).
     fn params(&self) -> Result<AuthParams, String> {
-        let password = load_credentials(&self.credentials_path)
-            .map_err(|e| format!("凭据文件: {e}（重跑 `flock-client login` 配置）"))?;
+        let password = load_credentials(&self.credentials_path).map_err(|e| {
+            format!("credentials file: {e} (re-run `flock-client login` to configure)")
+        })?;
         Ok(AuthParams {
             username: self.username.clone(),
             password,
@@ -733,10 +824,12 @@ impl AuthCtx {
     }
 }
 
-/// 登录保持任务：会话在位 ⇒ 登录（+key-bind hostname）⇒ 票据入内存 ⇒ 按 TTL 的 2/3
-/// 周期重登保持新鲜；会话失位 ⇒ 等新会话重登；拒绝类失败 ⇒ 退避重试。
+/// Login keepalive task: session up ⇒ login (+key-bind hostname) ⇒ ticket
+/// into memory ⇒ periodic re-login at 2/3 of the TTL to keep it fresh;
+/// session down ⇒ wait for a new session and re-login; rejection-class
+/// failures ⇒ retry with backoff.
 ///
-/// 永不正常返回（daemon 生命周期任务；`stop` 触发即退出）。
+/// Never returns normally (a daemon-lifetime task; exits when `stop` fires).
 pub async fn run_auth_keepalive(
     plane: ControlPlane,
     ctx: AuthCtx,
@@ -744,13 +837,14 @@ pub async fn run_auth_keepalive(
     stop: std::sync::Arc<tokio::sync::Notify>,
 ) {
     loop {
-        // —— 等会话在位（或停机）——
+        // —— Wait for the session to be up (or shutdown). ——
         shared.set_phase(AuthPhase::WaitingSession);
         tokio::select! {
             _ = plane.wait_up() => {}
             _ = stop.notified() => return
         }
-        // —— 登录循环（成功后按 refresh_after 周期重登；失位/停机退出本层）——
+        // —— Login loop (after success, re-login on the refresh_after
+        //     cadence; session-down/shutdown exits this level). ——
         loop {
             let params = match ctx.params() {
                 Ok(p) => p,
@@ -767,7 +861,8 @@ pub async fn run_auth_keepalive(
             match login_and_bind(&plane, &params).await {
                 Ok(out) => {
                     eprintln!(
-                        "flock-client: login ok user={} vip={} epoch={}（{} 后重登保持票据）",
+                        "flock-client: login ok user={} vip={} epoch={} (re-login in {}s to keep \
+                         the ticket fresh)",
                         params.username,
                         std::net::Ipv4Addr::from(out.vip),
                         out.epoch,
@@ -778,31 +873,38 @@ pub async fn run_auth_keepalive(
                     });
                     shared.set_ticket(Some(out.ticket));
                     tokio::select! {
-                        _ = tokio::time::sleep(out.refresh_after) => {} // 周期重登
-                        _ = plane.wait_down() => break,                  // 会话失位 ⇒ 等新会话
+                        _ = tokio::time::sleep(out.refresh_after) => {} // periodic re-login
+                        _ = plane.wait_down() => break,                  // session down ⇒ wait for a new one
                         _ = stop.notified() => return,
                     }
                 }
                 Err(LoginError::Io(e)) => {
-                    // 传输失败 = 控制流已不可用（EOF/坏帧；**首流契约**下本会话控制
-                    // 面不可再开——服务端只把流 id=1 分派为控制流）。毒化 ⇒ 杀会话
-                    // 重连换新流；不做「plane 仍在的短退避重试」——死流上重试只会
-                    // 空转（评审补：原 500ms 重试循环在服务端 30s 空闲关流后死循环）。
-                    eprintln!("flock-client: login io（控制流不可用，重连换流）: {e}");
+                    // Transport failure = the control stream is unusable
+                    // (EOF/bad frame; under the **first-stream contract** the
+                    // control plane cannot reopen in this session — the
+                    // server dispatches only stream id=1 as the control
+                    // stream). Poison ⇒ kill the session and reconnect for a
+                    // fresh stream; no "short-backoff retry while the plane
+                    // is still up" — retrying on a dead stream only spins
+                    // (review follow-up: the original 500ms retry loop
+                    // dead-looped after the server's 30s idle stream close).
+                    eprintln!("flock-client: login io (control stream unusable, reconnecting for a fresh stream): {e}");
                     shared.set_phase(AuthPhase::Failed {
-                        reason: format!("控制流 IO: {e}"),
+                        reason: format!("control stream IO: {e}"),
                     });
-                    plane.poison("登录传输失败");
+                    plane.poison("login transport failure");
                     tokio::select! {
                         _ = plane.wait_down() => break,
                         _ = stop.notified() => return,
                     }
                 }
                 Err(e @ LoginError::Refused(_)) => {
-                    // 服务端拒绝（口令错/票据权缺失等）——会话仍在：固定退避重试
-                    //（换口令重跑 `flock-client login` 后自动恢复）。
+                    // Server refusal (wrong password / missing ticket
+                    // privilege, etc.) — the session is still alive: fixed
+                    // backoff retry (recovers automatically after changing
+                    // the password via `flock-client login`).
                     eprintln!(
-                        "flock-client: login 被拒，{}s 后重试: {e}",
+                        "flock-client: login refused, retrying in {}s: {e}",
                         LOGIN_RETRY_BACKOFF.as_secs()
                     );
                     shared.set_phase(AuthPhase::Failed {
@@ -820,10 +922,12 @@ pub async fn run_auth_keepalive(
 }
 
 // ============================================================================
-// 名册拉取（PeerListPull 消费，§7-M7.4——票据保护；结果进 RosterCache）
+// Roster pull (PeerListPull consumption, §7-M7.4 — ticket-protected; result
+// goes into RosterCache)
 // ============================================================================
 
-/// 拉取成员名册（当前票据 + 控制流在位；成功由调用方 [`RosterCache::store` 缓存）。
+/// Pull the member roster (current ticket + control stream in place; the
+/// caller caches the result via [`RosterCache::store`]).
 pub async fn pull_roster(
     plane: &ControlPlane,
     ticket: &TicketWire,
@@ -836,14 +940,18 @@ pub async fn pull_roster(
     {
         Ok(CtrlResponse::PeerList { peers }) => Ok(peers),
         Ok(CtrlResponse::Err { code, msg }) => Err(format!("{code:?}: {msg}")),
-        Ok(other) => Err(format!("意外响应: {other:?}")),
-        Err(e) => Err(format!("控制流: {e}")),
+        Ok(other) => Err(format!(
+            "unexpected response: {}",
+            ctrl_response_variant(&other)
+        )),
+        Err(e) => Err(format!("control stream: {e}")),
     }
 }
 
 // ============================================================================
-// 单元测试：登录态机（mock 传输 + flock-protocol pake 双端函数内存走通——
-// 真 anchor 签名/验签、真 ke1/ke2/ke3、真 keybind 设备签名验证）
+// Unit tests: login state machine (mock transport + flock-protocol pake
+// both-sides functions in memory — real anchor signing/verification, real
+// ke1/ke2/ke3, real keybind device-signature verification)
 // ============================================================================
 
 #[cfg(test)]
@@ -859,8 +967,9 @@ mod tests {
     use flock_protocol::roster::{CtrlError, SignedTicket};
     use flock_protocol::session::{DeviceId, ServerEntry};
 
-    /// mock 服务端状态（真实 pake 服务端函数；票据签发用哑签名——客户端不验签，
-    /// 只透传与读 TTL hint）。
+    /// Mock server state (real pake server functions; tickets issued with a
+    /// dummy signature — the client does not verify, it only passes through
+    /// and reads the TTL hint).
     struct MockState {
         identity: flock_protocol::ed25519_dalek::SigningKey,
         attacker: flock_protocol::ed25519_dalek::SigningKey,
@@ -872,7 +981,8 @@ mod tests {
         password_set: bool,
         hostname_seen: Option<String>,
         keybind_device_sig_ok: Option<bool>,
-        /// 负路径开关：anchor 用攻击者密钥签（伪服务器替身）。
+        /// Negative-path switch: anchor signed with the attacker key (fake
+        /// server stand-in).
         forged_anchor: bool,
     }
 
@@ -894,7 +1004,8 @@ mod tests {
             }
         }
 
-        /// 钉扎目录（identity_pub = mock 服务端身份——anchor 验签锚）。
+        /// Pinned directory (identity_pub = mock server identity — the anchor
+        /// verification anchor).
         fn directory(&self) -> ClusterDirectory {
             ClusterDirectory {
                 cluster_id: ClusterId(self.cluster_id),
@@ -928,7 +1039,8 @@ mod tests {
                     server_id: self.server_id,
                 },
                 CtrlRequest::PwBegin { user, m1_b64 } => {
-                    // 与真服务端同语义：已设口令 ⇒ PasswordExists（首设一次成功）。
+                    // Same semantics as the real server: password already set
+                    // ⇒ PasswordExists (first set succeeds once).
                     if self.record.is_some() {
                         return self.err(CtrlError::PasswordExists);
                     }
@@ -986,7 +1098,8 @@ mod tests {
                         return self.err(CtrlError::LoginFailed);
                     }
                     let now = flock_protocol::trust::now_unix();
-                    // 哑票据（客户端不验签；TTL hint 60 ⇒ refresh_after 40s）。
+                    // Dummy ticket (the client does not verify; TTL hint 60 ⇒
+                    // refresh_after 40s).
                     CtrlResponse::LoginOk {
                         ticket: TicketWire::Local(SignedTicket {
                             user: "alice".into(),
@@ -1006,11 +1119,13 @@ mod tests {
                     sr_sig_pub,
                     device_sig,
                 } => {
-                    // 票据必须在位（哑票据透传语义：Local 即视为已登录产物）。
+                    // The ticket must be in place (dummy-ticket passthrough
+                    // semantics: Local counts as a login artifact).
                     let TicketWire::Local(t) = ticket else {
                         return self.err(CtrlError::TicketBad);
                     };
-                    // 设备签名真验证（keybind_canonical 与服务端同源）。
+                    // Real device-signature verification (keybind_canonical
+                    // shared with the server).
                     let user = t.user.clone();
                     let canonical = keybind_canonical(
                         &self.cluster_id,
@@ -1044,7 +1159,9 @@ mod tests {
         }
     }
 
-    /// mock 传输：请求即刻同步调度（pake 服务端函数全同步——无需真网络/yamux）。
+    /// Mock transport: requests dispatch synchronously on the spot (the pake
+    /// server functions are fully synchronous — no real network/yamux
+    /// needed).
     struct MockTransport {
         st: std::sync::Arc<std::sync::Mutex<MockState>>,
         log: std::sync::Arc<std::sync::Mutex<Vec<CtrlRequest>>>,
@@ -1086,19 +1203,21 @@ mod tests {
         }
     }
 
-    /// 正向全链：set_password → login_and_bind（anchor 验签过 + hostname 携带 +
-    /// 设备签名被服务端侧验过 + TTL hint → refresh 40s）。
+    /// Happy path, full chain: set_password → login_and_bind (anchor
+    /// verification passes + hostname carried + device signature verified on
+    /// the server side + TTL hint → refresh 40s).
     #[tokio::test]
     async fn login_state_machine_happy_path() {
         let st = std::sync::Arc::new(std::sync::Mutex::new(MockState::new()));
         let t = MockTransport::new(st.clone());
         let p = params(&st.lock().unwrap(), "pw-123", "box-m7");
 
-        // 首次配置：口令设置（真 reg 链路——服务端 mock 落 record）。
+        // First-time setup: password setting (real reg chain — the server
+        // mock stores the record).
         assert!(set_password_once(&t, "alice", "pw-123").await.unwrap());
         assert!(st.lock().unwrap().password_set);
 
-        let out = login_and_bind(&t, &p).await.expect("登录全链");
+        let out = login_and_bind(&t, &p).await.expect("full login chain");
         assert_eq!(out.vip, [100, 64, 0, 11]);
         assert_eq!(out.epoch, 3);
         assert_eq!(
@@ -1108,22 +1227,23 @@ mod tests {
         assert_eq!(
             out.refresh_after,
             Duration::from_secs(25),
-            "TTL 60 ⇒ 2/3=40 封顶 25（服务端控制流 30s 空闲窗内保活）"
+            "TTL 60 ⇒ 2/3=40 capped at 25 (keepalive within the server control stream's 30s idle window)"
         );
         let g = st.lock().unwrap();
         assert_eq!(
             g.hostname_seen.as_deref(),
             Some("box-m7"),
-            "key-bind 携带 hostname"
+            "key-bind carries the hostname"
         );
         assert_eq!(
             g.keybind_device_sig_ok,
             Some(true),
-            "设备签名服务端侧验证通过"
+            "device signature verified server-side"
         );
     }
 
-    /// 负路径：伪造 anchor（伪服务器替身）⇒ 客户端拒绝（ke3 不产生，后续步骤不走）。
+    /// Negative path: forged anchor (fake server stand-in) ⇒ client rejects
+    /// (no ke3 produced, subsequent steps skipped).
     #[tokio::test]
     async fn login_rejects_forged_anchor() {
         let st = std::sync::Arc::new(std::sync::Mutex::new(MockState::new()));
@@ -1137,21 +1257,22 @@ mod tests {
 
         let e = login_and_bind(&t, &p)
             .await
-            .expect_err("伪 anchor 必须被拒");
+            .expect_err("a forged anchor must be rejected");
         assert!(
             matches!(&e, LoginError::Refused(m) if m.contains("anchor")),
             "{e}"
         );
-        // 未推进到 LoginFinish（anchor 失败即止——不产生 ke3）。
+        // Not advanced to LoginFinish (stop at anchor failure — no ke3).
         let log = t.log.lock().unwrap();
         assert!(
             !log.iter()
                 .any(|r| matches!(r, CtrlRequest::LoginFinish { .. })),
-            "ke3 不产生"
+            "no ke3 produced"
         );
     }
 
-    /// 负路径：口令错 ⇒ 客户端本地 finish 失败（不产生 ke3；线上无差异）。
+    /// Negative path: wrong password ⇒ client-side finish failure (no ke3
+    /// produced; no difference on the wire).
     #[tokio::test]
     async fn login_wrong_password_fails_client_finish() {
         let st = std::sync::Arc::new(std::sync::Mutex::new(MockState::new()));
@@ -1159,17 +1280,20 @@ mod tests {
         set_password_once(&t, "alice", "pw-123").await.unwrap();
         let p = params(&st.lock().unwrap(), "wrong-pw", "box");
 
-        let e = login_and_bind(&t, &p).await.expect_err("错口令必须被拒");
+        let e = login_and_bind(&t, &p)
+            .await
+            .expect_err("a wrong password must be rejected");
         assert!(matches!(e, LoginError::Refused(_)), "{e}");
         let log = t.log.lock().unwrap();
         assert!(
             !log.iter()
                 .any(|r| matches!(r, CtrlRequest::LoginFinish { .. })),
-            "本地失败即止——第三请求不发"
+            "stops at the local failure — the third request is never sent"
         );
     }
 
-    /// set_password：已设口令 ⇒ Ok(false)（沿用语义——登录验证兜底）。
+    /// set_password: password already set ⇒ Ok(false) (keep semantics —
+    /// login verification is the fallback).
     #[tokio::test]
     async fn set_password_once_password_exists_is_ok_false() {
         let st = std::sync::Arc::new(std::sync::Mutex::new(MockState::new()));
@@ -1178,7 +1302,8 @@ mod tests {
         assert!(!set_password_once(&t, "alice", "other").await.unwrap());
     }
 
-    /// 凭据文件往返：0600（unix）+ 读回一致 + 空口令拒。
+    /// Credentials file roundtrip: 0600 (unix) + read-back identical +
+    /// empty password rejected.
     #[test]
     fn credentials_file_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -1190,22 +1315,24 @@ mod tests {
             assert_eq!(
                 std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
                 0o600,
-                "凭据文件 0600"
+                "credentials file is 0600"
             );
         }
         assert_eq!(
             load_credentials(&p).unwrap(),
             "s3cret pw ",
-            "行尾剥除、内空白保留"
+            "trailing newline stripped, inner whitespace preserved"
         );
         let empty = dir.path().join("empty-cred");
         std::fs::write(&empty, "\r\n").unwrap();
-        assert!(load_credentials(&empty).is_err(), "空口令拒");
+        assert!(load_credentials(&empty).is_err(), "empty password rejected");
     }
 
-    /// 评审项 3：换写路径——**已存在且权限松（0666）**的凭据文件被替换后：
-    /// (a) 新内容在位；(b) 权限 0600（rename 携新 inode 权限，旧松权限不残留）；
-    /// (c) 无 `.tmp.` 残留（rename 消费掉临时文件）。
+    /// Review item 3: rewrite path — a credentials file that **already exists
+    /// with loose permissions (0666)** gets replaced and then: (a) the new
+    /// content is in place; (b) permissions are 0600 (rename carries the new
+    /// inode's permissions, the old loose ones do not survive); (c) no
+    /// `.tmp.` leftovers (rename consumes the temp file).
     #[cfg(unix)]
     #[test]
     fn credentials_overwrite_replaces_loose_perm_file_with_0600() {
@@ -1219,27 +1346,36 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o600,
-            "换写后 0600（tempfile 出生权限随 rename 落位）"
+            "0600 after the rewrite (tempfile birth permissions land via rename)"
         );
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
-        assert!(leftovers.is_empty(), "临时文件不残留: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "no temp-file leftovers: {leftovers:?}"
+        );
     }
 
-    /// SR-SIG1 密钥落位：首建持久化、二次载入同种子。
+    /// SR-SIG1 key placement: first creation persists, second load yields
+    /// the same seed.
     #[test]
     fn sr_key_load_or_create_persists() {
         let dir = tempfile::tempdir().unwrap();
         let a = load_or_create_sr_key(dir.path()).unwrap();
         let b = load_or_create_sr_key(dir.path()).unwrap();
-        assert_eq!(a.to_seed(), b.to_seed(), "跨调用稳定（永不出机）");
+        assert_eq!(
+            a.to_seed(),
+            b.to_seed(),
+            "stable across calls (never leaves the machine)"
+        );
         assert!(dir.path().join(SR_SIG_KEY_FILE).exists());
     }
 
-    /// hostname 覆盖语义：trim 后规范化；空串 ⇒ "(unknown)"。
+    /// Hostname override semantics: normalized after trim; empty ⇒
+    /// "(unknown)".
     #[test]
     fn resolve_hostname_override_semantics() {
         assert_eq!(resolve_hostname(Some("  box-a ")), "box-a");
@@ -1248,47 +1384,55 @@ mod tests {
         assert_eq!(
             resolve_hostname(Some(&long)).len(),
             64,
-            "64B 截断与服务端对齐"
+            "64B truncation aligned with the server"
         );
     }
 
-    /// 评审项 5 文案一：`phase()==None`（未装配登录保持任务 = client.toml 无
-    /// `[auth]`）⇒ **login 引导**——不得是「稍候重试」（未配置不随时间自愈）。
+    /// Review item 5, message one: `phase()==None` (login keepalive task not
+    /// assembled = client.toml without `[auth]`) ⇒ **login bootstrap**
+    /// guidance — must not be "retry later" (unconfigured never self-heals).
     #[test]
     fn peers_block_reason_none_is_unconfigured_guidance() {
-        let r = AuthPhase::peers_block_reason(None).expect("未装配 ⇒ 阻断文案");
-        assert!(r.contains("未配置 [auth]"), "{r}");
+        let r = AuthPhase::peers_block_reason(None).expect("not assembled ⇒ blocking reason");
+        assert!(r.contains("no [auth]"), "{r}");
         assert!(r.contains("flock-client login"), "{r}");
-        assert!(!r.contains("稍候重试"), "未配置形态不得落「稍候重试」: {r}");
-        // 显式 Unconfigured 同文案（分支激活——与 None 等价）。
+        assert!(
+            !r.contains("retry shortly"),
+            "the unconfigured shape must not fall into 'retry shortly': {r}"
+        );
+        // Explicit Unconfigured yields the same message (branch activated —
+        // equivalent to None).
         assert_eq!(
             AuthPhase::peers_block_reason(Some(AuthPhase::Unconfigured)),
             AuthPhase::peers_block_reason(None)
         );
     }
 
-    /// 评审项 5 文案二：装配后的各阶段映射（等待/登录中给「稍候重试」类可自愈
-    /// 文案；LoggedIn 放行 None；Failed 透传原因）。
+    /// Review item 5, message two: phase mapping once assembled
+    /// (waiting/logging-in get self-healing "retry shortly"-style messages;
+    /// LoggedIn passes with None; Failed passes the reason through).
     #[test]
     fn peers_block_reason_maps_assembled_phases() {
         let r = AuthPhase::peers_block_reason(Some(AuthPhase::WaitingSession)).unwrap();
-        assert!(r.contains("隧道未连接"), "{r}");
+        assert!(r.contains("tunnel not connected"), "{r}");
         let r = AuthPhase::peers_block_reason(Some(AuthPhase::LoggingIn)).unwrap();
-        assert!(r.contains("稍候重试"), "{r}");
+        assert!(r.contains("retry shortly"), "{r}");
         assert_eq!(
             AuthPhase::peers_block_reason(Some(AuthPhase::Failed {
-                reason: "凭据文件: boom".into()
+                reason: "credentials file: boom".into()
             }))
             .as_deref(),
-            Some("凭据文件: boom")
+            Some("credentials file: boom")
         );
         assert!(
             AuthPhase::peers_block_reason(Some(AuthPhase::LoggedIn { user: "a".into() })).is_none(),
-            "LoggedIn 放行拉取"
+            "LoggedIn lets the pull proceed"
         );
     }
 
-    /// 评审项 8：describe_err 意外响应分支只打变体名——票据等载荷不进错误串。
+    /// Review item 8: describe_err's unexpected-response branch prints only
+    /// the variant name — tickets and other payloads stay out of error
+    /// strings.
     #[test]
     fn describe_err_unexpected_response_hides_payload() {
         let now = flock_protocol::trust::now_unix();
@@ -1304,10 +1448,16 @@ mod tests {
             epoch: 1,
         };
         let msg = describe_err(resp);
-        assert!(msg.contains("LoginOk"), "变体名在位: {msg}");
-        assert!(!msg.contains("secret-user"), "票据用户不进日志: {msg}");
-        assert!(!msg.contains("TicketWire"), "载荷 Debug 不进日志: {msg}");
-        // Err 变体原语义不变（code + msg）。
+        assert!(msg.contains("LoginOk"), "variant name present: {msg}");
+        assert!(
+            !msg.contains("secret-user"),
+            "ticket user stays out of logs: {msg}"
+        );
+        assert!(
+            !msg.contains("TicketWire"),
+            "payload Debug stays out of logs: {msg}"
+        );
+        // The Err variant keeps its original semantics (code + msg).
         assert_eq!(
             describe_err(CtrlResponse::Err {
                 code: CtrlError::LoginFailed,

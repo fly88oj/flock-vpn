@@ -1,50 +1,44 @@
-//! flock-client 进程入口（docs/design.md §3.12/§7-M3/§7-M6.4）。
+//! flock-client process entry point (docs/design.md §3.12/§7-M3/§7-M6.4).
 //!
-//! 子命令：
-//! - （缺省 `run`）：前台调试模式——tun（MTU 1280）+ 路由 + 接入器守护（退避重连）；
-//!   **不起 IPC**（日志直连 stderr；daemon 形态用 `service`）；
-//! - `service`：daemon 装配（§7-M6.1：supervise 复用 + 控制面 IPC + 优雅停服；
-//!   Windows 走 SCM 分派，终端直跑自动回落前台）；
-//! - `status`：向 daemon 发一次 `Status` 请求并打印（无托盘环境/测试探针）；
-//! - `tray`：托盘进程（§7-M6 第二阶段）：右键菜单「连接状态/VPN IP/退出」2s 轮询
-//!   刷新，经控制 IPC 查询/停服；无 GUI 主机优雅退出（tray feature 门控）；
-//! - `invite <path>`：载入邀请文件（b64 文本或原始字节）→ 钉扎集群根公钥 + 存根签
-//!   目录（一次性引导，§1.3.3f 强路径）；
-//! - `gen-keys`：生成/复用设备静态密钥并打印公钥（部署编排把公钥交给
-//!   `flock-server device-add`/`redeem` 预注册）；
-//! - `--smoke`：wintun/真机冒烟（§7-M3 Windows 手工清单）——建 tun + 配路由 +
-//!   打印接口状态即退。
+//! Subcommands:
+//! - (default `run`): foreground debug mode — tun (MTU 1280) + routes +
+//!   connector supervise (backoff reconnect); **no IPC** (logs straight to
+//!   stderr; for the daemon form use `service`);
+//! - `service`: daemon assembly (§7-M6.1: supervise reuse + control-plane
+//!   IPC + graceful shutdown; Windows goes through the SCM dispatcher, a
+//!   direct terminal run falls back to foreground);
+//! - `status`: send one `Status` request to the daemon and print it (for
+//!   tray-less environments / test probes);
+//! - `tray`: tray process (§7-M6 phase two): right-click menu
+//!   "connection status / VPN IP / quit", refreshed on a 2s poll, queries and
+//!   shuts down via control IPC; exits gracefully on GUI-less hosts (tray
+//!   feature-gated);
+//! - `invite <path>`: load an invite file (b64 text or raw bytes) → pin the
+//!   cluster root public key + store the root-signed directory (one-time
+//!   bootstrap, §1.3.3f strong path);
+//! - `gen-keys`: generate/reuse the device static keys and print the public
+//!   keys (deployment orchestration hands them to `flock-server
+//!   device-add`/`redeem` for pre-registration);
+//! - `--smoke`: wintun/on-machine smoke test (§7-M3 Windows manual checklist)
+//!   — create tun + apply routes + print interface status, then exit.
 //!
-//! Windows 路由注入与 wintun 运行路径留待 M5 真机手工验证（§7-M3 清单；route 模块
-//! 返回显式 `Unsupported` 并附手工指令）。macOS 无设备 ⇒ 未验证（utun 按 tun-rs
-//! 平台矩阵设计）。
+//! Interactive copy (usage, guidance, error prompts) is rendered through the
+//! [`flock_client::lang`] pack (`[general] language`, default auto-detect);
+//! operational diagnostic logs on stderr are English-only. Windows route
+//! injection and the wintun runtime path are pending M5 real-machine manual
+//! verification (§7-M3 checklist; the route module returns an explicit
+//! `Unsupported` with manual instructions). No macOS device ⇒ unverified
+//! (utun designed against the tun-rs platform matrix).
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use flock_client::config::ClientConfig;
 use flock_client::connector::{self, Backoff, ClientError, ClientState, ConnEvent};
+use flock_client::lang::{Lang, LanguageSetting};
 use flock_client::route::{self, RoutePlan};
 use flock_client::tun::{TunIo, TunSpec};
 use flock_protocol::trust::InviteFile;
-
-const USAGE: &str = "\
-flock-client [--config <client.toml>] [<subcommand>]
-
-子命令：
-  (run)                  前台调试模式（缺省）：tun + 路由 + 接入器守护（不起 IPC）
-  service                daemon：supervise + 控制面 IPC + 优雅停服（§7-M6）+ M7 登录保持
-  status                 向 daemon 发一次 Status 请求并打印（无托盘环境探针）
-  login                  首次配置：读口令 → 0600 凭据文件 → 设服务端口令 + 登录验证
-                         + hostname 入册（M7 §7-M7.7；daemon 非交互读文件）
-  peers [--json]         成员名册（VIP/主机名/账户/状态/延迟/流量；M7 §7-M7.7）
-  install [--user|--service]  安装服务+托盘自启（缺省两者；安装时 --config 记入服务定义）
-  uninstall [--user|--service] 反向卸载
-  tray                   托盘进程（右键菜单：连接状态/VPN IP/退出；无 GUI 会话优雅退出）
-  invite <path>          载入邀请（b64 文本/原始字节）→ 钉扎根公钥 + 存根签目录
-  gen-keys               生成/复用设备密钥并打印公钥（device-x=/device-ed= b64）
-  --smoke                真机冒烟：建 tun + 配路由 + 打印状态即退（§7-M3 手工清单）
-";
 
 fn main() {
     let code = match run_cli() {
@@ -85,7 +79,33 @@ enum Cmd {
     Smoke,
 }
 
-fn parse_args() -> Result<Cli, String> {
+/// Locate the `--config` path in raw args (pre-parse, only to resolve the UI
+/// language from client.toml — argument validation itself happens in
+/// [`parse_args`]).
+fn config_path_from_args() -> PathBuf {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--config" {
+            if let Some(v) = it.next() {
+                return PathBuf::from(v);
+            }
+        }
+    }
+    PathBuf::from("client.toml")
+}
+
+/// Best-effort UI language for interactive copy: client.toml
+/// `[general] language` when the file parses, otherwise runtime detection
+/// (`auto` semantics); never fails — interactive copy must not brick on a
+/// broken config (the later strict `ClientConfig::load` surfaces the error).
+fn best_effort_lang(config: &Path) -> Lang {
+    ClientConfig::load(config)
+        .map(|c| c.general.language.resolve())
+        .unwrap_or_else(|_| LanguageSetting::Auto.resolve())
+}
+
+fn parse_args(lang: Lang) -> Result<Cli, String> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut config = PathBuf::from("client.toml");
     let mut rest: Vec<String> = Vec::new();
@@ -94,7 +114,14 @@ fn parse_args() -> Result<Cli, String> {
         match raw[i].as_str() {
             "--config" => {
                 i += 1;
-                config = PathBuf::from(raw.get(i).ok_or("--config 值")?.clone());
+                config = PathBuf::from(
+                    raw.get(i)
+                        .ok_or_else(|| {
+                            lang.tr(flock_client::lang::Key::CliErrConfigValue)
+                                .to_string()
+                        })?
+                        .clone(),
+                );
             }
             "--smoke" => rest.push("--smoke".into()),
             other => rest.push(other.to_string()),
@@ -103,8 +130,9 @@ fn parse_args() -> Result<Cli, String> {
     }
     let mut it = rest.into_iter().peekable();
     let first = it.next();
-    // 范围旗标（install/uninstall）：--user 只托盘自启、--service 只服务、缺省两者
-    //（旗标跟在子命令之后：`install --user`）。
+    // Scope flags (install/uninstall): --user = tray autostart only,
+    // --service = service only, default both (flags follow the subcommand:
+    // `install --user`).
     let mut scope_user = false;
     let mut scope_service = false;
     if matches!(first.as_deref(), Some("install") | Some("uninstall")) {
@@ -127,7 +155,9 @@ fn parse_args() -> Result<Cli, String> {
         (false, true) => flock_client::install::Scope::ServiceOnly,
         (false, false) => flock_client::install::Scope::Both,
         (true, true) => {
-            return Err("--user 与 --service 互斥（缺省 = 两者都装）".into());
+            return Err(lang
+                .tr(flock_client::lang::Key::CliErrScopeMutex)
+                .to_string());
         }
     };
     let cmd = match first.as_deref() {
@@ -136,7 +166,7 @@ fn parse_args() -> Result<Cli, String> {
         Some("status") => Cmd::Status,
         Some("login") => Cmd::Login,
         Some("peers") => {
-            // `peers [--json]`：机读档旗标跟在子命令后。
+            // `peers [--json]`: the machine-readable flag follows the subcommand.
             let mut json = false;
             while let Some(flag) = it.peek() {
                 match flag.as_str() {
@@ -154,16 +184,25 @@ fn parse_args() -> Result<Cli, String> {
         #[cfg(feature = "tray")]
         Some("tray") => Cmd::Tray,
         #[cfg(not(feature = "tray"))]
-        Some("tray") => return Err(
-            "tray 子命令未编入本构建（--no-default-features 无头档；重编译请启用 tray feature）"
-                .into(),
-        ),
+        Some("tray") => {
+            return Err(lang
+                .tr(flock_client::lang::Key::CliErrTrayNotBuilt)
+                .to_string());
+        }
         Some("invite") => Cmd::Invite {
-            path: PathBuf::from(it.next().ok_or("invite 需要 <文件路径>")?),
+            path: PathBuf::from(it.next().ok_or_else(|| {
+                lang.tr(flock_client::lang::Key::CliErrInvitePath)
+                    .to_string()
+            })?),
         },
         Some("gen-keys") => Cmd::GenKeys,
         Some("--smoke") => Cmd::Smoke,
-        Some(other) => return Err(format!("未知子命令 {other:?}\n\n{USAGE}")),
+        Some(other) => {
+            return Err(lang.trf(
+                flock_client::lang::Key::CliErrUnknownSub,
+                &[&other, &lang.tr(flock_client::lang::Key::CliUsage)],
+            ))
+        }
     };
     Ok(Cli { config, cmd })
 }
@@ -178,21 +217,28 @@ fn b64_decode_flex(text: &str) -> Result<Vec<u8>, String> {
 }
 
 fn run_cli() -> Result<(), String> {
-    let cli = parse_args()?;
+    // Interactive-copy language: resolved once from client.toml (best-effort
+    // pre-scan of --config; falls back to detection), then threaded to every
+    // command that renders user-facing copy. Operational logs stay English.
+    let lang = best_effort_lang(&config_path_from_args());
+    let cli = parse_args(lang)?;
     match cli.cmd {
-        // status 不依赖 config（端点/token 全取平台缺省）；Windows service 在 SCM
-        // 上下文内自载 config（工作目录 = system32，配置路径须安装时写绝对路径）。
-        Cmd::Status => cmd_status(),
-        Cmd::Peers { json } => cmd_peers(json),
+        // status does not depend on config (endpoint/token take platform
+        // defaults); the Windows service loads config itself inside the SCM
+        // context (working dir = system32, so installation must record an
+        // absolute config path).
+        Cmd::Status => cmd_status(lang),
+        Cmd::Peers { json } => cmd_peers(json, lang),
         Cmd::Service => cmd_service(&cli.config),
         Cmd::Install { scope } => flock_client::install::install(&cli.config, scope)
-            .map_err(|e| format!("{e}\n（提权要求与平台矩阵见 docs/manual/service-install.md）")),
+            .map_err(|e| format!("{e}{}", lang.tr(flock_client::lang::Key::CliInstallDocHint))),
         Cmd::Uninstall { scope } => flock_client::install::uninstall(scope)
-            .map_err(|e| format!("{e}\n（提权要求与平台矩阵见 docs/manual/service-install.md）")),
+            .map_err(|e| format!("{e}{}", lang.tr(flock_client::lang::Key::CliInstallDocHint))),
         #[cfg(feature = "tray")]
-        Cmd::Tray => flock_client::tray::run_tray(),
+        Cmd::Tray => flock_client::tray::run_tray(lang),
         Cmd::Run | Cmd::GenKeys | Cmd::Invite { .. } | Cmd::Smoke | Cmd::Login => {
             let cfg = ClientConfig::load(&cli.config)?;
+            let lang = cfg.general.language.resolve();
             match cli.cmd {
                 Cmd::GenKeys => {
                     let device =
@@ -223,18 +269,20 @@ fn run_cli() -> Result<(), String> {
                     Ok(())
                 }
                 Cmd::Invite { path } => {
-                    // state_dir 无 directory 时 bootstrap 会拒——invite 路径先读密钥生成（容缺目录）。
+                    // bootstrap rejects a state_dir without directory — the
+                    // invite path reads/generates keys first (tolerates a
+                    // missing directory).
                     let text = std::fs::read_to_string(&path)
-                        .map_err(|e| format!("读 {}: {e}", path.display()))?;
+                        .map_err(|e| format!("read {}: {e}", path.display()))?;
                     let bytes = b64_decode_flex(&text)
                         .or_else(|_| std::fs::read(&path).map_err(|e| e.to_string()))?;
                     let invite =
-                        InviteFile::from_bytes(&bytes).map_err(|e| format!("邀请文件: {e}"))?;
+                        InviteFile::from_bytes(&bytes).map_err(|e| format!("invite file: {e}"))?;
                     connector::ingest_invite(&cfg.state_dir, &invite)
                         .map(|_| ())
                         .map_err(|e| e.to_string())?;
                     println!(
-                        "invite ok: cluster={} endpoints={}（已钉扎根公钥 + 存目录）",
+                        "invite ok: cluster={} endpoints={} (root key pinned + directory stored)",
                         hex::encode(invite.directory.cluster_id.0),
                         invite.directory.servers.len()
                     );
@@ -259,7 +307,7 @@ fn run_cli() -> Result<(), String> {
                         println!("tun: {} mtu={} vip={vip}", tun.name(), spec.mtu);
                         match route::apply(&RoutePlan::new(&cfg.tun_name, vip)).await {
                             Ok(()) => println!(
-                                "route: {}/{} → {}（rp_filter=1）",
+                                "route: {}/{} -> {} (rp_filter=1)",
                                 route::VIP_POOL.0,
                                 route::VIP_POOL.1,
                                 cfg.tun_name
@@ -296,19 +344,20 @@ fn run_cli() -> Result<(), String> {
                             .await
                             .map_err(|e| cli_err(ClientError::State(e.to_string())))?;
                         eprintln!(
-                            "flock-client: route {}/{} → {} + rp_filter=1",
+                            "flock-client: route {}/{} -> {} + rp_filter=1",
                             route::VIP_POOL.0,
                             route::VIP_POOL.1,
                             spec.name
                         );
-                        // 端点覆盖（断言钉死）优先；缺省 = 目录轮询。
+                        // Endpoint override (assertion pinning) wins; default
+                        // = directory rotation.
                         let state = if cfg.endpoints.is_empty() {
                             state
                         } else {
                             connector::override_endpoints(state, &cfg.endpoints)?
                         };
                         eprintln!(
-                            "flock-client: 守护启动（端点: {}）",
+                            "flock-client: supervise started (endpoints: {})",
                             state.endpoints().join(", ")
                         );
                         connector::supervise(
@@ -318,14 +367,14 @@ fn run_cli() -> Result<(), String> {
                             Backoff::default(),
                             |ev| match ev {
                                 ConnEvent::Dialing { endpoint, attempt } => {
-                                    eprintln!("flock-client: 拨号 {endpoint}（attempt {attempt}）")
+                                    eprintln!("flock-client: dialing {endpoint} (attempt {attempt})")
                                 }
                                 ConnEvent::Connected { endpoint, server } => eprintln!(
-                                    "flock-client: 已连接 {endpoint}（server={}）",
+                                    "flock-client: connected {endpoint} (server={})",
                                     hex::encode(server.0)
                                 ),
                                 ConnEvent::SessionEnded { endpoint, reason } => eprintln!(
-                                    "flock-client: 会话结束 {endpoint} reason={} → 进入重连",
+                                    "flock-client: session ended {endpoint} reason={} -> reconnecting",
                                     reason
                                         .map(|r| r.to_string())
                                         .unwrap_or_else(|| "none(io/fin)".into())
@@ -337,19 +386,20 @@ fn run_cli() -> Result<(), String> {
                     })
                 }
                 Cmd::Login => {
-                    cmd_login(&cfg)?;
+                    cmd_login(&cfg, lang)?;
                     Ok(())
                 }
-                // 不可达（外层 match 已分流；保穷尽性）。
+                // Unreachable (the outer match already dispatched; keeps
+                // exhaustiveness).
                 Cmd::Service
                 | Cmd::Status
                 | Cmd::Peers { .. }
                 | Cmd::Install { .. }
                 | Cmd::Uninstall { .. } => {
-                    unreachable!("已在 run_cli 分流")
+                    unreachable!("already dispatched in run_cli")
                 }
                 #[cfg(feature = "tray")]
-                Cmd::Tray => unreachable!("已在 run_cli 分流"),
+                Cmd::Tray => unreachable!("already dispatched in run_cli"),
             }
         }
     }
@@ -359,38 +409,45 @@ fn cli_err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// `login` 子命令（M7 §7-M7.7 首次配置）：读口令（stdin 单行）→ 0600 凭据文件 →
-/// 直连隧道控制流：设服务端口令（PwBegin/PwCommit——授权 = 设备 owner == [auth]
-/// username）→ 登录验证（anchor + key-bind hostname 入册）。
+/// `login` subcommand (M7 §7-M7.7 first-time setup): read the password (one
+/// stdin line) → 0600 credentials file → direct-over-tunnel control stream:
+/// set the service password (PwBegin/PwCommit — authorization = device owner
+/// == [auth] username) → login verification (anchor + key-bind hostname
+/// registration).
 ///
-/// 口令回显：tty 下 stdin 行读有回显——本地信任域内的取舍（OPAQUE 保证口令不上线；
-/// 本地静止 = 本地信任域，§7-M7.7）；管道/容器（echo pw | login）无回显无碍。
-fn cmd_login(cfg: &ClientConfig) -> Result<(), String> {
+/// Password echo: line-reading stdin under a tty echoes — an accepted
+/// trade-off inside the local trust domain (OPAQUE keeps the password off the
+/// wire; at rest locally = local trust domain, §7-M7.7); pipes/containers
+/// (`echo pw | login`) have no echo and no issue.
+fn cmd_login(cfg: &ClientConfig, lang: Lang) -> Result<(), String> {
+    use flock_client::lang::Key as K;
     let auth = cfg
         .auth
         .as_ref()
-        .ok_or_else(|| "client.toml 缺 [auth] username（登录配置）".to_string())?;
+        .ok_or_else(|| lang.tr(K::CliLoginErrNoAuth).to_string())?;
     let cred_path =
         flock_client::ctrl::credentials_path(&cfg.state_dir, auth.credentials_file.as_deref());
     eprint!(
-        "flock-client: 登录口令（user={}，单行，将保存到 {}）: ",
-        auth.username,
-        cred_path.display()
+        "{}",
+        lang.trf(K::CliLoginPrompt, &[&auth.username, &cred_path.display()])
     );
     let _ = std::io::stderr().flush();
     let mut pw = String::new();
     std::io::stdin()
         .read_line(&mut pw)
-        .map_err(|e| format!("读口令: {e}"))?;
+        .map_err(|e| lang.trf(K::CliLoginErrReadPassword, &[&e]))?;
     let pw = pw.trim_end_matches(['\n', '\r']).to_string();
     if pw.is_empty() {
-        return Err("口令为空".into());
+        return Err(lang.tr(K::CliLoginErrEmptyPassword).to_string());
     }
     flock_client::ctrl::save_credentials(&cred_path, &pw)
-        .map_err(|e| format!("写凭据文件: {e}"))?;
-    eprintln!("flock-client: 凭据已保存（0600）: {}", cred_path.display());
+        .map_err(|e| lang.trf(K::CliLoginErrWriteCredentials, &[&e]))?;
+    eprintln!(
+        "{}",
+        lang.trf(K::CliLoginCredentialsSaved, &[&cred_path.display()])
+    );
 
-    // 状态三件套（invite 先行）+ SR-SIG1 密钥 + hostname。
+    // State trio (invite first) + SR-SIG1 key + hostname.
     let state = ClientState::load(&cfg.state_dir, false).map_err(cli_err)?;
     let sr_key =
         flock_client::ctrl::load_or_create_sr_key(&cfg.state_dir).map_err(|e| e.to_string())?;
@@ -401,7 +458,7 @@ fn cmd_login(cfg: &ClientConfig) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     rt.block_on(async move {
-        let mut last_err = String::from("目录无可用端点（先 `flock-client invite <file>`）");
+        let mut last_err = lang.tr(K::CliLoginNoEndpoints).to_string();
         for ep in state.endpoints() {
             let Some(pin) = state.pin_for(&ep) else {
                 continue;
@@ -415,33 +472,32 @@ fn cmd_login(cfg: &ClientConfig) -> Result<(), String> {
             {
                 Ok(t) => t,
                 Err(e) => {
-                    last_err = format!("拨号 {ep}: {e}");
+                    last_err = format!("dial {ep}: {e}");
                     continue;
                 }
             };
-            let stream = match tunnel
-                .open_stream(flock_protocol::mux::Prio::Control)
-                .await
-            {
+            let stream = match tunnel.open_stream(flock_protocol::mux::Prio::Control).await {
                 Ok(s) => std::sync::Arc::new(tokio::sync::Mutex::new(s)),
                 Err(e) => {
-                    last_err = format!("控制流 {ep}: {e}");
+                    last_err = format!("control stream {ep}: {e}");
                     tunnel.shutdown().await;
                     continue;
                 }
             };
             let t = flock_client::ctrl::StreamTransport(stream);
-            // ① 设口令（PasswordExists = 已设——沿用，登录验证兜底）。
+            // (1) Set the password (PasswordExists = already set — keep it;
+            // login verification is the fallback check).
             match flock_client::ctrl::set_password_once(&t, &auth.username, &pw).await {
-                Ok(true) => eprintln!("flock-client: 服务端口令已设置"),
-                Ok(false) => eprintln!("flock-client: 服务端口令已存在（沿用；若登录失败说明口令失配）"),
+                Ok(true) => eprintln!("{}", lang.tr(K::CliLoginPwSet)),
+                Ok(false) => eprintln!("{}", lang.tr(K::CliLoginPwExists)),
                 Err(e) => {
                     tunnel.shutdown().await;
-                    last_err = format!("设口令: {e}");
+                    last_err = format!("set password: {e}");
                     continue;
                 }
             }
-            // ② 登录验证 + hostname 入册（票据不保留——一次性命令，daemon 自行登录）。
+            // (2) Login verification + hostname registration (no ticket
+            // retention — one-shot command; the daemon logs in on its own).
             let params = flock_client::ctrl::AuthParams {
                 username: auth.username.clone(),
                 password: pw.clone(),
@@ -457,30 +513,32 @@ fn cmd_login(cfg: &ClientConfig) -> Result<(), String> {
                 Ok(o) => o,
                 Err(e) => {
                     tunnel.shutdown().await;
-                    last_err = format!("登录验证: {e}");
+                    last_err = format!("login verification: {e}");
                     continue;
                 }
             };
             tunnel.shutdown().await;
+            // Stable English output line: m7_assert.sh greps '^login ok:'.
             println!(
-                "login ok: user={} vip={} hostname={}（hostname 已入册；daemon 将自动登录保持票据）",
+                "login ok: user={} vip={} hostname={} (hostname registered; the daemon will \
+                 log in automatically to keep the ticket fresh)",
                 auth.username,
                 std::net::Ipv4Addr::from(out.vip),
                 hostname
             );
             return Ok(());
         }
-        Err(format!(
-            "{last_err}（端点全试尽；凭据已写入 {}——排障后重跑 `flock-client login` 可换口令；\
-             检查服务端可达性与 device-add --user 是否为 {}）",
-            cred_path.display(),
-            auth.username
+        Err(lang.trf(
+            K::CliLoginAllFailed,
+            &[&last_err, &cred_path.display(), &auth.username],
         ))
     })
 }
 
-/// `service` 子命令：Windows 走 SCM 分派（终端直跑自动回落前台 daemon）；Unix
-/// 前台运行 daemon（systemd/launchd 的 ExecStart/Program 直接拉起本子命令）。
+/// `service` subcommand: Windows goes through the SCM dispatcher (a direct
+/// terminal run automatically falls back to the foreground daemon); Unix runs
+/// the daemon in the foreground (ExecStart/Program of systemd/launchd invoke
+/// this subcommand directly).
 fn cmd_service(config: &std::path::Path) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -498,12 +556,14 @@ fn cmd_service(config: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// `status` 子命令：读 token 文件 → 发一次 `Status` 请求 → 打印快照。
-fn cmd_status() -> Result<(), String> {
+/// `status` subcommand: read the token file → send one `Status` request →
+/// print the snapshot.
+fn cmd_status(lang: Lang) -> Result<(), String> {
     use flock_client::ipc::{ConnState, CtrlReq, CtrlResp};
+    use flock_client::lang::Key as K;
     let paths = flock_client::ipc::ControlPaths::platform_default();
     let token = flock_client::ipc::load_token_file(&paths.token_file)
-        .map_err(|e| format!("{e}（daemon 未运行，或本用户无权读取控制 token）"))?;
+        .map_err(|e| lang.trf(K::CliStatusErrToken, &[&e]))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -528,28 +588,22 @@ fn cmd_status() -> Result<(), String> {
                 println!("epoch={epoch} uptime={uptime_secs}s");
                 Ok(())
             }
-            Ok(CtrlResp::Denied) => {
-                Err("请求被拒（token 失配——daemon 重启后旧 token 失效，重试）".into())
-            }
-            Ok(other) => Err(format!("意外响应: {other:?}")),
-            Err(e) => Err(format!(
-                "控制面不可达: {e}（daemon 未运行？`flock-client service` 或服务管理器启动）"
-            )),
+            Ok(CtrlResp::Denied) => Err(lang.tr(K::CliErrDenied).to_string()),
+            Ok(other) => Err(lang.trf(K::CliErrUnexpectedResp, &[&format!("{other:?}")])),
+            Err(e) => Err(lang.trf(K::CliStatusErrUnreachable, &[&e])),
         }
     })
 }
 
-/// `peers` 子命令（M7 §7-M7.7）：IPC `Peers` → 表格（缺省）/`--json` 机读档。
-/// daemon 不在/未登录 ⇒ 明确错误与指引（退出码 2）。
-fn cmd_peers(json: bool) -> Result<(), String> {
+/// `peers` subcommand (M7 §7-M7.7): IPC `Peers` → table (default) / `--json`
+/// machine-readable. Daemon absent/not logged in ⇒ explicit error with
+/// guidance (exit code 2).
+fn cmd_peers(json: bool, lang: Lang) -> Result<(), String> {
     use flock_client::ipc::{CtrlReq, CtrlResp, PEERS_REQUEST_TIMEOUT};
+    use flock_client::lang::Key as K;
     let paths = flock_client::ipc::ControlPaths::platform_default();
-    let token = flock_client::ipc::load_token_file(&paths.token_file).map_err(|e| {
-        format!(
-            "{e}\n（daemon 未运行？`flock-client service` 或系统服务管理器启动；\
-             控制面 token 由 daemon 启动时生成）"
-        )
-    })?;
+    let token = flock_client::ipc::load_token_file(&paths.token_file)
+        .map_err(|e| lang.trf(K::CliPeersErrToken, &[&e]))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -566,21 +620,16 @@ fn cmd_peers(json: bool) -> Result<(), String> {
                 if json {
                     println!("{}", flock_client::peers::render_json(&rows)?);
                 } else {
-                    print!("{}", flock_client::peers::render_table(&rows));
+                    print!("{}", flock_client::peers::render_table(&rows, lang));
                 }
                 Ok(())
             }
-            Ok(CtrlResp::PeersUnavailable { reason }) => Err(format!(
-                "{reason}\n（指引：确认 `flock-client service` 在跑、client.toml 配置了 \
-                 `[auth] username`、且已跑过 `flock-client login` 完成口令引导）"
-            )),
-            Ok(CtrlResp::Denied) => {
-                Err("请求被拒（token 失配——daemon 重启后旧 token 失效，重试）".into())
+            Ok(CtrlResp::PeersUnavailable { reason }) => {
+                Err(lang.trf(K::CliPeersErrUnavailable, &[&reason]))
             }
-            Ok(other) => Err(format!("意外响应: {other:?}")),
-            Err(e) => Err(format!(
-                "控制面不可达: {e}\n（daemon 未运行？`flock-client service` 或系统服务管理器启动）"
-            )),
+            Ok(CtrlResp::Denied) => Err(lang.tr(K::CliErrDenied).to_string()),
+            Ok(other) => Err(lang.trf(K::CliErrUnexpectedResp, &[&format!("{other:?}")])),
+            Err(e) => Err(lang.trf(K::CliPeersErrUnreachable, &[&e])),
         }
     })
 }

@@ -1,57 +1,78 @@
-//! Windows/macOS 托盘后端（`tray-icon` 内建菜单——muda 经 `tray_icon::menu` 再导出
-//! 消费；docs/design.md §7-M6 第二阶段）。
+//! Windows/macOS tray backend (`tray-icon`'s built-in menu — muda consumed
+//! via the `tray_icon::menu` re-export; docs/design.md §7-M6 phase two).
 //!
-//! 选型与最小泵形态（不引入 winit/tauri/egui 全套 GUI 栈——本进程不建任何窗口）：
-//! - tray-icon 支持**无窗口**使用（Windows/macOS 原生托盘后端 + muda 原生菜单），
-//!   但事件派发依赖所在线程的**消息泵/事件循环**——两平台各配最小可行泵：
-//! - **Windows**：托盘/菜单线程亲和（Win32 消息驱动）——专用线程跑 `GetMessageW` 泵
-//!   （tray-icon 官方最小示例形态），主线程的轮询循环经 `PostThreadMessageW`
-//!   （自定义 `WM_APP` 消息）唤醒泵消费最新文案；「退出」经 `WM_QUIT` 收泵，
-//!   tray Drop 移除图标；
-//! - **macOS**：AppKit 要求托盘/NSMenu 在**主线程**且跑事件循环——主线程手动排空
-//!   NSApp 事件（`nextEvent…/sendEvent/updateWindows`，50ms 节律消费共享刷新），
-//!   轮询/IPC 跑独立线程（自有 tokio rt）。**本机无 macOS 设备：编译级验证 + 真机
-//!   清单留位（docs/manual/service-install.md §托盘真机清单）**。
+//! Selection and the minimal pump shape (no winit/tauri/egui GUI stack —
+//! this process creates no window at all):
+//! - tray-icon supports **windowless** use (the native tray backends on
+//!   Windows/macOS + muda native menus), but event delivery depends on the
+//!   owning thread's **message pump/event loop** — each platform gets a
+//!   minimal viable pump:
+//! - **Windows**: tray/menu thread affinity (Win32 message-driven) — a
+//!   dedicated thread runs the `GetMessageW` pump (tray-icon's official
+//!   minimal example shape); the main thread's polling loop wakes the pump
+//!   via `PostThreadMessageW` (a custom `WM_APP` message) to consume the
+//!   latest texts; "Quit" collects the pump via `WM_QUIT`, and tray Drop
+//!   removes the icon;
+//! - **macOS**: AppKit requires the tray/NSMenu on the **main thread** with
+//!   the event loop running — the main thread manually drains NSApp events
+//!   (`nextEvent…/sendEvent/updateWindows`, a 50ms cadence consuming the
+//!   shared refresh) while polling/IPC run on a separate thread (with their
+//!   own tokio rt). **No macOS device available here: compile-level
+//!   verification + the real-machine checklist placeholder
+//!   (docs/manual/service-install.md §tray real-machine checklist).**
 //!
-//! 平台差异只在「泵在哪跑、怎么唤醒」；菜单构建（三项：状态/VIP/退出）与轮询驱动
-//! （[`drive`]）共用。托盘创建失败（无 GUI 会话等）⇒ 打印清晰日志 + 进程优雅退出
-//! （退出码 0，不 panic）。
+//! The platform difference is only "where the pump runs and how it is
+//! woken"; menu construction (three items: status/VIP/quit — localized via
+//! [`crate::lang`]) and the polling driver ([`drive`]) are shared.
+//! Tray-creation failure (no GUI session, etc.) ⇒ print a clear log + the
+//! process exits gracefully (exit code 0, no panic).
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use super::icon::{flock_rgba, ICON_SIZE};
 use super::{ControlPaths, ExitDecision, MenuTexts, POLL_INTERVAL};
+use crate::lang::{Key, Lang};
 
-/// 菜单项 id（muda `MenuId` 字符串；「退出」匹配 MenuEvent，两项只读展示）。
+/// Menu item ids (muda `MenuId` strings; "Quit" matches MenuEvent, the two
+/// others are read-only display items).
 const ITEM_STATUS: &str = "flock-status";
 const ITEM_VIP: &str = "flock-vip";
 const ITEM_EXIT: &str = "flock-exit";
 
-/// 托盘句柄（状态/VIP 只读项 + tooltip；创建线程持有——Win32 菜单与 NSMenu 均线程
-/// 亲和，所有变更经拥有线程的泵/循环执行）。
+/// Tray handle (status/VIP read-only items + tooltip; held by the creating
+/// thread — both the Win32 menu and NSMenu are thread-affine, all mutations
+/// go through the owning thread's pump/loop).
 struct NativeTray {
     tray: TrayIcon,
     status: MenuItem,
     vip: MenuItem,
 }
 
-/// 建托盘：三项菜单（「连接状态」「VPN IP」disabled 只读项——置灰为只读展示的
-/// 平台惯用形态；「退出」动作项）+ 内嵌图标 + tooltip。
+/// Build the tray: a three-item menu ("Connection" and "VPN IP" disabled
+/// read-only items — greyed-out is the customary read-only display shape
+/// across platforms; "Quit" the action item) + the embedded icon + tooltip.
 ///
-/// 错误统一 `String`（菜单/图标/托盘三族错误只用于日志后优雅退出，不区分类别）。
-fn build_native_tray() -> Result<NativeTray, String> {
-    let status = MenuItem::with_id(ITEM_STATUS, "连接状态：服务未运行", false, None);
-    let vip = MenuItem::with_id(ITEM_VIP, "VPN IP：—", false, None);
-    let exit = MenuItem::with_id(ITEM_EXIT, "退出", true, None);
+/// Errors are uniformly `String` (the three menu/icon/tray error families
+/// only feed the log before a graceful exit; no per-class handling).
+fn build_native_tray(lang: Lang) -> Result<NativeTray, String> {
+    let down = lang.tr(Key::TrayServiceDown);
+    let status = MenuItem::with_id(
+        ITEM_STATUS,
+        lang.trf(Key::TrayStatusLine, &[&down]),
+        false,
+        None,
+    );
+    let vip = MenuItem::with_id(ITEM_VIP, lang.trf(Key::TrayVipLine, &[&"—"]), false, None);
+    let exit = MenuItem::with_id(ITEM_EXIT, lang.tr(Key::TrayQuit), true, None);
     let menu = Menu::new();
     menu.append_items(&[&status, &vip, &exit])
-        .map_err(|e| format!("菜单构建: {e}"))?;
+        .map_err(|e| format!("menu build: {e}"))?;
     let icon =
-        Icon::from_rgba(flock_rgba(), ICON_SIZE, ICON_SIZE).map_err(|e| format!("图标: {e}"))?;
+        Icon::from_rgba(flock_rgba(), ICON_SIZE, ICON_SIZE).map_err(|e| format!("icon: {e}"))?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("Flock VPN：服务未运行")
+        .with_tooltip(lang.trf(Key::TrayTooltip, &[&down, &"—"]))
         .with_icon(icon)
         .build()
         .map_err(|e| format!("{e}"))?;
@@ -59,17 +80,19 @@ fn build_native_tray() -> Result<NativeTray, String> {
 }
 
 impl NativeTray {
-    /// 应用最新文案（**须在创建线程调用**）。
+    /// Apply the latest texts (**must be called on the creating thread**).
     fn apply(&self, texts: &MenuTexts) {
         self.status.set_text(&texts.status);
         self.vip.set_text(&texts.vip);
-        // Windows szTip 上限 128 字符（含 NUL）——tooltip 文案远短于此。
+        // Windows szTip caps at 128 chars (including NUL) — the tooltip text
+        // is far below that.
         let _ = self.tray.set_tooltip(Some(texts.tooltip.as_str()));
     }
 }
 
-/// 菜单事件转发线程体：muda 全局通道 → tokio 侧（只读项无动作；仅「退出」转发）。
-/// 线程随进程退出终结（recv 阻塞，无泄漏路径）。
+/// Menu-event forwarder thread body: muda's global channel → the tokio side
+/// (read-only items have no action; only "Quit" is forwarded). The thread
+/// ends with the process (recv blocks; no leak path).
 fn forward_menu_events(exit_tx: tokio::sync::mpsc::UnboundedSender<()>) {
     loop {
         match MenuEvent::receiver().recv() {
@@ -82,24 +105,29 @@ fn forward_menu_events(exit_tx: tokio::sync::mpsc::UnboundedSender<()>) {
     }
 }
 
-/// 轮询/退出驱动（平台后端共用）：2s 拍轮询 → `refresh` 回调落位；「退出」→
-/// [`super::request_exit`] 裁决——ExitTray 结束循环（StayRunning 继续：token 已重载）。
+/// Polling/exit driver (shared by platform backends): poll on the 2s beat →
+/// the `refresh` callback lands the texts; "Quit" → [`super::request_exit`]
+/// verdict — ExitTray ends the loop (StayRunning continues: the token was
+/// reloaded).
 ///
-/// `pump_ended`（Windows 专用）：托盘泵线程终结（GetMessageW=-1 错误或 WM_QUIT
-/// 收泵）⇒ 立即结束驱动循环——图标已失，不留「无图标僵尸进程」（评审项 8）。
-/// macOS 侧持有永不发送的配对端（oneshot）——该臂不触发。
+/// `pump_ended` (Windows-specific): the tray pump thread terminated
+/// (GetMessageW=-1 error or a WM_QUIT collection) ⇒ end the drive loop
+/// immediately — the icon is gone; leave no "iconless zombie process"
+/// (review item 8). The macOS side holds a never-sending paired end
+/// (oneshot) — that arm never fires.
 async fn drive(
     paths: &ControlPaths,
+    lang: Lang,
     mut refresh: impl FnMut(MenuTexts),
     mut exit_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     mut pump_ended: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut tokens = super::TokenSource::new(paths.token_file.clone());
-    let mut ticker = tokio::time::interval(POLL_INTERVAL); // 首拍立即——启动即有文案
+    let mut ticker = tokio::time::interval(POLL_INTERVAL); // first tick immediate — texts right at startup
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let texts = super::poll_once(paths, &mut tokens).await;
+                let texts = super::poll_once(paths, &mut tokens, lang).await;
                 refresh(texts);
             }
             _ = exit_rx.recv() => {
@@ -108,9 +136,13 @@ async fn drive(
                     ExitDecision::StayRunning => continue,
                 }
             }
-            // Ok（泵发过信号）/Err（发送端 drop）均视为泵已终结——直接退出进程。
+            // Ok (the pump signalled) / Err (sender dropped) both count as
+            // the pump terminated — exit the process directly.
             _ = &mut pump_ended => {
-                eprintln!("flock-client tray: 托盘泵已结束——进程收尾（不留无图标僵尸进程）");
+                eprintln!(
+                    "flock-client tray: tray pump ended — wrapping up the process (no iconless \
+                     zombie)"
+                );
                 break;
             }
         }
@@ -118,137 +150,153 @@ async fn drive(
 }
 
 // ============================================================================
-// Windows：托盘线程（GetMessageW 泵）+ 主线程 tokio 驱动
+// Windows: tray thread (GetMessageW pump) + main-thread tokio driver
 // ============================================================================
 
 #[cfg(windows)]
-pub fn run(paths: &ControlPaths) -> Result<(), String> {
+pub fn run(paths: &ControlPaths, lang: Lang) -> Result<(), String> {
     use std::sync::{Arc, Mutex};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_APP, WM_QUIT,
     };
-    /// 自定义线程消息：泵消费最新文案刷新菜单/tooltip（WM_APP 段应用自定义）。
+    /// Custom thread message: the pump consumes the latest texts and
+    /// refreshes the menu/tooltip (the WM_APP range is application-defined).
     const WM_APP_TRAY_UPDATE: u32 = WM_APP + 1;
 
     let latest: Arc<Mutex<Option<MenuTexts>>> = Arc::new(Mutex::new(None));
     let pump_latest = latest.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
-    // 泵终结信号（评审项 8）：泵线程 GetMessageW=-1（错误）或收泵退出时通知
-    // drive 循环结束——图标已失的进程不得继续空转。
+    // Pump-termination signal (review item 8): the pump thread notifies the
+    // drive loop to end when GetMessageW=-1 (error) or it collects a quit —
+    // a process whose icon is gone must not keep spinning.
     let (pump_end_tx, pump_end_rx) = tokio::sync::oneshot::channel::<()>();
     let tray_thread = std::thread::Builder::new()
         .name("flock-tray".into())
         .spawn(move || {
-            // pump_end_tx 随本线程 Drop——「线程意外终结」同样点亮 drive 的该臂。
+            // pump_end_tx Drops with this thread — "thread died unexpectedly"
+            // also lights that arm of drive.
             let _pump_end_tx = pump_end_tx;
-            let native = match build_native_tray() {
+            let native = match build_native_tray(lang) {
                 Ok(n) => n,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e.to_string()));
                     return;
                 }
             };
-            // SAFETY：取本线程 id 供 PostThreadMessageW 唤醒（无参数副作用）。
+            // SAFETY: take this thread's id for PostThreadMessageW wake-ups
+            // (no parameter side effects).
             let tid = unsafe { GetCurrentThreadId() };
             if ready_tx.send(Ok(tid)).is_err() {
-                return; // 主线程已放弃（接收端 drop）
+                return; // main thread gave up (receiver dropped)
             }
-            // 泵循环（tray-icon 官方最小示例形态）：GetMessageW 阻塞等消息；
-            // 更新消息消费最新文案；WM_QUIT（0）/错误（-1）结束——native Drop
-            // 在本线程发生（Windows 侧 Drop 移除托盘图标）。-1 与正常收泵分别
-            // 记日志（评审项 8：-1 不再无声吞掉）。
-            // SAFETY：msg 为合法出参指针；句柄参数 NULL = 不按窗口过滤。
+            // Pump loop (tray-icon's official minimal example shape):
+            // GetMessageW blocks awaiting messages; update messages consume
+            // the latest texts; WM_QUIT (0)/error (-1) end it — the native
+            // Drop happens on this thread (on Windows, Drop removes the tray
+            // icon). -1 and a normal quit are logged separately (review
+            // item 8: -1 is no longer swallowed silently).
+            // SAFETY: msg is a valid out-param pointer; a NULL handle
+            // argument = no window filtering.
             unsafe {
                 let mut msg: MSG = std::mem::zeroed();
                 loop {
                     let got = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
                     if got == 0 {
-                        break; // WM_QUIT（正常收泵）
+                        break; // WM_QUIT (normal pump collection)
                     }
                     if got == -1 {
                         eprintln!(
-                            "flock-client tray: 消息泵错误（GetMessageW=-1）——图标失联，托盘收尾"
+                            "flock-client tray: message pump error (GetMessageW=-1) — icon lost, \
+                             wrapping up the tray"
                         );
                         break;
                     }
                     if msg.message == WM_APP_TRAY_UPDATE {
-                        if let Some(texts) = pump_latest.lock().expect("托盘状态锁中毒").take()
+                        if let Some(texts) =
+                            pump_latest.lock().expect("tray state lock poisoned").take()
                         {
                             native.apply(&texts);
                         }
-                        continue; // posted 线程消息无窗口句柄，无须 Translate/Dispatch
+                        continue; // posted thread messages carry no window handle; no Translate/Dispatch needed
                     }
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
             }
         })
-        .map_err(|e| format!("托盘线程创建失败: {e}"))?;
+        .map_err(|e| format!("tray thread creation failed: {e}"))?;
 
     let thread_id = match ready_rx.recv() {
         Ok(Ok(tid)) => tid,
         Ok(Err(e)) => {
             eprintln!(
-                "flock-client tray: 托盘创建失败: {e}——无 GUI 会话或系统托盘不可用，\
-                 托盘未启动（进程优雅退出）"
+                "flock-client tray: tray creation failed: {e} — no GUI session or the system tray \
+                 is unavailable, tray not started (process exits gracefully)"
             );
             let _ = tray_thread.join();
             return Ok(());
         }
         Err(_) => {
             let _ = tray_thread.join();
-            return Err("托盘线程未就绪（通道提前关闭）".into());
+            return Err("tray thread not ready (channel closed early)".into());
         }
     };
 
-    // 菜单事件转发线程 + tokio 驱动（主线程）。
+    // Menu-event forwarder thread + tokio driver (main thread).
     let (exit_tx, exit_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     std::thread::Builder::new()
         .name("flock-tray-menu".into())
         .spawn(move || forward_menu_events(exit_tx))
-        .map_err(|e| format!("菜单事件线程创建失败: {e}"))?;
+        .map_err(|e| format!("menu event thread creation failed: {e}"))?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("tokio 运行时创建失败: {e}"))?;
+        .map_err(|e| format!("tokio runtime creation failed: {e}"))?;
     let drive_latest = latest.clone();
     rt.block_on(drive(
         paths,
+        lang,
         move |texts| {
-            *drive_latest.lock().expect("托盘状态锁中毒") = Some(texts);
-            // SAFETY：线程消息投递（唤醒泵消费最新文案）；托盘线程已结束时失败可忽略。
+            *drive_latest.lock().expect("tray state lock poisoned") = Some(texts);
+            // SAFETY: thread-message post (wakes the pump to consume the
+            // latest texts); failure is ignorable once the tray thread has
+            // ended.
             unsafe { PostThreadMessageW(thread_id, WM_APP_TRAY_UPDATE, 0, 0) };
         },
         exit_rx,
         pump_end_rx,
     ));
 
-    // 收泵：WM_QUIT 令 GetMessageW 返回 0；join 确保图标移除后进程再退。
-    // SAFETY：同上。
+    // Collect the pump: WM_QUIT makes GetMessageW return 0; the join ensures
+    // the icon is removed before the process exits.
+    // SAFETY: same as above.
     unsafe { PostThreadMessageW(thread_id, WM_QUIT, 0, 0) };
     let _ = tray_thread.join();
-    eprintln!("flock-client tray: 已退出");
+    eprintln!("flock-client tray: exited");
     Ok(())
 }
 
 // ============================================================================
-// macOS：主线程 NSApp 事件排空 + 独立轮询线程（编译级验证——无设备，真机清单留位）
+// macOS: main-thread NSApp event draining + a separate polling thread
+// (compile-level verification — no device, real-machine checklist
+// placeholder)
 // ============================================================================
 
 #[cfg(target_os = "macos")]
-pub fn run(paths: &ControlPaths) -> Result<(), String> {
+pub fn run(paths: &ControlPaths, lang: Lang) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    // 主线程先行：托盘/菜单创建（AppKit 主线程约束）——失败 ⇒ 优雅退出。
-    let native = match build_native_tray() {
+    // Main thread first: tray/menu creation (the AppKit main-thread
+    // constraint) — failure ⇒ graceful exit.
+    let native = match build_native_tray(lang) {
         Ok(n) => n,
         Err(e) => {
             eprintln!(
-                "flock-client tray: 托盘创建失败: {e}——无 GUI 会话或系统托盘不可用，\
-                 托盘未启动（进程优雅退出）"
+                "flock-client tray: tray creation failed: {e} — no GUI session or the system tray \
+                 is unavailable, tray not started (process exits gracefully)"
             );
             return Ok(());
         }
@@ -256,10 +304,12 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
     let latest: Arc<Mutex<Option<MenuTexts>>> = Arc::new(Mutex::new(None));
     let quit = Arc::new(AtomicBool::new(false));
 
-    // 轮询/IPC 线程（自有 tokio rt）：刷新写共享状态（主循环消费）；ExitTray 置退出。
+    // Polling/IPC thread (its own tokio rt): refreshes write the shared
+    // state (consumed by the main loop); ExitTray sets the quit flag.
     let poll_latest = latest.clone();
     let poll_quit = quit.clone();
     let poll_paths = paths.clone();
+    let poll_lang = lang;
     let poll_thread = std::thread::Builder::new()
         .name("flock-tray-poll".into())
         .spawn(move || {
@@ -269,45 +319,58 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    eprintln!("flock-client tray: 轮询线程运行时创建失败: {e}——托盘退出");
+                    eprintln!(
+                        "flock-client tray: polling thread runtime creation failed: {e} — tray \
+                         exiting"
+                    );
                     poll_quit.store(true, Ordering::SeqCst);
                     return;
                 }
             };
             let (exit_tx, exit_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-            // 菜单事件转发线程（NSApp sendEvent → muda 全局通道 → 本循环）。
+            // Menu-event forwarder thread (NSApp sendEvent → muda global
+            // channel → this loop).
             let _ = std::thread::Builder::new()
                 .name("flock-tray-menu".into())
                 .spawn(move || forward_menu_events(exit_tx));
             let poll_latest = poll_latest;
-            // macOS 无独立泵线程（主线程 NSApp 循环即泵）——drive 的泵终结臂配
-            // 永不发送的占位通道（tx 随本闭包持有至轮询线程结束，该臂不触发；
-            // 线程终结时 tx Drop ⇒ rx Err 点亮 = 同样收尾，语义不劣化）。
+            // macOS has no separate pump thread (the main-thread NSApp loop
+            // is the pump) — drive's pump-termination arm gets a
+            // never-sending placeholder channel (the tx is held by this
+            // closure until the polling thread ends, so the arm never fires;
+            // when the thread ends, tx Drop ⇒ rx Err lights it = the same
+            // wrap-up, no semantic downgrade).
             let (_pump_hold_tx, pump_end_rx) = tokio::sync::oneshot::channel::<()>();
             rt.block_on(drive(
                 &poll_paths,
+                poll_lang,
                 move |texts| {
-                    *poll_latest.lock().expect("托盘状态锁中毒") = Some(texts);
+                    *poll_latest.lock().expect("tray state lock poisoned") = Some(texts);
                 },
                 exit_rx,
                 pump_end_rx,
             ));
             poll_quit.store(true, Ordering::SeqCst);
         })
-        .map_err(|e| format!("轮询线程创建失败: {e}"))?;
+        .map_err(|e| format!("polling thread creation failed: {e}"))?;
 
-    // 主线程：排空 NSApp 事件（菜单点击经 sendEvent 派发到 muda）+ 50ms 节律消费
-    // 共享刷新/退出标志（tray-icon mac 后端要求主线程事件循环在跑）。
+    // Main thread: drain NSApp events (menu clicks dispatch to muda via
+    // sendEvent) + consume the shared refresh/quit flag on a 50ms cadence
+    // (the tray-icon mac backend requires the main-thread event loop to be
+    // running).
     use objc2_app_kit::{NSApplication, NSEventMask};
     use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
-    // MainThreadMarker::new() 在非主线程返回 None（托盘后端入口保证主线程调用）。
+    // MainThreadMarker::new() returns None off the main thread (the tray
+    // backend entry point guarantees a main-thread call).
     let Some(mtm) = objc2::MainThreadMarker::new() else {
-        return Err("托盘主循环不在主线程（内部错误）".into());
+        return Err("tray main loop not on the main thread (internal error)".into());
     };
     let app = NSApplication::sharedApplication(mtm);
     let past = NSDate::distantPast();
-    // SAFETY：NSDefaultRunLoopMode 是 AppKit 常量全局（不可变 NSString）——objc2 将
-    // 其暴露为 extern static，读取引用需 unsafe（惯例姿势）；只读、'static。
+    // SAFETY: NSDefaultRunLoopMode is an immutable AppKit global constant
+    // (an immutable NSString) — objc2 exposes it as an extern static, and
+    // reading the reference requires unsafe (the customary form);
+    // read-only, 'static.
     let mode = unsafe { &NSDefaultRunLoopMode };
     while !quit.load(Ordering::SeqCst) {
         while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
@@ -319,12 +382,12 @@ pub fn run(paths: &ControlPaths) -> Result<(), String> {
             app.sendEvent(&event);
             app.updateWindows();
         }
-        if let Some(texts) = latest.lock().expect("托盘状态锁中毒").take() {
+        if let Some(texts) = latest.lock().expect("tray state lock poisoned").take() {
             native.apply(&texts);
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let _ = poll_thread.join();
-    eprintln!("flock-client tray: 已退出");
+    eprintln!("flock-client tray: exited");
     Ok(())
 }

@@ -1,25 +1,32 @@
-//! TUN 设备接缝（docs/design.md §2.3 / §3.12，VPN-14）。
+//! TUN device seam (docs/design.md §2.3 / §3.12, VPN-14).
 //!
-//! [`TunDevice`] = 客户端对 TUN 的全部认知面：`open/read/write/close` 四方法
-//! （§3.12 接口）。平台适配器：
+//! [`TunDevice`] = the client's entire knowledge surface of a TUN: four
+//! methods `open/read/write/close` (§3.12 interface). Platform adapters:
 //!
-//! - **tun-rs 原生适配器**（Linux/Windows/macOS，cfg 门控）：`DeviceBuilder` 创建
-//!   （name + MTU 1280），Unix 上设非阻塞（读泵轮询模型，见 [`TunIo`]）；
-//! - **Android/iOS fd 注入接缝**（仅注释，不装配）：两平台无 native 等价 API，fd 必须
-//!   由上层框架注入（vpn-mesh §1.1）——
-//!   - Android：`VpnService.Builder().establish().getFd()` 取 fd 后
-//!     `tun_rs::SyncDevice::from_fd(fd)`（unsafe：fd 所有权移交）；本 crate 的
-//!     [`TunDevice::open`] 不覆盖此路径，留给上层装配（tun-rs 2.8 内置该示例）；
-//!   - iOS：`NEPacketTunnelProvider.packetFlow` 的 `socket.fileDescriptor` 取 fd，
-//!     同 `from_fd`。两平台路由由 `VpnService.Builder` /
-//!     `NEPacketTunnelProvider` 参数承担（§2.3），不走本 crate 的 route 模块。
+//! - **tun-rs native adapter** (Linux/Windows/macOS, cfg-gated): created via
+//!   `DeviceBuilder` (name + MTU 1280), non-blocking on Unix (read-pump
+//!   polling model, see [`TunIo`]);
+//! - **Android/iOS fd-injection seam** (comments only, not assembled): the
+//!   two platforms have no native equivalent API; the fd must be injected by
+//!   the upper framework (vpn-mesh §1.1) —
+//!   - Android: after `VpnService.Builder().establish().getFd()` yields the
+//!     fd, `tun_rs::SyncDevice::from_fd(fd)` (unsafe: fd ownership
+//!     transferred); [`TunDevice::open`] in this crate does not cover this
+//!     path — left for upper-layer assembly (tun-rs 2.8 ships that example);
+//!   - iOS: take the fd from `NEPacketTunnelProvider.packetFlow`'s
+//!     `socket.fileDescriptor`, same `from_fd`. Routing on both platforms is
+//!     handled by `VpnService.Builder` / `NEPacketTunnelProvider` parameters
+//!     (§2.3), not by this crate's route module.
 //!
-//! [`MockTunDevice`]：宿主单测用（§7-M3「tun 单测用 mock TunDevice——主机无容器
-//! NET_ADMIN 环境」）——读空队列返回 `WouldBlock` 模拟非阻塞内核面。
+//! [`MockTunDevice`]: for host unit tests (§7-M3 "tun unit tests use a mock
+//! TunDevice — hosts lack the container NET_ADMIN environment") — an empty
+//! read queue returns `WouldBlock` to mimic the non-blocking kernel surface.
 //!
-//! [`TunIo`]/[`TunSession`]：把同步 [`TunDevice`] 桥成 tokio 异步面（两条阻塞线程 +
-//! 有界通道）。TUN 设备跨重连**常驻**（接口在，路由才在）；每条隧道会话取一个
-//! [`TunSession`]，会话结束即拆线程、设备不动。
+//! [`TunIo`]/[`TunSession`]: bridge the synchronous [`TunDevice`] into a
+//! tokio async surface (two blocking threads + bounded channels). The TUN
+//! device is **resident** across reconnects (only while the interface exists
+//! do the routes); each tunnel session takes one [`TunSession`], and when
+//! the session ends its threads are torn down while the device stays.
 
 use std::collections::VecDeque;
 use std::io;
@@ -29,15 +36,17 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-/// 部署形态 MTU = 1280（§2.1：Tailscale 同款、IPv6 下限，vpn-mesh §3.2）。
+/// Deployment-form MTU = 1280 (§2.1: same as Tailscale, IPv6 floor, vpn-mesh
+/// §3.2).
 pub const MTU: u16 = 1280;
 
-/// TUN 创建参数。
+/// TUN creation parameters.
 #[derive(Debug, Clone)]
 pub struct TunSpec {
-    /// 接口名（Linux ≤15 字符；缺省 "tun0"——§6.3 A3 断言按 `ip link show tun0`）。
+    /// Interface name (Linux ≤15 chars; default "tun0" — the §6.3 A3
+    /// assertion targets `ip link show tun0`).
     pub name: String,
-    /// MTU（缺省 [`MTU`]）。
+    /// MTU (default [`MTU`]).
     pub mtu: u16,
 }
 
@@ -50,27 +59,31 @@ impl Default for TunSpec {
     }
 }
 
-/// TUN 设备接缝（§3.12：open/read/write/close）。
+/// TUN device seam (§3.12: open/read/write/close).
 ///
-/// `read/write` 取 `&self`：真实 TUN fd 全双工且 read/write 互不阻塞（tun-rs 的
-/// `recv/send` 均为 `&self`），读/写两线程可共享一个 `Arc<dyn TunDevice>` 而无锁竞争。
+/// `read/write` take `&self`: a real TUN fd is full-duplex and read/write do
+/// not block each other (tun-rs's `recv/send` are both `&self`), so the
+/// read/write threads can share one `Arc<dyn TunDevice>` without lock
+/// contention.
 pub trait TunDevice: Send + Sync + 'static {
-    /// 打开设备（平台适配器装配点）。
+    /// Open the device (platform adapter assembly point).
     fn open(spec: &TunSpec) -> io::Result<Self>
     where
         Self: Sized;
-    /// 读一个 IP 包进 buf；返回读到的字节数。无包 ⇒ `ErrorKind::WouldBlock`
-    /// （Linux 非阻塞语义；Mock 对齐）。
+    /// Read one IP packet into buf; returns the byte count read. No packet ⇒
+    /// `ErrorKind::WouldBlock` (Linux non-blocking semantics; the Mock is
+    /// aligned).
     fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
-    /// 写一个 IP 包。
+    /// Write one IP packet.
     fn write(&self, buf: &[u8]) -> io::Result<usize>;
-    /// 关闭设备（此后 read/write 报错）。
+    /// Close the device (read/write error afterwards).
     fn close(&self) -> io::Result<()>;
-    /// 接口名（路由配置/日志用）。
+    /// Interface name (for route configuration/logging).
     fn name(&self) -> String;
 }
 
-/// 装配平台适配器（宿主/容器统一入口；无适配器平台返回明确错误而非 panic）。
+/// Assemble the platform adapter (unified host/container entry point;
+/// platforms without an adapter get an explicit error rather than a panic).
 pub fn open(spec: &TunSpec) -> io::Result<Box<dyn TunDevice>> {
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     {
@@ -78,19 +91,22 @@ pub fn open(spec: &TunSpec) -> io::Result<Box<dyn TunDevice>> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        // Android/iOS：fd 注入接缝（模块文档）——由上层框架持有 fd 构造，不走 open。
+        // Android/iOS: fd-injection seam (module docs) — constructed by the
+        // upper framework holding the fd, not via open.
         let _ = spec;
         Err(io::Error::other(
-            "tun: 平台无原生适配器（Android/iOS 走 fd 注入接缝，§2.3/§3.12）",
+            "tun: no native adapter on this platform (Android/iOS go through the fd-injection \
+             seam, §2.3/§3.12)",
         ))
     }
 }
 
 // ============================================================================
-// tun-rs 原生适配器（Linux/Windows/macOS）
+// tun-rs native adapter (Linux/Windows/macOS)
 // ============================================================================
 
-/// tun-rs 2.8 适配器（§2.3 选型：平台矩阵最全、活跃度最高，vpn-mesh §1.2）。
+/// tun-rs 2.8 adapter (§2.3 selection: fullest platform matrix, highest
+/// activity, vpn-mesh §1.2).
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub struct TunRsDevice {
     dev: tun_rs::SyncDevice,
@@ -105,8 +121,10 @@ impl TunDevice for TunRsDevice {
             .mtu(spec.mtu)
             .build_sync()
             .map_err(|e| io::Error::other(format!("tun-rs create {}: {e}", spec.name)))?;
-        // Unix：读泵 = 非阻塞轮询模型（见 TunIo 文档），显式设非阻塞。
-        // Windows（wintun）运行路径留待 M5 真机手工验证（§7-M3 清单）。
+        // Unix: read pump = non-blocking polling model (see the TunIo docs);
+        // set non-blocking explicitly.
+        // The Windows (wintun) runtime path is pending M5 real-machine manual
+        // verification (§7-M3 checklist).
         #[cfg(unix)]
         dev.set_nonblocking(true)
             .map_err(|e| io::Error::other(format!("tun nonblocking: {e}")))?;
@@ -117,11 +135,15 @@ impl TunDevice for TunRsDevice {
     }
 
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        // Windows（wintun）：tun-rs 的 recv 是**阻塞**语义（无跨平台非阻塞开关，
-        // set_nonblocking 仅 unix）——阻塞读会让读泵线程卡在 recv 内，TunSession::drop
-        // 的 stop 位在无流量时永远得不到检查（两泵退出承诺失效，见 TunIo::session）。
-        // 改 try_recv 轮询（tun-rs 仅 Windows 提供该 API）：无包 ⇒ WouldBlock，
-        // 走读泵的 POLL 间隔节流。Unix 维持非阻塞 recv（open 时已 set_nonblocking）。
+        // Windows (wintun): tun-rs's recv is **blocking** semantics (no
+        // cross-platform non-blocking switch; set_nonblocking is unix-only) —
+        // a blocking read would leave the read-pump thread stuck inside recv,
+        // and TunSession::drop's stop flag would never be checked when there
+        // is no traffic (breaking the both-pumps-exit promise, see
+        // TunIo::session). Switch to try_recv polling (an API tun-rs provides
+        // on Windows only): no packet ⇒ WouldBlock, throttled by the read
+        // pump's POLL interval. Unix keeps the non-blocking recv
+        // (set_nonblocking was applied at open).
         #[cfg(windows)]
         {
             self.dev.try_recv(buf)
@@ -137,7 +159,8 @@ impl TunDevice for TunRsDevice {
     }
 
     fn close(&self) -> io::Result<()> {
-        // tun-rs 无显式 close（fd 随 Drop 关）；置 down 即拆接口。
+        // tun-rs has no explicit close (the fd closes with Drop); setting
+        // down tears down the interface.
         self.dev
             .enabled(false)
             .map_err(|e| io::Error::other(format!("tun down: {e}")))
@@ -149,13 +172,15 @@ impl TunDevice for TunRsDevice {
 }
 
 // ============================================================================
-// Mock（宿主单测）
+// Mock (host unit tests)
 // ============================================================================
 
-/// 内存 TUN：`inject` 模拟内核→本机包（读侧），`written` 收集本机→内核包（写侧）。
+/// In-memory TUN: `inject` simulates kernel→local packets (read side),
+/// `written` collects local→kernel packets (write side).
 ///
-/// 读语义与 Linux 适配器对齐：空队列 ⇒ `WouldBlock`（`TunIo` 读泵的轮询路径在宿主
-/// 单测中被真实走到）。
+/// Read semantics align with the Linux adapter: empty queue ⇒ `WouldBlock`
+/// (the poll path of the [`TunIo`] read pump is genuinely exercised in host
+/// unit tests).
 #[derive(Debug, Default)]
 pub struct MockTunDevice {
     to_read: std::sync::Mutex<VecDeque<Vec<u8>>>,
@@ -165,7 +190,7 @@ pub struct MockTunDevice {
 }
 
 impl MockTunDevice {
-    /// 注入一个「内核发出」的包（读侧可见）。
+    /// Inject a "kernel-sent" packet (visible on the read side).
     pub fn inject(&self, pkt: &[u8]) {
         self.to_read
             .lock()
@@ -173,12 +198,12 @@ impl MockTunDevice {
             .push_back(pkt.to_vec());
     }
 
-    /// 本机写入的全部包（写侧记录）。
+    /// All packets written by the local side (write-side record).
     pub fn written(&self) -> Vec<Vec<u8>> {
         self.written.lock().expect("mock tun poisoned").clone()
     }
 
-    /// 打开时的 spec（断言 open 参数用）。
+    /// The spec at open time (for asserting open parameters).
     pub fn spec(&self) -> Option<TunSpec> {
         self.spec.lock().expect("mock tun poisoned").clone()
     }
@@ -233,19 +258,26 @@ impl TunDevice for MockTunDevice {
 }
 
 // ============================================================================
-// TunIo：同步设备 → tokio 异步桥
+// TunIo: sync device → tokio async bridge
 // ============================================================================
 
-/// 读泵轮询间隔（非阻塞 read 的 WouldBlock 空转节流；1280B@100Mbps ≈ 万包/s，
-/// 5ms 粒度批量排空对 A4 吞吐无感）。
+/// Read-pump poll interval (throttles WouldBlock spinning of the
+/// non-blocking read; 1280B@100Mbps ≈ 10k packets/s, draining in batches at
+/// a 5ms granularity is imperceptible for A4 throughput).
 const POLL: Duration = Duration::from_millis(5);
-/// 单通道在途包数（背压：TUN 读快于会话写时阻塞读泵而非丢包/膨胀）。
+/// In-flight packets per channel (backpressure: when TUN reads faster than
+/// the session writes, block the read pump rather than dropping packets or
+/// ballooning).
 const CHAN_CAP: usize = 1024;
-/// 读泵缓冲（循环复用）：按 IP 包上限一次分配——按 MTU+余量裁剪会在部署改 MTU/
-/// 异常大包时静默截断；复用消除「每包 64KiB 分配」（投递副本按实际长度精确分配）。
+/// Read-pump buffer (reused in a loop): allocated once at the IP packet
+/// ceiling — trimming to MTU+margin would silently truncate on a deployment
+/// MTU change or an unusually large packet; reuse removes the "64KiB
+/// allocation per packet" (delivery copies are allocated at the exact
+/// length).
 const READ_BUF_LEN: usize = 65535;
 
-/// 常驻 TUN 异步句柄：设备跨会话存活；每会话 [`TunIo::session`] 取一对通道。
+/// Resident TUN async handle: the device survives across sessions; each
+/// session takes one pair of channels from [`TunIo::session`].
 pub struct TunIo {
     dev: Arc<dyn TunDevice>,
     name: String,
@@ -260,34 +292,40 @@ impl std::fmt::Debug for TunIo {
 }
 
 impl TunIo {
-    /// 打开真设备并装配（`tun::open` + [`TunIo::from_arc`]）。
+    /// Open the real device and assemble (`tun::open` +
+    /// [`TunIo::from_arc`]).
     pub fn open(spec: &TunSpec) -> io::Result<Self> {
         Ok(Self::from_arc(Arc::from(open(spec)?)))
     }
 
-    /// 由共享设备装配（测试持 `Arc<MockTunDevice>` 双句柄时用）。
+    /// Assemble from a shared device (for tests holding an
+    /// `Arc<MockTunDevice>` dual-handle).
     pub fn from_arc(dev: Arc<dyn TunDevice>) -> Self {
         let name = dev.name();
         TunIo { dev, name }
     }
 
-    /// 接口名。
+    /// Interface name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// 内部设备引用（mock 注入/诊断）。
+    /// Internal device reference (mock injection/diagnostics).
     pub fn device(&self) -> &Arc<dyn TunDevice> {
         &self.dev
     }
 
-    /// 起一条会话通道：spawns 读泵（设备→rx）与写泵（tx→设备）两条阻塞线程。
-    /// 返回值 drop ⇒ 两泵在一个轮询周期内退出（设备保持打开，供下一会话复用）。
+    /// Start one session channel: spawns a read pump (device→rx) and a write
+    /// pump (tx→device), two blocking threads. Dropping the return value ⇒
+    /// both pumps exit within one poll period (the device stays open for the
+    /// next session to reuse).
     pub fn session(&self) -> TunSession {
         let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(CHAN_CAP);
         let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(CHAN_CAP);
-        // 会话级停止位（TunSession::drop 置位；无流量也能及时退出读泵轮询）。
-        // 全局停机走 shutdown 的设备 close：读/写随 Err 退出。
+        // Session-level stop flag (set by TunSession::drop; lets the read
+        // pump exit its polling loop promptly even with no traffic).
+        // Global shutdown goes through shutdown's device close: reads/writes
+        // exit with Err.
         let session_stop = Arc::new(AtomicBool::new(false));
         {
             let dev = self.dev.clone();
@@ -295,26 +333,29 @@ impl TunIo {
             std::thread::Builder::new()
                 .name("tun-read".into())
                 .spawn(move || {
-                    // 读缓冲循环复用（READ_BUF_LEN 注记）：每包不再新分配 64KiB；
-                    // 投递副本按实际读长精确分配。
+                    // Read buffer reused in a loop (READ_BUF_LEN note): no
+                    // fresh 64KiB per packet; delivery copies are allocated
+                    // at the exact read length.
                     let mut buf = vec![0u8; READ_BUF_LEN];
                     loop {
                         if stop.load(Ordering::Relaxed) {
                             break;
                         }
                         match dev.read(&mut buf) {
-                            // Ok(0)：设备侧「暂无数据」的零长读——按轮询间隔节流，
-                            // 不得裸转（否则无包时 100% CPU 自旋）。
+                            // Ok(0): a zero-length read meaning "no data for
+                            // now" on the device side — throttle by the poll
+                            // interval; must not be converted naively
+                            // (otherwise 100% CPU spin with no packets).
                             Ok(0) => std::thread::sleep(POLL),
                             Ok(n) => {
                                 if read_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                                    break; // 会话通道已拆
+                                    break; // session channel torn down
                                 }
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 std::thread::sleep(POLL);
                             }
-                            Err(_) => break, // 设备关闭/故障
+                            Err(_) => break, // device closed/failure
                         }
                     }
                 })
@@ -328,7 +369,9 @@ impl TunIo {
                     while let Some(pkt) = write_rx.blocking_recv() {
                         match dev.write(&pkt) {
                             Ok(_) => {}
-                            // 非阻塞 fd 写侧 EAGAIN（设备队列瞬满）：小睡重试，不判死。
+                            // Write-side EAGAIN on a non-blocking fd
+                            // (device queue momentarily full): brief sleep
+                            // and retry, not fatal.
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 std::thread::sleep(POLL);
                             }
@@ -345,13 +388,15 @@ impl TunIo {
         }
     }
 
-    /// 全局停机：关设备（读/写泵随设备报错退出；进程退出路径）。
+    /// Global shutdown: close the device (read/write pumps exit on the
+    /// device erroring; the process-exit path).
     pub fn shutdown(&self) {
         let _ = self.dev.close();
     }
 }
 
-/// 会话通道：`rx` = 设备读出的包（内核→隧道），`tx` = 待写入设备的包（隧道→内核）。
+/// Session channel: `rx` = packets read from the device (kernel→tunnel),
+/// `tx` = packets to write to the device (tunnel→kernel).
 pub struct TunSession {
     pub rx: mpsc::Receiver<Vec<u8>>,
     pub tx: mpsc::Sender<Vec<u8>>,
@@ -365,7 +410,8 @@ impl Drop for TunSession {
 }
 
 // ============================================================================
-// 单元测试（宿主：mock 面；真设备路径由 deploy/m3_assert.sh 在容器实跑）
+// Unit tests (host: mock surface; the real-device path is exercised by
+// deploy/m3_assert.sh in a container)
 // ============================================================================
 
 #[cfg(test)]
@@ -380,21 +426,26 @@ mod tests {
         })
         .unwrap();
         let mut buf = [0u8; 2048];
-        // 读空队列 ⇒ WouldBlock（对齐 Linux 非阻塞语义）。
+        // Empty queue read ⇒ WouldBlock (aligned with Linux non-blocking
+        // semantics).
         assert_eq!(
             dev.read(&mut buf).unwrap_err().kind(),
             io::ErrorKind::WouldBlock,
-            "空队列 ⇒ WouldBlock"
+            "empty queue ⇒ WouldBlock"
         );
         assert_eq!(dev.name(), "tun0");
-        assert_eq!(dev.spec().unwrap().mtu, MTU, "MTU 1280 进 spec（§2.1）");
-        // 注入 → 读到；写 → 记录。
+        assert_eq!(
+            dev.spec().unwrap().mtu,
+            MTU,
+            "MTU 1280 lands in the spec (§2.1)"
+        );
+        // Inject → read; write → recorded.
         dev.inject(b"\x45\x00\x00\x14abc");
         let n = dev.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"\x45\x00\x00\x14abc");
         dev.write(b"\x45\x00\x00\x08").unwrap();
         assert_eq!(dev.written(), vec![b"\x45\x00\x00\x08".to_vec()]);
-        // close 后读写皆拒。
+        // After close, both read and write are rejected.
         dev.close().unwrap();
         assert_eq!(
             dev.read(&mut buf).err().map(|e| e.kind()),
@@ -411,28 +462,41 @@ mod tests {
         let mock = Arc::new(MockTunDevice::open(&TunSpec::default()).unwrap());
         let io = TunIo::from_arc(mock.clone());
         let mut s1 = io.session();
-        // 读泵：注入一个包 ⇒ rx 可收（≤ 轮询间隔+裕量）。
+        // Read pump: inject one packet ⇒ receivable on rx (≤ poll interval +
+        // margin).
         mock.inject(b"\x45\x00\x00\x14ping");
         let pkt = tokio::time::timeout(Duration::from_secs(2), s1.rx.recv())
             .await
-            .expect("5ms 轮询内应收到注入包")
-            .expect("读泵存活");
+            .expect("injected packet should arrive within the 5ms poll cadence")
+            .expect("read pump alive");
         assert_eq!(pkt, b"\x45\x00\x00\x14ping");
-        // 写泵：tx 发包 ⇒ mock written 可见。
+        // Write pump: send a packet on tx ⇒ visible in mock written.
         s1.tx.send(b"\x45\x00\x00\x15pong".to_vec()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(mock.written(), vec![b"\x45\x00\x00\x15pong".to_vec()]);
-        // 会话拆除（drop）⇒ 新会话通道照常（设备常驻跨会话；旧泵随会话停位退出）。
+        // Session teardown (drop) ⇒ a fresh session channel works as usual
+        // (device resident across sessions; the old pumps exit on the stop
+        // flag).
         drop(s1);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let s2 = io.session();
         s2.tx.send(b"\x45\x00\x00\x16next".to_vec()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(mock.written().len(), 2, "新会话复用同一设备");
-        // 全局停机：设备关闭 ⇒ 后续读写拒。
+        assert_eq!(
+            mock.written().len(),
+            2,
+            "new session reuses the same device"
+        );
+        // Global shutdown: device closed ⇒ subsequent reads/writes rejected.
         io.shutdown();
         let mut buf = [0u8; 64];
-        assert!(mock.read(&mut buf).is_err(), "shutdown 后设备读拒");
-        assert!(mock.write(b"x").is_err(), "shutdown 后设备写拒");
+        assert!(
+            mock.read(&mut buf).is_err(),
+            "device read rejected after shutdown"
+        );
+        assert!(
+            mock.write(b"x").is_err(),
+            "device write rejected after shutdown"
+        );
     }
 }

@@ -4,63 +4,78 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Flock VPN 客户端装配（docs/design.md §2.3/§3.12/§7-M3）：tun 适配（TunDevice 接缝）+ 接入器退避/端点轮询 + IP 包 ↔ PacketChannel 数据面 + 路由配置"
+description = "Flock VPN client assembly (docs/design.md §2.3/§3.12/§7-M3): tun adapter (TunDevice seam) + connector backoff/endpoint rotation + IP packet ↔ PacketChannel data plane + route configuration"
 
 [dependencies]
-# 独立协议仓（原 crates/flock-protocol，v0.1.0 起独立发布）：anchor feature
-# （OPAQUE 登录锚）照搬抽取前声明。
+# Standalone protocol crate (formerly crates/flock-protocol, independently
+# published since v0.1.0): the anchor feature (OPAQUE login anchor) keeps the
+# same declaration as before extraction.
 flock-protocol = { git = "https://github.com/fly88oj/flock-protocol.git", tag = "v0.1.0", features = ["anchor"] }
 futures = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
-# 控制 IPC（§7-M6.2：postcard over 命名管道/Unix socket，帧格式与 admin 面同构）。
+# Control IPC (§7-M6.2: postcard over named pipe/Unix socket, frame format
+# isomorphic to the admin plane).
 postcard = { workspace = true }
-# 接入器主循环（多线程 rt + 定时退避）。
+# Connector main loop (multi-threaded rt + timed backoff).
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
-# M7 §7-M7.7：上报 hostname 的 OS 主机名源（跨平台 gethostname 薄封装，纯 Rust）。
+# M7 §7-M7.7: OS hostname source for hostname reporting (thin cross-platform
+# gethostname wrapper, pure Rust).
 hostname = "0.4"
-# M7 peers 延迟探测：raw ICMP echo（socket2 建 SOCK_RAW/IPPROTO_ICMP；选型理由见
-# ping.rs 模块文档——三平台同一 API 面，tokio 注册经 from_std 转换）。
+# M7 peers latency probing: raw ICMP echo (socket2 creates SOCK_RAW/
+# IPPROTO_ICMP; rationale in the ping.rs module docs — same API surface on all
+# three platforms, tokio registration via from_std conversion).
 socket2 = "0.6"
-# M7 peers --json 机读档输出。
+# M7 peers --json machine-readable output.
 serde_json = "1"
 
-# tun-rs 平台适配器（§2.3）：Linux/Windows/macOS 三平台原生路径；Android/iOS 走 fd 注入
-# 接缝（vpn-mesh §1.1——两平台无 native 等价 API），不装配 tun-rs 构建路径。
+# tun-rs platform adapter (§2.3): native paths on Linux/Windows/macOS;
+# Android/iOS go through the fd injection seam (vpn-mesh §1.1 — the two
+# platforms have no native equivalent API) and do not assemble the tun-rs
+# build path.
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 tun-rs = { workspace = true }
 
-# 路由配置（§2.3：rtnetlink /16 池指向 TUN + rp_filter=1）仅 Linux。
-# ksni（§7-M6 二阶段）= Linux 托盘：纯 Rust DBus StatusNotifierItem（zbus 后端，
-# tokio 特性与既有运行时同域）——不引 GTK/libappindicator 系统依赖。optional + 仅
-# tray feature 拉起（无头档 --no-default-features 编译面零 GUI 依赖）。
+# Route configuration (§2.3: rtnetlink /16 pool pointing at the TUN +
+# rp_filter=1) is Linux only. ksni (§7-M6 phase two) = Linux tray: pure Rust
+# DBus StatusNotifierItem (zbus backend, tokio feature in the same domain as
+# the existing runtime) — no GTK/libappindicator system dependencies.
+# optional + pulled up only by the tray feature (headless
+# --no-default-features build has zero GUI dependencies).
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = { workspace = true }
 ksni = { version = "0.3", default-features = false, features = ["tokio"], optional = true }
 
-# 控制 IPC Windows 侧（§7-M6.2）：命名管道显式 DACL（SDDL）+ token 文件 ACL。
-# Authorization = SDDL 转换/SetNamedSecurityInfo；Foundation = LocalFree。
-# 托盘（§7-M6 二阶段）追加：WindowsAndMessaging = Win32 消息泵（GetMessageW/
-#   PostThreadMessageW/DispatchMessageW——tray 后端）；Threading = GetCurrentThreadId。
-#   仅 facade 声明（零运行时依赖），无 GUI 库面。
+# Control IPC, Windows side (§7-M6.2): named pipe explicit DACL (SDDL) +
+# token file ACL. Authorization = SDDL conversion/SetNamedSecurityInfo;
+# Foundation = LocalFree. Tray (§7-M6 phase two) adds: WindowsAndMessaging =
+# Win32 message pump (GetMessageW/PostThreadMessageW/DispatchMessageW — tray
+# backend); Threading = GetCurrentThreadId; Globalization =
+# GetUserDefaultUILanguage (lang.rs `auto` UI-language detection — facade
+# declaration only). All facade-only (zero runtime dependencies), no GUI
+# library surface.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_EventLog", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
-# 服务化（§7-M6.3）：SCM 分派器 + 服务安装/恢复策略（编译级验证；真机安装列手工清单）。
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_EventLog", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Globalization"] }
+# Service integration (§7-M6.3): SCM dispatcher + service install/recovery
+# policy (compile-level verification; real-machine installation is on the
+# manual checklist).
 windows-service = "0.8"
-# 托盘自启 HKCU Run 键 + 事件日志源注册（§7-M6.3）。
+# Tray autostart HKCU Run key + event log source registration (§7-M6.3).
 winreg = "0.56"
 
-# 托盘（§7-M6 第二阶段）：Windows/macOS 用 tray-icon（内建 muda 菜单经
-# tray_icon::menu 再导出消费——不直接依赖 muda）。default-features=false 关掉
-# libappindicator（Linux/BSD 面的 GTK 路径——本平台不用）。
+# Tray (§7-M6 phase two): Windows/macOS use tray-icon (built-in muda menu
+# consumed via the tray_icon::menu re-export — no direct muda dependency).
+# default-features=false disables libappindicator (the GTK path for the
+# Linux/BSD surface — not used on this platform).
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = { version = "0.26", default-features = false, optional = true }
 
-# macOS 托盘主循环（tray-icon mac 后端要求主线程 NSApplication 事件循环）：
-# NSApplication/NSEvent = 事件排空；objc2-foundation = NSDate/NSDefaultRunLoopMode；
-# objc2 = MainThreadMarker。编译级验证（无设备，真机清单留位）。
+# macOS tray main loop (the tray-icon mac backend requires the main-thread
+# NSApplication event loop): NSApplication/NSEvent = event draining;
+# objc2-foundation = NSDate/NSDefaultRunLoopMode; objc2 = MainThreadMarker.
+# Compile-level verification (no device; real-machine checklist pending).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"], optional = true }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSResponder", "NSEvent"], optional = true }
@@ -68,13 +83,17 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSO
 
 [dev-dependencies]
 tempfile = "3"
-# 测试档：tokio paused 时钟（start_paused + auto-advance）——serve_conn 10s 整链
-# 超时单测即时推进（不真等 10s；仅 dev 面拉起 test-util，不进生产特性面）。
+# Test profile: tokio paused clock (start_paused + auto-advance) — the
+# serve_conn 10s whole-chain timeout unit test advances instantly (no real
+# 10s wait; test-util pulled up on the dev side only, never in the production
+# feature set).
 tokio = { workspace = true, features = ["test-util"] }
 
-# §7-M6.5：tray feature 门控。GUI 依赖全部按 target 门控挂 optional、由 tray 拉起
-# （cargo 限制如实声明：dep: 引用在不匹配 target 上为 no-op——Linux 默认构建不出现
-# tray-icon/objc2 面，Windows 不出现 ksni 面；--no-default-features 三平台全零）。
+# §7-M6.5: tray feature gating. All GUI dependencies are target-gated,
+# optional, and pulled up by tray (cargo limitation honestly declared:
+# dep: references are a no-op on non-matching targets — a default Linux build
+# never sees the tray-icon/objc2 surface, Windows never sees the ksni surface;
+# --no-default-features is all zero on all three platforms).
 [features]
 default = ["tray"]
 tray = [

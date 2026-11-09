@@ -1,30 +1,42 @@
-//! flock-client 库面（docs/design.md §2.3 / §3.12 / §7-M3）。
+//! flock-client library surface (docs/design.md §2.3 / §3.12 / §7-M3).
 //!
-//! 模块：
-//! - [`tun`]：`TunDevice` 接缝（open/read/write/close）+ tun-rs 适配器（cfg 门控）+
-//!   `MockTunDevice`（宿主单测）+ `TunIo/TunSession`（同步设备 → tokio 桥）；
-//! - [`route`]：路由配置适配器（Linux rtnetlink /16 池 + rp_filter=1；Windows 注明
-//!   留待 M5 真机手工验证）；
-//! - [`connector`]：接入器（邀请/钉扎目录加载 → 端点拨号 → `session::initiate`；
-//!   指数退避 + 端点轮询）；
-//! - [`ctrl`]：控制流半边（M7 §7-M7.7：OPAQUE 登录/key-bind/票据保持的客户端实现——
-//!   线类型复用 `flock_protocol::roster`，两端同类型）；
-//! - [`ping`]：peers 延迟探测（M7 §7-M7.7：raw ICMP echo 经 tun，3 探针 2s 超时取
-//!   中位；socket2 薄层——选型理由见模块文档）；
-//! - [`peers`]：名册组装与渲染（M7 §7-M7.7：PeerRow 增强名册 + 表格/--json）；
-//! - [`dataplane`]：IP 包 ↔ `PacketChannel` 桥；
-//! - [`ipc`]：控制 IPC v1 契约 + daemon 服务端 + 客户端单次请求（§7-M6.2——托盘
-//!   工程直接消费本模块，`service` 子命令装配服务端）；
-//! - [`service`]：daemon 装配（§7-M6.1：supervise 复用 + IPC 服务端 + 状态快照源 +
-//!   优雅停服 + Windows SCM 集成）；
-//! - [`install`]：服务安装/卸载 + 托盘自启注册（§7-M6.3：Windows SCM/事件日志源/
-//!   HKCU Run、systemd 单元、launchd plist）；
-//! - [`tray`]：托盘进程（§7-M6 第二阶段；`tray` feature 门控——平台无关核心 + 平台
-//!   后端：Windows/macOS tray-icon、Linux ksni）。
+//! Modules:
+//! - [`tun`]: the `TunDevice` seam (open/read/write/close) + the tun-rs
+//!   adapter (cfg-gated) + `MockTunDevice` (host unit tests) +
+//!   `TunIo/TunSession` (sync device → tokio bridge);
+//! - [`route`]: route configuration adapter (Linux rtnetlink /16 pool +
+//!   rp_filter=1; Windows noted as pending M5 real-machine manual
+//!   verification);
+//! - [`connector`]: the connector (invite/pinned-directory loading →
+//!   endpoint dialing → `session::initiate`; exponential backoff + endpoint
+//!   rotation);
+//! - [`ctrl`]: the client half of the control stream (M7 §7-M7.7: the client
+//!   implementation of OPAQUE login/key-bind/ticket keepalive — wire types
+//!   reuse `flock_protocol::roster`, same types on both ends);
+//! - [`ping`]: peers latency probing (M7 §7-M7.7: raw ICMP echo via tun,
+//!   median of 3 probes with a 2s timeout; a thin socket2 layer — rationale
+//!   in the module docs);
+//! - [`peers`]: roster assembly and rendering (M7 §7-M7.7: the PeerRow
+//!   enhanced roster + table/--json);
+//! - [`dataplane`]: IP packet ↔ `PacketChannel` bridge;
+//! - [`ipc`]: control IPC v1 contract + daemon server + client one-shot
+//!   request (§7-M6.2 — the tray project consumes this module directly; the
+//!   `service` subcommand assembles the server side);
+//! - [`service`]: daemon assembly (§7-M6.1: supervise reuse + IPC server +
+//!   status snapshot source + graceful shutdown + Windows SCM integration);
+//! - [`install`]: service install/uninstall + tray autostart registration
+//!   (§7-M6.3: Windows SCM/event log source/HKCU Run, systemd unit, launchd
+//!   plist);
+//! - [`tray`]: the tray process (§7-M6 phase two; `tray` feature-gated —
+//!   platform-independent core + platform backends: Windows/macOS tray-icon,
+//!   Linux ksni);
+//! - [`lang`]: UI language pack for tray/CLI interactive copy (en default,
+//!   zh pack; operational logs stay English).
 //!
-//! 服务器（`flock-server`）以库形式复用 [`tun`]/[`route`]/dataplane 桥
-//! （§2.2「服务端自身也是 peer」、§3.11「对上挂 tun 适配器」）——`TunDevice` 接缝按
-//! §3.12 落位本 crate，跨 app 复用即此接缝的第二个消费者。
+//! The server (`flock-server`) reuses [`tun`]/[`route`]/the dataplane bridge
+//! as a library (§2.2 "the server is itself a peer", §3.11 "hang a tun
+//! adapter on top") — the `TunDevice` seam lives in this crate per §3.12, and
+//! the cross-app reuse is the seam's second consumer.
 
 pub mod config;
 pub mod connector;
@@ -32,9 +44,11 @@ pub mod ctrl;
 pub mod dataplane;
 pub mod install;
 pub mod ipc;
+pub mod lang;
 pub mod peers;
 pub mod ping;
-// 控制面平台传输（私有：契约/服务端/客户端入口全走 [`ipc`]）。
+// Control-plane platform transport (private: contract/server/client entry
+// points all go through [`ipc`]).
 #[cfg(unix)]
 mod ipc_unix;
 #[cfg(windows)]

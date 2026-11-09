@@ -1,17 +1,24 @@
-//! 数据面（docs/design.md §2.3 / §3.12）：IP 包 ↔ [`PacketChannel`]。
+//! Data plane (docs/design.md §2.3 / §3.12): IP packets ↔ [`PacketChannel`].
 //!
-//! 客户端侧桥：TUN 读泵产出的包 → 上行帧；下行帧 → TUN 写泵。任一侧错误/EOF ⇒
-//! 返回（会话结束，接入器退避重连，[`supervise`]）。
+//! Client-side bridge: packets produced by the TUN read pump → upstream
+//! frames; downstream frames → the TUN write pump. Any side's error/EOF ⇒
+//! return (session over; the connector backs off and reconnects,
+//! [`supervise`]).
 //!
-//! # 取消安全结构（关键不变量）
+//! # Cancellation-safety structure (key invariant)
 //!
-//! 包通道帧化（`[u16 len][pkt]`）是**两次 read_exact**——绝不可作为 select! 的臂
-//! future：对臂胜出时半途 future 被丢弃，已消费的帧头/帧体字节随之丢失，下行帧流
-//! 永久失步（垃圾包写入 tun；回归测试
-//! `bridge_survives_split_downstream_frames_with_interleaved_upstream` 的红形态）。
-//! 因此读侧不用 select：`futures::poll_fn` 内做**单次** `poll_read`（裸读无跨 poll
-//! 状态——让位零损失）+ 持久接收缓冲完成帧化；流只在 poll_fn 的一次 poll 期间被
-//! 借用，上行写（整帧 [`send_packet`] 至完成）在 poll_fn 返回后另行借用。
+//! Packet-channel framing (`[u16 len][pkt]`) is **two read_exacts** — it must
+//! never be an arm future of a select!: when the other arm wins, the
+//! half-completed future is dropped and the frame header/body bytes already
+//! consumed are lost, permanently desynchronizing the downstream frame stream
+//! (garbage packets written into tun; the red shape of the regression test
+//! `bridge_survives_split_downstream_frames_with_interleaved_upstream`).
+//! Therefore the read side uses no select: inside `futures::poll_fn` do a
+//! **single** `poll_read` (a raw read has no cross-poll state — yielding
+//! loses nothing) + a persistent receive buffer completes the framing; the
+//! stream is borrowed only during one poll of the poll_fn, and the upstream
+//! write (a whole-frame [`send_packet`] to completion) borrows separately
+//! after the poll_fn returns.
 
 use std::io;
 use std::pin::pin;
@@ -22,14 +29,17 @@ use futures::io::AsyncRead as _;
 
 use crate::tun::TunSession;
 
-/// 读块大小（≤ 单帧上限；帧在持久缓冲内重组，读块无需整帧）。
+/// Read chunk size (≤ single-frame cap; frames reassemble inside the
+/// persistent buffer, so a read chunk need not hold a whole frame).
 ///
-/// pub：服务器侧 dataplane（`flock-server`，§2.2「服务端自身也是 peer」）共用
-/// 同一取消安全帧化形态。
+/// pub: the server-side dataplane (`flock-server`, §2.2 "the server is
+/// itself a peer") shares the same cancellation-safe framing shape.
 pub const READ_CHUNK: usize = 4096;
 
-/// 下行帧化缓冲：`[u16 len][pkt]` 持续累积，能取整帧即取（取消安全的帧化半途
-/// 状态容器——字节一旦入缓冲不再丢失）。
+/// Downstream framing buffer: `[u16 len][pkt]` accumulates continuously;
+/// whole frames are taken whenever available (the cancellation-safe
+/// container for half-completed framing — bytes once in the buffer are never
+/// lost).
 pub struct FrameBuf {
     buf: Vec<u8>,
 }
@@ -51,7 +61,7 @@ impl FrameBuf {
         self.buf.extend_from_slice(bytes);
     }
 
-    /// 取出一个完整帧（不足整帧 ⇒ None）。
+    /// Take out one complete frame (less than a full frame ⇒ None).
     pub fn take_frame(&mut self) -> Option<Vec<u8>> {
         if self.buf.len() < 2 {
             return None;
@@ -69,7 +79,8 @@ impl FrameBuf {
     }
 }
 
-/// poll_fn 单步产物（两路 poll 均无跨 poll 状态）。
+/// Single-step product of the poll_fn (neither poll carries cross-poll
+/// state).
 enum Step {
     Upstream(Option<Vec<u8>>),
     DownBytes(usize),
@@ -77,20 +88,24 @@ enum Step {
     DownEof,
 }
 
-/// 桥接循环：tun ↔ packet channel（首个错误即返回；取消安全结构见模块文档）。
+/// Bridge loop: tun ↔ packet channel (returns on the first error;
+/// cancellation-safety structure in the module docs).
 pub async fn bridge(sess: &mut TunSession, ch: PacketChannel) -> io::Result<()> {
     let mut stream = ch.into_stream();
     let mut frames = FrameBuf::new();
     let mut chunk = vec![0u8; READ_CHUNK];
     loop {
-        // 已缓冲的完整帧全部落地（EOF 判定前排空，保「FIN 且无残包」语义）。
+        // Drain all complete buffered frames (before the EOF verdict, to
+        // keep the "FIN with no partial packets" semantics).
         while let Some(pkt) = frames.take_frame() {
             if sess.tx.send(pkt).await.is_err() {
-                return Err(io::Error::other("tun: 写泵已退出"));
+                return Err(io::Error::other("tun: write pump has exited"));
             }
         }
-        // 单步等待：上行包到 / 下行字节到 / 下行读错。本 poll_fn future 即便被上层
-        // 让位也不丢字节（无跨 poll 状态；`poll_recv` 与单次 `poll_read` 均安全）。
+        // Single-step wait: upstream packet / downstream bytes / downstream
+        // read error. Even when this poll_fn future is preempted by the layer
+        // above, no bytes are lost (no cross-poll state; `poll_recv` and a
+        // single `poll_read` are both safe).
         let step = std::future::poll_fn(|cx| {
             match sess.rx.poll_recv(cx) {
                 Poll::Ready(up) => return Poll::Ready(Step::Upstream(up)),
@@ -106,24 +121,27 @@ pub async fn bridge(sess: &mut TunSession, ch: PacketChannel) -> io::Result<()> 
         .await;
         match step {
             Step::Upstream(Some(pkt)) => send_packet(&mut stream, &pkt).await?,
-            Step::Upstream(None) => return Err(io::Error::other("tun: 读泵已退出")),
+            Step::Upstream(None) => return Err(io::Error::other("tun: read pump has exited")),
             Step::DownBytes(n) => frames.extend(&chunk[..n]),
             Step::DownErr(e) => return Err(e),
             Step::DownEof => {
-                // 对端 FIN：仅当无残包才算通道自然结束（残包 = 半帧截断违约）。
+                // Peer FIN: only a natural channel end when no partial
+                // packets remain (a partial = half-frame truncation
+                // violation).
                 if frames.has_partial() {
                     return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
                 }
-                return Err(io::Error::other("packet: 对端 FIN（通道结束）"));
+                return Err(io::Error::other("packet: peer FIN (channel closed)"));
             }
         }
     }
 }
 // ============================================================================
-// 集成测试（宿主可跑：mock tun + TCP/duplex 上的真握手/记录层/复用器）
+// Integration tests (host-runnable: mock tun + real handshake/record
+// layer/mux over TCP/duplex)
 // ============================================================================
 
-/// 测试对端工具（connector 守护循环测试共用）。
+/// Test peer utilities (shared with the connector supervise-loop tests).
 #[cfg(test)]
 pub(crate) mod testutil {
     use std::sync::Arc;
@@ -136,10 +154,13 @@ pub(crate) mod testutil {
     use flock_protocol::trust::ClusterDirectory;
     use flock_protocol::{mux::PacketChannel, rand};
 
-    /// respond 侧真材料 + 设备注册表 + 每流回显 + 会话级 kill 开关。
-    /// `chunked = true`：每个回显帧拆成「帧头 → 250ms 间隔 → 帧体」两段下发——
-    /// 构造下游帧半途状态，逼出 select 循环内 PacketChannel::recv 的取消不安全
-    /// （半途 future 被丢弃 ⇒ 已消费字节丢失、帧流失步）。
+    /// Real respond-side material + device registry + per-stream echo +
+    /// session-level kill switch.
+    /// `chunked = true`: every echoed frame is delivered as "frame header →
+    /// 250ms gap → frame body" — constructing a downstream half-frame state
+    /// to force out the cancellation-unsafety of PacketChannel::recv inside a
+    /// select loop (a dropped half-completed future ⇒ consumed bytes lost,
+    /// frame stream desynchronized).
     pub(crate) struct EchoPeer {
         pub identity: ServerIdentity,
         pub directory: ClusterDirectory,
@@ -174,7 +195,7 @@ pub(crate) mod testutil {
             }
         }
 
-        /// 设备入注册表（Active）。
+        /// Register a device (Active).
         pub(crate) fn register(&self, device: &DeviceStaticKeys) {
             self.devices.lock().unwrap().register(DeviceRecord {
                 device_x25519: device.x25519_public(),
@@ -182,8 +203,10 @@ pub(crate) mod testutil {
             });
         }
 
-        /// accept 循环：每入连 respond → 每条流按 PacketChannel 回显
-        /// （客户端首流为控制流占位：无字节 ⇒ 回显任务静默等待，行为等价）。
+        /// Accept loop: respond per inbound connection → echo every stream as
+        /// a PacketChannel (the client's first stream is the control-stream
+        /// placeholder: no bytes ⇒ the echo task waits silently, behaviorally
+        /// equivalent).
         pub(crate) async fn serve(self: Arc<Self>, listener: tokio::net::TcpListener) {
             loop {
                 let Ok((io, _)) = listener.accept().await else {
@@ -206,7 +229,8 @@ pub(crate) mod testutil {
                             tokio::spawn(async move {
                                 while let Ok(pkt) = ch.recv().await {
                                     if chunked {
-                                        // 拆帧回显：先发帧头，250ms 后发帧体。
+                                        // Split-frame echo: send the header
+                                        // first, the body 250ms later.
                                         let mut s = ch.into_stream();
                                         if s.write_all(&(pkt.len() as u16).to_le_bytes())
                                             .await
@@ -231,7 +255,9 @@ pub(crate) mod testutil {
             }
         }
 
-        /// 杀死全部已建立会话（模拟服务器侧拆链；监听继续 ⇒ 客户端应可重连）。
+        /// Kill every established session (simulating a server-side link
+        /// teardown; the listener keeps running ⇒ the client should be able
+        /// to reconnect).
         pub(crate) fn kill_sessions(&self) {
             let mut g = self.conns.lock().unwrap();
             for h in g.iter() {
@@ -255,7 +281,8 @@ mod tests {
     use super::*;
     use crate::tun::{MockTunDevice, TunDevice as _, TunIo, TunSpec};
 
-    /// 端到端：mock tun 包 → 客户端隧道（TCP 真路径）→ 对端回显 → 回到 mock 写侧。
+    /// End to end: mock tun packets → client tunnel (real TCP path) → peer
+    /// echo → back to the mock's write side.
     #[tokio::test]
     async fn bridge_carries_packets_both_directions_over_real_session() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -272,7 +299,8 @@ mod tests {
             entry: peer.directory.servers[0].clone(),
         };
 
-        // 隧道 + 首流控制占位 + 包通道（与 supervise 的排序契约一致）。
+        // Tunnel + first-stream control placeholder + packet channel (same
+        // ordering contract as supervise).
         let io = tokio::net::TcpStream::connect(&ep).await.unwrap();
         let tunnel = flock_protocol::session::initiate(io, &device, &pin, TunnelConfig::default())
             .await
@@ -283,22 +311,24 @@ mod tests {
             .unwrap();
         let ch = tunnel.open_packet_channel().await.unwrap();
 
-        // mock tun + 桥任务。
+        // Mock tun + bridge task.
         let mock = Arc::new(MockTunDevice::open(&TunSpec::default()).unwrap());
         let tun = TunIo::from_arc(mock.clone());
         let mut sess = tun.session();
         let bridged = tokio::spawn(async move { bridge(&mut sess, ch).await });
 
-        // 内核 → 隧道 → 回显 → 写侧。
+        // Kernel → tunnel → echo → write side.
         mock.inject(b"\x45\x00\x00\x14echo-me");
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
             mock.written(),
             vec![b"\x45\x00\x00\x14echo-me".to_vec()],
-            "包经隧道往返（mock 写侧收到回显）"
+            "packet round-trips through the tunnel (mock write side receives the echo)"
         );
 
-        // 批量（帧化保边界：100 包逐包回显，不粘连；首包 echo 已在写侧——base 计入）。
+        // Bulk (framing preserves boundaries: 100 packets echoed one by one,
+        // no coalescing; the first echo is already on the write side — count
+        // it in the base).
         let base = mock.written().len();
         for i in 0..100u16 {
             let mut pkt = vec![0x45u8, (i >> 8) as u8, i as u8];
@@ -309,23 +339,27 @@ mod tests {
         while mock.written().len() < base + 100 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert_eq!(mock.written().len(), base + 100, "100 包全回显");
+        assert_eq!(mock.written().len(), base + 100, "all 100 packets echoed");
         assert_eq!(mock.written()[base + 99], {
             let mut pkt = vec![0x45u8, 0, 99];
             pkt.extend_from_slice(&99u16.to_le_bytes());
             pkt
         });
 
-        // 会话拆 ⇒ bridge 返回（通道 EOF）。
+        // Session torn down ⇒ bridge returns (channel EOF).
         tunnel.shutdown().await;
         let _ = tokio::time::timeout(Duration::from_secs(3), bridged).await;
         tun.shutdown();
     }
 
-    /// 回归（取消安全）：对端把每个回显帧拆成「帧头 → 250ms → 帧体」，并在间隔期
-    /// 持续注入上行包——若 bridge 在 select! 内直接 await PacketChannel::recv（帧化
-    /// = 两次 read_exact），上行臂胜出会丢弃半途 future：已消费的帧头/帧体字节丢失，
-    /// 下行帧流永久失步（垃圾包/丢包写入 tun）。专职读任务形态下必须逐字节完整往返。
+    /// Regression (cancellation safety): the peer splits every echoed frame
+    /// into "header → 250ms → body" and keeps injecting upstream packets
+    /// during the gap — if bridge awaited PacketChannel::recv directly inside
+    /// a select! (framing = two read_exacts), the upstream arm winning would
+    /// drop the half-completed future: the consumed frame header/body bytes
+    /// are lost and the downstream frame stream desynchronizes permanently
+    /// (garbage/lost packets written into tun). With the dedicated read-task
+    /// shape, every byte must round-trip completely.
     #[tokio::test]
     async fn bridge_survives_split_downstream_frames_with_interleaved_upstream() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -356,14 +390,17 @@ mod tests {
         let mut sess = tun.session();
         let bridged = tokio::spawn(async move { bridge(&mut sess, ch).await });
 
-        // 载荷可辨识（序号在字节 3），断言逐字节完整且顺序不乱。
+        // Payloads are identifiable (sequence number in byte 3); assert
+        // byte-exact completeness and ordering.
         let pkt_i = |i: u8| -> Vec<u8> {
             let mut v = vec![0x45u8, 0x00, 0x14, i];
             v.extend_from_slice(&[0xA5; 12]);
             v
         };
-        // 注入序列：偶数步在对端拆帧窗口内（帧头已到、帧体未到）追加注入下一包，
-        // 在半途帧上制造 select 臂切换压力（正是取消不安全缺陷的触发形态）。
+        // Injection sequence: on even steps, inside the peer's split-frame
+        // window (header arrived, body not yet), inject the next packet —
+        // creating select-arm switching pressure on a half-completed frame
+        // (exactly the trigger shape of the cancellation-unsafety defect).
         let mut expected: Vec<Vec<u8>> = Vec::new();
         let mut i = 0u8;
         while (i as usize) < 10 {
@@ -386,16 +423,19 @@ mod tests {
         assert_eq!(
             got.len(),
             expected.len(),
-            "全部回显（无丢失/无重复）：{got:?}"
+            "all echoed (no loss/no duplication): {got:?}"
         );
-        assert_eq!(got, expected, "逐包逐字节完整且有序（下行帧流无失步）");
+        assert_eq!(
+            got, expected,
+            "every packet byte-complete and in order (downstream frame stream not desynchronized)"
+        );
 
         tunnel.shutdown().await;
         let _ = tokio::time::timeout(Duration::from_secs(3), bridged).await;
         tun.shutdown();
     }
 
-    /// duplex 冒烟：记录层/复用器最小路径（跳过 TCP）。
+    /// duplex smoke: record layer/mux minimal path (TCP skipped).
     #[tokio::test]
     async fn session_duplex_smoke() {
         let peer = EchoPeer::new("127.0.0.1:9443");
@@ -422,8 +462,10 @@ mod tests {
                     return;
                 }
             };
-            // 注：yamux SYN 惰性（首帧携带）——控制流占位无数据 ⇒ 首个被接受的流
-            // 即包通道（与 M1 session_mux 的 PacketChannel 测试同语义）。
+            // Note: yamux SYN is lazy (carried by the first frame) — the
+            // control-stream placeholder carries no data ⇒ the first accepted
+            // stream is the packet channel (same semantics as the M1
+            // session_mux PacketChannel test).
             let Some(s) = t.accept_stream().await else {
                 return;
             };
@@ -441,22 +483,24 @@ mod tests {
         .await;
         let tunnel = match tunnel {
             Ok(Ok(t)) => t,
-            Ok(Err(e)) => panic!("duplex 上 1-RTT 握手失败: {e}"),
-            Err(_) => panic!("duplex initiate 5s 超时"),
+            Ok(Err(e)) => panic!("1-RTT handshake over duplex failed: {e}"),
+            Err(_) => panic!("duplex initiate 5s timeout"),
         };
         let _hold = t_open_hold(&tunnel).await;
         let mut ch = tunnel.open_packet_channel().await.unwrap();
         ch.send(b"\x45\x00\x00\x03abc").await.unwrap();
         let back = tokio::time::timeout(Duration::from_secs(3), ch.recv())
             .await
-            .expect("回显超时")
+            .expect("echo timeout")
             .unwrap();
         assert_eq!(back, b"\x45\x00\x00\x03abc");
-        // 控制流占位被客户端持有 ⇒ 服务端回显循环不结束——有界等待后收尾。
+        // The control-stream placeholder is held by the client ⇒ the server
+        // echo loop does not end — wrap up after a bounded wait.
         let _ = tokio::time::timeout(Duration::from_secs(2), server_side).await;
     }
 
-    /// 控制流占位打开（首流排序契约；返回持有句柄防止过早 Drop）。
+    /// Open the control-stream placeholder (first-stream ordering contract;
+    /// returns a held handle to prevent a premature Drop).
     async fn t_open_hold(tunnel: &flock_protocol::session::Tunnel) -> flock_protocol::mux::Stream {
         tunnel
             .open_stream(flock_protocol::mux::Prio::Control)
