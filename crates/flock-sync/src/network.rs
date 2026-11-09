@@ -1,6 +1,7 @@
-//! openraft 网络适配器：挂在服务器-服务器 E2E 会话之上（§3.10 接缝：Raft 网络传输
-//! 直接 TCP / 经中继——都跑 server-server profile 的互连会话；此处只依赖
-//! [`Interconnect`]，与具体织物解耦）。
+//! openraft network adapter: rides on top of the server-server E2E session
+//! (§3.10 seam: Raft network transport over direct TCP / via relay — both run
+//! interconnect sessions with the server-server profile; this file depends
+//! only on [`Interconnect`], decoupled from any specific fabric).
 
 use openraft::error::{RPCError, RaftError};
 use openraft::network::{RaftNetwork, RaftNetworkFactory};
@@ -13,7 +14,8 @@ use openraft::BasicNode;
 use crate::raft_types::SyncConfig;
 use crate::wire::{remote_error, rpc_error_of, Interconnect, WireCallError, WireResp, WireRpc};
 
-/// 网络工厂（Raft 每个复制/投票任务各建一个客户端——实现为互连管理器的轻柄）。
+/// Network factory (Raft builds one client per replication/vote task —
+/// implemented as a light handle on the interconnect manager).
 #[derive(Clone)]
 pub struct SyncNetFactory {
     pub ic: std::sync::Arc<Interconnect>,
@@ -30,7 +32,8 @@ impl RaftNetworkFactory<SyncConfig> for SyncNetFactory {
     }
 }
 
-/// 到单个对端的网络客户端（经互连会话开流收发）。
+/// Network client toward a single peer (opens streams over interconnect
+/// sessions to send/receive).
 #[derive(Clone)]
 pub struct SyncNetwork {
     ic: std::sync::Arc<Interconnect>,

@@ -4,11 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Flock VPN 多主多活同步：openraft 复制状态机 + redb 存储 + 服务器-服务器 profile E2E 传输（docs/design.md §3.10/§4，VPN-15）"
+description = "Flock VPN multi-primary multi-active synchronization: openraft replicated state machine + redb storage + server-server profile E2E transport (docs/design.md §3.10/§4, VPN-15)"
 
 [dependencies]
-# 独立协议仓（原 crates/flock-protocol，v0.1.0 起独立发布）：全 VPN 默认档、
-# 无具名 feature——与抽取前的依赖声明一致。
+# Standalone protocol repository (formerly crates/flock-protocol, independently
+# published since v0.1.0): the whole VPN's default profile, no named features —
+# identical to the dependency declaration before the extraction.
 flock-protocol = { git = "https://github.com/fly88oj/flock-protocol.git", tag = "v0.1.0" }
 openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
 redb = { workspace = true }
@@ -23,10 +24,12 @@ rand = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-# 集成测试启用 test-util（内存织物/RTT 注入）：dev-dependency 不污染对外默认档。
+# Integration tests enable test-util (in-memory fabric / RTT injection): a
+# dev-dependency does not pollute the outward default profile.
 flock-sync = { path = ".", features = ["test-util"] }
 
 [features]
 default = []
-# 内存互连织物 + RTT/故障注入（tests/cluster 用；不入生产默认档）。
+# In-memory interconnect fabric + RTT/failure injection (used by tests/cluster;
+# not in the production default profile).
 test-util = []

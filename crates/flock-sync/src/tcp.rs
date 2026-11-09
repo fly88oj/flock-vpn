@@ -1,12 +1,18 @@
-//! 生产织物：直接 TCP 监听/拨号（docs/design.md §3.10 接缝「Raft 网络传输直接 TCP /
-//! 经中继」的直接形态；§6.2 srvmesh 内联网——服务器-服务器 profile E2E 会话跑在其上）。
+//! Production fabric: direct TCP listen/dial (docs/design.md §3.10 seam
+//! "Raft network transport over direct TCP / via relay", the direct form;
+//! §6.2 srvmesh internal network — server-server profile E2E sessions run on
+//! top).
 //!
-//! [`TcpFabric`] = `bind` 监听 + `NodeId → SocketAddr` 对端表：
-//! - `accept`：收入连（交给 [`crate::wire::Interconnect::serve_loop`] 做 profile 应答）；
-//! - `dial`：按 [`crate::wire::sid_of`] 的逆映射（ServerId 前 8B 大端）取对端地址拨号。
+//! [`TcpFabric`] = `bind` listener + a `NodeId → SocketAddr` peer table:
+//! - `accept`: incoming connections (handed to
+//!   [`crate::wire::Interconnect::serve_loop`] to answer the profile);
+//! - `dial`: resolves the peer address via the inverse mapping of
+//!   [`crate::wire::sid_of`] (first 8B of ServerId, big-endian) and dials.
 //!
-//! 认证不在本层——织物只提供「一条 TCP 字节流」，互连认证由其上的服务器-服务器
-//! profile 握手承担（无入群凭证的对端在握手层即被拒，§4-2）。
+//! Authentication is not in this layer — the fabric only provides "a TCP
+//! byte stream"; interconnect authentication is carried by the server-server
+//! profile handshake above it (peers without enrollment credentials are
+//! rejected right at the handshake layer, §4-2).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -18,16 +24,18 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::proto::NodeId;
 use crate::wire::{Fabric, PeerIo};
 
-/// 直接 TCP 织物（生产默认；监听端通常只对内联网暴露——§6.2 srvmesh）。
+/// Direct TCP fabric (production default; the listener is usually exposed
+/// only to the internal network — §6.2 srvmesh).
 pub struct TcpFabric {
     listener: Arc<TcpListener>,
-    /// 节点号 → `host:port`（容器网络别名/DNS 名——拨号时解析，§6.2 raft-N:9500）。
+    /// Node id → `host:port` (container network aliases/DNS names — resolved
+    /// at dial time, §6.2 raft-N:9500).
     peers: BTreeMap<NodeId, String>,
 }
 
 impl TcpFabric {
-    /// 绑定监听端。`peers` = `节点号 → host:port`（配置驱动；缺本机条目无妨——
-    /// 不会向自己拨号）。
+    /// Bind the listener. `peers` = `node id → host:port` (configuration
+    /// driven; a missing local entry is fine — it never dials itself).
     pub async fn bind(
         bind: std::net::SocketAddr,
         peers: BTreeMap<NodeId, String>,
@@ -36,7 +44,7 @@ impl TcpFabric {
         Ok(Arc::new(TcpFabric { listener, peers }))
     }
 
-    /// 监听本地地址（诊断/日志）。
+    /// Local listen address (diagnostics/logging).
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
     }
@@ -47,7 +55,8 @@ impl Fabric for TcpFabric {
         &self,
         target: &flock_protocol::session::ServerId,
     ) -> BoxFuture<'static, io::Result<PeerIo>> {
-        // ServerId ↔ NodeId 逆映射（前 8B 大端——与 wire::sid_of 成对）。
+        // ServerId ↔ NodeId inverse mapping (first 8B big-endian — paired
+        // with wire::sid_of).
         let mut b = [0u8; 8];
         b.copy_from_slice(&target.0[..8]);
         let nid = u64::from_be_bytes(b);
@@ -61,9 +70,11 @@ impl Fabric for TcpFabric {
             })?;
             let (host, port) = split_host_port(&target)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            // (host, port) 形态 ⇒ tokio 侧 DNS 解析（容器网络别名 raft-N）。
-            // 拨号预算 3s：对端宕机时 DNS（NXDOMAIN 在部分解析器上秒级）不得拖住
-            // 调用方（Raft 心跳 500ms——M5 e2e A7 窗口实测教训）。
+            // (host, port) form ⇒ DNS resolution on the tokio side (container
+            // network alias raft-N). Dial budget 3s: when the peer is down,
+            // DNS (NXDOMAIN can take seconds on some resolvers) must not hang
+            // the caller (Raft heartbeat 500ms — a lesson from the M5 e2e A7
+            // window).
             let io = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 TcpStream::connect((host.as_str(), port)),
@@ -78,7 +89,8 @@ impl Fabric for TcpFabric {
     }
 
     fn accept(&self) -> BoxFuture<'static, io::Result<PeerIo>> {
-        // BoxFuture<'static>：监听柄克隆进 future（Arc 面，廉价）。
+        // BoxFuture<'static>: the listener handle is cloned into the future
+        // (Arc surface, cheap).
         let listener = self.listener.clone();
         Box::pin(async move {
             let (io, _peer) = listener.accept().await?;
@@ -88,32 +100,34 @@ impl Fabric for TcpFabric {
     }
 }
 
-/// 配置串 `"1=raft-1:9500"` → `(1, "raft-1:9500")`（server.toml `sync.raft_peers`
-/// 解析；host 允许 DNS 名——SocketAddr 字面量不接受主机名，解析推迟到拨号时）。
+/// Parse a config entry `"1=raft-1:9500"` → `(1, "raft-1:9500")` (server.toml
+/// `sync.raft_peers` parsing; host may be a DNS name — SocketAddr literals do
+/// not accept hostnames, resolution is deferred to dial time).
 pub fn parse_peer_entry(s: &str) -> Result<(NodeId, String), String> {
     let (id, addr) = s
         .split_once('=')
-        .ok_or_else(|| format!("raft_peers 条目 {s:?} 缺 '='（形如 1=host:port）"))?;
+        .ok_or_else(|| format!("raft_peers entry {s:?} missing '=' (expected 1=host:port)"))?;
     let id: NodeId = id
         .trim()
         .parse()
-        .map_err(|e| format!("raft_peers 节点号 {id:?}: {e}"))?;
+        .map_err(|e| format!("raft_peers node id {id:?}: {e}"))?;
     let addr = addr.trim();
-    let _ = split_host_port(addr)?; // 形态校验（host 非空 + 端口数字）
+    let _ = split_host_port(addr)?; // shape validation (non-empty host + numeric port)
     Ok((id, addr.to_string()))
 }
 
-/// `host:port` 拆分（末位 ':'——IPv6 字面量不在 e2e 面，容器别名/IPv4 均单冒号）。
+/// Split `host:port` (at the last ':' — IPv6 literals are not on the e2e
+/// surface; container aliases/IPv4 are both single-colon).
 fn split_host_port(s: &str) -> Result<(String, u16), String> {
     let (host, port) = s
         .rsplit_once(':')
-        .ok_or_else(|| format!("raft_peers 地址 {s:?} 缺端口"))?;
+        .ok_or_else(|| format!("raft_peers address {s:?} missing port"))?;
     if host.is_empty() {
-        return Err(format!("raft_peers 地址 {s:?} host 为空"));
+        return Err(format!("raft_peers address {s:?} has an empty host"));
     }
     let port: u16 = port
         .parse()
-        .map_err(|e| format!("raft_peers 端口 {port:?}: {e}"))?;
+        .map_err(|e| format!("raft_peers port {port:?}: {e}"))?;
     Ok((host.to_string(), port))
 }
 
@@ -131,20 +145,30 @@ mod tests {
             parse_peer_entry("1=172.29.0.10:9500").unwrap(),
             (1, "172.29.0.10:9500".into())
         );
-        assert!(parse_peer_entry("raft-3:9500").is_err(), "缺 '=' ⇒ 拒");
+        assert!(
+            parse_peer_entry("raft-3:9500").is_err(),
+            "missing '=' ⇒ rejected"
+        );
         assert!(
             parse_peer_entry("x=raft-3:9500").is_err(),
-            "非数字节点号 ⇒ 拒"
+            "non-numeric node id ⇒ rejected"
         );
-        assert!(parse_peer_entry("3=raft-3").is_err(), "缺端口 ⇒ 拒");
-        assert!(parse_peer_entry("3=:9500").is_err(), "host 为空 ⇒ 拒");
+        assert!(
+            parse_peer_entry("3=raft-3").is_err(),
+            "missing port ⇒ rejected"
+        );
+        assert!(
+            parse_peer_entry("3=:9500").is_err(),
+            "empty host ⇒ rejected"
+        );
         assert!(
             parse_peer_entry("3=raft-3:http").is_err(),
-            "非数字端口 ⇒ 拒"
+            "non-numeric port ⇒ rejected"
         );
     }
 
-    /// ServerId ↔ NodeId 映射与 wire::sid_of 往返一致（dial 寻址键）。
+    /// The ServerId ↔ NodeId mapping agrees with the wire::sid_of round trip
+    /// (the dial addressing key).
     #[test]
     fn server_id_node_id_roundtrip() {
         let sid = crate::wire::sid_of(7);
@@ -153,8 +177,9 @@ mod tests {
         assert_eq!(u64::from_be_bytes(b), 7);
     }
 
-    /// 监听/拨号地址配对真连通（accept 面真收发；dial 的表驱动部分已由
-    /// parse_peer_entry/server_id_node_id_roundtrip 覆盖）。
+    /// Listen/dial address pairs are genuinely connected (the accept side
+    /// really sends/receives; the table-driven part of dial is covered by
+    /// parse_peer_entry/server_id_node_id_roundtrip).
     #[tokio::test]
     async fn tcp_fabric_accept_pair() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

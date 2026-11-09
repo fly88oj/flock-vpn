@@ -1,19 +1,28 @@
-//! gossip 租约表（§3.10 `LeaseTable::{publish, observe}`；vpn-mesh §5.2）。
+//! Gossip lease table (§3.10 `LeaseTable::{publish, observe}`; vpn-mesh §5.2).
 //!
-//! **设备当前位置的唯一真相源 = 租约域**：每台服务器权威发布「连在我这的设备」，
-//! 租约 TTL 30s；事件推送 ≤1s（publish 即时广播）+ 5s 反熵（全表摘要，装配的反熵循环
-//! 调用 [`LeaseTable::anti_entropy_msg`]）。
+//! **The single source of truth for a device's current location = the lease
+//! domain**: every server authoritatively publishes "the devices connected to
+//! me", lease TTL 30s; event push ≤1s (publish broadcasts immediately) + 5s
+//! anti-entropy (full-table digest; the assembly's anti-entropy loop calls
+//! [`LeaseTable::anti_entropy_msg`]).
 //!
-//! **冲突 = 新者胜 + 旧端踢会话**：term 单调（unix 毫秒 + 持有者 tie-break）；收到比本地
-//! 更新的他机租约且本地持有时，触发 [`crate::hooks::SyncHooks::on_lease_evicted`]
-//! （旧服务器踢出该设备会话——ZeroTer 撤销快速传播思路，vpn-mesh §5.2）。
+//! **Conflict = newest wins + old-side session eviction**: terms are monotonic
+//! (unix milliseconds + holder tie-break); when a remote lease newer than the
+//! local one arrives while we hold it locally,
+//! [`crate::hooks::SyncHooks::on_lease_evicted`] fires (the old server evicts
+//! the device's session — the ZeroTer fast-revocation-propagation idea,
+//! vpn-mesh §5.2).
 //!
-//! M7（§7-M7.3）：租约条目携带 per-device **EWMA 流量**（`tx_ewma/rx_ewma`，bytes/s，
-//! 设备视角）与 `last_seen_unix`——动态面搭租约便车（publish/反熵同步，不进 Raft）。
-//! 持有者权威：只有本机持有的行由本机折叠 EWMA；远端行的值以持有者消息为准。
+//! M7 (§7-M7.3): lease entries carry per-device **EWMA traffic**
+//! (`tx_ewma/rx_ewma`, bytes/s, device view) and `last_seen_unix` — the
+//! dynamics plane rides the lease (publish/anti-entropy synchronization, not
+//! into Raft). Holder authority: only rows held locally get their EWMA folded
+//! by this machine; remote rows take the holder-reported values.
 //!
-//! `location_query`（一次性跨服位置询问，fan-out ≤3）属跨服转发面（§2.2-4），与
-//! ForwardEnvelope 同批落地；本模块先提供本地 `observe`（含 TTL 判定）。
+//! `location_query` (the one-shot cross-server location inquiry, fan-out ≤3)
+//! belongs to the cross-server forwarding plane (§2.2-4), landed in the same
+//! batch as ForwardEnvelope; this module first provides the local `observe`
+//! (including TTL determination).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,34 +35,43 @@ use serde::{Deserialize, Serialize};
 use crate::hooks::HookRegistry;
 use crate::proto::NodeId;
 
-/// 租约默认 TTL（§3.10：30s）。
+/// Default lease TTL (§3.10: 30s).
 pub const LEASE_TTL: Duration = Duration::from_secs(30);
-/// 反熵周期（§3.10：5s）。
+/// Anti-entropy period (§3.10: 5s).
 pub const ANTI_ENTROPY: Duration = Duration::from_secs(5);
-/// 本地会话租约续期周期（TTL/3——**长寿命会话必须周期重发布**：publish 只在建连时
-/// 触发一次，无续期则 30s 后全网「忘记」仍在线的设备（M5 e2e 实测暴露——A1 的
-/// 90s 字节透传把 A2 推过 TTL 窗，跨服转发全体退化为 NOT_HERE）。
+/// Local session lease refresh period (TTL/3 — **long-lived sessions must
+/// re-publish periodically**: publish fires only once at connection setup;
+/// without refresh the whole network "forgets" a still-online device after 30s
+/// (exposed by the M5 e2e run — A1's 90s bulk transfer pushed A2 past the TTL
+/// window and cross-server forwarding all degraded to NOT_HERE).
 pub const LEASE_REFRESH: Duration = Duration::from_secs(10);
-/// M7：EWMA 更新周期（§7-M7.3——1s 折叠窗；node 装配的 tick 循环驱动）。
+/// M7: EWMA update period (§7-M7.3 — 1s folding window; driven by the tick
+/// loop assembled in node).
 pub const EWMA_TICK: Duration = Duration::from_secs(1);
-/// M7：EWMA α = 1/5 = 0.2（§7-M7.3）。
+/// M7: EWMA α = 1/5 = 0.2 (§7-M7.3).
 pub const EWMA_ALPHA_NUM: u64 = 1;
 pub const EWMA_ALPHA_DEN: u64 = 5;
 
-/// EWMA 折叠：`next = prev·(1−α) + rate·α`（整数算术：`(prev·(DEN−NUM) + rate·NUM)/DEN`）。
+/// EWMA fold: `next = prev·(1−α) + rate·α` (integer arithmetic:
+/// `(prev·(DEN−NUM) + rate·NUM)/DEN`).
 pub fn ewma_fold(prev: u64, rate: u64) -> u64 {
     (prev.saturating_mul(EWMA_ALPHA_DEN - EWMA_ALPHA_NUM) + rate.saturating_mul(EWMA_ALPHA_NUM))
         / EWMA_ALPHA_DEN
 }
 
-/// M7（§7-M7.3 修订）：离线衰减因子——TTL 已过期且本窗无累加的行每窗 ×4/5
-/// （与 α 无关的独立常数：语义是「无累加证据时的指数遗忘」，非速率估计）。
+/// M7 (§7-M7.3 revision): offline decay factor — rows whose TTL has expired
+/// and that had no accumulation this window decay ×4/5 per window (an
+/// independent constant unrelated to α: the semantics are "exponential
+/// forgetting absent accumulation evidence", not a rate estimate).
 pub const EWMA_OFFLINE_DECAY_NUM: u64 = 4;
 pub const EWMA_OFFLINE_DECAY_DEN: u64 = 5;
-/// 离线衰减地板：按窗衰减至低于该速率（B/s）即置 0——名册不再呈现离线非零流量。
+/// Offline decay floor: once per-window decay drops below this rate (B/s) the
+/// value is set to 0 — the roster no longer shows non-zero traffic for offline
+/// devices.
 pub const EWMA_OFFLINE_FLOOR_BPS: u64 = 8;
 
-/// 离线衰减单步：`v × 4/5`，低于 [`EWMA_OFFLINE_FLOOR_BPS`] 置 0。
+/// Offline decay single step: `v × 4/5`, set to 0 below
+/// [`EWMA_OFFLINE_FLOOR_BPS`].
 pub fn ewma_offline_decay(v: u64) -> u64 {
     let d = v.saturating_mul(EWMA_OFFLINE_DECAY_NUM) / EWMA_OFFLINE_DECAY_DEN;
     if d < EWMA_OFFLINE_FLOOR_BPS {
@@ -63,9 +81,12 @@ pub fn ewma_offline_decay(v: u64) -> u64 {
     }
 }
 
-/// 服务器自身在租约域的合成设备键（M7：Server 名册条目的自发布/计数锚）。
-/// node_id 大端居前 8B + 固定标记后缀——真实设备 id 是 sha256(ed25519)，结构化前缀
-/// 碰撞概率可忽略；各服务器以该键自发布租约（携带自身 EWMA），全网名册可装配。
+/// Synthetic device key for the server itself in the lease domain (M7: the
+/// self-publish/counting anchor for roster Server entries). node_id
+/// big-endian in the first 8B + a fixed marker suffix — real device ids are
+/// sha256(ed25519), so the collision probability of the structured prefix is
+/// negligible; each server self-publishes a lease under this key (carrying its
+/// own EWMA), making the network-wide roster assemblable.
 pub fn server_self_device_id(node_id: NodeId) -> [u8; 32] {
     let mut id = [0u8; 32];
     id[..8].copy_from_slice(&node_id.to_be_bytes());
@@ -73,7 +94,8 @@ pub fn server_self_device_id(node_id: NodeId) -> [u8; 32] {
     id
 }
 
-/// 反熵单条目（M7：带宽/last_seen 字段随表摘要同步——持有者权威值）。
+/// Anti-entropy single entry (M7: bandwidth/last_seen fields synchronized with
+/// the table digest — holder-authoritative values).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AntiEntry {
     pub device: Vec<u8>,
@@ -84,10 +106,11 @@ pub struct AntiEntry {
     pub last_seen_unix: u64,
 }
 
-/// gossip 线消息（M7：Publish/Anti 均携带 EWMA 与 last_seen）。
+/// Gossip wire message (M7: Publish/Anti both carry EWMA and last_seen).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GossipMsg {
-    /// 单条租约事件推送（publish 即时广播，≤1s 语义）。
+    /// Single lease event push (publish broadcasts immediately, ≤1s
+    /// semantics).
     Publish {
         device: [u8; 32],
         holder: NodeId,
@@ -96,34 +119,39 @@ pub enum GossipMsg {
         rx_ewma: u64,
         last_seen_unix: u64,
     },
-    /// 全表摘要（反熵；TTL 由收端以本机时钟重置）。
+    /// Full-table digest (anti-entropy; the receiver resets the TTL using its
+    /// own clock).
     Anti { entries: Vec<AntiEntry> },
 }
 
-/// 单条租约。
+/// A single lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lease {
     pub holder: NodeId,
     pub term_ms: u64,
     pub expires_at: Instant,
-    /// M7：设备视角 EWMA（bytes/s）——持有者维护，随 publish/反熵传播。
+    /// M7: device-view EWMA (bytes/s) — maintained by the holder, propagated
+    /// with publish/anti-entropy.
     pub tx_ewma: u64,
     pub rx_ewma: u64,
-    /// M7：最后在线时刻（unix 秒；TTL 过期后行保留——名册离线设备展示用）。
+    /// M7: last-seen moment (unix seconds; rows are retained after TTL expiry
+    /// — for showing offline devices in the roster).
     pub last_seen_unix: u64,
 }
 
-/// 名册/回收器消费的本地租约视图统计（在线判定 + EWMA + last_seen）。
+/// Local lease-view statistics consumed by the roster/reaper (online
+/// determination + EWMA + last_seen).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerLeaseStats {
-    /// TTL 内（唯一真相源本地视图）。
+    /// Within TTL (local view of the single source of truth).
     pub online: bool,
     pub last_seen_unix: u64,
     pub tx_ewma: u64,
     pub rx_ewma: u64,
 }
 
-/// 本机 per-device 字节累加器（EWMA 折叠源；持有者侧维护）。
+/// Per-device byte accumulator on this machine (EWMA folding source;
+/// holder-side maintenance).
 #[derive(Debug, Clone, Copy, Default)]
 struct TrafficAcc {
     tx: u64,
@@ -131,29 +159,39 @@ struct TrafficAcc {
     last_fold_ms: u64,
 }
 
-/// 本地租约表。
+/// Local lease table.
 pub struct LeaseTable {
     me: NodeId,
     ttl: Duration,
     hooks: HookRegistry,
     st: Mutex<BTreeMap<[u8; 32], Lease>>,
-    /// 本机测量累加器（M7；只对「本机持有」的行折叠进 ewma——远端行以持有者消息为准）。
+    /// Local measurement accumulator (M7; only rows "held locally" get folded
+    /// into ewma — remote rows take the holder-reported values).
     acc: Mutex<BTreeMap<[u8; 32], TrafficAcc>>,
-    /// 已见远端 term 水位（含被拒收的旧条目——任何到达即抬升）。
+    /// High-water mark of seen remote terms (including rejected stale entries
+    /// — any arrival raises it).
     ///
-    /// 反「时钟偏移误踢」护栏：本地 publish/续期的 term 至少取 `floor + 1`——本机墙钟
-    /// 可能落后于已见远端 term（偏移或远端时钟超前），直接用 `now` 会让本地真实在线的
-    /// 设备在「新者胜」比较中输掉自己见过的远端旧条目（单向连通下反复被踢）。
-    /// 残余依赖（诚实披露）：从未互通 term 的两节点间仍按各自墙钟定序——绝对时钟
-    /// 偏移可让先到者暂时取胜，TTL 过期 + 反熵兜底收敛。
+    /// Guard rail against "clock-skew wrongful eviction": a local
+    /// publish/renewal takes a term of at least `floor + 1` — the local wall
+    /// clock may sit behind already-seen remote terms (skew, or a remote clock
+    /// running ahead); using `now` directly would let a genuinely online local
+    /// device lose, in the "newest wins" comparison, against a stale remote
+    /// entry it has already seen (repeatedly evicted under one-way
+    /// connectivity). Residual dependency (honest disclosure): between two
+    /// nodes that never exchanged terms, ordering still follows their own wall
+    /// clocks — absolute clock skew can let the first arrival win temporarily;
+    /// TTL expiry + anti-entropy backstop convergence.
     term_floor: AtomicU64,
-    /// 自创建起合并过的远端 gossip 消息数（含空反熵摘要——任何到达都证明互连/反熵
-    /// 面已活）。回收器「视图就绪」闸门的信号（[`LeaseTable::reaper_view_ready`]）。
+    /// Count of remote gossip messages merged since creation (including empty
+    /// anti-entropy digests — any arrival proves the interconnect/anti-entropy
+    /// plane is alive). The signal for the reaper's "view ready" gate
+    /// ([`LeaseTable::reaper_view_ready`]).
     remote_events: AtomicU64,
 }
 
 impl LeaseTable {
-    /// `hooks` 与状态机共用同一注册表（on_lease_evicted 与 on_revocation_applied 同源）。
+    /// `hooks` shares the same registry as the state machine
+    /// (on_lease_evicted and on_revocation_applied share one source).
     pub fn new(me: NodeId, ttl: Duration, hooks: HookRegistry) -> Arc<Self> {
         Arc::new(LeaseTable {
             me,
@@ -166,14 +204,16 @@ impl LeaseTable {
         })
     }
 
-    /// 本机节点号。
+    /// The local node id.
     pub fn me(&self) -> NodeId {
         self.me
     }
 
-    /// M7：计一笔设备流量（转发面投递成功点调用；持有者侧维护——跨服 FRWD 的 dst
-    /// 计数发生在收端/持有端，origin 不计 dst，见 forward.rs 注记）。累入 acc 并抬升
-    /// 本机持有行的 last_seen。
+    /// M7: record a unit of device traffic (called at successful
+    /// forwarding-plane delivery points; holder-side maintenance — dst counting
+    /// for cross-server FRWD happens at the receiving/holding end, origin does
+    /// not count dst, see the note in forward.rs). Accumulates into acc and
+    /// raises last_seen of locally held rows.
     pub fn note_tx(&self, device: &[u8; 32], bytes: u64) {
         self.note_traffic(device, bytes, 0);
     }
@@ -189,7 +229,8 @@ impl LeaseTable {
             e.tx = e.tx.saturating_add(tx);
             e.rx = e.rx.saturating_add(rx);
         }
-        // 本机持有的行：流量即活跃证据 ⇒ 抬 last_seen（远端行不动——持有者权威）。
+        // Locally held rows: traffic is evidence of liveness ⇒ raise
+        // last_seen (remote rows untouched — holder authority).
         let now = now_unix();
         let mut st = self.st.lock().expect("lease table");
         if let Some(l) = st.get_mut(device) {
@@ -199,17 +240,22 @@ impl LeaseTable {
         }
     }
 
-    /// M7：EWMA 折叠（1s 窗；node 装配的 tick 循环调用，`now_ms` 显式注入可测）。
-    /// 只折本机持有的行——acc 里的远端设备流量（如本机作为 FRWD 收端代计前的瞬态）
-    /// 不覆写持有者发布的值。
+    /// M7: EWMA folding (1s window; called by the tick loop assembled in
+    /// node, `now_ms` injected explicitly for testability). Folds only rows
+    /// held locally — remote device traffic sitting in acc (e.g. the transient
+    /// before this machine acts as the FRWD receiver and hands counting over)
+    /// must not overwrite the holder-published values.
     ///
-    /// 离线衰减（§7-M7.3 修订）：TTL 已过期且**无本地累加器**（远端行/从未计流的本机
-    /// 行——下方折叠循环触不到）的行按窗 ×4/5 衰减、<8B/s 置 0——名册不再呈现离线
-    /// 非零流量。有累加器的行由折叠循环的零速率折叠（同 ×4/5 数学）自然衰减至 0。
+    /// Offline decay (§7-M7.3 revision): rows whose TTL has expired and that
+    /// have **no local accumulator** (remote rows / local rows never counted —
+    /// out of reach of the folding loop below) decay ×4/5 per window and are
+    /// zeroed below 8B/s — the roster no longer shows non-zero traffic for
+    /// offline devices. Rows with accumulators decay naturally to 0 via the
+    /// folding loop's zero-rate fold (the same ×4/5 math).
     pub fn tick_ewma(&self, now_ms_val: u64) {
         let mut acc = self.acc.lock().expect("lease acc");
         let mut st = self.st.lock().expect("lease table");
-        // ① 折叠：本机持有 + 有累加（既有逻辑）。
+        // ① Fold: locally held + accumulated (existing logic).
         for (dev, a) in acc.iter_mut() {
             if a.last_fold_ms == 0 {
                 a.last_fold_ms = now_ms_val;
@@ -221,7 +267,8 @@ impl LeaseTable {
             }
             let Some(l) = st.get_mut(dev) else { continue };
             if l.holder != self.me {
-                // 非本机持有：累加器留待持有权变化后重置（publish 重置 acc）。
+                // Not held locally: the accumulator waits until ownership
+                // changes to be reset (publish resets acc).
                 continue;
             }
             let secs = dt as f64 / 1000.0;
@@ -233,7 +280,8 @@ impl LeaseTable {
             a.rx = 0;
             a.last_fold_ms = now_ms_val;
         }
-        // ② 离线衰减：TTL 过期且折叠循环触不到（无 acc 条目）的行。
+        // ② Offline decay: rows past TTL and out of reach of the folding loop
+        //    (no acc entry).
         let now = Instant::now();
         for (dev, l) in st.iter_mut() {
             if l.expires_at > now {
@@ -247,16 +295,23 @@ impl LeaseTable {
         }
     }
 
-    /// 发布本机租约（新者胜）。返回被本机取代的旧持有者（若有——冲突场景的对端）。
-    /// 远端传播由调用方（node 装配）广播 [`GossipMsg::Publish`]。
+    /// Publish the local lease (newest wins). Returns the previous holder
+    /// superseded locally (if any — the peer in the conflict scenario). Remote
+    /// propagation is up to the caller (the node assembly) broadcasting
+    /// [`GossipMsg::Publish`].
     ///
-    /// term 至少取 `max(已见远端 term) + 1`（墙钟与本机取大）：本机时钟偏移（落后于
-    /// 已见远端条目）不得让本地真实在线的设备在续期时输掉「新者胜」（见 `term_floor`）。
-    /// M7：ewma 从既有行**继承**（续期不清零流量视图）；接管他机行（或全新发布）时
-    /// 本机 acc 重置——旧累加器是旧持有者的测量，不作数。
+    /// The term is at least `max(seen remote terms) + 1` (max of that with the
+    /// wall clock): local clock skew (running behind already-seen remote
+    /// entries) must not let a genuinely online local device lose the "newest
+    /// wins" race at renewal (see `term_floor`). M7: ewma is **inherited**
+    /// from the existing row (renewal does not reset the traffic view); when
+    /// taking over another machine's row (or publishing fresh), the local acc
+    /// is reset — the old accumulator was the old holder's measurement and
+    /// does not count.
     ///
-    /// 锁纪律：st 与 acc 不嵌套（tick_ewma 以 acc→st 序嵌套——本函数先释 st 再碰 acc，
-    /// 全表只有 tick 一处嵌套，无反向序）。
+    /// Lock discipline: st and acc are never nested here (tick_ewma nests in
+    /// acc→st order — this function releases st before touching acc; the tick
+    /// is the only nesting site in the table, no reverse order).
     pub fn publish(&self, device: &[u8; 32]) -> Option<NodeId> {
         let floor = self.term_floor.load(Ordering::SeqCst);
         let term = now_ms().max(floor.saturating_add(1));
@@ -282,11 +337,14 @@ impl LeaseTable {
         prev.filter(|p| p.holder != self.me).map(|p| p.holder)
     }
 
-    /// 收到远端 publish/反熵条目：合并（新者胜）；本地持有的租约被更新者取代 ⇒
-    /// 触发踢出钩子（旧端踢会话）。
+    /// A remote publish/anti-entropy entry arrived: merge (newest wins); a
+    /// locally held lease superseded by a newer one ⇒ fire the eviction hooks
+    /// (old side evicts the session).
     ///
-    /// 任何到达（含空反熵摘要）都计入 `remote_events`——「互连/反熵面已活」的证明，
-    /// 回收器闸门据此判定重启后的租约视图是否已就绪（§7-M7.5）。
+    /// Every arrival (including empty anti-entropy digests) counts toward
+    /// `remote_events` — proof that "the interconnect/anti-entropy plane is
+    /// alive", by which the reaper gate decides whether the post-restart
+    /// lease view is ready (§7-M7.5).
     pub fn merge_remote(&self, msg: GossipMsg) {
         self.remote_events.fetch_add(1, Ordering::SeqCst);
         let entries: Vec<AntiEntry> = match msg {
@@ -322,15 +380,18 @@ impl LeaseTable {
                     last_seen_unix,
                     ..
                 } = e;
-                // 任何到达的远端 term（含被拒收的旧条目）都抬升本地基准：
-                // 下次本地 publish 至少 term+1（时钟偏移护栏，见 `term_floor`）。
+                // Every arriving remote term (including rejected stale
+                // entries) raises the local floor: the next local publish
+                // takes at least term+1 (clock-skew guard rail, see
+                // `term_floor`).
                 self.term_floor.fetch_max(term, Ordering::SeqCst);
                 let newer = match st.get(&device) {
                     Some(cur) => (term, holder) > (cur.term_ms, cur.holder),
                     None => true,
                 };
                 if newer {
-                    // 本地持有且被他人更新者取代 ⇒ 旧端踢出（新者胜）。
+                    // Held locally and superseded by a newer remote ⇒ old
+                    // side evicts (newest wins).
                     if let Some(cur) = st.get(&device) {
                         if cur.holder == self.me && holder != self.me {
                             evicted.push(device);
@@ -355,9 +416,11 @@ impl LeaseTable {
         }
     }
 
-    /// 查询设备当前归属（TTL 过期 ⇒ None；「设备当前位置唯一真相源」的本地视图）。
-    /// M7：过期行**保留**（不再删除）——last_seen/EWMA 供名册离线设备展示；
-    /// `live_len`/反熵仍按 TTL 过滤。
+    /// Query a device's current holder (TTL expired ⇒ None; the local view of
+    /// "the lease domain is the single source of truth for device current
+    /// location"). M7: expired rows are **retained** (no longer deleted) —
+    /// last_seen/EWMA serve the roster's offline-device display;
+    /// `live_len`/anti-entropy still filter by TTL.
     pub fn observe(&self, device: &[u8; 32]) -> Option<Lease> {
         let st = self.st.lock().expect("lease table");
         match st.get(device).copied() {
@@ -366,7 +429,8 @@ impl LeaseTable {
         }
     }
 
-    /// M7：名册/回收器视图（在线判定 + last_seen + EWMA；从未见过租约 ⇒ None）。
+    /// M7: roster/reaper view (online determination + last_seen + EWMA; never
+    /// seen a lease ⇒ None).
     pub fn peer_stats(&self, device: &[u8; 32]) -> Option<PeerLeaseStats> {
         let st = self.st.lock().expect("lease table");
         st.get(device).map(|l| PeerLeaseStats {
@@ -377,9 +441,12 @@ impl LeaseTable {
         })
     }
 
-    /// 一次性跨服位置询问（§3.10 `location_query`：fan-out ≤3，不缓存不重试——
-    /// 失败即丢包+ICMP，由上层恢复）。本地租约域命中即答（唯一真相源）；
-    /// 否则经 [`LocateFanout`] 问互连服务器「谁在托管该设备」，取首个肯定回答。
+    /// One-shot cross-server location inquiry (§3.10 `location_query`:
+    /// fan-out ≤3, no caching, no retries — failure is just a dropped packet +
+    /// ICMP, recovery is up to the upper layer). Answer from a local lease
+    /// domain hit (single source of truth); otherwise ask via [`LocateFanout`]
+    /// the interconnected servers "who is hosting this device" and take the
+    /// first positive answer.
     pub async fn location_query(
         &self,
         device: &[u8; 32],
@@ -391,7 +458,8 @@ impl LeaseTable {
         fanout.locate(device).await
     }
 
-    /// 非过期租约条数（诊断/断言面：gossip 传播是否工作）。
+    /// Number of non-expired lease entries (diagnostics/assertion surface:
+    /// whether gossip propagation works).
     pub fn live_len(&self) -> usize {
         let st = self.st.lock().expect("lease table");
         st.iter()
@@ -399,34 +467,46 @@ impl LeaseTable {
             .count()
     }
 
-    /// 表内总行数（**含 TTL 过期的保留行**——M7 过期不删，名册离线展示用）。
+    /// Total rows in the table (**including TTL-expired retained rows** — M7
+    /// keeps expired rows for the roster's offline display).
     pub fn total_rows(&self) -> usize {
         self.st.lock().expect("lease table").len()
     }
 
-    /// 自创建起合并过的远端 gossip 消息数（含空摘要）。
+    /// Count of remote gossip messages merged since creation (including empty
+    /// digests).
     pub fn remote_events(&self) -> u64 {
         self.remote_events.load(Ordering::SeqCst)
     }
 
-    /// M7 回收器「视图就绪」闸门（§7-M7.5，**最小可靠形态**）：表非空**且**自启动起
-    /// 收到过至少一条远端 gossip ⇒ 本地租约视图足以支撑回收判定。
+    /// M7 reaper "view ready" gate (§7-M7.5, **minimal reliable form**):
+    /// table non-empty **and** at least one remote gossip received since
+    /// start ⇒ the local lease view is sufficient to support reaping
+    /// decisions.
     ///
-    /// 语义取舍（如实注明）：
-    /// - 刚重启的节点租约表为空、且在收到首条远端事件（对端反熵摘要 ≤1 个周期 5s、
-    ///   或本机首台设备建连 publish）之前，视图不可判 ⇒ 回收跳过——闭合「反熵回填与
-    ///   回收首拍赛跑」窗口（该窗口内远端托管设备的租约行缺失，`last_seen=0` 会被
-    ///   锚到 `registered_at`，长注册的在线设备可能被误终态化）。
-    /// - 残余 1：闸门开启后首拍仍可能早于对端摘要回填（≤1 个反熵周期）——由回收周期
-    ///   60s ≫ 5s 与「真离线设备才超锚窗」共同兜底；主修复是 registered_at 锚，
-    ///   本闸门是纵深防御。
-    /// - 残余 2：单节点 raft 集群（无对端）永无远端事件 ⇒ 闸门恒关、保留期不生效——
-    ///   该形态不在部署面（§6.2 ≥2 台）；如需启用，接受此残留或补第 2 台服务器。
+    /// Semantic trade-offs (noted honestly):
+    /// - On a freshly restarted node the lease table is empty, and until the
+    ///   first remote event arrives (peer anti-entropy digest within ≤1
+    ///   period of 5s, or this machine's first device-connection publish), the
+    ///   view cannot be judged ⇒ reaping is skipped — closing the
+    ///   "anti-entropy backfill races the reaper's first tick" window (in that
+    ///   window the lease row of a remotely hosted device is missing,
+    ///   `last_seen=0` would anchor to `registered_at`, and a long-registered
+    ///   online device could be wrongly finalized).
+    /// - Residual 1: after the gate opens, the first tick can still precede
+    ///   peer digest backfill (≤1 anti-entropy period) — backstopped jointly
+    ///   by the 60s reaping period ≫ 5s and "only truly offline devices exceed
+    ///   the anchor window"; the primary fix is the registered_at anchor; this
+    ///   gate is defense in depth.
+    /// - Residual 2: a single-node raft cluster (no peers) never sees remote
+    ///   events ⇒ the gate stays closed and the retention period never
+    ///   applies — that shape is not on the deployment surface (§6.2 ≥2
+    ///   servers); to enable it, accept this residue or add a 2nd server.
     pub fn reaper_view_ready(&self) -> bool {
         self.total_rows() > 0 && self.remote_events() > 0
     }
 
-    /// 全表摘要（反熵消息体）。
+    /// Full-table digest (anti-entropy message body).
     pub fn anti_entropy_msg(&self) -> GossipMsg {
         let st = self.st.lock().expect("lease table");
         GossipMsg::Anti {
@@ -453,7 +533,8 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// 位置询问扇出接缝（node 装配注入 wire 实现：WireRpc::Locate，至多 3 台互连服务器）。
+/// Location-inquiry fan-out seam (the node assembly injects the wire
+/// implementation: WireRpc::Locate, to at most 3 interconnected servers).
 pub trait LocateFanout: Send + Sync + 'static {
     fn locate(&self, device: &[u8; 32]) -> BoxFuture<'static, Option<NodeId>>;
 }
@@ -466,11 +547,14 @@ fn now_ms() -> u64 {
 }
 
 // ============================================================================
-// TrafficMeter：单服形态的独立流量计（同 EWMA 数学，无 gossip；§7-M7.3）
+// TrafficMeter: standalone traffic meter for the single-server shape (same
+// EWMA math, no gossip; §7-M7.3)
 // ============================================================================
 
-/// 任意键（设备 VIP 字节 / 服务器自身键）的 per-key EWMA + last_seen 计量器。
-/// 单服形态（无租约表）由 `PeerRouter` 双向计数喂入；多主形态走 `LeaseTable`。
+/// Per-key EWMA + last_seen meter for arbitrary keys (device VIP bytes / the
+/// server's own key). In the single-server shape (no lease table) it is fed by
+/// `PeerRouter` counting both directions; the multi-primary shape uses
+/// `LeaseTable`.
 pub struct TrafficMeter {
     st: Mutex<std::collections::HashMap<Vec<u8>, MeterEntry>>,
 }
@@ -509,7 +593,7 @@ impl TrafficMeter {
         e.last_seen_unix = e.last_seen_unix.max(now);
     }
 
-    /// 1s 窗折叠（`now_ms` 显式注入可测）。
+    /// 1s-window folding (`now_ms` injected explicitly for testability).
     pub fn tick(&self, now_ms_val: u64) {
         let mut st = self.st.lock().expect("traffic meter");
         for e in st.values_mut() {
@@ -530,15 +614,17 @@ impl TrafficMeter {
         }
     }
 
-    /// 名册视图（无条目 ⇒ None——从未见过流量）。
+    /// Roster view (no entry ⇒ None — never saw any traffic).
     pub fn stats(&self, key: &[u8]) -> Option<(u64, u64, u64)> {
         let st = self.st.lock().expect("traffic meter");
         st.get(key)
             .map(|e| (e.tx_ewma, e.rx_ewma, e.last_seen_unix))
     }
 
-    /// 是否有过任何观测（空表 = 自创建起从未计到任何流量——单服回收器的重启闸门
-    /// 用，§7-M7.5：TrafficMeter 纯内存，重启即清空；空表且注册表非空 ⇒ 刚重启）。
+    /// Whether there has been any observation at all (empty table = no traffic
+    /// counted since creation — used by the single-server reaper's restart
+    /// gate, §7-M7.5: TrafficMeter is purely in-memory and resets on restart;
+    /// empty table with a non-empty registry ⇒ just restarted).
     pub fn has_any(&self) -> bool {
         !self.st.lock().expect("traffic meter").is_empty()
     }
@@ -553,7 +639,7 @@ impl Default for TrafficMeter {
 }
 
 // ============================================================================
-// 单元测试：新者胜 + 旧端踢出回调 + TTL
+// Unit tests: newest wins + old-side eviction callback + TTL
 // ============================================================================
 
 #[cfg(test)]
@@ -577,7 +663,8 @@ mod tests {
         let t1 = table_with_hooks(1, rec.clone());
         t1.publish(&[7; 32]);
         assert_eq!(t1.observe(&[7; 32]).unwrap().holder, 1);
-        // 节点 2 的更新租约到达节点 1 ⇒ 新者胜 + 节点 1 踢出回调。
+        // Node 2's newer lease arrives at node 1 ⇒ newest wins + node 1's
+        // eviction callback.
         t1.merge_remote(GossipMsg::Publish {
             device: [7; 32],
             holder: 2,
@@ -586,9 +673,13 @@ mod tests {
             rx_ewma: 0,
             last_seen_unix: 0,
         });
-        assert_eq!(t1.observe(&[7; 32]).unwrap().holder, 2, "新者胜");
-        assert_eq!(rec.evictions(), vec![[7u8; 32]], "旧端踢出回调触发");
-        // 旧 term 再来 ⇒ 不回退。
+        assert_eq!(t1.observe(&[7; 32]).unwrap().holder, 2, "newest wins");
+        assert_eq!(
+            rec.evictions(),
+            vec![[7u8; 32]],
+            "old-side eviction callback fired"
+        );
+        // A stale term arriving again ⇒ no rollback.
         t1.merge_remote(GossipMsg::Publish {
             device: [7; 32],
             holder: 1,
@@ -597,16 +688,21 @@ mod tests {
             rx_ewma: 0,
             last_seen_unix: 0,
         });
-        assert_eq!(t1.observe(&[7; 32]).unwrap().holder, 2, "旧者不覆盖");
+        assert_eq!(
+            t1.observe(&[7; 32]).unwrap().holder,
+            2,
+            "the older entry does not override"
+        );
     }
 
-    /// 续期周期守门：LEASE_REFRESH 必须显著短于 TTL（两次续期窗内不过期——
-    /// M5 e2e 暴露的「长寿命会话租约蒸发」回归面）。
+    /// Refresh-period gate: LEASE_REFRESH must be well within the TTL (no
+    /// expiry inside two refresh windows — the regression surface of the
+    /// "long-lived session lease evaporation" exposed by M5 e2e).
     #[test]
     fn refresh_period_is_well_within_ttl() {
         assert!(
             LEASE_REFRESH + LEASE_REFRESH < LEASE_TTL,
-            "两个续期周期必须都在 TTL 内（缺一轮续期仍存活——10s 续期 × 30s TTL）"
+            "two refresh periods must both fit within the TTL (survive one missed renewal — 10s refresh × 30s TTL)"
         );
     }
 
@@ -617,31 +713,35 @@ mod tests {
         let t2 = table(2);
         t1.publish(&[1; 32]);
         t1.publish(&[2; 32]);
-        // 反熵：t1 全表 → t2。
+        // Anti-entropy: t1's full table → t2.
         let msg = t1.anti_entropy_msg();
         t2.merge_remote(msg);
         assert_eq!(t2.observe(&[1; 32]).unwrap().holder, 1);
         assert_eq!(t2.observe(&[2; 32]).unwrap().holder, 1);
-        // TTL 过期 ⇒ observe None（短 TTL 表）。
+        // TTL expiry ⇒ observe None (short-TTL table).
         let t3 = LeaseTable::new(3, Duration::from_millis(20), HookRegistry::new());
         t3.publish(&[9; 32]);
         std::thread::sleep(Duration::from_millis(40));
-        assert_eq!(t3.observe(&[9; 32]), None, "TTL 过期即失效");
+        assert_eq!(t3.observe(&[9; 32]), None, "invalid once TTL expires");
     }
 
-    /// 时钟偏移护栏：本地墙钟落后于已见远端 term（远端时钟超前 5s + 单向连通——本地
-    /// 收得到远端）时，本地续期 term 仍越过已见远端 term ⇒「新者胜」不反转、本地在线
-    /// 设备不被误踢。
+    /// Clock-skew guard rail: when the local wall clock runs behind an
+    /// already-seen remote term (remote clock 5s ahead + one-way
+    /// connectivity — the local side can receive from the remote), a local
+    /// renewal term still surpasses the seen remote term ⇒ the "newest wins"
+    /// ordering is not inverted and the locally online device is not wrongly
+    /// evicted.
     #[test]
     fn republish_beats_seen_remote_term_despite_clock_skew() {
         let t1 = table_with_hooks(1, HookRecorder::new());
         let t2 = table_with_hooks(2, HookRecorder::new());
         let dev = [0x5e; 32];
-        // 节点 1 先持有（本地时钟正常）。
+        // Node 1 holds first (local clock normal).
         t1.publish(&dev);
         let t1_term = t1.observe(&dev).unwrap().term_ms;
-        // 节点 2 见到节点 1 的租约（抬升基准），随后设备移到节点 2 —— 但节点 2 墙钟
-        // 落后（模拟：远端条目 term 超前本地 now 5s 到达）。
+        // Node 2 sees node 1's lease (raising its floor), then the device
+        // moves to node 2 — but node 2's wall clock lags (simulated: a remote
+        // entry whose term is 5s ahead of local now arrives).
         let skewed_remote = now_ms() + 5_000;
         t2.merge_remote(GossipMsg::Publish {
             device: dev,
@@ -651,17 +751,23 @@ mod tests {
             rx_ewma: 0,
             last_seen_unix: 0,
         });
-        assert_eq!(t2.observe(&dev).unwrap().holder, 3, "超前的远端条目先入表");
-        // 节点 2 本地续期（设备真实在节点 2）：term ≥ skewed_remote+1（越过已见远端）。
+        assert_eq!(
+            t2.observe(&dev).unwrap().holder,
+            3,
+            "the ahead-of-time remote entry enters the table first"
+        );
+        // Node 2 renews locally (the device is genuinely on node 2): term ≥
+        // skewed_remote+1 (past the seen remote term).
         t2.publish(&dev);
         let l2 = t2.observe(&dev).unwrap();
         assert_eq!(l2.holder, 2);
         assert!(
             l2.term_ms > skewed_remote,
-            "本地续期 term 越过已见远端 term（不因时钟落后丢新者胜）"
+            "local renewal term surpasses the seen remote term (no loss of newest-wins to clock lag)"
         );
         assert!(l2.term_ms > t1_term);
-        // 该续期到达节点 1 ⇒ 新者胜 + 旧端（节点 3 的视角对 1 而言即覆盖）+ 踢出钩子。
+        // That renewal arrives at node 1 ⇒ newest wins + old side (node 3's
+        // view, which to node 1 is simply overwritten) + eviction hook.
         t1.merge_remote(GossipMsg::Publish {
             device: dev,
             holder: 2,
@@ -670,15 +776,22 @@ mod tests {
             rx_ewma: 0,
             last_seen_unix: 0,
         });
-        assert_eq!(t1.observe(&dev).unwrap().holder, 2, "续期传播后新者胜");
+        assert_eq!(
+            t1.observe(&dev).unwrap().holder,
+            2,
+            "newest wins after renewal propagates"
+        );
     }
 
     // ------------------------------------------------------------------
-    // M7（§7-M7.3）：EWMA 收敛 / gossip 带宽字段往返 / last_seen 维护
+    // M7 (§7-M7.3): EWMA convergence / gossip bandwidth-field round trip /
+    // last_seen maintenance
     // ------------------------------------------------------------------
 
-    /// EWMA 收敛：恒定速率（每秒 1000B）喂养 + 1s 折叠 ⇒ ewma 逼近 1000
-    ///（α=0.2：20 折后残差 ≈ 1000·0.8²⁰ ≈ 1.2%，5% 容差充分）；中途单调非减。
+    /// EWMA convergence: feed a constant rate (1000B per second) + 1s folding
+    /// ⇒ ewma approaches 1000 (α=0.2: after 20 folds the residual ≈
+    /// 1000·0.8²⁰ ≈ 1.2%, a 5% tolerance is ample); monotone non-decreasing
+    /// along the way.
     #[test]
     fn ewma_converges_under_constant_rate() {
         let t = table(1);
@@ -693,29 +806,30 @@ mod tests {
             let ewma = t.peer_stats(&dev).unwrap().tx_ewma;
             assert!(
                 ewma >= prev_ewma,
-                "恒定速率下折叠单调非减（{prev_ewma}→{ewma}）"
+                "folding monotone non-decreasing under a constant rate ({prev_ewma}→{ewma})"
             );
             prev_ewma = ewma;
         }
         let stats = t.peer_stats(&dev).unwrap();
         assert!(
             (stats.tx_ewma as i64 - 1000).abs() <= 50,
-            "20 折后 ewma 收敛到 1000±5%: {}",
+            "after 20 folds ewma converges to 1000±5%: {}",
             stats.tx_ewma
         );
-        assert_eq!(stats.rx_ewma, 0, "rx 未喂养 ⇒ 0");
-        assert!(stats.online, "刚发布 ⇒ 在线");
+        assert_eq!(stats.rx_ewma, 0, "rx never fed ⇒ 0");
+        assert!(stats.online, "just published ⇒ online");
     }
 
-    /// gossip 带宽字段往返：持有者折叠出的 ewma/last_seen 经 Publish 与反熵两条通路
-    /// 到达远端节点——线格式（postcard）往返 + peer_stats 取值一致。
+    /// Gossip bandwidth-field round trip: the ewma/last_seen folded by the
+    /// holder reach a remote node via both the Publish and anti-entropy paths
+    /// — wire format (postcard) round trip + peer_stats values identical.
     #[test]
     fn gossip_carries_bandwidth_fields_roundtrip() {
         let t1 = table(1);
         let t2 = table(2);
         let dev = [0x22; 32];
         t1.publish(&dev);
-        // 喂 2 秒恒定速率并折叠。
+        // Feed 2 seconds of constant rate and fold.
         let mut ms = 5_000_000u64;
         for _ in 0..10 {
             t1.note_tx(&dev, 500);
@@ -724,9 +838,13 @@ mod tests {
             t1.tick_ewma(ms);
         }
         let s1 = t1.peer_stats(&dev).unwrap();
-        assert!(s1.tx_ewma > 0 && s1.rx_ewma > 0, "持有者侧 ewma 非零");
+        assert!(
+            s1.tx_ewma > 0 && s1.rx_ewma > 0,
+            "holder-side ewma non-zero"
+        );
 
-        // Publish 通路：线格式往返（postcard 编解码）后合并到 t2。
+        // Publish path: wire-format round trip (postcard encode/decode), then
+        // merge into t2.
         let l = t1.observe(&dev).unwrap();
         let msg = GossipMsg::Publish {
             device: dev,
@@ -743,11 +861,12 @@ mod tests {
         assert_eq!(
             (s2.tx_ewma, s2.rx_ewma, s2.last_seen_unix),
             (s1.tx_ewma, s1.rx_ewma, s1.last_seen_unix),
-            "Publish 通路带宽字段一致"
+            "bandwidth fields agree over the Publish path"
         );
         assert_eq!(t2.observe(&dev).unwrap().holder, 1);
 
-        // 反熵通路：全表摘要（AntiEntry 线格式）→ 第三个节点。
+        // Anti-entropy path: full-table digest (AntiEntry wire format) → a
+        // third node.
         let t3 = table(3);
         let anti = t1.anti_entropy_msg();
         let wire = postcard::to_allocvec(&anti).expect("encode");
@@ -757,44 +876,57 @@ mod tests {
         assert_eq!(
             (s3.tx_ewma, s3.rx_ewma),
             (s1.tx_ewma, s1.rx_ewma),
-            "反熵通路一致"
+            "anti-entropy path agrees"
         );
-        assert!(s3.online, "反熵携带的条目 TTL 由收端重置 ⇒ 在线");
+        assert!(
+            s3.online,
+            "the TTL of entries carried by anti-entropy is reset by the receiver ⇒ online"
+        );
     }
 
-    /// last_seen 维护：流量计数抬升持有者行 last_seen；TTL 过期后行保留（observe None
-    /// 但 peer_stats 仍给 last_seen/ewma——名册离线设备展示面）。
+    /// last_seen maintenance: traffic counting raises the holder row's
+    /// last_seen; after TTL expiry the row is retained (observe None but
+    /// peer_stats still reports last_seen/ewma — the roster's offline-device
+    /// display surface).
     #[test]
     fn last_seen_bumped_by_traffic_and_retained_after_expiry() {
-        // 短 TTL 表（40ms）观察过期保留。
+        // Short-TTL table (40ms) to observe expiry retention.
         let t = LeaseTable::new(9, Duration::from_millis(40), HookRegistry::new());
         let dev = [0x33; 32];
         t.publish(&dev);
         t.note_tx(&dev, 100);
         let before = t.peer_stats(&dev).unwrap().last_seen_unix;
-        assert!(before > 0, "publish/note 已置 last_seen");
-        // 过期：observe ⇒ None（在线判定收回），行保留 ⇒ peer_stats 仍在。
+        assert!(before > 0, "publish/note already set last_seen");
+        // Expired: observe ⇒ None (online determination withdrawn), row
+        // retained ⇒ peer_stats still there.
         std::thread::sleep(Duration::from_millis(80));
-        assert!(t.observe(&dev).is_none(), "TTL 过期 ⇒ observe None");
+        assert!(t.observe(&dev).is_none(), "TTL expired ⇒ observe None");
         let s = t
             .peer_stats(&dev)
-            .expect("行保留（M7：过期不删——名册 last_seen）");
+            .expect("row retained (M7: expiry does not delete — roster last_seen)");
         assert!(!s.online);
         assert_eq!(s.last_seen_unix, before);
-        // 反熵/在线计数不再包含过期行。
+        // Anti-entropy/online counts no longer include the expired row.
         let anti = t.anti_entropy_msg();
         let GossipMsg::Anti { entries } = anti else {
             panic!()
         };
-        assert!(entries.is_empty(), "过期行不进反熵摘要");
+        assert!(
+            entries.is_empty(),
+            "expired rows do not enter the anti-entropy digest"
+        );
     }
 
-    /// M7（§7-M7.3 修订）：TTL 过期后的离线衰减——**远端行**（无本地累加器，折叠
-    /// 循环触不到）按窗 ×4/5 衰减、<8B/s 置 0（名册不再呈现离线非零流量）；收敛
-    /// 单调非增且有限窗内到 0。本机累加行由零速率折叠（同数学）衰减。
+    /// M7 (§7-M7.3 revision): offline decay after TTL expiry — **remote rows**
+    /// (no local accumulator, out of reach of the folding loop) decay ×4/5 per
+    /// window and are zeroed below 8B/s (the roster no longer shows non-zero
+    /// traffic for offline devices); convergence is monotone non-increasing
+    /// and reaches 0 within a bounded number of windows. Local accumulated
+    /// rows decay via the zero-rate fold (same math).
     #[test]
     fn offline_ewma_decays_to_zero_after_ttl() {
-        // 远端行：远端发布携带非零 ewma → TTL 过期（短表 40ms）→ 无 acc ⇒ 衰减支路。
+        // Remote row: a remote publish carrying non-zero ewma → TTL expired
+        // (short table 40ms) → no acc ⇒ decay branch.
         let t = LeaseTable::new(1, Duration::from_millis(40), HookRegistry::new());
         let remote = [0x55; 32];
         t.merge_remote(GossipMsg::Publish {
@@ -806,7 +938,7 @@ mod tests {
             last_seen_unix: 100,
         });
         assert_eq!(t.peer_stats(&remote).unwrap().tx_ewma, 5_000);
-        std::thread::sleep(Duration::from_millis(60)); // TTL 过期（observe None，行保留）
+        std::thread::sleep(Duration::from_millis(60)); // TTL expired (observe None, row retained)
         assert!(t.observe(&remote).is_none());
         let mut ms = 8_000_000u64;
         let mut rounds = 0u32;
@@ -816,14 +948,20 @@ mod tests {
             t.tick_ewma(ms);
             rounds += 1;
             let cur = t.peer_stats(&remote).unwrap().tx_ewma;
-            assert!(cur <= prev, "衰减单调非减变（{prev}→{cur}）");
+            assert!(cur <= prev, "decay monotone non-increasing ({prev}→{cur})");
             prev = cur;
-            assert!(rounds < 100, "有限窗内收敛到 0（{} 轮后 {}）", rounds, cur);
+            assert!(
+                rounds < 100,
+                "converges to 0 within a bounded window ({} rounds, now {})",
+                rounds,
+                cur
+            );
         }
         assert_eq!(t.peer_stats(&remote).unwrap().rx_ewma, 0);
 
-        // 本机持有 + 有累加的行：离线后由零速率折叠衰减（同 ×4/5 数学）——在线期先
-        // 收敛出非零，断流过期后同样归 0。
+        // Locally held + accumulated row: after going offline it decays via
+        // the zero-rate fold (same ×4/5 math) — first converge to non-zero
+        // while online, then go to 0 after traffic stops and TTL expires.
         let t2 = LeaseTable::new(9, Duration::from_millis(40), HookRegistry::new());
         let local = [0x66; 32];
         t2.publish(&local);
@@ -835,7 +973,7 @@ mod tests {
         }
         assert!(
             t2.peer_stats(&local).unwrap().tx_ewma > 100,
-            "在线期收敛非零（{}）",
+            "converges to non-zero while online ({})",
             t2.peer_stats(&local).unwrap().tx_ewma
         );
         std::thread::sleep(Duration::from_millis(60));
@@ -844,11 +982,15 @@ mod tests {
             ms2 += 1000;
             t2.tick_ewma(ms2);
             rounds += 1;
-            assert!(rounds < 100, "本机行有限窗收敛到 0");
+            assert!(
+                rounds < 100,
+                "local row converges to 0 within a bounded window"
+            );
         }
     }
 
-    /// 服务器自身合成键：不同 node_id 不碰撞、与真实设备 id（sha256）结构可区分。
+    /// The server's own synthetic key: different node_ids do not collide, and
+    /// it is structurally distinguishable from real device ids (sha256).
     #[test]
     fn server_self_device_id_distinct() {
         let a = server_self_device_id(1);
@@ -856,10 +998,11 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a, server_self_device_id(1));
         assert_eq!(&a[..8], &1u64.to_be_bytes());
-        assert!(a[8..].iter().all(|&x| x == 0x5A), "固定标记后缀");
+        assert!(a[8..].iter().all(|&x| x == 0x5A), "fixed marker suffix");
     }
 
-    /// TrafficMeter（单服形态）：恒定速率收敛 + last_seen 抬升 + stats 键隔离。
+    /// TrafficMeter (single-server shape): constant-rate convergence +
+    /// last_seen raised + stats key isolation.
     #[test]
     fn traffic_meter_converges_and_keys_isolated() {
         let m = TrafficMeter::new();
@@ -872,12 +1015,12 @@ mod tests {
             m.tick(ms);
         }
         m.note_rx(&k2, 777);
-        let (tx1, rx1, ls1) = m.stats(&k1).expect("k1 有条目");
-        assert!((tx1 as i64 - 2000).abs() <= 100, "k1 tx 收敛: {tx1}");
+        let (tx1, rx1, ls1) = m.stats(&k1).expect("k1 has an entry");
+        assert!((tx1 as i64 - 2000).abs() <= 100, "k1 tx converges: {tx1}");
         assert_eq!(rx1, 0);
         assert!(ls1 > 0);
-        let (tx2, rx2, _) = m.stats(&k2).expect("k2 有条目");
-        assert_eq!((tx2, rx2), (0, 0), "k2 尚未折叠（无 tick 后喂入）");
-        assert!(m.stats(&[9, 9, 9, 9]).is_none(), "未知键 ⇒ None");
+        let (tx2, rx2, _) = m.stats(&k2).expect("k2 has an entry");
+        assert_eq!((tx2, rx2), (0, 0), "k2 not folded yet (fed after the tick)");
+        assert!(m.stats(&[9, 9, 9, 9]).is_none(), "unknown key ⇒ None");
     }
 }

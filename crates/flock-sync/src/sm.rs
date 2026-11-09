@@ -1,16 +1,23 @@
-//! openraft 状态机适配器（RaftStateMachine v2）+ apply 回调钩子 + 滞后注入。
+//! openraft state machine adapter (RaftStateMachine v2) + apply callback hooks
+//! + lag injection.
 //!
-//! 职责（§2.2 吊销传播界）：
-//! - apply 每条 Normal 日志 → [`NetStateData::apply`] 确定性执行；
-//! - 阻断性转移（Revoke/Disable）⇒ 触发 [`crate::hooks`] 杀本地会话钩子 +
-//!   广播 epoch watch（记录缓存据此失效）；
-//! - Membership 日志 ⇒ 维护 `last_membership`（applied_state 契约）；
-//! - 快照 = postcard(NetStateData)（redb 独立表持久化；表名与日志存储分离，避开
-//!   redb 写事务表级冲突）。
+//! Responsibilities (§2.2 revocation-propagation boundary):
+//! - apply each Normal log entry → deterministic execution by
+//!   [`NetStateData::apply`];
+//! - blocking transitions (Revoke/Disable) ⇒ fire the [`crate::hooks`]
+//!   kill-local-session hooks + broadcast the epoch watch (the record cache
+//!   invalidates on it);
+//! - Membership entries ⇒ maintain `last_membership` (the applied_state
+//!   contract);
+//! - snapshot = postcard(NetStateData) (persisted in a separate redb table;
+//!   the table name is distinct from the log store's, avoiding redb
+//!   write-transaction table-level conflicts).
 //!
-//! 共享面：`SmCore` 被 [`crate::node`]/[`crate::dir`] 以 `Arc` 持有做本地读（缓存路径）；
-//! Raft 持有 `RedbStateMachine` 做串行 apply——状态本体在 `RwLock` 后面，apply 路径
-//! 无 await 持锁（钩子/计时发送不阻塞）。
+//! Shared surface: `SmCore` is held via `Arc` by [`crate::node`]/
+//! [`crate::dir`] for local reads (the cache path); Raft holds
+//! `RedbStateMachine` for serialized applies — the state itself sits behind an
+//! `RwLock`, and the apply path holds no lock across awaits (hooks/timed
+//! sends do not block).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -30,19 +37,22 @@ use crate::proto::SyncResponse;
 use crate::raft_types::SyncConfig;
 use crate::state::NetStateData;
 
-/// SM 侧快照持久化表（与日志存储表分离：redb 并发写事务按表粒度避冲突）。
+/// SM-side snapshot persistence table (separate from the log-store tables:
+/// redb concurrent write transactions avoid conflicts at table granularity).
 pub const SMKV_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("flock_sync_sm");
 
-/// 快照束（wire + 持久化格式）。
+/// Snapshot bundle (wire + persistence format).
 #[derive(Serialize, Deserialize)]
 struct SnapBundle {
     meta: SnapshotMeta<u64, BasicNode>,
     data: NetStateData,
 }
 
-/// 测试用 apply 滞后注入（M4 §7：人为让 follower 落后 5s ⇒ apply-lag 熔断用例）。
-/// 武装后每个 apply 批次先 sleep 指定时长——日志照常收（storage append 不延迟）、
-/// 心跳照常进（网络不延迟），仅状态机 apply 停摆。
+/// Test-side apply lag injection (M4 §7: artificially stall a follower by 5s ⇒
+/// apply-lag breaker cases). Once armed, every apply batch first sleeps the
+/// configured duration — logs are still received as usual (storage append is
+/// not delayed), heartbeats still flow (the network is not delayed); only the
+/// state machine apply stalls.
 #[derive(Debug)]
 pub struct LagInjector {
     armed: AtomicBool,
@@ -57,13 +67,13 @@ impl LagInjector {
         })
     }
 
-    /// 武装（delay = 每批次 apply 停摆时长）。
+    /// Arm (delay = how long each apply batch stalls).
     pub fn arm(&self, delay: Duration) {
         *self.delay.write().expect("lag delay") = delay;
         self.armed.store(true, Ordering::SeqCst);
     }
 
-    /// 解除。
+    /// Disarm.
     pub fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
     }
@@ -82,29 +92,34 @@ impl LagInjector {
     }
 }
 
-/// 状态机共享核（读路径 + 钩子 + watch）。
+/// State machine shared core (read path + hooks + watch).
 pub struct SmCore {
     db: Arc<Database>,
     data: RwLock<NetStateData>,
-    /// 本机配置钉住的集群根公钥（admin 验签双保险；Bootstrap 之后以状态内为准）。
+    /// The cluster root public key pinned by this node's config (a second
+    /// line of defense for admin verification; after Bootstrap the in-state
+    /// one is authoritative).
     pinned_root: Option<ed25519_dalek::VerifyingKey>,
     hooks: std::sync::Mutex<HookRegistry>,
-    /// 已 apply 的最高日志 index（LagMonitor 共享消费）。
+    /// Highest applied log index (shared consumer: LagMonitor).
     applied_index: Arc<AtomicU64>,
-    /// 当前全局 revocation_epoch 广播（记录缓存失效 + 票据校验消费）。
+    /// Broadcast of the current global revocation_epoch (record cache
+    /// invalidation + ticket verification consumption).
     epoch_tx: watch::Sender<u64>,
-    /// 测试滞后注入。
+    /// Test lag injection.
     pub lag: Arc<LagInjector>,
 }
 
 impl SmCore {
-    /// 以既有 redb 库与初始状态构造（`pinned_root` = 本机钉扎根，可 None）。
+    /// Construct from an existing redb database and initial state
+    /// (`pinned_root` = the locally pinned root, may be None).
     pub fn new(
         db: Arc<Database>,
         mut data: NetStateData,
         pinned_root: Option<ed25519_dalek::VerifyingKey>,
     ) -> Arc<Self> {
-        // VIP 反查索引是派生数据（不序列化）：任何来源（空库/快照恢复）进场即重建。
+        // The VIP reverse-lookup index is derived data (not serialized):
+        // rebuilt on entry from any source (empty DB / snapshot restore).
         data.reindex_vips();
         let epoch = data.epoch;
         let applied = data.last_applied.map(|l| l.index).unwrap_or(0);
@@ -120,12 +135,14 @@ impl SmCore {
         })
     }
 
-    /// 空库启动（无快照；由 Raft 重放/追赶补齐）。
+    /// Start on an empty database (no snapshot; Raft replay/catch-up fills it
+    /// in).
     pub fn empty(db: Arc<Database>, pinned_root: Option<ed25519_dalek::VerifyingKey>) -> Arc<Self> {
         Self::new(db, NetStateData::new(), pinned_root)
     }
 
-    /// 从库内快照恢复（存在时），否则空状态。
+    /// Restore from the in-database snapshot (if present), otherwise empty
+    /// state.
     pub fn restore_or_empty(
         db: Arc<Database>,
         pinned_root: Option<ed25519_dalek::VerifyingKey>,
@@ -136,43 +153,45 @@ impl SmCore {
         }
     }
 
-    /// 注册 apply 钩子（装配期注入；杀本地会话/清拒票据）。
+    /// Register an apply hook (injected at assembly; kills local sessions /
+    /// rejects outstanding tickets).
     pub fn register_hook(&self, h: Arc<dyn crate::hooks::SyncHooks>) {
         self.hooks.lock().expect("sm hooks").add(h);
     }
 
-    /// 钩子注册表共享柄（LeaseTable 等共用）。
+    /// Shared handle to the hook registry (shared with LeaseTable etc.).
     pub fn shared_hooks(&self) -> HookRegistry {
         self.hooks.lock().expect("sm hooks").clone()
     }
 
-    /// 本地（非线性一致）读视图快照——仅缓存/展示路径使用。
+    /// Local (not linearizable) read-view snapshot — cache/display paths
+    /// only.
     pub fn with_data<R>(&self, f: impl FnOnce(&NetStateData) -> R) -> R {
         f(&self.data.read().expect("sm data"))
     }
 
-    /// 当前本地 epoch。
+    /// Current local epoch.
     pub fn epoch(&self) -> u64 {
         *self.epoch_tx.borrow()
     }
 
-    /// epoch watch 订阅。
+    /// Subscribe to the epoch watch.
     pub fn epoch_watch(&self) -> watch::Receiver<u64> {
         self.epoch_tx.subscribe()
     }
 
-    /// 已 apply 最高 index。
+    /// Highest applied index.
     pub fn applied_index(&self) -> u64 {
         self.applied_index.load(Ordering::SeqCst)
     }
 
-    /// applied 计数器共享柄（LagMonitor 消费）。
+    /// Shared handle to the applied counter (consumed by LagMonitor).
     pub fn applied_counter(&self) -> Arc<AtomicU64> {
         self.applied_index.clone()
     }
 
-    /// 票据密钥根（Raft 内；Bootstrap 后存在）。
-    /// 集群共享 OPRF key（b64；Bootstrap+SetOprf 后可用）。
+    /// The ticket key root (inside Raft; present after Bootstrap). The
+    /// cluster-shared OPRF key (b64; available after Bootstrap+SetOprf).
     pub fn oprf_b64(&self) -> Option<String> {
         self.with_data(|d| d.oprf_b64.clone())
     }
@@ -181,18 +200,21 @@ impl SmCore {
         self.with_data(|d| d.ticket_root)
     }
 
-    /// 设备注册 VIP（转发面第 0 步源绑定校验/路由解析用）。
+    /// A device's registered VIP (for the forwarding plane's step-0 source
+    /// binding check / route resolution).
     pub fn vip_of(&self, device: &[u8; 32]) -> Option<[u8; 4]> {
         self.with_data(|d| d.devices.get(device).map(|r| r.vip))
     }
 
-    /// 按 VIP 反查设备（目标归属解析；每包转发热路径——`NetStateData` 的 VIP 索引，
-    /// O(log N)；NetState 只存静态注册信息——不含当前位置）。
+    /// Reverse lookup of a device by VIP (destination-holder resolution; the
+    /// per-packet forwarding hot path — `NetStateData`'s VIP index, O(log N);
+    /// NetState stores only static registration info — no current location).
     pub fn device_by_vip(&self, vip: &[u8; 4]) -> Option<[u8; 32]> {
         self.with_data(|d| d.device_by_vip(vip))
     }
 
-    /// 执行一批日志的 apply（核心转移 + 钩子触发 + watch 推进）。
+    /// Apply a batch of log entries (core transitions + hook firing + watch
+    /// advancement).
     pub(crate) async fn apply_entries(&self, entries: &[Entry<SyncConfig>]) -> Vec<SyncResponse> {
         self.lag.maybe_delay().await;
         let mut out = Vec::with_capacity(entries.len());
@@ -200,7 +222,9 @@ impl SmCore {
         for e in entries {
             let idx = e.log_id.index;
             match &e.payload {
-                // openraft 契约：apply 每条日志恰一个响应（Blank/成员日志给占位响应）。
+                // openraft contract: apply yields exactly one response per
+                // entry (Blank/membership entries get a placeholder
+                // response).
                 EntryPayload::Blank => out.push(SyncResponse::Ok),
                 EntryPayload::Normal(req) => {
                     let outcome = {
@@ -240,7 +264,8 @@ impl SmCore {
         out
     }
 
-    /// 构建快照并持久化（重试避开偶发写冲突）。
+    /// Build a snapshot and persist it (retries to ride out sporadic write
+    /// conflicts).
     fn build_and_persist_snapshot(&self) -> Snapshot<SyncConfig> {
         let (bundle, meta) = {
             let d = self.data.read().expect("sm data");
@@ -288,10 +313,12 @@ fn persist_snapshot(db: &Arc<Database>, bytes: &[u8]) {
             return;
         }
     }
-    // 三次重试皆败：不致命（日志在，重启可重放——openraft 启动重放语义），但必须
-    // 可观测（静默失败会让「快照存在」假设悄悄失真——snapshot_and_purge 据此决策）。
+    // All three retries failed: not fatal (the logs are there, a restart
+    // replays them — openraft startup replay semantics), but it must be
+    // observable (a silent failure quietly falsifies the "a snapshot exists"
+    // assumption — snapshot_and_purge decides based on it).
     eprintln!(
-        "sm: snapshot persist failed after 3 attempts ({} bytes) — 日志仍在，重启走重放",
+        "sm: snapshot persist failed after 3 attempts ({} bytes) — logs intact, restart will replay",
         bytes.len()
     );
 }
@@ -303,7 +330,8 @@ fn read_snapshot(db: &Arc<Database>) -> Option<SnapBundle> {
     postcard::from_bytes(v.value()).ok()
 }
 
-/// openraft 状态机句柄（Raft 持有；核以 Arc 共享给读路径）。
+/// openraft state machine handle (held by Raft; the core is Arc-shared with
+/// the read path).
 #[derive(Clone)]
 pub struct RedbStateMachine {
     pub core: Arc<SmCore>,
@@ -358,11 +386,13 @@ impl openraft::storage::RaftStateMachine<SyncConfig> for RedbStateMachine {
                 .sto_res(|| (ErrorSubject::Store, ErrorVerb::Read))
                 .expect_err("Err")
         })?;
-        // 快照数据自身携带 meta；以传入 meta 为准对齐（openraft 契约）。
+        // The snapshot data carries its own meta; align with the passed-in
+        // meta (openraft contract).
         let mut data = bundle.data;
         data.last_applied = meta.last_log_id;
         data.last_membership = meta.last_membership.clone();
-        // 索引是派生数据（快照字节不含）——整体替换状态时同步重建。
+        // The index is derived data (not in the snapshot bytes) — rebuild it
+        // when wholesale-replacing the state.
         data.reindex_vips();
         let epoch = data.epoch;
         let applied = meta.last_log_id.map(|l| l.index).unwrap_or(0);
@@ -371,8 +401,9 @@ impl openraft::storage::RaftStateMachine<SyncConfig> for RedbStateMachine {
             *d = data;
         }
         self.core.applied_index.store(applied, Ordering::SeqCst);
-        // 与 apply 路径对齐：单调推进（send 会无条件覆盖——快照 epoch 低于当前 watch
-        // 值的异常形态不得回退观察者）。
+        // Aligned with the apply path: monotonic advancement (send would
+        // overwrite unconditionally — the anomalous shape of a snapshot epoch
+        // below the current watch value must not roll observers back).
         let _ = self.core.epoch_tx.send_if_modified(|cur| {
             if *cur < epoch {
                 *cur = epoch;
@@ -381,7 +412,8 @@ impl openraft::storage::RaftStateMachine<SyncConfig> for RedbStateMachine {
                 false
             }
         });
-        // 安装即持久（下次重启直接从快照恢复）。
+        // Install is persist-on-arrival (the next restart restores straight
+        // from the snapshot).
         let re_bundle = SnapBundle {
             meta: meta.clone(),
             data: self.core.data.read().expect("sm data").clone(),
@@ -404,7 +436,7 @@ impl openraft::storage::RaftStateMachine<SyncConfig> for RedbStateMachine {
     }
 }
 
-/// 快照构建器（Raft 触发压缩时调用）。
+/// Snapshot builder (called when Raft triggers compaction).
 pub struct SmSnapshotBuilder {
     core: Arc<SmCore>,
 }
@@ -416,7 +448,7 @@ impl RaftSnapshotBuilder<SyncConfig> for SmSnapshotBuilder {
 }
 
 // ============================================================================
-// 单元测试：apply 钩子触发 + epoch watch + 快照恢复
+// Unit tests: apply hook firing + epoch watch + snapshot restore
 // ============================================================================
 
 #[cfg(test)]
@@ -458,10 +490,10 @@ mod tests {
         ];
         let res = c.apply_entries(&entries).await;
         assert_eq!(res.len(), 3);
-        assert_eq!(c.epoch(), 1, "epoch watch 推进");
+        assert_eq!(c.epoch(), 1, "epoch watch advanced");
         assert_eq!(c.applied_index(), 3);
         let revs = rec.revocations();
-        assert_eq!(revs.len(), 1, "杀会话钩子恰好一次");
+        assert_eq!(revs.len(), 1, "kill-session hook fired exactly once");
         assert_eq!(revs[0].device, sha(&[1; 32]));
         assert_eq!(revs[0].new_epoch, 1);
         assert_eq!(revs[0].log_index, 3);
@@ -481,12 +513,15 @@ mod tests {
             .await;
         assert!(
             t0.elapsed() >= Duration::from_millis(300),
-            "武装后 apply 停摆"
+            "apply stalls once armed"
         );
         c.lag.disarm();
         let t1 = std::time::Instant::now();
         let _ = c.apply_entries(&[entry(2, SyncRequest::AllocateIp)]).await;
-        assert!(t1.elapsed() < Duration::from_millis(200), "解除后不停摆");
+        assert!(
+            t1.elapsed() < Duration::from_millis(200),
+            "no stall after disarm"
+        );
     }
 
     #[tokio::test]
@@ -512,21 +547,35 @@ mod tests {
             .await;
         let snap = c.build_and_persist_snapshot();
         assert_eq!(snap.meta.last_log_id.map(|l| l.index), Some(2));
-        // 热路径索引：注册后即查得（apply 增量维护）。
+        // Hot-path index: resolvable right after registration (apply maintains
+        // it incrementally).
         let dev: [u8; 32] = {
             use sha2::Digest as _;
             sha2::Sha256::digest([1u8; 32]).into()
         };
         let vip = c.vip_of(&dev).expect("vip");
-        assert_eq!(c.device_by_vip(&vip), Some(dev), "apply 后索引即查得");
-        // 新核从库内快照恢复。
+        assert_eq!(
+            c.device_by_vip(&vip),
+            Some(dev),
+            "index resolvable right after apply"
+        );
+        // A fresh core restores from the in-database snapshot.
         let c2 = SmCore::restore_or_empty(db, None);
         assert_eq!(c2.epoch(), c.epoch());
         assert_eq!(c2.applied_index(), 2);
         assert!(c2.with_data(|d| d.devices.len() == 1));
-        assert_eq!(c2.ticket_root(), Some([9; 32]), "票据密钥根随快照恢复");
-        // 恢复路径重建索引（索引不序列化——派生数据）。
-        assert_eq!(c2.device_by_vip(&vip), Some(dev), "快照恢复后索引重建");
+        assert_eq!(
+            c2.ticket_root(),
+            Some([9; 32]),
+            "ticket key root restored with the snapshot"
+        );
+        // The restore path rebuilds the index (the index is not serialized —
+        // derived data).
+        assert_eq!(
+            c2.device_by_vip(&vip),
+            Some(dev),
+            "index rebuilt after snapshot restore"
+        );
     }
 
     fn entry(idx: u64, req: SyncRequest) -> Entry<SyncConfig> {

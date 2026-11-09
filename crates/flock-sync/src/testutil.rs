@@ -1,10 +1,12 @@
-//! 测试支撑（`--features test-util`；不入默认构建）。
+//! Test support (`--features test-util`; not in the default build).
 //!
-//! - [`MemoryFabric`]：进程内互连织物——`dial` 造 duplex 对投递到对端 accept 队列
-//!   （模拟 TCP 拨号；节点 kill = accept 队列拆除 + dial 拒绝）；
-//! - 双向延迟桥：两对 duplex 之间每方向 sleep `delay` ⇒ RTT = 2×delay（§7-M4 注入
-//!   100ms 校准）；
-//! - [`MemoryFabric::cut`]：单节点故障注入（kill leader 用例）。
+//! - [`MemoryFabric`]: in-process interconnect fabric — `dial` creates a
+//!   duplex pair and delivers the peer's end to its accept queue (simulating
+//!   a TCP dial; node kill = accept queue torn down + dial refused);
+//! - bidirectional delay bridge: between the two duplex pairs, each direction
+//!   sleeps `delay` ⇒ RTT = 2×delay (§7-M4 injects 100ms for calibration);
+//! - [`MemoryFabric::cut`]: single-node failure injection (for the kill
+//!   leader case).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -19,7 +21,8 @@ use tokio::sync::mpsc;
 
 use crate::wire::{Fabric, PeerIo};
 
-/// 单向泵：读 `r` → sleep `delay` → 写 `w`（线路传播延迟模型）。
+/// One-way pump: read `r` → sleep `delay` → write `w` (a line-propagation
+/// delay model).
 async fn pump(
     mut r: tokio::io::ReadHalf<DuplexStream>,
     mut w: tokio::io::WriteHalf<DuplexStream>,
@@ -41,10 +44,13 @@ async fn pump(
     }
 }
 
-/// 双向延迟桥：`x ↔ y` 每方向 sleep `delay` 再转发；**任一侧关闭（EOF）⇒ 双向拆除**
-/// （仿真 TCP 单侧 close 的 FIN 传播——否则对端永远等不到 EOF，坏握手会挂死）。
-/// 返回两泵的 AbortHandle（登记进两端 NodeSlot——`cut` 时可斩断已建立的连接，
-/// 仿真完全分区：仅拒新拨号不足以让缓存会话失联）。
+/// Bidirectional delay bridge: `x ↔ y`, each direction sleeps `delay` before
+/// forwarding; **either side closing (EOF) ⇒ both directions torn down**
+/// (emulating the FIN propagation of a TCP one-sided close — otherwise the
+/// peer never sees EOF and a bad handshake would hang forever). Returns both
+/// pumps' AbortHandles (registered into the NodeSlot at both ends — `cut` can
+/// sever established connections, emulating a full partition: merely refusing
+/// new dials is not enough to disconnect cached sessions).
 fn spawn_bridge(
     x: DuplexStream,
     y: DuplexStream,
@@ -64,18 +70,20 @@ fn spawn_bridge(
     handles
 }
 
-/// 节点接入槽（公开可见性承载 FabricRegistry 类型别名）。
+/// Node access slot (public visibility carries the FabricRegistry type
+/// alias).
 pub struct NodeSlot {
     tx: mpsc::Sender<PeerIo>,
     alive: bool,
-    /// 本节点为端点的已建立桥（拨号方与被拨方各登记一份）——`cut` 时全部斩断。
+    /// Established bridges with this node as an endpoint (the dialer and the
+    /// dialed each register one copy) — all severed on `cut`.
     bridges: Vec<[tokio::task::AbortHandle; 2]>,
 }
 
-/// 节点注册表（全部节点共享）。
+/// Node registry (shared by all nodes).
 pub type FabricRegistry = Arc<Mutex<BTreeMap<[u8; 16], NodeSlot>>>;
 
-/// 进程内互连织物（每节点一个实例）。
+/// In-process interconnect fabric (one instance per node).
 pub struct MemoryFabric {
     me: ServerId,
     reg: FabricRegistry,
@@ -85,12 +93,13 @@ pub struct MemoryFabric {
 }
 
 impl MemoryFabric {
-    /// 空注册表。
+    /// Empty registry.
     pub fn registry() -> FabricRegistry {
         Arc::new(Mutex::new(BTreeMap::new()))
     }
 
-    /// 建节点织物并注册。`delay` = 单向传播延迟（RTT = 2×delay）；`buf` = duplex 缓冲。
+    /// Build a node's fabric and register it. `delay` = one-way propagation
+    /// delay (RTT = 2×delay); `buf` = duplex buffer.
     pub fn new(me: ServerId, reg: &FabricRegistry, delay: Duration, buf: usize) -> Arc<Self> {
         let (tx, rx) = mpsc::channel::<PeerIo>(64);
         reg.lock().expect("fabric reg").insert(
@@ -110,8 +119,10 @@ impl MemoryFabric {
         })
     }
 
-    /// 节点下线（完全分区形态：dial 拒绝 + **斩断已建立的桥**——缓存 E2E 会话随连接
-    /// 消亡，观察流消失；在途 accept 队列保留至耗尽——kill leader 用例）。
+    /// Take a node offline (full-partition shape: dial refused + **sever
+    /// established bridges** — cached E2E sessions die with the connections,
+    /// observation streams vanish; the in-flight accept queue is retained
+    /// until drained — for the kill leader case).
     pub fn cut(reg: &FabricRegistry, id: &ServerId) {
         if let Some(slot) = reg.lock().expect("fabric reg").get_mut(&id.0) {
             slot.alive = false;
@@ -123,14 +134,14 @@ impl MemoryFabric {
         }
     }
 
-    /// 节点恢复。
+    /// Bring a node back.
     pub fn uncut(reg: &FabricRegistry, id: &ServerId) {
         if let Some(slot) = reg.lock().expect("fabric reg").get_mut(&id.0) {
             slot.alive = true;
         }
     }
 
-    /// 本机身份。
+    /// The local identity.
     pub fn id(&self) -> &ServerId {
         &self.me
     }
@@ -144,15 +155,18 @@ impl Fabric for MemoryFabric {
         let delay = self.delay;
         let buf = self.buf;
         async move {
-            // 双 duplex + 延迟桥：dialer 持 d1a、acceptor 得 d2a，桥接 d1b↔d2b。
+            // Two duplexes + delay bridge: the dialer holds d1a, the acceptor
+            // gets d2a, and d1b↔d2b are bridged.
             let (dial_io, d1b) = tokio::io::duplex(buf);
             let (acc_io, d2b) = tokio::io::duplex(buf);
             let handles = spawn_bridge(d1b, d2b, delay);
             let tx = {
                 let mut reg = reg.lock().expect("fabric reg");
                 let tx = {
-                    // 本端也被切断 ⇒ 出向同样拒（完全分区 = 双向阻断——被切节点既收不到
-                    // 入连也拨不出去，单向放行会让 fail-closed 断言失真）。
+                    // This end was cut too ⇒ outbound is refused as well
+                    // (full partition = bidirectional blocking — a cut node
+                    // neither receives connections nor dials out; one-way
+                    // allowance would falsify the fail-closed assertions).
                     let self_alive = reg.get(&me.0).is_some_and(|s| s.alive);
                     let slot = reg.get_mut(&target.0).ok_or_else(|| {
                         io::Error::new(io::ErrorKind::ConnectionRefused, "no such node")
@@ -165,7 +179,8 @@ impl Fabric for MemoryFabric {
                     }
                     slot.tx.clone()
                 };
-                // 桥登记进两端（cut 任一端即斩断——完全分区语义）。
+                // Register the bridge at both ends (severed when either end
+                // is cut — full-partition semantics).
                 let mine_copy = [handles[0].clone(), handles[1].clone()];
                 if let Some(slot) = reg.get_mut(&target.0) {
                     slot.bridges.push(handles);
@@ -186,10 +201,13 @@ impl Fabric for MemoryFabric {
     fn accept(&self) -> BoxFuture<'static, io::Result<PeerIo>> {
         let rx = self.rx.clone();
         async move {
-            // tokio Mutex：guard 可跨 await（单 serve_loop 消费者，无争用）。
+            // tokio Mutex: the guard can be held across an await (a single
+            // serve_loop consumer, no contention).
             let mut rx = rx.lock().await;
-            // 关闭形态 = NotConnected（wire::is_fabric_closed 的约定信号：
-            // 注册表消亡/全部拨号端拆除——serve_loop 据此退出而非按瞬时错误重试）。
+            // The closed shape = NotConnected (wire::is_fabric_closed's
+            // conventional signal: registry gone / all dialers torn down —
+            // serve_loop exits on it instead of retrying on a transient
+            // error).
             rx.recv()
                 .await
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "fabric closed"))

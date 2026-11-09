@@ -1,12 +1,18 @@
-//! [`SyncNode`]：单服务器侧的同步装配（§3.10 第一部分的对外门面）。
+//! [`SyncNode`]: the single-server-side synchronization assembly (the
+//! outward facade of docs/design.md §3.10 part one).
 //!
-//! - **任意节点写**：本地 `client_write`，非 leader ⇒ ForwardToLeader ⇒ 经互连会话转发
-//!   leader（§4「写转发 leader」，多一跳中转延迟）；
-//! - **任意节点线性一致读**：leader 本机 `ensure_linearizable` 后读已 apply 状态；
-//!   follower 转发 leader（`read_linearizable`）；
-//! - **目录两级读**：[`crate::dir::SyncDirectory`]（缓存 + epoch + lag 熔断）；
-//! - **租约 gossip**：publish 即时广播 + 反熵循环（§3.10 LeaseTable）；
-//! - **票据签发**：密钥根来自 Raft 状态（Bootstrap 后可用）。
+//! - **Write on any node**: local `client_write`; not the leader ⇒
+//!   ForwardToLeader ⇒ forwarded to the leader over an interconnect session
+//!   (§4 "write forwarding to the leader", one extra relay hop of latency);
+//! - **Linearizable read on any node**: the leader locally runs
+//!   `ensure_linearizable` then reads applied state; followers forward to the
+//!   leader (`read_linearizable`);
+//! - **Two-tier directory reads**: [`crate::dir::SyncDirectory`] (cache +
+//!   epoch + lag breaker);
+//! - **Lease gossip**: publish broadcasts immediately + the anti-entropy loop
+//!   (§3.10 LeaseTable);
+//! - **Ticket issuing**: the key root comes from Raft state (available after
+//!   Bootstrap).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -34,17 +40,18 @@ use crate::store::RedbLogStore;
 use crate::ticket::TicketIssuer;
 use crate::wire::{Fabric, Interconnect, LagMonitor, RpcTarget, WireResp, WireRpc};
 
-/// 集群运行参数（§4：心跳 500ms / 选举 1.5s~3s——按中转 RTT 100ms 校准；lag 熔断 2s）。
+/// Cluster runtime parameters (§4: heartbeat 500ms / election 1.5s~3s —
+/// calibrated for a relay RTT of 100ms; lag breaker 2s).
 #[derive(Debug, Clone)]
 pub struct SyncSettings {
     pub heartbeat_ms: u64,
     pub election_min_ms: u64,
     pub election_max_ms: u64,
-    /// apply-lag 熔断阈值（A6 时序预算：2s）。
+    /// apply-lag breaker threshold (A6 timing budget: 2s).
     pub lag_threshold: Duration,
-    /// 单次互连 RPC 预算。
+    /// Budget of a single interconnect RPC.
     pub rpc_timeout: Duration,
-    /// 写/读转发重试总预算。
+    /// Total budget for write/read forwarding retries.
     pub forward_deadline: Duration,
     pub lease_ttl: Duration,
 }
@@ -63,18 +70,21 @@ impl Default for SyncSettings {
     }
 }
 
-/// 节点构造入参。
+/// Node construction inputs.
 pub struct SyncNodeBuilder {
     pub settings: SyncSettings,
-    /// 本机入群身份（根签 ServerIdentity——enroll 产物）。
+    /// The local enrollment identity (root-signed ServerIdentity — the enroll
+    /// product).
     pub ident: Arc<ServerIdentity>,
-    /// 根签集群目录（对端接入材料；`verify` 在 build 时执行）。
+    /// The root-signed cluster directory (peer access material; `verify` runs
+    /// at build time).
     pub directory: ClusterDirectory,
-    /// 原始织物（内存 duplex / TCP）。
+    /// The raw fabric (in-memory duplex / TCP).
     pub fabric: Arc<dyn Fabric>,
-    /// redb 库文件路径。
+    /// redb database file path.
     pub db_path: PathBuf,
-    /// 本机钉扎的集群根公钥（缺省取 ident.root_pub）。
+    /// The locally pinned cluster root public key (defaults to
+    /// ident.root_pub).
     pub pinned_root: Option<ed25519_dalek::VerifyingKey>,
     hooks: Vec<Arc<dyn SyncHooks>>,
     members: BTreeMap<NodeId, BasicNode>,
@@ -103,7 +113,7 @@ impl SyncNodeBuilder {
         }
     }
 
-    /// 初始成员集（全部 voter；`initialize` 用）。
+    /// The initial member set (all voters; used by `initialize`).
     pub fn voters(mut self, ids: &[NodeId]) -> Self {
         self.members = ids
             .iter()
@@ -112,21 +122,23 @@ impl SyncNodeBuilder {
         self
     }
 
-    /// 注册 apply/租约钩子。
+    /// Register an apply/lease hook.
     pub fn hook(mut self, h: Arc<dyn SyncHooks>) -> Self {
         self.hooks.push(h);
         self
     }
 
-    /// 钉扎根公钥（缺省 = ident.root_pub）。
+    /// Pin the root public key (default = ident.root_pub).
     pub fn pinned_root(mut self, root: ed25519_dalek::VerifyingKey) -> Self {
         self.pinned_root = Some(root);
         self
     }
 
-    /// 装配并启动（Raft 任务 + 互连服务循环 + 反熵循环 + 成员初始化）。
+    /// Assemble and start (Raft task + interconnect serve loop + anti-entropy
+    /// loop + membership initialization).
     pub async fn build(self) -> Result<SyncNode, SyncError> {
-        // 根签目录验证（无签名/换根 ⇒ 拒装配）。
+        // Root-signed directory verification (no signature / a different root
+        // ⇒ refuse to assemble).
         if !self.directory.verify(&self.ident.root_pub) {
             return Err(SyncError::Raft(
                 "cluster directory failed root verification".into(),
@@ -182,7 +194,8 @@ impl SyncNodeBuilder {
         );
         let forward = ForwardPlane::new(self.node_id, sm.clone(), lease.clone());
 
-        // 互连应答循环（无凭证对端在此层被拒）。
+        // Interconnect answer loop (peers without credentials are rejected at
+        // this layer).
         let target = RpcTarget {
             raft: raft.clone(),
             sm: sm.clone(),
@@ -195,8 +208,9 @@ impl SyncNodeBuilder {
             ic_serve_ic.serve_loop(target).await;
         });
 
-        // 反熵循环（5s 全表摘要 fan-out）+ 本地会话租约续期（TTL/3 重发布）+ EWMA
-        // 折叠（1s 窗——M7）。
+        // Anti-entropy loop (5s full-table digest fan-out) + local session
+        // lease refresh (TTL/3 re-publication) + EWMA folding (1s window —
+        // M7).
         tokio::spawn(anti_entropy_loop(ic.clone(), lease.clone(), self.node_id));
         tokio::spawn(lease_refresh_loop(
             ic.clone(),
@@ -206,12 +220,17 @@ impl SyncNodeBuilder {
         ));
         tokio::spawn(ewma_tick_loop(lease.clone()));
 
-        // 成员初始化（同配置多节点并发 initialize 安全——openraft 契约）。
+        // Membership initialization (concurrent initialize from multiple
+        // nodes with the same config is safe — the openraft contract).
         if !self.members.is_empty() {
             if let Err(e) = raft.initialize(self.members.clone()).await {
-                // NotAllowed = 集群已有日志/成员（他节点先初始化或本机重启再入）——正常
-                // 收敛路径，静默放行；其余错误（NotInMembers 等）记日志：初成员集装配
-                // 故障必须可观测，静默吞掉会让「带病启动」无迹可循。
+                // NotAllowed = the cluster already has logs/membership
+                // (another node initialized first, or this machine rejoining
+                // after a restart) — a normal convergence path, silently
+                // allowed; other errors (NotInMembers etc.) are logged: an
+                // initial-member-set assembly failure must be observable,
+                // silently swallowing it would leave a "sick startup"
+                // traceless.
                 if !matches!(
                     e,
                     RaftError::APIError(openraft::error::InitializeError::NotAllowed(_))
@@ -221,7 +240,8 @@ impl SyncNodeBuilder {
             }
         }
 
-        // 转发面互连接缝（FRWD 流 + location_query 扇出）。
+        // Forwarding-plane interconnect seams (FRWD stream + location_query
+        // fan-out).
         let fwd_transport = Arc::new(IcForwardTransport { ic: ic.clone() });
         let fwd_fanout = Arc::new(IcLocateFanout {
             ic: ic.clone(),
@@ -248,10 +268,12 @@ impl SyncNodeBuilder {
     }
 }
 
-/// 本地会话租约续期：每 [`LEASE_REFRESH`]（TTL/3）把仍在本机在线的设备重新
-/// publish + 广播（publish 建连时只发一次——无此循环则 30s 后租约全网蒸发）。
-/// M7：同循环**自发布服务器自身租约**（合成设备键——名册 Server 条目的 ewma/在线
-/// 状态经既有 gossip 通路全网可见）。
+/// Local session lease refresh: every [`LEASE_REFRESH`] (TTL/3), re-publish
+/// and broadcast the devices still online locally (publish fires only once at
+/// connection setup — without this loop, leases network-wide evaporate after
+/// 30s). M7: the same loop **self-publishes the server's own lease**
+/// (synthetic device key — the roster Server entry's ewma/online state
+/// becomes visible network-wide over the existing gossip path).
 async fn lease_refresh_loop(
     ic: Arc<Interconnect>,
     lease: Arc<LeaseTable>,
@@ -271,8 +293,9 @@ async fn lease_refresh_loop(
     }
 }
 
-/// M7：EWMA 折叠循环（1s 窗，§7-M7.3）——持有者侧把 per-device 字节累加器折进行内
-/// ewma（下一个续期/反熵携带出去）。
+/// M7: the EWMA folding loop (1s window, §7-M7.3) — the holder side folds the
+/// per-device byte accumulators into the row's ewma (carried out by the next
+/// refresh/anti-entropy).
 async fn ewma_tick_loop(lease: Arc<LeaseTable>) {
     let mut tick = tokio::time::interval(crate::lease::EWMA_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -289,9 +312,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 单条租约事件广播（publish/续期共用）。M7：消息携带行内 ewma/last_seen（持有者
-/// 权威值）；term 取刚 publish 落表的那条（消除旧实现「广播 term 与落表 term 各取
-/// 一次时钟」的毫秒级错位）。
+/// Broadcast of a single lease event (shared by publish/refresh). M7: the
+/// message carries the row's ewma/last_seen (holder-authoritative values);
+/// the term is the one just published into the table (eliminating the old
+/// implementation's millisecond-level mismatch of "the broadcast term and
+/// the table term each read the clock once").
 fn broadcast_publish(
     ic: &Arc<Interconnect>,
     lease: &Arc<LeaseTable>,
@@ -329,9 +354,11 @@ async fn anti_entropy_loop(ic: Arc<Interconnect>, lease: Arc<LeaseTable>, me: No
         tick.tick().await;
         let msg = lease.anti_entropy_msg();
         for peer in ic_peer_ids(&ic) {
-            // 自摘要自合并是纯浪费（同 (term, holder) 不可能「更新」⇒ 恒 no-op），且会
-            // 污染 LeaseTable::remote_events 的「远端视图已回填」信号（回收器闸门用，
-            // §7-M7.5）——与 broadcast_publish/locate 的自过滤同纪律。
+            // Self-digest merged into self is a pure waste (the same (term,
+            // holder) can never be "newer" ⇒ always a no-op), and it would
+            // pollute LeaseTable::remote_events' "remote view has been
+            // backfilled" signal (used by the reaper gate, §7-M7.5) — the
+            // same discipline as broadcast_publish/locate's self-filtering.
             if peer == me {
                 continue;
             }
@@ -346,7 +373,7 @@ fn ic_peer_ids(ic: &Interconnect) -> Vec<NodeId> {
     ic.node_ids()
 }
 
-/// ServerId([u8;16]) ↔ NodeId(u64)（前 8B 大端）。
+/// ServerId([u8;16]) ↔ NodeId(u64) (first 8B big-endian).
 pub fn node_id_of(sid: &flock_protocol::session::ServerId) -> NodeId {
     u64::from_be_bytes(sid.0[..8].try_into().expect("8B"))
 }
@@ -365,7 +392,8 @@ pub(crate) struct NodeInner {
     ticket_seq: AtomicU64,
 }
 
-/// FRWD 流发送接缝：ForwardEnvelope 经互连 E2E 会话（外层服务器间加密）。
+/// FRWD stream send seam: ForwardEnvelope over an interconnect E2E session
+/// (server-to-server encryption on the outer layer).
 struct IcForwardTransport {
     ic: Arc<Interconnect>,
 }
@@ -390,7 +418,8 @@ impl ForwardTransport for IcForwardTransport {
     }
 }
 
-/// location_query 扇出接缝：问 ≤3 台互连服务器「谁在托管该设备」（一次性，不重试）。
+/// location_query fan-out seam: ask ≤3 interconnected servers "who is hosting
+/// this device" (one-shot, no retries).
 struct IcLocateFanout {
     ic: Arc<Interconnect>,
     me: NodeId,
@@ -421,7 +450,8 @@ impl LocateFanout for IcLocateFanout {
     }
 }
 
-/// 目录的线性一致读句柄（`'static` future 要求——克隆内柄）。
+/// Linearizable-read handle for the directory (the `'static` future
+/// requirement — clone the inner handle).
 struct NodeReader(Arc<NodeInner>);
 
 impl LinearizableReader for NodeReader {
@@ -432,11 +462,14 @@ impl LinearizableReader for NodeReader {
 }
 
 impl NodeInner {
-    /// 写（leader 本机 / follower 转发；§4 写转发）。
+    /// Write (leader local / follower forwards; §4 write forwarding).
     ///
-    /// 转发重试纪律：远端又回 `ForwardToLeader`（leader 更替中）或 `NoLeader` 时**不透传
-    /// 给调用方**——回到循环在 `forward_deadline`（12s）预算内重试，与本地 client_write
-    /// 路径一致；远端确定性错误（Raft fatal 等）才直接返回。
+    /// Forwarding retry discipline: when the remote again answers
+    /// `ForwardToLeader` (leader change in progress) or `NoLeader`, it is
+    /// **not passed through to the caller** — back to the loop, retrying
+    /// within the `forward_deadline` (12s) budget, same as the local
+    /// client_write path; only deterministic remote errors (Raft fatal etc.)
+    /// return directly.
     pub async fn write(&self, req: SyncRequest) -> Result<SyncResponse, SyncError> {
         let deadline = Instant::now() + self.settings.forward_deadline;
         loop {
@@ -454,7 +487,8 @@ impl NodeInner {
                             .await
                         {
                             Ok(WireResp::Write(Ok(resp))) => return Ok(resp),
-                            // 远端也在 leader 更替中 ⇒ 回环重试（预算内），不透传。
+                            // The remote is also mid-leader-change ⇒ loop and
+                            // retry (within budget), no pass-through.
                             Ok(WireResp::Write(Err(
                                 SyncError::ForwardToLeader { .. } | SyncError::NoLeader,
                             ))) => {}
@@ -478,7 +512,8 @@ impl NodeInner {
         }
     }
 
-    /// 线性一致读（leader 本机 ensure；follower 转发 leader）。
+    /// Linearizable read (leader locally ensures; followers forward to the
+    /// leader).
     pub async fn read_linearizable(&self, q: ReadQuery) -> Result<ReadView, SyncError> {
         let deadline = Instant::now() + self.settings.forward_deadline;
         loop {
@@ -510,7 +545,8 @@ impl NodeInner {
         }
     }
 
-    /// 票据签发器（密钥根在 Raft 状态内；Bootstrap 前为 None）。
+    /// Ticket issuer (the key root is inside Raft state; None before
+    /// Bootstrap).
     pub fn ticket_issuer(&self) -> Option<TicketIssuer> {
         self.sm.ticket_root().map(|r| TicketIssuer::from_root(&r))
     }
@@ -520,44 +556,45 @@ impl NodeInner {
     }
 }
 
-/// 服务器同步门面。
+/// Server synchronization facade.
 pub struct SyncNode {
     pub(crate) inner: Arc<NodeInner>,
     pub(crate) dir: Arc<SyncDirectory>,
 }
 
 impl SyncNode {
-    /// 节点号。
+    /// Node id.
     pub fn id(&self) -> NodeId {
         self.inner.id
     }
 
-    /// NetState 写操作（任意节点进入；自动转发 leader）。
+    /// NetState write operations (enter at any node; auto-forwarded to the
+    /// leader).
     pub async fn write(&self, req: SyncRequest) -> Result<SyncResponse, SyncError> {
         self.inner.write(req).await
     }
 
-    /// 线性一致读（任意节点进入）。
+    /// Linearizable read (enter at any node).
     pub async fn read_linearizable(&self, q: ReadQuery) -> Result<ReadView, SyncError> {
         self.inner.read_linearizable(q).await
     }
 
-    /// DeviceDirectory 接缝句柄（session::respond 注入）。
+    /// DeviceDirectory seam handle (injected into session::respond).
     pub fn device_directory(&self) -> DirHandle {
         DirHandle(self.dir.clone())
     }
 
-    /// 目录本体（统计/失效缓存用）。
+    /// The directory itself (for stats / cache invalidation).
     pub fn dir(&self) -> &Arc<SyncDirectory> {
         &self.dir
     }
 
-    /// 当前 leader（metrics 视图；None = 选举中）。
+    /// Current leader (metrics view; None = election in progress).
     pub async fn current_leader(&self) -> Option<NodeId> {
         self.inner.raft.current_leader().await
     }
 
-    /// 等待 leader 出现（测试/装配用）。
+    /// Wait for a leader to appear (tests/assembly).
     pub async fn wait_leader(&self, budget: Duration) -> Option<NodeId> {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
@@ -569,22 +606,24 @@ impl SyncNode {
         None
     }
 
-    /// 本地 epoch（随 apply 推进）。
+    /// Local epoch (advances with apply).
     pub fn local_epoch(&self) -> u64 {
         self.inner.sm.epoch()
     }
 
-    /// apply-lag 熔断状态。
+    /// apply-lag breaker state.
     pub fn breaker_open(&self) -> bool {
         self.inner.lag.breaker_open()
     }
 
-    /// 租约表（publish/observe；冲突新者胜 + 旧端踢出回调）。
+    /// The lease table (publish/observe; conflicts newest-wins + old-side
+    /// eviction callbacks).
     pub fn lease(&self) -> &Arc<LeaseTable> {
         &self.inner.lease
     }
 
-    /// 签发本地票据（TTL 60s，绑定 device + 当前本地 epoch）。
+    /// Issue a local ticket (TTL 60s, bound to device + the current local
+    /// epoch).
     pub fn issue_ticket(
         &self,
         device: [u8; 32],
@@ -602,7 +641,8 @@ impl SyncNode {
         ))
     }
 
-    /// 校验票据（以本机当前 epoch——§2.2-3 清拒语义）。
+    /// Verify a ticket (against this machine's current epoch — §2.2-3
+    /// outstanding-ticket rejection semantics).
     pub fn verify_ticket(
         &self,
         t: &crate::ticket::Ticket,
@@ -616,25 +656,30 @@ impl SyncNode {
         issuer.verify(t, device, self.inner.sm.epoch(), now_unix)
     }
 
-    /// 发布本机设备租约（gossip 事件广播 ≤1s + 反熵兜底 + TTL/3 续期循环）。
+    /// Publish a local device lease (gossip event broadcast ≤1s + anti-entropy
+    /// backstop + TTL/3 refresh loop).
     pub async fn publish_lease(&self, device: &[u8; 32]) -> Option<NodeId> {
         let prev = self.inner.lease.publish(device);
         broadcast_publish(&self.inner.ic, &self.inner.lease, self.inner.id, *device);
         prev
     }
 
-    /// Raft 句柄（**仅 `test-util` 档**：本 crate 集成测试以外部 crate 视角用
-    /// `.raft().metrics()` 断言成员收敛——tests/cluster、tests/admission 等）。
+    /// Raft handle (**`test-util` profile only**: this crate's integration
+    /// tests use `.raft().metrics()` from an external-crate viewpoint to
+    /// assert membership convergence — tests/cluster, tests/admission etc.).
     ///
-    /// 可见性收敛（评审项 13）：生产构建不存在裸 Raft 访问器——外部消费方
-    /// （flock-server 等）所需能力经白名单方法（[`SyncNode::membership_voters`]/
-    /// [`SyncNode::raft_state`] 等）；crate 内部直接持 `inner.raft`。
+    /// Visibility convergence (review item 13): no bare Raft accessor exists
+    /// in production builds — what external consumers (flock-server etc.)
+    /// need is provided via allowlisted methods
+    /// ([`SyncNode::membership_voters`]/[`SyncNode::raft_state` etc.]);
+    /// in-crate code holds `inner.raft` directly.
     #[cfg(feature = "test-util")]
     pub fn raft(&self) -> &Raft<SyncConfig> {
         &self.inner.raft
     }
 
-    /// openraft 真实 membership 的 voter 集（白名单查询——外部对账用，替代裸句柄）。
+    /// The voter set of openraft's real membership (an allowlisted query —
+    /// for external reconciliation, replacing the bare handle).
     pub fn membership_voters(&self) -> std::collections::BTreeSet<NodeId> {
         self.inner
             .raft
@@ -645,31 +690,39 @@ impl SyncNode {
             .collect()
     }
 
-    /// Raft metrics 摘要：本节点 server state（Leader/Follower/Candidate/Learner）。
+    /// Raft metrics digest: this node's server state
+    /// (Leader/Follower/Candidate/Learner).
     pub fn raft_state(&self) -> openraft::ServerState {
         self.inner.raft.metrics().borrow().state
     }
 
-    /// 本机入群凭证公开部分（ServerEntry——server_keys/rewrap 封装目标等用）。
+    /// The public part of this machine's enrollment credential (ServerEntry
+    /// — the target of server_keys/rewrap wrapping etc.).
     pub fn entry(&self) -> &flock_protocol::session::ServerEntry {
         &self.inner.entry
     }
 
-    /// 应答侧握手拒绝计数（无凭证/伪造凭证在握手层被拒——admission 断言面）。
+    /// Answer-side handshake rejection count (no credentials / forged
+    /// credentials rejected at the handshake layer — the admission assertion
+    /// surface).
     pub fn rejected_handshakes(&self) -> u64 {
         self.inner.ic.rejected_handshakes()
     }
 
-    /// 互连诊断计数（拨号 ok/err，RPC ok/err——M5 排障面）。
+    /// Interconnect diagnostics counters (dial ok/err, RPC ok/err — the M5
+    /// troubleshooting surface).
     pub fn interconnect_diag(&self) -> (u64, u64, u64, u64) {
         self.inner.ic.diag()
     }
 
     // ------------------------------------------------------------------
-    // 集群准入（§4-3：learner → 快照同步 → add_voter 根签 → 提升；§3.10）
+    // Cluster admission (§4-3: learner → snapshot sync → add_voter root
+    // signature → promotion; §3.10)
     // ------------------------------------------------------------------
 
-    /// 安装根签新目录（根验签 + 版本回退拒；热更新互连映射——准入新服务器后全网可拨）。
+    /// Install a new root-signed directory (root verification + version
+    /// rollback rejection; interconnect mapping hot update — after admitting
+    /// a new server, the whole network can dial it).
     pub fn install_directory(&self, dir: &ClusterDirectory) -> Result<(), SyncError> {
         self.inner
             .directory
@@ -681,12 +734,14 @@ impl SyncNode {
         Ok(())
     }
 
-    /// 目录服务（dir_pull 下发根签 ClusterDirectory，§3.10 `Directory::serve`）。
+    /// Directory service (dir_pull distributes the root-signed
+    /// ClusterDirectory, §3.10 `Directory::serve`).
     pub fn directory(&self) -> &Arc<Directory> {
         &self.inner.directory
     }
 
-    /// 以 learner 加入集群（leader 侧调用；blocking = 等日志/快照追平）。
+    /// Join the cluster as a learner (called on the leader; blocking = wait
+    /// for log/snapshot catch-up).
     pub async fn add_learner(&self, node_id: NodeId) -> Result<(), SyncError> {
         self.inner
             .raft
@@ -700,15 +755,20 @@ impl SyncNode {
             .map_err(|e| SyncError::Raft(format!("add_learner: {e}")))
     }
 
-    /// 快照触发 + 日志压实（准入流水用：迫使新 learner 走快照同步路径）。
+    /// Snapshot trigger + log purge (for the admission pipeline: forces the
+    /// new learner down the snapshot-sync path).
     ///
-    /// **压实前置条件**：快照确认落盘且覆盖 `applied` 才 purge——快照未在预算内确认
-    /// 即返回 [`SyncError::Raft`] 并**跳过 purge**（压实未落盘快照之下的日志 = 重启后
-    /// 状态丢失；openraft 的 `get_snapshot` 可能返回旧快照，故校验其边界 ≥ applied）。
+    /// **Purge precondition**: purge only after the snapshot is confirmed on
+    /// disk and covers `applied` — if the snapshot is not confirmed within
+    /// the budget, return [`SyncError::Raft`] and **skip the purge** (purging
+    /// logs below an unpersisted snapshot = state loss after restart;
+    /// openraft's `get_snapshot` may return an old snapshot, hence the check
+    /// that its boundary ≥ applied).
     pub async fn snapshot_and_purge(&self) -> Result<u64, SyncError> {
         let applied = self.inner.sm.applied_index();
         if applied == 0 {
-            // 空日志无谓压实（也无状态可丢）。
+            // Purging an empty log is pointless (and there is no state to
+            // lose).
             return Ok(0);
         }
         self.inner
@@ -749,15 +809,22 @@ impl SyncNode {
         Ok(applied)
     }
 
-    /// add_voter 管理操作（§4-3）：先经 Raft 状态机提交根签 AdminOp::AddVoter（验签后
-    /// 记录 voters + config_version），再执行 openraft 成员提升（joint 共识）。
-    /// 状态机拒绝（无根签名/未引导）⇒ 不提升，原样返回拒绝响应。
+    /// The add_voter administrative operation (§4-3): first commit the
+    /// root-signed AdminOp::AddVoter through the Raft state machine (after
+    /// verification it records voters + config_version), then perform the
+    /// openraft membership promotion (joint consensus). A state-machine
+    /// rejection (no root signature / not bootstrapped) ⇒ no promotion; the
+    /// rejection response returned as-is.
     ///
-    /// **提升前对账**：状态机 voters 与 openraft 真实 membership（`raft.metrics()`）是
-    /// 两个真相源，可能发散（错过的成员日志/部分完成的提升）。差异（超出本次新增的
-    /// node_id）时告警，并以**真实 membership 为基准合并**（并集——状态机已提交的
-    /// admin 准入不丢，openraft 已有的 voter 不误删；旧实现只看状态机副本，
-    /// 发散时会静默丢 voter 或复活死节点）。
+    /// **Pre-promotion reconciliation**: the state machine's voters and
+    /// openraft's real membership (`raft.metrics()`) are two sources of truth
+    /// and can drift (missed membership entries / a partially completed
+    /// promotion). On drift (beyond the node_id being added here), warn and
+    /// **merge on the basis of the real membership** (union — admin
+    /// admissions already committed in the state machine are not lost, and
+    /// voters openraft already has are not wrongly deleted; the old
+    /// implementation looked only at the state-machine copy and would
+    /// silently drop voters or resurrect dead nodes on drift).
     pub async fn add_voter_signed(
         &self,
         root: &ed25519_dalek::SigningKey,
@@ -769,7 +836,8 @@ impl SyncNode {
         if matches!(resp, SyncResponse::Error(_)) {
             return Ok(resp);
         }
-        // 真实 membership（openraft metrics——Raft 实际共识的成员集）。
+        // The real membership (openraft metrics — the member set Raft actually
+        // consensus-agrees on).
         let real: std::collections::BTreeSet<NodeId> = self
             .inner
             .raft
@@ -786,8 +854,8 @@ impl SyncNode {
             .collect();
         if !drift.is_empty() {
             eprintln!(
-                "add_voter: SM voters 与 openraft membership 发散（{drift:?}）——\
-                 以真实 membership 为基准合并提升集"
+                "add_voter: SM voters and openraft membership diverged ({drift:?}) — \
+                 merging the promotion set on the basis of the real membership"
             );
         }
         let mut voters = real;
@@ -803,25 +871,28 @@ impl SyncNode {
     }
 
     // ------------------------------------------------------------------
-    // 转发面 + 租约（§2.2/§3.10）
+    // Forwarding plane + leases (§2.2/§3.10)
     // ------------------------------------------------------------------
 
-    /// 转发面（本机投递/跨服转发/源 VIP 校验）。
+    /// The forwarding plane (local delivery / cross-server forwarding /
+    /// source VIP verification).
     pub fn forward(&self) -> &Arc<ForwardPlane> {
         &self.inner.forward
     }
 
-    /// 挂载本地设备会话投递 sink（装配层映射 PacketChannel）。
+    /// Attach a local device session delivery sink (the assembly layer maps
+    /// the PacketChannel).
     pub fn attach_session(&self, device: [u8; 32], sink: Arc<dyn PacketSink>) {
         self.inner.forward.attach_session(device, sink);
     }
 
-    /// 卸载本地设备会话。
+    /// Detach a local device session.
     pub fn detach_session(&self, device: &[u8; 32]) {
         self.inner.forward.detach_session(device);
     }
 
-    /// 会话入向处理（§2.2 转发判定序；装配层从 PacketChannel 读出后调用）。
+    /// Session ingress processing (§2.2 forwarding decision order; called by
+    /// the assembly layer after reading from the PacketChannel).
     pub async fn ingest_packet(
         &self,
         device: &[u8; 32],
@@ -830,8 +901,10 @@ impl SyncNode {
         self.inner.forward.ingest(device, pkt).await
     }
 
-    /// 挂载本机内核（服务器自身 peer 面，§2.2）：`vip` = 本机 tun VIP，`sink` = tun
-    /// 写泵。dst = 自身 VIP 的入向包注入内核（A2 ping / A4 iperf 本服路径）。
+    /// Attach the local kernel (the server's own peer surface, §2.2): `vip` =
+    /// the local tun VIP, `sink` = the tun write pump. Inbound packets with
+    /// dst = own VIP are injected into the kernel (the local-server path of
+    /// A2 ping / A4 iperf).
     pub fn set_local_peer(
         &self,
         vip: std::net::Ipv4Addr,
@@ -840,12 +913,14 @@ impl SyncNode {
         self.inner.forward.set_local_peer(vip, sink);
     }
 
-    /// 本机内核出向（tun 读泵产出：ICMP 回程/本机协议栈流量）路由进 mesh。
+    /// Local kernel egress (tun read pump output: ICMP return path / local
+    /// protocol-stack traffic) routed into the mesh.
     pub async fn route_outbound(&self, pkt: &[u8]) {
         self.inner.forward.route_outbound(pkt).await
     }
 
-    /// 一次性位置询问（本地租约域优先；fan-out ≤3 台互连服务器）。
+    /// One-shot location inquiry (local lease domain first; fan-out ≤3
+    /// interconnected servers).
     pub async fn location_query(&self, device: &[u8; 32]) -> Option<NodeId> {
         let fanout = IcLocateFanout {
             ic: self.inner.ic.clone(),
@@ -854,39 +929,48 @@ impl SyncNode {
         self.inner.lease.location_query(device, &fanout).await
     }
 
-    /// SM 核（**仅 `test-util` 档**：本 crate 集成测试的观察面——lag 注入器
-    /// （tests/cluster 的 apply-lag 熔断用例）/VIP 反查断言等。评审项 13 收敛：
-    /// 生产构建不存在裸 SM 访问器——外部（flock-server）所需能力经下方白名单
-    /// 方法（register_hook/oprf_b64/local_wrap）获得，不再直捣状态机核。
+    /// The SM core (**`test-util` profile only**: the observation surface of
+    /// this crate's integration tests — the lag injector (the apply-lag
+    /// breaker case in tests/cluster) / VIP reverse-lookup assertions etc.
+    /// Review item 13 convergence: no bare SM accessor exists in production
+    /// builds — what externals (flock-server) need is obtained via the
+    /// allowlisted methods below (register_hook/oprf_b64/local_wrap), no more
+    /// reaching straight into the state machine core.
     #[cfg(feature = "test-util")]
     pub fn sm(&self) -> &Arc<SmCore> {
         &self.inner.sm
     }
 
-    /// 注册 apply/租约钩子（[`SyncNodeBuilder::hook`] 的 build 后等价物——装配层
-    /// （flock-server `open_sync`）在节点构建后才具备 hooks 所需的 sessions/node
-    /// 句柄，无法全部前置到 builder；评审项 13 白名单方法）。
+    /// Register an apply/lease hook (the post-build equivalent of
+    /// [`SyncNodeBuilder::hook`] — the assembly layer (flock-server
+    /// `open_sync`) only obtains the sessions/node handles needed by hooks
+    /// after the node is built, so not everything can be front-loaded into
+    /// the builder; review item 13 allowlisted method).
     pub fn register_hook(&self, h: Arc<dyn SyncHooks>) {
         self.inner.sm.register_hook(h);
     }
 
-    /// 集群共享 OPRF key（b64；本地已 apply 视图，未登记 ⇒ None）。
-    /// （评审项 13：原 `sm().oprf_b64()` 的白名单形态。）
+    /// The cluster-shared OPRF key (b64; the locally applied view; not
+    /// registered ⇒ None). (Review item 13: the allowlisted form of the old
+    /// `sm().oprf_b64()`.)
     pub fn oprf_b64(&self) -> Option<String> {
         self.inner.sm.oprf_b64()
     }
 
-    /// M7（§7-M7.4）：注册表快照——**本地已 apply 视图**（两级读缓存档即可，不强制
-    /// 线性一致读：名册是展示面，允许 follower 视图的秒级陈旧）。评审项 13 白名单
-    /// 方法（外部不经裸 SM 访问器取全表）。
+    /// M7 (§7-M7.4): registry snapshot — **the locally applied view** (the
+    /// two-tier cache profile suffices; a linearizable read is not forced:
+    /// the roster is a display surface, tolerating seconds of staleness in a
+    /// follower's view). Review item 13 allowlisted method (externals do not
+    /// fetch the full table through a bare SM accessor).
     pub fn devices_snapshot(&self) -> Vec<([u8; 32], crate::proto::DeviceRow)> {
         self.inner
             .sm
             .with_data(|d| d.devices.iter().map(|(k, v)| (*k, v.clone())).collect())
     }
 
-    /// M8（§7-M8.4 `/api/users`·`/api/dashboard/summary`）：用户表快照——本地已
-    /// apply 视图（展示面档位，与 [`SyncNode::devices_snapshot`] 同一致性级别）。
+    /// M8 (§7-M8.4 `/api/users`·`/api/dashboard/summary`): user table
+    /// snapshot — the locally applied view (display-surface tier, same
+    /// consistency level as [`SyncNode::devices_snapshot`]).
     pub fn users_snapshot(&self) -> Vec<(String, crate::proto::UserRow)> {
         self.inner.sm.with_data(|d| {
             d.users
@@ -896,24 +980,26 @@ impl SyncNode {
         })
     }
 
-    /// M7（§7-M7.4）：server_keys 快照（本地已 apply 视图——名册 Server 条目的
-    /// vip/节点号数据源）。
+    /// M7 (§7-M7.4): server_keys snapshot (the locally applied view — the
+    /// data source of the roster Server entry's vip/node id).
     pub fn server_keys_snapshot(&self) -> Vec<(NodeId, crate::proto::ServerKeyEntry)> {
         self.inner
             .sm
             .with_data(|d| d.server_keys.iter().map(|(k, v)| (*k, v.clone())).collect())
     }
 
-    /// 本机已 apply 视图内某服务器的 secrets-rewrap 封装副本（OPRF 封装面：
-    /// 各服务器启动时取自己的 wrap 用本机 hybrid sk 解封；None = 该服务器的
-    /// 封装尚未在本节点 apply）。
+    /// A server's secrets-rewrap wrapped copy within this machine's applied
+    /// view (the OPRF wrapping surface: at startup each server fetches its
+    /// own wrap and unwraps it with its local hybrid sk; None = that server's
+    /// wrap has not been applied on this node yet).
     pub fn local_wrap(&self, server_id: NodeId) -> Option<Vec<u8>> {
         self.inner
             .sm
             .with_data(|d| d.wraps.get(&server_id).cloned())
     }
 
-    /// 停机（Raft 关闭；互连织物由外部管理）。
+    /// Shut down (Raft shutdown; the interconnect fabric is managed
+    /// externally).
     pub async fn shutdown(&self) -> Result<(), SyncError> {
         self.inner
             .raft

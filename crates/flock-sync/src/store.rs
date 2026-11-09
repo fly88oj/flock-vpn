@@ -1,12 +1,15 @@
-//! openraft 日志/投票存储的 redb 适配器（§3.10 接缝：redb 单文件嵌入、纯 Rust，
-//! 契合「无共享数据库」部署形态）。
+//! redb adapter for openraft log/vote storage (§3.10 seam: redb is a
+//! single-file embedded, pure-Rust store, fitting the "no shared database"
+//! deployment shape).
 //!
-//! 表布局：
-//! - `log`：u64 index → postcard(Entry\<SyncConfig\>)；
-//! - `kv`：`vote`（postcard(Vote\<u64\>)）/ `last_purged`（postcard(LogId)）。
+//! Table layout:
+//! - `log`: u64 index → postcard(Entry\<SyncConfig\>);
+//! - `kv`: `vote` (postcard(Vote\<u64\>)) / `last_purged` (postcard(LogId)).
 //!
-//! 正确性：所有写在一个 redb 写事务内完成且 commit 即持久（`append` 返回前可读、
-//! [`LogFlushed`] 回调在 commit 后触发）；无洞纪律由 openraft 调用序 + 范围删除保证。
+//! Correctness: all writes complete inside one redb write transaction and a
+//! commit is durable (readable before `append` returns; the [`LogFlushed`]
+//! callback fires after commit); the no-gaps discipline is guaranteed by the
+//! openraft call order + range deletion.
 
 use std::fmt;
 use std::ops::RangeBounds;
@@ -19,12 +22,12 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::raft_types::SyncConfig;
 
-/// 日志表：index → entry 字节。
+/// Log table: index → entry bytes.
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("flock_sync_log");
-/// KV 表：vote / last_purged。
+/// KV table: vote / last_purged.
 const KV: TableDefinition<&str, &[u8]> = TableDefinition::new("flock_sync_kv");
 
-/// redb 打开/读写失败 → openraft StorageError。
+/// redb open/read/write failure → openraft StorageError.
 fn storage_err(e: impl fmt::Display) -> openraft::StorageError<u64> {
     let io_err = std::io::Error::other(format!("redb: {e}"));
     Err::<(), std::io::Error>(io_err)
@@ -32,7 +35,8 @@ fn storage_err(e: impl fmt::Display) -> openraft::StorageError<u64> {
         .expect_err("Err")
 }
 
-/// redb 日志存储（RaftLogStorage + RaftLogReader；`Clone` 供 LogReader 派发）。
+/// redb log storage (RaftLogStorage + RaftLogReader; `Clone` for LogReader
+/// dispatch).
 #[derive(Clone)]
 pub struct RedbLogStore {
     db: Arc<Database>,
@@ -45,8 +49,10 @@ impl fmt::Debug for RedbLogStore {
 }
 
 impl RedbLogStore {
-    /// 打开/创建（文件不存在则建库；目录自动创建）。
-    /// （Err 载荷 = openraft StorageError（224B）——trait 签名约束，盒装不可行，显式豁免。）
+    /// Open/create (creates the database if the file does not exist;
+    /// directories created automatically). (The Err payload = openraft
+    /// StorageError (224B) — a trait-signature constraint; boxing is not
+    /// viable, exemption explicit.)
     #[allow(clippy::result_large_err)]
     pub fn open(path: &Path) -> Result<Self, openraft::StorageError<u64>> {
         if let Some(dir) = path.parent() {
@@ -58,7 +64,9 @@ impl RedbLogStore {
         Ok(RedbLogStore { db })
     }
 
-    /// 建表（幂等；装配方自持 Database 时调用——状态机快照表同库创建）。
+    /// Create tables (idempotent; called when the assembler holds its own
+    /// Database — the state machine snapshot table is created in the same
+    /// database).
     #[allow(clippy::result_large_err)]
     pub fn init_tables(db: &Arc<Database>) -> Result<(), openraft::StorageError<u64>> {
         let txn = db.begin_write().map_err(storage_err)?;
@@ -70,7 +78,8 @@ impl RedbLogStore {
         txn.commit().map_err(storage_err)
     }
 
-    /// 由既有库构造（表须已建——[`RedbLogStore::init_tables`]）。
+    /// Construct from an existing database (tables must already exist —
+    /// [`RedbLogStore::init_tables`]).
     pub fn from_db(db: Arc<Database>) -> Self {
         RedbLogStore { db }
     }
@@ -145,9 +154,12 @@ impl RaftLogStorage<SyncConfig> for RedbLogStore {
         let txn = self.db.begin_read().map_err(storage_err)?;
         let kv = txn.open_table(KV).map_err(storage_err)?;
         match kv.get("vote").map_err(storage_err)? {
-            // 写侧（save_vote）序列化的是裸 Vote——读侧必须同型解码。此前读侧按
-            // 返回位置的 Option<Vote> 推断，首字节被当作 Option 判别式 ⇒ 选举后
-            // 任意重启必炸（M5 A7 的 stop/start 实测暴露；tests/store_reopen 回归）。
+            // The write side (save_vote) serializes a bare Vote — the read
+            // side must decode the same shape. Previously the read side
+            // inferred from the return position's Option<Vote>, so the first
+            // byte was consumed as an Option discriminant ⇒ any restart after
+            // an election blew up (exposed by M5 A7's stop/start run;
+            // tests/store_reopen regression).
             Some(v) => Ok(Some(
                 postcard::from_bytes::<Vote<u64>>(v.value()).map_err(storage_err)?,
             )),
@@ -179,7 +191,8 @@ impl RaftLogStorage<SyncConfig> for RedbLogStore {
             }
         }
         txn.commit().map_err(storage_err)?;
-        // commit 即持久（redb WAL）；回调在持久后触发（契约：可先于/后于本方法返回）。
+        // Commit is durable (redb WAL); the callback fires after durability
+        // (contract: may run before or after this method returns).
         callback.log_io_completed(Ok(()));
         Ok(())
     }
@@ -193,15 +206,23 @@ impl RaftLogStorage<SyncConfig> for RedbLogStore {
     }
 }
 
-/// 每批删除的 key 上限（分批收集-删除：旧实现的 collect-then-remove 把整段日志 index
-/// 一次性物化进内存 + 单事务内逐 key 删——大日志下内存尖峰与长事务；每批独立事务，
-/// 批间崩溃留下残余 key 幂等安全（下次重删同区间））。
+/// Upper bound of keys deleted per batch (batched collect-then-delete: the
+/// old implementation's collect-then-remove materialized an entire log index
+/// range into memory at once + deleted key by key inside a single
+/// transaction — memory spikes and long transactions on large logs; each
+/// batch is its own transaction, and leftover keys from a crash between
+/// batches are idempotently safe to re-delete (the same range is removed
+/// next time)).
 const REMOVE_BATCH: usize = 10_000;
 
-/// 分批删除日志区间。`purged` 非空 = purge 语义：`last_purged` 水位只在**末批**（不足
-/// 一整批 = 区间已删净）同事务落盘——先推水位后删净的反向形态不出现（那会让
-/// get_log_state 声称已压实而 key 仍在）。前批已删的 key 不再命中 range，循环自然推进。
-#[allow(clippy::result_large_err)] // Err 载荷 = openraft StorageError（224B）——与文件内既有豁免同因
+/// Batched deletion of a log range. Non-empty `purged` = purge semantics: the
+/// `last_purged` watermark is persisted only in the **final batch** (shorter
+/// than a full batch = the range has been fully deleted) within the same
+/// transaction — the reverse shape (advancing the watermark before deleting
+/// everything) never occurs (that would let get_log_state claim compaction
+/// while the keys are still there). Keys already deleted by earlier batches
+/// no longer match the range, so the loop naturally advances.
+#[allow(clippy::result_large_err)] // Err payload = openraft StorageError (224B) — same reason as the existing exemption in this file
 fn remove_range<R: RangeBounds<u64> + Clone>(
     db: &Arc<Database>,
     range: R,

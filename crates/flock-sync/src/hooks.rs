@@ -1,36 +1,46 @@
-//! apply 回调钩子（§2.2 吊销传播界 + vpn-mesh §5.2 租约冲突）。
+//! Apply callback hooks (§2.2 revocation-propagation boundary + vpn-mesh
+//! §5.2 lease conflicts).
 //!
-//! 每台服务器在**自己的日志 apply 回调**里：
-//! (a) 推进 revocation_epoch、失效记录缓存（由 [`crate::sm`] 维护）；
-//! (b) **杀死本地该设备会话**（[`SyncHooks::on_revocation_applied`]——装配层注入会话
-//!     管理器；本 crate 提供 registry 与测试记录器）；
-//! (c) 清拒其票据（票据 epoch < 当前 epoch 即拒——[`crate::ticket`] 消费 epoch）。
+//! Every server, in **its own log apply callback**:
+//! (a) advances revocation_epoch and invalidates the record cache (maintained
+//!     by [`crate::sm`]);
+//! (b) **kills the device's local session**
+//!     ([`SyncHooks::on_revocation_applied`] — the assembly layer injects the
+//!     session manager; this crate provides the registry and a test recorder);
+//! (c) rejects its outstanding tickets (a ticket whose epoch < current epoch is
+//!     rejected — [`crate::ticket`] consumes the epoch).
 //!
-//! 租约冲突（新者胜 + 旧端踢会话）：[`SyncHooks::on_lease_evicted`]。
+//! Lease conflict (newest wins + old-side session eviction):
+//! [`SyncHooks::on_lease_evicted`].
 
 use std::sync::{Arc, Mutex};
 
 use crate::state::RevocationEffect;
 
-/// 吊销传播事件（apply 回调现场产出）。
+/// Revocation-propagation event (produced at the apply-callback site).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RevocationEvent {
     pub device: [u8; 32],
     pub new_epoch: u64,
-    /// 触发转移的日志 index（定位与断言用）。
+    /// Log index of the transition that triggered it (for locating and
+    /// assertions).
     pub log_index: u64,
 }
 
-/// 装配层注入的本地副作用钩子（默认全空；server 装配批次接会话管理器）。
+/// Local side-effect hooks injected by the assembly layer (all empty by
+/// default; the server assembly batch wires the session manager).
 pub trait SyncHooks: Send + Sync + 'static {
-    /// 吊销/禁用已在本节点 apply：杀本地该设备会话 + 清拒票据。
+    /// Revocation/disable applied on this node: kill the device's local
+    /// session + reject outstanding tickets.
     fn on_revocation_applied(&self, _ev: RevocationEvent) {}
-    /// 该设备的在线租约被更新的租约取代（新者胜）：踢出本地会话。
+    /// The device's online lease was superseded by a newer lease (newest
+    /// wins): evict the local session.
     fn on_lease_evicted(&self, _device: &[u8; 32]) {}
 }
 
-/// 钩子注册表（状态机 apply 与租约冲突路径调用；内部 `Arc` 共享——SM 核与 LeaseTable
-/// 可共用同一实例，注册一次全网关生效）。
+/// Hook registry (called from the state machine apply and the lease-conflict
+/// paths; shared internally via `Arc` — the SM core and LeaseTable can share
+/// one instance; register once and it takes effect network-wide).
 #[derive(Clone, Default)]
 pub struct HookRegistry {
     hooks: Arc<Mutex<Vec<Arc<dyn SyncHooks>>>>,
@@ -41,12 +51,13 @@ impl HookRegistry {
         Self::default()
     }
 
-    /// 注册一个钩子。
+    /// Register a hook.
     pub fn add(&self, h: Arc<dyn SyncHooks>) {
         self.hooks.lock().expect("hook registry").push(h);
     }
 
-    /// 触发吊销传播钩子（幂等：每条阻断性转移恰好一次）。
+    /// Fire the revocation-propagation hooks (idempotent: exactly once per
+    /// blocking transition).
     pub fn fire_revocation(&self, ev: RevocationEffect, log_index: u64) {
         let event = RevocationEvent {
             device: ev.device,
@@ -58,7 +69,7 @@ impl HookRegistry {
         }
     }
 
-    /// 触发租约冲突踢出钩子。
+    /// Fire the lease-conflict eviction hooks.
     pub fn fire_lease_evict(&self, device: &[u8; 32]) {
         for h in self.hooks.lock().expect("hook registry").iter() {
             h.on_lease_evicted(device);
@@ -74,10 +85,12 @@ impl std::fmt::Debug for HookRegistry {
     }
 }
 
-/// 测试记录器（cluster 断言用：epoch 前进 + 杀会话钩子时序）。
+/// Test recorder (for cluster assertions: epoch advancement + kill-session
+/// hook timing).
 ///
-/// 仅测试面（`test-util` feature 门控——不入生产默认档；集成测试与 flock-server 的
-/// 测试 dev-dependency 均启用该 feature）。
+/// Test surface only (`test-util` feature-gated — not in the production
+/// default profile; both the integration tests and the flock-server test
+/// dev-dependency enable that feature).
 #[cfg(feature = "test-util")]
 #[derive(Debug, Default)]
 pub struct HookRecorder {
@@ -99,7 +112,7 @@ impl HookRecorder {
         self.evictions.lock().expect("evictions").clone()
     }
 
-    /// 指定设备的吊销事件数。
+    /// Number of revocation events for the given device.
     pub fn revocation_count(&self, device: &[u8; 32]) -> usize {
         self.revocations()
             .iter()

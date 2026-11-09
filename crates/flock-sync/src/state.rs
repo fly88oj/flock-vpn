@@ -1,17 +1,27 @@
-//! 纯状态机数据：NetState 的确定性执行核（docs/design.md §3.10/§2.2 语义纪律）。
+//! Pure state machine data: NetState's deterministic execution core
+//! (docs/design.md §3.10/§2.2 semantic discipline).
 //!
-//! 语义纪律（与 M2 单服 StateStore 一致，M4 = 同语义的 Raft 复制形态）：
-//! - **VIP 100.64.0.0/10 分配**：`100.64.0.1`–`.10` 保留服务器自身，水位线只进不退。
-//!   IP 复用策略（§2.1 M7 修订）：**吊销/禁用 → IP 永不复用**（行保留）；**Expired
-//!   （离线超保留期）→ VIP 归还 `vip_pool` 分配池**，新设备可分到——过期行保留在册
-//!   （审计），名册查询排除。
-//! - **invite_id 单次消费**：redeem 在同一状态转移内查重 + 标记（Raft 单次提交 = 原子）。
-//! - **吊销推进全局 revocation_epoch**：仅阻断性转移（→Disabled/→Revoked/→Expired）+1；
-//!   Enable 是恢复，不动 epoch（否则会无害地废掉全网在途票据）。
-//! - **票据密钥根在 Raft 内**（Bootstrap 落库，§4）。
+//! Semantic discipline (same as the M2 single-server StateStore; M4 = the
+//! Raft-replicated form of the same semantics):
+//! - **VIP 100.64.0.0/10 allocation**: `100.64.0.1`–`.10` reserved for the
+//!   servers themselves, the watermark only moves forward. IP-reuse policy
+//!   (§2.1 M7 revision): **revoked/disabled → IP never reused** (row
+//!   retained); **Expired (offline past the retention period) → the VIP is
+//!   returned to the `vip_pool`** allocation pool and a new device may get it
+//!   — the expired row stays on the books (audit) and is excluded from roster
+//!   queries.
+//! - **invite_id single-use consumption**: redeem dedups + marks within one
+//!   state transition (a single Raft commit = atomic).
+//! - **Revocation advances the global revocation_epoch**: only blocking
+//!   transitions (→Disabled/→Revoked/→Expired) increment; Enable is a
+//!   restoration and does not touch the epoch (otherwise it would
+//!   harmlessly invalidate in-flight tickets network-wide).
+//! - **The ticket key root lives inside Raft** (landed by Bootstrap, §4).
 //!
-//! `apply` 是纯函数式的确定性转移：所有节点对同一日志条目产生同一结果——验证失败的
-//! 管理操作返回 [`SyncResponse::Error`]（一致拒绝，不发散）。
+//! `apply` is a pure, deterministic transition: all nodes produce the same
+//! result for the same log entry — administrative operations that fail
+//! verification return [`SyncResponse::Error`] (uniform rejection, no
+//! divergence).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,25 +37,27 @@ use crate::proto::{
     SyncRequest, SyncResponse, UserRow, VerdictW, VIP_FIRST, VIP_LAST,
 };
 
-/// 集群身份（Bootstrap 产物）。
+/// Cluster identity (Bootstrap product).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterIdent {
     pub cluster_id: [u8; 16],
     pub root_pub: [u8; 32],
 }
 
-/// 吊销副作用（apply 产出，由 [`crate::sm`] 包装层触发钩子：杀本地会话/清拒票据）。
+/// Revocation side effect (produced by apply; the [`crate::sm`] wrapper fires
+/// the hooks: kill local session / reject outstanding tickets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RevocationEffect {
     pub device: [u8; 32],
     pub new_epoch: u64,
 }
 
-/// 单条写操作的 apply 产物。
+/// Apply product of a single write operation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApplyOutcome {
     pub resp: SyncResponse,
-    /// 阻断性状态转移（Revoke/Disable）非空 ⇒ 触发吊销传播钩子（§2.2）。
+    /// Non-empty for blocking status transitions (Revoke/Disable) ⇒ fire the
+    /// revocation-propagation hooks (§2.2).
     pub revoked: Option<RevocationEffect>,
 }
 
@@ -64,7 +76,7 @@ impl ApplyOutcome {
     }
 }
 
-/// NetState 状态机数据（快照 = 本结构序列化）。
+/// NetState state machine data (snapshot = serialization of this struct).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetStateData {
     pub cluster: Option<ClusterIdent>,
@@ -72,13 +84,17 @@ pub struct NetStateData {
     pub vip_next: u32,
     pub config_version: u64,
     pub devices: BTreeMap<[u8; 32], DeviceRow>,
-    /// M7：Expired 归还的 VIP 分配池（有序——分配取最小；序列化进快照）。
+    /// M7: the VIP allocation pool of VIPs returned by Expired rows (ordered
+    /// — allocation takes the smallest; serialized into the snapshot).
     pub vip_pool: BTreeSet<[u8; 4]>,
-    /// VIP → 设备反查索引（`devices` 的**派生数据**，不序列化——快照/重放后由
-    /// [`NetStateData::reindex_vips`] 重建，apply 注册路径增量维护）。每包转发热路径
-    /// （`sm::SmCore::device_by_vip`）从 O(N) 全表扫描降为 O(log N)。单射性由
-    /// 「Expired 行不进索引（其 VIP 已归还池）」维持——池内 VIP 与索引键不相交，
-    /// 池重派即插入新行。
+    /// VIP → device reverse-lookup index (**derived data** of `devices`, not
+    /// serialized — rebuilt after snapshot/replay by
+    /// [`NetStateData::reindex_vips`], maintained incrementally on the apply
+    /// registration path). Takes the per-packet forwarding hot path
+    /// (`sm::SmCore::device_by_vip`) from an O(N) full-table scan down to
+    /// O(log N). Injectivity is maintained by "Expired rows do not enter the
+    /// index (their VIP is already back in the pool)" — pool VIPs and index
+    /// keys are disjoint, so re-assigning from the pool inserts a new row.
     #[serde(skip, default)]
     pub vip_index: BTreeMap<[u8; 4], [u8; 32]>,
     pub users: BTreeMap<String, UserRow>,
@@ -87,32 +103,36 @@ pub struct NetStateData {
     pub server_keys: BTreeMap<NodeId, ServerKeyEntry>,
     pub wraps: BTreeMap<NodeId, Vec<u8>>,
     pub ticket_root: Option<[u8; 32]>,
-    /// 集群共享 OPRF key（b64 ServerSetup；根签 SetOprf 登记——OPAQUE 记录全网可验，§2.4）。
+    /// Cluster-shared OPRF key (b64 ServerSetup; registered by root-signed
+    /// SetOprf — OPAQUE records verifiable network-wide, §2.4).
     pub oprf_b64: Option<String>,
     pub voters: BTreeSet<NodeId>,
-    /// 最后一条已 apply 的普通/成员日志（快照边界；由 sm 包装层维护）。
+    /// The last applied normal/membership entry (snapshot boundary;
+    /// maintained by the sm wrapper).
     pub last_applied: Option<LogId<u64>>,
     pub last_membership: StoredMembership<u64, BasicNode>,
 }
 
 impl NetStateData {
-    /// 空状态。
+    /// Empty state.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 序列化（快照线格式；postcard 确定性编码）。
+    /// Serialize (snapshot wire format; postcard deterministic encoding).
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).expect("netstate serialize")
     }
 
-    /// 反序列化。
+    /// Deserialize.
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
         postcard::from_bytes(b).ok()
     }
 
-    /// 目录三态查询（session::DeviceDirectory 数据源；损坏行 fail-closed = NotFound）。
-    /// Expired 同为阻断态（离线超保留期的时间性淘汰——与 Revoked 同拒握手，§7-M7）。
+    /// Directory three-way query (the session::DeviceDirectory data source;
+    /// corrupt rows fail-closed = NotFound). Expired is likewise a blocking
+    /// state (time-based eviction after being offline past the retention
+    /// period — refuses handshakes the same as Revoked, §7-M7).
     pub fn lookup(&self, id: &[u8; 32]) -> VerdictW {
         match self.devices.get(id) {
             Some(row) => match row.status {
@@ -130,14 +150,16 @@ impl NetStateData {
         }
     }
 
-    /// 当前全局 revocation_epoch。
+    /// Current global revocation_epoch.
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
 
-    /// 全量重建 VIP 反查索引（恢复/快照安装/一致性自检用；幂等）。**Expired 行不进
-    /// 索引**（其 VIP 已归还 `vip_pool`——池重派后同池 VIP 会出现在新行；索引只收
-    /// 非 Expired 行 ⇒ 键唯一）。
+    /// Fully rebuild the VIP reverse-lookup index (for restore/snapshot
+    /// install/consistency self-checks; idempotent). **Expired rows do not
+    /// enter the index** (their VIP is already back in `vip_pool` — after the
+    /// pool re-assigns it, the same pool VIP appears in a new row; the index
+    /// only collects non-Expired rows ⇒ unique keys).
     pub fn reindex_vips(&mut self) {
         self.vip_index = self
             .devices
@@ -147,18 +169,20 @@ impl NetStateData {
             .collect();
     }
 
-    /// 按 VIP 反查设备（每包转发热路径——索引 O(log N)）。VIP 水位单调不复用 ⇒ 命中
-    /// 唯一。NetState 只存静态注册信息——不含当前位置。
+    /// Reverse lookup of a device by VIP (per-packet forwarding hot path —
+    /// index O(log N)). VIP watermark is monotonic with no reuse ⇒ a hit is
+    /// unique. NetState stores only static registration info — no current
+    /// location.
     pub fn device_by_vip(&self, vip: &[u8; 4]) -> Option<[u8; 32]> {
         self.vip_index.get(vip).copied()
     }
 
-    /// 集群共享 OPRF key（b64；未登记 ⇒ None）。
+    /// Cluster-shared OPRF key (b64; unregistered ⇒ None).
     pub fn oprf_b64(&self) -> Option<&str> {
         self.oprf_b64.as_deref()
     }
 
-    /// 状态摘要（线性一致读 ReadQuery::State）。
+    /// State digest (linearizable read ReadQuery::State).
     pub fn state_view(&self) -> crate::proto::StateView {
         crate::proto::StateView {
             epoch: self.epoch,
@@ -189,9 +213,11 @@ impl NetStateData {
 
     // ------------------------------------------------------------------
 
-    /// 确定性执行一条写操作。
+    /// Deterministically execute one write operation.
     ///
-    /// `expected_root`：本机配置钉住的集群根公钥（None = 未配置，仅 Bootstrap 自证生效）。
+    /// `expected_root`: the cluster root public key pinned by this node's
+    /// config (None = not configured; only the Bootstrap self-attestation is
+    /// enforced).
     pub fn apply(
         &mut self,
         req: &SyncRequest,
@@ -228,7 +254,8 @@ impl NetStateData {
                 invite_id,
                 expiry_unix,
             } => {
-                // 幂等登记：同 id 同 expiry 且未消费 ⇒ 重复登记放行（签发侧重放）。
+                // Idempotent registration: same id + same expiry + unconsumed
+                // ⇒ duplicate registration allowed (issuer-side replay).
                 match self.invites.get(invite_id) {
                     Some(row)
                         if row.expiry_unix == *expiry_unix && row.status == InviteStatus::Valid =>
@@ -301,7 +328,9 @@ impl NetStateData {
             }
             SyncRequest::ServerKeys(rs) => self.apply_server_keys(rs, expected_root),
             SyncRequest::AdminOp(rs) => self.apply_admin(rs, expected_root),
-            // —— M8（§7-M8.3）：Web 管理面普通写（尾部追加；授权在提交方层）。——
+            // —— M8 (§7-M8.3): ordinary writes of the web admin plane
+            //    (appended at the tail; authorization lives in the submitter
+            //    layer). ——
             SyncRequest::CreateUser {
                 username,
                 pw_bootstrap,
@@ -327,9 +356,11 @@ impl NetStateData {
                 let Some(row) = self.users.get_mut(user) else {
                     return ApplyOutcome::err(StateError::NoSuchUser);
                 };
-                // 原子三判定（Raft 单次提交）：令牌匹配（None = 已消费 ⇒ 同错——重放拒）
-                // 且记录为空 ⇒ 落记录 + 清令牌。前置判定顺序：令牌先于记录（令牌错
-                // 不泄漏「是否已有口令」）。
+                // Atomic triple determination (a single Raft commit): token
+                // matches (None = already consumed ⇒ same error — replay
+                // rejected) AND record empty ⇒ land record + clear token.
+                // Determination order: token before record (a wrong token
+                // must not leak "whether a password already exists").
                 if row.pw_bootstrap != Some(*token) {
                     return ApplyOutcome::err(StateError::BadBootstrapToken);
                 }
@@ -345,7 +376,9 @@ impl NetStateData {
                 let Some(row) = self.users.get_mut(user) else {
                     return ApplyOutcome::err(StateError::NoSuchUser);
                 };
-                // 清记录 + 置新令牌（旧口令即刻失效——登录侧 record=None 走 dummy）。
+                // Clear record + set the new token (the old password becomes
+                // invalid immediately — record=None on the login side takes
+                // the dummy path).
                 row.opaque_record = None;
                 row.opaque_profile = 0;
                 row.pw_bootstrap = Some(*new_token);
@@ -380,7 +413,8 @@ impl NetStateData {
             Ok(vk) => vk,
             Err(_) => return ApplyOutcome::err(StateError::BadRootSignature),
         };
-        // 自证：根公钥对 canonical 字节的签名（防字段拼接）。
+        // Self-attestation: the root public key's signature over the canonical
+        // bytes (guards against field concatenation).
         if vk
             .verify(
                 &bootstrap_canonical(&cluster_id, &root_pub, &ticket_root),
@@ -396,14 +430,15 @@ impl NetStateData {
                     && existing.root_pub == root_pub
                     && self.ticket_root == Some(ticket_root)
                 {
-                    // 幂等重放放行（Raft 重放/追赶路径）。
+                    // Idempotent replay allowed (Raft replay/catch-up path).
                     ApplyOutcome::ok(SyncResponse::Ok)
                 } else {
                     ApplyOutcome::err(StateError::AlreadyBootstrapped)
                 }
             }
             None => {
-                // 本机钉扎根比对（防「他签根」进集群身份）。
+                // Compare against the locally pinned root (prevents "someone
+                // else's signed root" entering the cluster identity).
                 if let Some(pinned) = expected_root {
                     if pinned.as_bytes() != &root_pub {
                         return ApplyOutcome::err(StateError::RootMismatch);
@@ -424,7 +459,7 @@ impl NetStateData {
         rs: &RootSigned<String>,
         expected_root: Option<&VerifyingKey>,
     ) -> ApplyOutcome {
-        let _ = expected_root; // 根公钥固定为 bootstrap 身份（下方与 cluster 比对）
+        let _ = expected_root; // The root public key is fixed to the bootstrap identity (compared against `cluster` below)
         let Some(cluster) = &self.cluster else {
             return ApplyOutcome::err(StateError::NotBootstrapped);
         };
@@ -443,7 +478,7 @@ impl NetStateData {
             return ApplyOutcome::err(StateError::BadRootSignature);
         }
         match &self.oprf_b64 {
-            Some(cur) if cur == &rs.op => ApplyOutcome::ok(SyncResponse::Ok), // 幂等重放
+            Some(cur) if cur == &rs.op => ApplyOutcome::ok(SyncResponse::Ok), // Idempotent replay
             Some(_) => ApplyOutcome::err(StateError::AlreadyBootstrapped),
             None => {
                 self.oprf_b64 = Some(rs.op.clone());
@@ -495,12 +530,15 @@ impl NetStateData {
             return ApplyOutcome::err(StateError::RevokedIsTerminal);
         }
         if matches!(row.status, DeviceStatus::Expired) && status != DeviceStatus::Expired {
-            // Expired 终态不可逆（旧 VIP 可能已属他设备——复活破索引单射，§7-M7）。
+            // Expired is an irreversible terminal state (the old VIP may
+            // already belong to another device — revival breaks index
+            // injectivity, §7-M7).
             return ApplyOutcome::err(StateError::ExpiredIsTerminal);
         }
         let mut effect = None;
         if row.status != status {
-            // 仅阻断性转移（→Disabled/→Revoked）推进全局 revocation_epoch（§2.2）。
+            // Only blocking transitions (→Disabled/→Revoked) advance the
+            // global revocation_epoch (§2.2).
             if status != DeviceStatus::Active {
                 self.epoch += 1;
                 row.since_epoch = self.epoch;
@@ -517,9 +555,13 @@ impl NetStateData {
         }
     }
 
-    /// M7：过期转移（回收器提交）——**VIP 归还分配池**（Expired ≠ Revoked 的核心差异：
-    /// 行保留审计、池内 VIP 可重派；复用吊销的 epoch 推进 + 传播钩子路径，仅状态语义
-    /// 不同）。幂等：已 Expired 的重放放行（回收器多机并发提交的收敛路径）、不动 epoch。
+    /// M7: the Expire transition (submitted by the reaper) — **the VIP is
+    /// returned to the allocation pool** (the core difference from Revoked:
+    /// the row is retained for audit, and the pooled VIP can be re-assigned;
+    /// it reuses the revocation epoch advancement + propagation-hook path,
+    /// only the status semantics differ). Idempotent: replay over an
+    /// already-Expired row is allowed (the convergence path for the reaper's
+    /// concurrent multi-machine submissions) and does not touch the epoch.
     fn apply_expire(&mut self, device: &[u8; 32], now_unix: u64) -> ApplyOutcome {
         let Some(row) = self.devices.get_mut(device) else {
             return ApplyOutcome::err(StateError::DeviceNotFound);
@@ -528,11 +570,13 @@ impl NetStateData {
             return ApplyOutcome::ok(SyncResponse::Epoch(self.epoch));
         }
         if row.status == DeviceStatus::Revoked {
-            // Revoked 行 VIP 永不复用（§2.1）——吊销不因时间推进转化为可重派。
+            // A Revoked row's VIP is never reused (§2.1) — revocation does not
+            // convert into re-assignability with the passage of time.
             return ApplyOutcome::err(StateError::RevokedIsTerminal);
         }
-        // 阻断性转移：epoch 推进 + 吊销传播钩子（杀残留会话/废票据——与 Revoked 同
-        // 路径，§7-M2）。
+        // Blocking transition: epoch advancement + revocation propagation
+        // hooks (kill leftover sessions / void tickets — same path as
+        // Revoked, §7-M2).
         self.epoch += 1;
         row.since_epoch = self.epoch;
         row.status = DeviceStatus::Expired;
@@ -541,7 +585,8 @@ impl NetStateData {
             device: *device,
             new_epoch: self.epoch,
         };
-        // 释放 VIP：索引删旧条目 + 归还池（有序集合——重派取最小）。
+        // Release the VIP: delete the old index entry + return to the pool
+        // (ordered set — re-assignment takes the smallest).
         let released = row.vip;
         self.vip_index.remove(&released);
         self.vip_pool.insert(released);
@@ -551,7 +596,7 @@ impl NetStateData {
         }
     }
 
-    /// M7：hostname 更新（re-register 路径；仅非终态行）。
+    /// M7: hostname update (re-register path; non-terminal rows only).
     fn apply_set_hostname(&mut self, device: &[u8; 32], hostname: &str) -> ApplyOutcome {
         let Some(row) = self.devices.get_mut(device) else {
             return ApplyOutcome::err(StateError::DeviceNotFound);
@@ -575,7 +620,8 @@ impl NetStateData {
         hostname: &str,
         now_unix: u64,
     ) -> ApplyOutcome {
-        // 根签名/结构校验 + 本集群身份钉死，先于任何状态触碰（同 M2）。
+        // Root-signature/structure checks + pinning to this cluster's
+        // identity, before any state is touched (same as M2).
         let Some(cluster) = self.cluster.clone() else {
             return ApplyOutcome::err(StateError::NotBootstrapped);
         };
@@ -597,7 +643,7 @@ impl NetStateData {
         let Some(row) = self.invites.get(&invite_id) else {
             return ApplyOutcome::err(StateError::UnknownInvite);
         };
-        // 一次性三判定（§1.3.3f 邀请一生）。
+        // One-shot triple determination (§1.3.3f an invite's lifetime).
         match row.status {
             InviteStatus::Used => return ApplyOutcome::err(StateError::AlreadyUsed),
             InviteStatus::Revoked => return ApplyOutcome::err(StateError::InviteRevoked),
@@ -633,12 +679,14 @@ impl NetStateData {
                 since_epoch: 0,
                 hostname: crate::proto::normalize_hostname(hostname),
                 expired_at: None,
-                // 兑换时刻即注册时刻（回收器锚，§7-M7.5）。
+                // The redemption moment is the registration moment (the
+                // reaper's anchor, §7-M7.5).
                 registered_at: now_unix,
             },
         );
         self.vip_index.insert(vip, device_id);
-        // 同一状态转移内标记 used（查重与标记间无窗口——Raft 单次提交）。
+        // Mark used within the same state transition (no window between dedup
+        // and marking — a single Raft commit).
         self.invites.insert(
             invite_id,
             InviteRow {
@@ -728,7 +776,9 @@ impl NetStateData {
         }
     }
 
-    /// 状态内根公钥（admin 验签锚）；`expected_root` 优先（本机钉扎，双保险）。
+    /// The in-state root public key (the anchor for admin verification);
+    /// `expected_root` wins when present (local pinning, a second line of
+    /// defense).
     fn root_verifier(&self, expected_root: Option<&VerifyingKey>) -> Option<VerifyingKey> {
         if let Some(pinned) = expected_root {
             return Some(*pinned);
@@ -738,9 +788,11 @@ impl NetStateData {
             .and_then(|c| VerifyingKey::from_bytes(&c.root_pub).ok())
     }
 
-    /// VIP 分配（M7 两级：**Expired 归还池优先**（取最小——确定性），池空回退单调
-    /// 水位线 `vip_next`（只进不退，吊销/禁用行的 VIP 永不进池，§2.1）；越
-    /// [`VIP_LAST`] 即耗尽）。
+    /// VIP allocation (M7 two-tier: **the Expired return pool first** (take
+    /// the smallest — deterministic), fall back to the monotonic watermark
+    /// `vip_next` when the pool is empty (only moves forward; the VIPs of
+    /// revoked/disabled rows never enter the pool, §2.1); past [`VIP_LAST`]
+    /// means exhausted).
     fn alloc_vip(&mut self) -> Result<[u8; 4], StateError> {
         if let Some(pool_vip) = self.vip_pool.iter().next().copied() {
             self.vip_pool.remove(&pool_vip);
@@ -760,7 +812,8 @@ impl NetStateData {
 }
 
 // ============================================================================
-// 单元测试：纯状态机语义（VIP 纪律/邀请一次性/epoch 推进/admin 验签）
+// Unit tests: pure state machine semantics (VIP discipline / invite
+// single-use / epoch advancement / admin verification)
 // ============================================================================
 
 #[cfg(test)]
@@ -804,7 +857,10 @@ mod tests {
         let SyncResponse::Device(a) = a else { panic!() };
         let id: [u8; 32] = Sha256::digest([1u8; 32]).into();
         let e1 = d.apply(&SyncRequest::Revoke { device: id }, None).resp;
-        assert!(matches!(e1, SyncResponse::Epoch(1)), "吊销推进 epoch");
+        assert!(
+            matches!(e1, SyncResponse::Epoch(1)),
+            "revocation advances the epoch"
+        );
         let b = d
             .apply(
                 &SyncRequest::RegisterDevice {
@@ -819,9 +875,9 @@ mod tests {
             .resp;
         let SyncResponse::Device(b) = b else { panic!() };
         let (ia, ib) = (u32::from_be_bytes(a.vip), u32::from_be_bytes(b.vip));
-        assert_eq!(ia, VIP_FIRST, "首 VIP = 100.64.0.2");
-        assert!(ib > ia, "IP 不复用（水位线只进不退）");
-        // 同设备重注册拒（行保留）。
+        assert_eq!(ia, VIP_FIRST, "first VIP = 100.64.0.2");
+        assert!(ib > ia, "IP not reused (watermark only moves forward)");
+        // Re-registering the same device rejected (row retained).
         assert!(matches!(
             d.apply(
                 &SyncRequest::RegisterDevice {
@@ -836,25 +892,26 @@ mod tests {
             .resp,
             SyncResponse::Error(StateError::DeviceExists)
         ));
-        // 禁用不删除：行保留、VIP 不回收。
+        // Disable does not delete: row retained, VIP not reclaimed.
         let id2: [u8; 32] = Sha256::digest([2u8; 32]).into();
         assert!(matches!(
             d.apply(&SyncRequest::Disable { device: id2 }, None).resp,
             SyncResponse::Epoch(2)
         ));
-        assert_eq!(d.devices.get(&id2).unwrap().vip, b.vip, "VIP 不回收");
+        assert_eq!(d.devices.get(&id2).unwrap().vip, b.vip, "VIP not reclaimed");
         assert!(matches!(d.lookup(&id2), VerdictW::Revoked { .. }));
-        // Revoked 终态不可逆。
+        // Revoked is an irreversible terminal state.
         assert!(matches!(
             d.apply(&SyncRequest::Enable { device: id }, None).resp,
             SyncResponse::Error(StateError::RevokedIsTerminal)
         ));
-        // hostname 空串落 "(unknown)"（M7 默认值链路）。
+        // Empty hostname lands as "(unknown)" (the M7 default-value chain).
         assert_eq!(a.hostname, crate::proto::HOSTNAME_UNKNOWN);
     }
 
-    /// M7：Expired 释放 VIP 回池 + 新设备拿到该 VIP + Expired ≠ Revoked 可区分 +
-    /// 幂等重放放行 + 终态不可逆 + 索引单射维持。
+    /// M7: Expire releases the VIP back to the pool + a new device gets that
+    /// VIP + Expired ≠ Revoked distinguishable + idempotent replay allowed +
+    /// terminal irreversibility + index injectivity maintained.
     #[test]
     fn expire_releases_vip_to_pool_and_reassigns() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
@@ -873,7 +930,8 @@ mod tests {
         let _b = d.apply(&reg(2, "laptop-b"), None).resp;
         let id_a: [u8; 32] = Sha256::digest([1u8; 32]).into();
 
-        // Expire（注入时钟）：epoch 推进 + expired_at 落库 + VIP 归还池。
+        // Expire (clock injected): epoch advanced + expired_at landed + VIP
+        // returned to the pool.
         let e = d
             .apply(
                 &SyncRequest::Expire {
@@ -885,20 +943,28 @@ mod tests {
             .resp;
         assert!(
             matches!(e, SyncResponse::Epoch(1)),
-            "expire 推进 epoch: {e:?}"
+            "expire advances the epoch: {e:?}"
         );
         let row = d.devices.get(&id_a).unwrap();
         assert_eq!(row.status, DeviceStatus::Expired, "Expired ≠ Revoked");
         assert_eq!(row.expired_at, Some(1_700_000_000));
-        assert_eq!(row.vip, a_row.vip, "行保留（审计）：VIP 字段不动");
-        assert!(d.vip_pool.contains(&a_row.vip), "VIP 归还池");
-        assert_eq!(d.device_by_vip(&a_row.vip), None, "索引删旧条目");
+        assert_eq!(
+            row.vip, a_row.vip,
+            "row retained (audit): the VIP field is untouched"
+        );
+        assert!(d.vip_pool.contains(&a_row.vip), "VIP returned to the pool");
+        assert_eq!(
+            d.device_by_vip(&a_row.vip),
+            None,
+            "index drops the old entry"
+        );
         assert!(
             !d.vip_pool.contains(&d.devices[&dev_id(&[2u8; 32])].vip),
-            "未过期设备的 VIP 不进池"
+            "the VIP of a non-expired device does not enter the pool"
         );
 
-        // 幂等重放：已 Expired ⇒ 放行且不动 epoch。
+        // Idempotent replay: already Expired ⇒ allowed and the epoch is
+        // untouched.
         let e2 = d
             .apply(
                 &SyncRequest::Expire {
@@ -913,23 +979,31 @@ mod tests {
         assert_eq!(
             d.devices.get(&id_a).unwrap().expired_at,
             Some(1_700_000_000),
-            "重放不刷新 expired_at"
+            "replay does not refresh expired_at"
         );
 
-        // 新设备拿到被释放的 VIP（池优先于水位线）。
+        // A new device gets the released VIP (the pool beats the watermark).
         let c = d.apply(&reg(3, "laptop-c"), None).resp;
         let SyncResponse::Device(c_row) = c else {
             panic!()
         };
-        assert_eq!(c_row.vip, a_row.vip, "池内 VIP 重派给新设备");
+        assert_eq!(
+            c_row.vip, a_row.vip,
+            "the pooled VIP is re-assigned to the new device"
+        );
 
-        // 索引单射：同 VIP 现在只指向新设备；重建后一致（Expired 行不进索引）。
+        // Index injectivity: the same VIP now points only to the new device;
+        // identical after a rebuild (Expired rows do not enter the index).
         assert_eq!(d.device_by_vip(&a_row.vip), Some(dev_id(&[3u8; 32])));
         let incremental = d.vip_index.clone();
         d.reindex_vips();
-        assert_eq!(d.vip_index, incremental, "重建 == 增量（Expired 排除）");
+        assert_eq!(
+            d.vip_index, incremental,
+            "rebuild == incremental (Expired excluded)"
+        );
 
-        // 终态不可逆：Enable/Disable/再 Expire 换时刻均拒或幂等。
+        // Terminal irreversibility: Enable/Disable/re-Expire with a different
+        // moment are all rejected or idempotent.
         assert!(matches!(
             d.apply(&SyncRequest::Enable { device: id_a }, None).resp,
             SyncResponse::Error(StateError::ExpiredIsTerminal)
@@ -938,7 +1012,7 @@ mod tests {
             d.apply(&SyncRequest::Disable { device: id_a }, None).resp,
             SyncResponse::Error(StateError::ExpiredIsTerminal)
         ));
-        // hostname 更新拒（终态行）。
+        // Hostname update rejected (terminal row).
         assert!(matches!(
             d.apply(
                 &SyncRequest::SetHostname {
@@ -950,10 +1024,11 @@ mod tests {
             .resp,
             SyncResponse::Error(StateError::ExpiredIsTerminal)
         ));
-        // lookup：Expired 阻断握手（Revoked 判定外形）。
+        // lookup: Expired blocks handshakes (the Revoked verdict shape).
         assert!(matches!(d.lookup(&id_a), VerdictW::Revoked { .. }));
 
-        // Revoked 不因时间转化为可重派：吊销后再 Expire ⇒ 拒。
+        // Revoked does not convert into re-assignability with time: Expire
+        // after Revoke ⇒ rejected.
         let id_c: [u8; 32] = Sha256::digest([3u8; 32]).into();
         d.apply(&SyncRequest::Revoke { device: id_c }, None);
         assert!(matches!(
@@ -969,11 +1044,12 @@ mod tests {
         ));
         assert!(
             !d.vip_pool.contains(&c_row.vip),
-            "吊销 VIP 不进池（永不复用）"
+            "a revoked VIP does not enter the pool (never reused)"
         );
     }
 
-    /// M7：hostname 规范化（空 ⇒ "(unknown)"；trim；超长截断）+ SetHostname 更新。
+    /// M7: hostname normalization (empty ⇒ "(unknown)"; trim; overlong
+    /// truncated) + SetHostname update.
     #[test]
     fn hostname_normalize_and_set_update() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[10; 32]);
@@ -996,7 +1072,7 @@ mod tests {
         assert_eq!(row.hostname, "my-laptop", "trim");
         let id: [u8; 32] = Sha256::digest([1u8; 32]).into();
 
-        // 超长截断（char 边界安全）。
+        // Overlong truncated (char-boundary safe).
         let long = "x".repeat(100);
         let out = d
             .apply(
@@ -1012,7 +1088,7 @@ mod tests {
         };
         assert_eq!(row.hostname.len(), crate::proto::HOSTNAME_MAX);
 
-        // re-register 更新（SetHostname）。
+        // Re-register update (SetHostname).
         let out = d
             .apply(
                 &SyncRequest::SetHostname {
@@ -1025,7 +1101,7 @@ mod tests {
         assert!(matches!(out, SyncResponse::Device(_)));
         assert_eq!(d.devices.get(&id).unwrap().hostname, "renamed");
 
-        // 未知设备拒。
+        // Unknown device rejected.
         assert!(matches!(
             d.apply(
                 &SyncRequest::SetHostname {
@@ -1043,7 +1119,7 @@ mod tests {
     fn redeem_single_consumption_and_epoch_rules() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
         let mut d = bootstrapped(&root);
-        // 邀请 fixture（根签 v3）。
+        // Invite fixture (root-signed v3).
         let entry = flock_protocol::session::ServerEntry {
             server_id: flock_protocol::session::ServerId([1; 16]),
             relay_endpoint: "127.0.0.1:9443".into(),
@@ -1068,7 +1144,7 @@ mod tests {
             },
             None,
         );
-        // 首次兑换成功。
+        // First redemption succeeds.
         let r = d
             .apply(
                 &SyncRequest::RedeemInvite {
@@ -1083,7 +1159,7 @@ mod tests {
             )
             .resp;
         assert!(matches!(r, SyncResponse::Redeem { .. }), "{r:?}");
-        // 二次兑换拒（单次消费查重）。
+        // Second redemption rejected (single-use consumption dedup).
         let r2 = d
             .apply(
                 &SyncRequest::RedeemInvite {
@@ -1105,13 +1181,14 @@ mod tests {
         let root = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
         let other = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
         let mut d = bootstrapped(&root);
-        // 他签（无根密钥）⇒ 拒。
+        // Signed by someone else (no root key) ⇒ rejected.
         let forged = SyncRequest::rewrap_signed(&other, 2, vec![1; 16]);
         assert_eq!(
             d.apply(&forged, Some(&root.verifying_key())).resp,
             SyncResponse::Error(StateError::BadRootSignature)
         );
-        // server_keys 先落库（根签），再 rewrap（根签）⇒ 生效。
+        // server_keys lands first (root-signed), then rewrap (root-signed) ⇒
+        // effective.
         let entries = vec![ServerKeyEntry {
             server_id: 2,
             identity_pub: *other.verifying_key().as_bytes(),
@@ -1131,28 +1208,28 @@ mod tests {
                 bytes: 3
             })
         );
-        assert_eq!(d.wraps.get(&2).map(|v| v.len()), Some(3), "rewrap 落库");
-        // rewrap 到未登记 server ⇒ 拒。
+        assert_eq!(d.wraps.get(&2).map(|v| v.len()), Some(3), "rewrap landed");
+        // rewrap to an unregistered server ⇒ rejected.
         let rw2 = SyncRequest::rewrap_signed(&root, 9, vec![1]);
         assert!(matches!(
             d.apply(&rw2, Some(&root.verifying_key())).resp,
             SyncResponse::Error(StateError::NotFound(_))
         ));
-        // add_voter（根签）⇒ voters + config_version。
+        // add_voter (root-signed) ⇒ voters + config_version.
         let av = SyncRequest::add_voter_signed(&root, 5);
         assert_eq!(
             d.apply(&av, Some(&root.verifying_key())).resp,
             SyncResponse::Admin(AdminAck::AddVoter { node_id: 5 })
         );
         assert!(d.voters.contains(&5));
-        assert_eq!(d.config_version, 2, "server_keys/add_voter 各 +1");
+        assert_eq!(d.config_version, 2, "server_keys/add_voter each +1");
     }
 
     #[test]
     fn bootstrap_once_and_root_pin() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
         let mut d = NetStateData::new();
-        // 未钉扎根时自证签名即可成立。
+        // With no pinned root, the self-attestation signature alone suffices.
         assert!(matches!(
             d.apply(
                 &SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32]),
@@ -1161,7 +1238,7 @@ mod tests {
             .resp,
             SyncResponse::Ok
         ));
-        // 幂等重放放行。
+        // Idempotent replay allowed.
         assert!(matches!(
             d.apply(
                 &SyncRequest::bootstrap_signed(&root, [7; 16], [9; 32]),
@@ -1170,7 +1247,7 @@ mod tests {
             .resp,
             SyncResponse::Ok
         ));
-        // 不同身份再 bootstrap ⇒ 拒。
+        // Bootstrapping a different identity ⇒ rejected.
         assert!(matches!(
             d.apply(
                 &SyncRequest::bootstrap_signed(&root, [7; 16], [8; 32]),
@@ -1179,7 +1256,8 @@ mod tests {
             .resp,
             SyncResponse::Error(StateError::AlreadyBootstrapped)
         ));
-        // 钉扎根不符 ⇒ 拒（防他签根）。
+        // Pinned root mismatch ⇒ rejected (guards against someone else's
+        // signed root).
         let mut e = NetStateData::new();
         let pinned = root.verifying_key();
         let other = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
@@ -1212,31 +1290,43 @@ mod tests {
         assert_eq!(back.devices.len(), 1);
         assert_eq!(back.epoch, d.epoch);
         assert_eq!(back.ticket_root, d.ticket_root);
-        // M7 新字段随快照往返。
+        // M7 new fields survive the snapshot round trip.
         let id: [u8; 32] = Sha256::digest([1u8; 32]).into();
         assert_eq!(back.devices.get(&id).unwrap().hostname, "host-rt");
         assert_eq!(back.devices.get(&id).unwrap().expired_at, None);
-        // VIP 索引不序列化（派生数据）——重建后与原状态一致。
-        assert!(back.vip_index.is_empty(), "索引不进快照字节");
+        // The VIP index is not serialized (derived data) — after rebuilding it
+        // matches the original state.
+        assert!(
+            back.vip_index.is_empty(),
+            "the index is not in the snapshot bytes"
+        );
         back.reindex_vips();
-        assert_eq!(back.vip_index, d.vip_index, "重建后索引一致");
+        assert_eq!(back.vip_index, d.vip_index, "index identical after rebuild");
     }
 
-    /// M7 快照兼容性声明（如实断言）：DeviceRow 加字段（hostname/expired_at/
-    /// registered_at）后，**旧格式快照不可解码**——postcard 无字段标签，from_bytes
-    /// 对旧字节干净失败（返回 None，节点从日志/重建路径恢复）。未发布窗口允许
-    /// （§7-M7.1）；本测试固化「失败必须干净」（不得 panic/半解码）：旧行编码字节
-    /// 与任意截断字节均 None。
+    /// M7 snapshot compatibility statement (asserted honestly): after
+    /// DeviceRow gains fields (hostname/expired_at/registered_at), **old-format
+    /// snapshots no longer decode** — postcard has no field tags, from_bytes
+    /// fails cleanly on old bytes (returns None; the node recovers via the
+    /// log/rebuild path). Allowed within the unreleased window (§7-M7.1);
+    /// this test pins down "the failure must be clean" (no panic / no partial
+    /// decode): old-row encoded bytes and arbitrary truncated bytes both give
+    /// None.
     ///
-    /// 「旧行字节」是**镜像近似**：`LegacyRow` 为手工维护的 pre-M7 形状 postcard
-    /// 镜像——非旧代码产物的真实采样（旧格式无法由当前代码再生成），其价值不在
-    /// 逐字节复刻，而在构造「合法 postcard 但字段布局错位」的字节流验证解码器的
-    /// 失败干净性。后续再加字段时同步更新该镜像即可（当前镜像 = pre-M7 形状；
-    /// M7 后的「旧」= 无 registered_at 的三字段前形状，同理适用）。
+    /// The "old row bytes" are a **mirror approximation**: `LegacyRow` is a
+    /// hand-maintained postcard mirror of the pre-M7 shape — not a genuine
+    /// sample of old-code output (the old format cannot be regenerated by the
+    /// current code); its value is not byte-for-byte replication but
+    /// constructing a "valid postcard with a misaligned field layout" byte
+    /// stream to verify the decoder fails cleanly. When adding fields later,
+    /// update the mirror accordingly (the current mirror = the pre-M7 shape;
+    /// the post-M7 "old" = the earlier three-field shape without
+    /// registered_at, same reasoning applies).
     #[test]
     fn legacy_snapshot_bytes_fail_clean() {
-        // 旧 DeviceRow 形状（无 hostname/expired_at/registered_at）——postcard 编码
-        // 镜像（来源见上：镜像近似，非真实采样）。
+        // The old DeviceRow shape (no hostname/expired_at/registered_at) — a
+        // postcard encoding mirror (source above: mirror approximation, not a
+        // real sample).
         #[derive(serde::Serialize)]
         struct LegacyRow {
             owner: String,
@@ -1255,24 +1345,29 @@ mod tests {
             since_epoch: 0,
         })
         .expect("legacy encode");
-        // 旧行字节对新解码器是错位流（hostname 读不到合法 varint/长度）⇒ None。
+        // To the new decoder the old row bytes are a misaligned stream
+        // (hostname cannot read a valid varint/length) ⇒ None.
         assert!(
             NetStateData::from_bytes(&legacy_row).is_none(),
-            "旧格式字节必须干净失败（None）"
+            "old-format bytes must fail cleanly (None)"
         );
-        // 截断的新格式字节同样 None（不 panic、不半解码）。
+        // Truncated new-format bytes likewise None (no panic, no partial
+        // decode).
         let fresh = NetStateData::new().to_bytes();
         assert!(NetStateData::from_bytes(&fresh[..fresh.len() - 1]).is_none());
         assert!(NetStateData::from_bytes(b"\x01\x00").is_none());
     }
 
-    /// VIP 反查索引一致性：apply 维护（注册/兑换/吊销后行保留不删除）+ 全量重建
-    /// 幂等 + 查询结果与全表扫描等价（M7：Expired 行不进索引——吊销行保留）。
+    /// VIP reverse-lookup index consistency: apply maintenance
+    /// (registration/redemption/revocation keeps rows without deletion) +
+    /// full rebuild idempotent + query results equivalent to a full-table scan
+    /// (M7: Expired rows do not enter the index — revoked rows are retained).
     #[test]
     fn vip_index_consistency_across_apply_and_rebuild() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
         let mut d = bootstrapped(&root);
-        // 注册 3 台 + 吊销 1 台（禁用不删除：行与 VIP 均保留 ⇒ 索引条目保留）。
+        // Register 3 devices + revoke 1 (disable does not delete: row and VIP
+        // both retained ⇒ the index entry is retained).
         for i in 1u8..=3 {
             let out = d
                 .apply(
@@ -1295,7 +1390,8 @@ mod tests {
             },
             None,
         );
-        // 一致性：索引 ↔ devices 全表扫描（对每个 VIP 查询结果等价；条目数相等）。
+        // Consistency: index ↔ devices full-table scan (equivalent query
+        // result for every VIP; equal entry counts).
         let expect: Vec<([u8; 4], [u8; 32])> = d
             .devices
             .iter()
@@ -1305,29 +1401,43 @@ mod tests {
         assert_eq!(
             d.vip_index.len(),
             expect.len(),
-            "吊销不删行 ⇒ 索引不缩（Expired 排除）"
+            "revocation keeps the row ⇒ the index does not shrink (Expired excluded)"
         );
         for (vip, dev) in &expect {
-            assert_eq!(d.device_by_vip(vip), Some(*dev), "索引查询 = 全表扫描");
+            assert_eq!(
+                d.device_by_vip(vip),
+                Some(*dev),
+                "index query = full-table scan"
+            );
         }
-        // 未分配 VIP ⇒ None。
+        // Unallocated VIP ⇒ None.
         assert_eq!(d.device_by_vip(&[127, 0, 0, 1]), None);
-        // 全量重建幂等且与增量维护结果一致。
+        // Full rebuild is idempotent and matches incremental maintenance.
         let incremental = d.vip_index.clone();
         d.reindex_vips();
-        assert_eq!(d.vip_index, incremental, "重建 == 增量维护");
-        // 序列化→反序列化→重建也一致（快照恢复路径）。
+        assert_eq!(
+            d.vip_index, incremental,
+            "rebuild == incremental maintenance"
+        );
+        // serialize→deserialize→rebuild also matches (the snapshot-restore
+        // path).
         let mut back = NetStateData::from_bytes(&d.to_bytes()).expect("roundtrip");
         back.reindex_vips();
-        assert_eq!(back.vip_index, incremental, "快照往返后重建一致");
+        assert_eq!(
+            back.vip_index, incremental,
+            "rebuild after snapshot round trip matches"
+        );
     }
 
     // ------------------------------------------------------------------
-    // M8（§7-M8.3）：UserRow 三新字段 + 五写变体语义
+    // M8 (§7-M8.3): UserRow's three new fields + the semantics of the five
+    // write variants
     // ------------------------------------------------------------------
 
-    /// UserRow 新字段 postcard 往返 + 旧格式（三字段形状）字节对新解码器干净失败
-    /// （§7-M7.1 同一纪律：镜像近似——非旧代码产物真实采样，验证失败干净性）。
+    /// UserRow new fields postcard round trip + old-format (three-field
+    /// shape) bytes fail cleanly on the new decoder (§7-M7.1 same discipline:
+    /// mirror approximation — not a genuine sample of old-code output,
+    /// verifying the failure is clean).
     #[test]
     fn user_row_new_fields_roundtrip_and_legacy_fails_clean() {
         let row = UserRow {
@@ -1340,7 +1450,8 @@ mod tests {
         };
         let bytes = postcard::to_allocvec(&row).unwrap();
         assert_eq!(postcard::from_bytes::<UserRow>(&bytes).unwrap(), row);
-        // Default 全零面（CreateUser 前的用户不存在；RegisterDevice 自动建户走此形状）。
+        // The all-zero Default face (the user does not exist before
+        // CreateUser; RegisterDevice's auto user-creation takes this shape).
         assert_eq!(
             UserRow::default(),
             UserRow {
@@ -1352,7 +1463,8 @@ mod tests {
                 pw_bootstrap: None,
             }
         );
-        // 旧格式（pre-M8 三字段）postcard 镜像：解码必须失败（不 panic、不半解码）。
+        // Old format (pre-M8 three fields) postcard mirror: decoding must fail
+        // (no panic, no partial decode).
         #[derive(serde::Serialize)]
         struct LegacyUserRow {
             opaque_record: Option<String>,
@@ -1367,15 +1479,20 @@ mod tests {
         .unwrap();
         assert!(
             postcard::from_bytes::<UserRow>(&legacy).is_err(),
-            "旧格式 UserRow 字节必须干净失败"
+            "old-format UserRow bytes must fail cleanly"
         );
-        // 含旧格式用户行的整快照同样干净失败（NetStateData::from_bytes → None）。
-        // 构造：手工把 legacy 字节嵌不进（map 键在结构内），改验「任意 UserRow 非
-        // 新形状字节流」路径——直接以 legacy 行字节作 NetStateData 快照字节 ⇒ None。
+        // A whole snapshot containing the old-format user row likewise fails
+        // cleanly (NetStateData::from_bytes → None). Construction: hand-
+        // embedding the legacy bytes is impossible (map keys live inside the
+        // structure), so instead verify the "any UserRow byte stream that is
+        // not the new shape" path — feeding the legacy row bytes directly as
+        // NetStateData snapshot bytes ⇒ None.
         assert!(NetStateData::from_bytes(&legacy).is_none());
     }
 
-    /// CreateUser：建户落令牌；重名 ⇒ UserExists（提交方按需幂等忽略——CLI 层职责）。
+    /// CreateUser: user creation lands the token; duplicate name ⇒ UserExists
+    /// (the submitter may ignore idempotently as needed — a CLI-layer
+    /// responsibility).
     #[test]
     fn m8_create_user_semantics() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
@@ -1389,10 +1506,20 @@ mod tests {
             SyncResponse::Ok
         ));
         let row = d.users.get("web-admin").unwrap();
-        assert_eq!(row.pw_bootstrap, Some([1; 16]), "令牌随建户落库");
-        assert!(!row.admin && !row.disabled, "新户默认非 admin、未禁用");
-        assert!(row.opaque_record.is_none(), "新户无口令记录");
-        // 重名拒。
+        assert_eq!(
+            row.pw_bootstrap,
+            Some([1; 16]),
+            "token landed with user creation"
+        );
+        assert!(
+            !row.admin && !row.disabled,
+            "a new user defaults to non-admin, not disabled"
+        );
+        assert!(
+            row.opaque_record.is_none(),
+            "a new user has no password record"
+        );
+        // Duplicate name rejected.
         assert!(matches!(
             d.apply(&create("web-admin", 2), None).resp,
             SyncResponse::Error(StateError::UserExists)
@@ -1400,13 +1527,16 @@ mod tests {
         assert_eq!(
             d.users.get("web-admin").unwrap().pw_bootstrap,
             Some([1; 16]),
-            "拒绝路径不动原行"
+            "the rejection path does not touch the original row"
         );
     }
 
-    /// SetPasswordBootstrap：原子消费（令牌匹配且记录为空 ⇒ 落记录 + 清令牌）；
-    /// 令牌错/重放 ⇒ BadBootstrapToken；记录已有 ⇒ PasswordExists；未知用户 ⇒ NoSuchUser；
-    /// 令牌判定先于记录判定（令牌错不泄漏「是否已有口令」）。
+    /// SetPasswordBootstrap: atomic consumption (token matches AND record
+    /// empty ⇒ land record + clear token); wrong token/replay ⇒
+    /// BadBootstrapToken; record already present ⇒ PasswordExists; unknown
+    /// user ⇒ NoSuchUser; the token determination precedes the record
+    /// determination (a wrong token does not leak "whether a password already
+    /// exists").
     #[test]
     fn m8_set_password_bootstrap_atomic_token_consumption() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[12; 32]);
@@ -1424,17 +1554,17 @@ mod tests {
             record_b64: rec.into(),
             profile: 0,
         };
-        // 未知用户 ⇒ NoSuchUser。
+        // Unknown user ⇒ NoSuchUser.
         assert!(matches!(
             d.apply(&commit("ghost", [0xA1; 16], "r"), None).resp,
             SyncResponse::Error(StateError::NoSuchUser)
         ));
-        // 令牌错 ⇒ BadBootstrapToken。
+        // Wrong token ⇒ BadBootstrapToken.
         assert!(matches!(
             d.apply(&commit("alice", [0xB2; 16], "r"), None).resp,
             SyncResponse::Error(StateError::BadBootstrapToken)
         ));
-        // 正确令牌 ⇒ 落记录 + 清令牌。
+        // Correct token ⇒ land record + clear token.
         assert!(matches!(
             d.apply(&commit("alice", [0xA1; 16], "rec-alice"), None)
                 .resp,
@@ -1443,16 +1573,20 @@ mod tests {
         let row = d.users.get("alice").unwrap();
         assert_eq!(row.opaque_record.as_deref(), Some("rec-alice"));
         assert_eq!(row.opaque_profile, 0);
-        assert_eq!(row.pw_bootstrap, None, "令牌消费即清");
-        // 令牌重放（已消费 = None ≠ 任何令牌）⇒ BadBootstrapToken（同错——不泄漏
-        // 「已消费」与「错令牌」的区别）。
+        assert_eq!(row.pw_bootstrap, None, "token cleared upon consumption");
+        // Token replay (already consumed = None ≠ any token) ⇒
+        // BadBootstrapToken (same error — does not leak the difference
+        // between "already consumed" and "wrong token").
         assert!(matches!(
             d.apply(&commit("alice", [0xA1; 16], "rec-2"), None).resp,
             SyncResponse::Error(StateError::BadBootstrapToken)
         ));
-        // 记录已有且令牌仍有效（ResetPassword 后重设前绕过？——令牌已被清，此路径
-        // 需经 ResetPassword 重新置令牌；直接构造：重置口令后令牌有效 + 记录为空 ⇒
-        // 再次 commit 成功）。先验 PasswordExists 分支：手工置令牌且记录非空。
+        // Record present and the token still valid (bypassing after
+        // ResetPassword? — the token was already cleared; this path needs a
+        // fresh token from ResetPassword; direct construction: after a
+        // password reset the token is valid + the record empty ⇒ another
+        // commit succeeds). First exercise the PasswordExists branch: hand-set
+        // the token with the record non-empty.
         d.apply(
             &SyncRequest::ResetPassword {
                 user: "alice".into(),
@@ -1461,10 +1595,16 @@ mod tests {
             None,
         );
         let row = d.users.get("alice").unwrap();
-        assert!(row.opaque_record.is_none(), "重置即清记录（旧口令失效）");
+        assert!(
+            row.opaque_record.is_none(),
+            "reset clears the record (old password invalidated)"
+        );
         assert_eq!(row.pw_bootstrap, Some([0xC3; 16]));
-        // 手工模拟「令牌有效但记录已有」：先 commit 成功，再手工置回令牌（只有状态
-        // 机内可构造——外层路径 ResetPassword 总是清记录；此断言固化状态机级判定序）。
+        // Hand-simulate "token valid but record already present": first commit
+        // successfully, then hand-set the token back (constructible only
+        // inside the state machine — the outer ResetPassword path always
+        // clears the record; this assertion pins the state-machine-level
+        // determination order).
         assert!(matches!(
             d.apply(&commit("alice", [0xC3; 16], "rec-3"), None).resp,
             SyncResponse::Ok
@@ -1476,8 +1616,10 @@ mod tests {
         ));
     }
 
-    /// ResetPassword：清记录 + 置新令牌（旧口令即刻失效——record=None ⇒ 登录侧走
-    /// dummy）；未知用户 ⇒ NoSuchUser；幂等重放（同令牌）放行不报错。
+    /// ResetPassword: clear record + set a new token (the old password becomes
+    /// invalid immediately — record=None ⇒ the login side takes the dummy
+    /// path); unknown user ⇒ NoSuchUser; idempotent replay (same token)
+    /// allowed without error.
     #[test]
     fn m8_reset_password_invalidates_old_record() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
@@ -1498,7 +1640,7 @@ mod tests {
             },
             None,
         );
-        // 未知用户。
+        // Unknown user.
         assert!(matches!(
             d.apply(
                 &SyncRequest::ResetPassword {
@@ -1510,7 +1652,8 @@ mod tests {
             .resp,
             SyncResponse::Error(StateError::NoSuchUser)
         ));
-        // 重置：旧记录即刻失效（登录侧 record=None → dummy——枚举面同形）。
+        // Reset: the old record is invalidated immediately (login side
+        // record=None → dummy — same shape for enumeration).
         assert!(matches!(
             d.apply(
                 &SyncRequest::ResetPassword {
@@ -1523,10 +1666,10 @@ mod tests {
             SyncResponse::Ok
         ));
         let row = d.users.get("bob").unwrap();
-        assert_eq!(row.opaque_record, None, "旧口令记录失效");
+        assert_eq!(row.opaque_record, None, "old password record invalidated");
         assert_eq!(row.opaque_profile, 0);
-        assert_eq!(row.pw_bootstrap, Some([2; 16]), "新令牌就位");
-        // 新令牌可落新记录。
+        assert_eq!(row.pw_bootstrap, Some([2; 16]), "new token in place");
+        // The new token can land a new record.
         assert!(matches!(
             d.apply(
                 &SyncRequest::SetPasswordBootstrap {
@@ -1546,8 +1689,10 @@ mod tests {
         );
     }
 
-    /// SetUserAdmin/SetUserDisabled：置位/复位 + 未知用户拒；禁用不追溯清口令
-    /// （`disabled` 与记录是两个正交维度——enable 后原口令继续可用）。
+    /// SetUserAdmin/SetUserDisabled: set/unset + unknown user rejected;
+    /// disabling does not retroactively clear the password (`disabled` and
+    /// the record are two orthogonal dimensions — after enable, the original
+    /// password keeps working).
     #[test]
     fn m8_set_user_admin_disabled_semantics() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[14; 32]);
@@ -1592,8 +1737,9 @@ mod tests {
             SyncResponse::Ok
         ));
         assert!(!d.users.get("carol").unwrap().admin);
-        // 禁用/启用往返：口令记录保留（enable 后原口令继续可用——设计语义：disabled
-        // 只阻断登录，不是凭据吊销）。
+        // Disable/enable round trip: the password record is retained (after
+        // enable, the original password keeps working — design semantics:
+        // disabled only blocks login, it is not a credential revocation).
         assert!(matches!(
             d.apply(
                 &SyncRequest::SetUserDisabled {
@@ -1610,7 +1756,7 @@ mod tests {
         assert_eq!(
             row.opaque_record.as_deref(),
             Some("rec"),
-            "禁用不清口令记录"
+            "disabling does not clear the password record"
         );
         assert!(matches!(
             d.apply(
@@ -1624,7 +1770,7 @@ mod tests {
             SyncResponse::Ok
         ));
         assert!(!d.users.get("carol").unwrap().disabled);
-        // 未知用户两写同拒。
+        // Both writes reject an unknown user.
         for req in [
             SyncRequest::SetUserAdmin {
                 user: "ghost".into(),
@@ -1640,10 +1786,10 @@ mod tests {
                     d.apply(&req, None).resp,
                     SyncResponse::Error(StateError::NoSuchUser)
                 ),
-                "{req:?} 未知用户 ⇒ NoSuchUser"
+                "{req:?} unknown user ⇒ NoSuchUser"
             );
         }
-        // 幂等：同值重放放行（Raft 重放路径）。
+        // Idempotent: same-value replay allowed (the Raft replay path).
         assert!(matches!(
             d.apply(
                 &SyncRequest::SetUserAdmin {
@@ -1657,8 +1803,10 @@ mod tests {
         ));
     }
 
-    /// 快照往返：新 UserRow 三字段随 NetStateData 快照序列化/反序列化保留
-    /// （M8 加字段后的快照兼容性正向锚——与 legacy 失败测试成对）。
+    /// Snapshot round trip: UserRow's new three-field set survives
+    /// NetStateData snapshot serialization/deserialization (the positive
+    /// anchor for snapshot compatibility after the M8 field additions —
+    /// paired with the legacy failure test).
     #[test]
     fn m8_user_fields_survive_snapshot_roundtrip() {
         let root = ed25519_dalek::SigningKey::from_bytes(&[15; 32]);

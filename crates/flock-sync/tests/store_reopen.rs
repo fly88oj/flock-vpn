@@ -1,13 +1,18 @@
-//! 回归：redb 日志存储跨进程重开（M5 A7 的 stop/start 路径）。
+//! Regression: redb log store reopened across processes (the M5 A7
+//! stop/start path).
 //!
-//! 曾经的缺陷（容器实测暴露）：`save_vote` 序列化裸 `Vote`，而 `read_vote` 的
-//! `postcard::from_bytes` 按返回位置推断成 `Option<Vote>`——首字节被当作 Option
-//! 判别式 ⇒「Found an Option discriminant that wasn't 0 or 1」。首次建库时 vote
-//! 键不存在（不触发解码）所以起服正常；**选举写入 vote 后的任意一次重启必炸**。
-//! M4 内存/单进程测试从未重启节点，故未暴露。
+//! The former defect (exposed by container runs): `save_vote` serialized a
+//! bare `Vote`, while `read_vote`'s `postcard::from_bytes` inferred an
+//! `Option<Vote>` from the return position — the first byte was consumed as
+//! an Option discriminant ⇒ "Found an Option discriminant that wasn't 0 or
+//! 1". On first database creation the vote key does not exist (decoding not
+//! triggered), so startup was fine; **any restart after an election wrote a
+//! vote blew up**. The M4 in-memory/single-process tests never restarted a
+//! node, so it went unseen.
 //!
-//! 本测试钉住重开语义：写（vote + Blank/Normal 各类日志条目）→ 关库 → 重开 →
-//! `read_vote`/`get_log_state` 原样恢复 + `save_vote` 真入口闭环。
+//! This test pins the reopen semantics: write (vote + Blank/Normal log
+//! entries of each kind) → close → reopen → `read_vote`/`get_log_state`
+//! restored verbatim + a `save_vote` real-entry round trip.
 
 use std::sync::Arc;
 
@@ -27,16 +32,18 @@ async fn store_reopen_recovers_vote_and_log() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.redb");
 
-    // Vote 的裸字节形态（[term, node, committed]——无 Option 外壳）。
+    // The bare byte shape of a Vote ([term, node, committed] — no Option
+    // shell).
     let vote = openraft::Vote::<u64>::new(3, 2);
     let vote_bytes = postcard::to_allocvec(&vote).unwrap();
     assert_eq!(
         vote_bytes,
         vec![3, 2, 0],
-        "裸 Vote 编码（无 Option 判别字节）"
+        "bare Vote encoding (no Option discriminant byte)"
     );
 
-    // —— 第一段：与 save_vote/append 相同的字节写入库 → 关库 ——
+    // —— Stage one: write bytes identical to save_vote/append into the
+    //    database → close ——
     {
         let db = Arc::new(redb::Database::create(&path).unwrap());
         RedbLogStore::init_tables(&db).unwrap();
@@ -64,22 +71,25 @@ async fn store_reopen_recovers_vote_and_log() {
             }
         }
         txn.commit().unwrap();
-        drop(db); // 干净关闭
+        drop(db); // clean close
     }
 
-    // —— 第二段：重开（新 Database 实例 = 模拟进程重启）——
+    // —— Stage two: reopen (a new Database instance = simulating a process
+    //    restart) ——
     {
         let db = Arc::new(redb::Database::create(&path).unwrap());
         let mut store = RedbLogStore::from_db(db.clone());
-        // 修复点：vote 存在 ⇒ 必须成功解码（旧代码在此抛 Option discriminant）。
-        let v = store.read_vote().await.unwrap().expect("vote 恢复");
+        // The fix point: the vote exists ⇒ decoding must succeed (the old
+        // code threw the Option discriminant here).
+        let v = store.read_vote().await.unwrap().expect("vote restored");
         assert_eq!(v, vote);
         let st = store.get_log_state().await.unwrap();
         assert_eq!(st.last_log_id, Some(lid(2)));
         assert_eq!(st.last_purged_log_id, None);
         drop(store);
 
-        // 再来一轮 store 真入口（save_vote）+ 重开闭环。
+        // Another round through the store's real entry point (save_vote) +
+        // reopen, closing the loop.
         let mut store2 = RedbLogStore::from_db(db);
         store2.save_vote(&openraft::Vote::new(4, 1)).await.unwrap();
         drop(store2);
@@ -88,21 +98,24 @@ async fn store_reopen_recovers_vote_and_log() {
         assert_eq!(
             store3.read_vote().await.unwrap(),
             Some(openraft::Vote::new(4, 1)),
-            "save_vote → 重启 → read_vote 闭环"
+            "save_vote → restart → read_vote closed loop"
         );
     }
 }
 
-/// 分批删除（truncate/purge 每批 ≤10000 key）：跨批边界的大区间删净 + purge 只在
-/// 末批落 `last_purged` 水位（get_log_state 可观测）。
+/// Batched deletion (truncate/purge, ≤10000 keys per batch): a large range
+/// spanning batch boundaries fully deleted + purge persists the
+/// `last_purged` watermark only in the final batch (observable via
+/// get_log_state).
 #[tokio::test]
 async fn store_purge_truncate_across_batch_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(redb::Database::create(dir.path().join("batch.redb")).unwrap());
     RedbLogStore::init_tables(&db).unwrap();
 
-    // 10005 条 Blank 日志（> 一批 10000 ⇒ 至少两批）；`LogFlushed` 回调是 openraft
-    // 内部类型（pub(crate) 构造），此处与上文同法直写 LOG 表。
+    // 10005 Blank entries (> one 10000-key batch ⇒ at least two batches); the
+    // `LogFlushed` callback is an openraft-internal type (pub(crate)
+    // constructor), so we write the LOG table directly, same as above.
     let n: u64 = 10_005;
     {
         let txn = db.begin_write().unwrap();
@@ -126,15 +139,21 @@ async fn store_purge_truncate_across_batch_boundary() {
         Some(lid(n))
     );
 
-    // purge 1..=10003（两整批 + 3 条）：全段删净后水位 = 10003（末批同事务落盘）。
+    // purge 1..=10003 (two full batches + 3 entries): after the whole range
+    // is deleted the watermark = 10003 (the final batch persists it in the
+    // same transaction).
     store.purge(lid(n - 2)).await.unwrap();
     let st = store.get_log_state().await.unwrap();
     assert_eq!(
         st.last_purged_log_id,
         Some(lid(n - 2)),
-        "分批删净后 last_purged 落末批事务"
+        "after batched deletion last_purged lands in the final batch's transaction"
     );
-    assert_eq!(st.last_log_id, Some(lid(n)), "剩余尾部日志完好");
+    assert_eq!(
+        st.last_log_id,
+        Some(lid(n)),
+        "the remaining tail log intact"
+    );
     let left: Vec<_> = store
         .try_get_log_entries((n - 2)..=n)
         .await
@@ -142,15 +161,24 @@ async fn store_purge_truncate_across_batch_boundary() {
         .into_iter()
         .map(|e| e.log_id.index)
         .collect();
-    assert_eq!(left, vec![n - 1, n], "区间内残余仅未 purge 部分");
+    assert_eq!(
+        left,
+        vec![n - 1, n],
+        "residue inside the range is only the un-purged part"
+    );
 
-    // truncate 尾部（同构复核：小段一批内删净）——自 10005 起截，剩 10004 一条。
+    // Truncate the tail (isomorphic recheck: a small range deleted within one
+    // batch) — cut from 10005, leaving a single entry 10004.
     store.truncate(lid(n)).await.unwrap();
     let st = store.get_log_state().await.unwrap();
-    assert_eq!(st.last_log_id, Some(lid(n - 1)), "truncate 后末条 = 10004");
+    assert_eq!(
+        st.last_log_id,
+        Some(lid(n - 1)),
+        "after truncate the last entry = 10004"
+    );
     assert_eq!(
         st.last_purged_log_id,
         Some(lid(n - 2)),
-        "truncate 不动 purge 水位"
+        "truncate does not move the purge watermark"
     );
 }

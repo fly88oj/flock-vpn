@@ -1,22 +1,36 @@
-//! 服务器-服务器 profile E2E 会话传输（§3.10 接缝 / §4-2 互连认证）+ RPC 分发 +
-//! apply-lag 熔断监控（§4 读与缓存）。
+//! Server-server profile E2E session transport (§3.10 seam / §4-2
+//! interconnect authentication) + RPC dispatch + apply-lag breaker monitoring
+//! (§4 reads and caching).
 //!
-//! **互连认证**：服务器互连（Raft/gossip）跑 flock-protocol 会话协议的服务器-服务器
-//! profile——双向入群凭证：
-//! - 发起侧 `session::initiate`：以本机身份/静态密钥为「设备」材料，对端 ServerPin 来自
-//!   根签 ClusterDirectory（I1 的 KEM 封给对端静态混合公钥；R1 身份签名按根签条目验证）；
-//! - 应答侧 `session::respond` + [`PeerDirectory`]：只认根签 ClusterDirectory 内的
-//!   服务器身份（设备目录三态查无 ⇒ 同一不透明 `DeviceRejected`）。
-//!   ⇒ **无有效入群凭证的对端在握手层即被拒**（拿不到快照也进不了 Raft，R19 红线）。
+//! **Interconnect authentication**: server interconnects (Raft/gossip) run
+//! the server-server profile of the flock-protocol session protocol — mutual
+//! enrollment credentials:
+//! - Initiating side `session::initiate`: uses this machine's
+//!   identity/static keys as the "device" material; the peer ServerPin comes
+//!   from the root-signed ClusterDirectory (I1's KEM is sealed to the peer's
+//!   static hybrid public key; R1's identity signature is verified against
+//!   the root-signed entry);
+//! - Answering side `session::respond` + [`PeerDirectory`]: only accepts
+//!   server identities inside the root-signed ClusterDirectory (a
+//!   three-way directory lookup miss ⇒ the same opaque `DeviceRejected`).
+//!   ⇒ **peers without valid enrollment credentials are rejected right at
+//!   the handshake layer** (they can neither fetch snapshots nor enter Raft,
+//!   the R19 red line).
 //!
-//! **RPC 帧协议**：一条互连会话（Tunnel）内每 RPC 开一条 yamux 流，帧 = `[u32 LE 长度]
-//! postcard(WireRpc)`，响应同构。长连会话由 [`Interconnect`] 缓存复用（断流重建）。
+//! **RPC frame protocol**: inside one interconnect session (Tunnel), each RPC
+//! opens one yamux stream; frame = `[u32 LE length] postcard(WireRpc)`, and
+//! the response is isomorphic. Long-lived sessions are cached and reused by
+//! [`Interconnect`] (rebuilt on stream break).
 //!
-//! **apply-lag 熔断**：分发器在收到 AppendEntries 时观察 `leader_commit`（openraft 携带
-//! leader 全局提交点），配合本机 SM 的 applied index，落后超过阈值（2s = A6 时序预算）
-//! 即 [`LagMonitor::breaker_open`]——本地缓存路径停用、降级线性一致读（§4/R24）。
-//! 完全分区（观察流消失）由「心跳静默」维度覆盖：距上一帧观察超过
-//! max(lag_threshold, election_timeout) 同样开熔断（`LagMonitor` 文档）。
+//! **apply-lag breaker**: the dispatcher observes `leader_commit` when
+//! receiving AppendEntries (openraft carries the leader's global commit
+//! point) and, combined with the local SM's applied index, opens
+//! [`LagMonitor::breaker_open`] once the lag exceeds the threshold (2s = the
+//! A6 timing budget) — the local cache path is disabled, degrading to
+//! linearizable reads (§4/R24). Full partition (observation stream gone) is
+//! covered by the "heartbeat silence" dimension: no frame observed for more
+//! than max(lag_threshold, election_timeout) likewise opens the breaker (see
+//! the `LagMonitor` docs).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -46,21 +60,23 @@ use crate::proto::{NodeId, ReadQuery, ReadView, SyncError, SyncRequest};
 use crate::raft_types::SyncConfig;
 use crate::sm::SmCore;
 
-/// 帧上限（快照分片缺省 512KiB + 余量）。
+/// Frame size cap (default snapshot chunk 512KiB + headroom).
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 
 // ============================================================================
-// 接缝：原始 IO 织物（内存 duplex / TCP——后者由服务器装配批次接）
+// Seam: raw IO fabric (in-memory duplex / TCP — the latter wired in by the
+// server assembly batch)
 // ============================================================================
 
-/// 双向异步流对象类型。
+/// Bidirectional async stream object type.
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Send {}
 impl<T: AsyncRead + AsyncWrite + Send> AsyncReadWrite for T {}
-/// 装箱的对端 IO。
+/// Boxed peer IO.
 pub type PeerIo = Box<dyn AsyncReadWrite + Unpin>;
 
-/// 原始传输织物接缝：`dial` 拨对端、`accept` 收入连（生产 = TCP 监听；测试 = 内存
-/// duplex 对，可叠加 RTT/故障注入）。
+/// Raw transport fabric seam: `dial` dials a peer, `accept` receives inbound
+/// connections (production = TCP listener; tests = in-memory duplex pairs,
+/// with RTT/failure injection layered on top).
 pub trait Fabric: Send + Sync + 'static {
     fn dial(
         &self,
@@ -69,7 +85,9 @@ pub trait Fabric: Send + Sync + 'static {
     fn accept(&self) -> BoxFuture<'static, io::Result<PeerIo>>;
 }
 
-/// NodeId(u64) ↔ ServerId([u8;16]) 映射（前 8B 大端承载，低位补零——目录内一一对应）。
+/// NodeId(u64) ↔ ServerId([u8;16]) mapping (carried in the first 8B
+/// big-endian, low bytes zero-padded — a one-to-one correspondence inside
+/// the directory).
 pub fn sid_of(node: NodeId) -> flock_protocol::session::ServerId {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&node.to_be_bytes());
@@ -77,26 +95,36 @@ pub fn sid_of(node: NodeId) -> flock_protocol::session::ServerId {
 }
 
 // ============================================================================
-// apply-lag 熔断监控（§4 读与缓存 / R24）
+// apply-lag breaker monitoring (§4 reads and caching / R24)
 // ============================================================================
 
-/// follower 侧 apply 滞后监控——两个维度，任一触发即熔断打开（停用本地缓存、降级
-/// 线性一致读）：
+/// Follower-side apply lag monitoring — two dimensions; either one triggering
+/// opens the breaker (disable the local cache, degrade to linearizable
+/// reads):
 ///
-/// 1. **apply-lag**：心跳/AppendEntries 携带的 leader commit index 与本地 applied index
-///    之差持续超过 `threshold`（A6 时序预算 2s）；
-/// 2. **心跳静默**：距上一帧 AppendEntries/心跳观察超过 `max(threshold,
-///    election_timeout)`。完全分区下 `leader_commit` 冻结且等于本地 applied——「未落后」
-///    是盲区（leader 可能已提交吊销而本机看不见），观察流本身消失才是可靠信号。
-///    从未观察过的节点（启动后未入网/被隔离的原 leader）自监控构造时刻起算。
+/// 1. **apply-lag**: the gap between the leader commit index carried by
+///    heartbeats/AppendEntries and the local applied index persistently
+///    exceeds `threshold` (A6 timing budget 2s);
+/// 2. **heartbeat silence**: no AppendEntries/heartbeat frame observed for
+///    more than `max(threshold, election_timeout)`. Under a full partition
+///    `leader_commit` freezes equal to the local applied — "not lagging" is a
+///    blind spot (the leader may have committed a revocation this machine
+///    cannot see); the observation stream itself disappearing is the reliable
+///    signal. For a node never observed (offline since joining / a isolated
+///    former leader), the clock starts at monitor construction.
 ///
-/// 静默的代价披露：稳定 leader 不收 AppendEntries，其自身熔断会因静默常开——语义安全
-/// （降级路径 = leader 本机 `ensure_linearizable`，结果与缓存一致），代价是 leader 侧
-/// 缓存不生效（R18 的风暴吸收由 follower 承担）。分区恢复首帧观察到 `leader_commit >
-/// applied` 时，pending 窗起点回溯到静默起点（恢复即已超窗，立即熔断，不重新计时）。
+/// Cost disclosure of the silence dimension: a stable leader receives no
+/// AppendEntries, so its own breaker stays open due to silence — semantically
+/// safe (the degraded path = the leader's local `ensure_linearizable`,
+/// results consistent with the cache), the cost being that the leader-side
+/// cache never engages (R18's storm absorption is carried by followers). When
+/// the first frame after partition recovery observes `leader_commit >
+/// applied`, the pending window's start point is backdated to the start of
+/// the silence (already past the window at recovery, breaker opens
+/// immediately, no fresh timing).
 pub struct LagMonitor {
     threshold: Duration,
-    /// 静默上限 = max(threshold, election_timeout)。
+    /// Silence limit = max(threshold, election_timeout).
     silence_limit: Duration,
     applied: Arc<AtomicU64>,
     st: Mutex<MonitorSt>,
@@ -105,14 +133,17 @@ pub struct LagMonitor {
 struct MonitorSt {
     leader_commit: u64,
     pending_since: Option<Instant>,
-    /// 最近一次收到 AppendEntries/心跳观察的时刻（构造时刻起算）。
+    /// The last time an AppendEntries/heartbeat observation was received
+    /// (counted from construction time).
     last_obs: Instant,
     open: bool,
 }
 
 impl LagMonitor {
-    /// `applied` = SM 维护的已 apply 最高 index（`SmCore`）；`election_timeout` =
-    /// 本机选举超时上限（静默判定第二维——小于它即选举窗口内，不构成失联证据）。
+    /// `applied` = the highest applied index maintained by the SM (`SmCore`);
+    /// `election_timeout` = this machine's election-timeout upper bound (the
+    /// second dimension of the silence determination — below it means still
+    /// inside the election window, not evidence of disconnection).
     pub fn new(
         threshold: Duration,
         election_timeout: Duration,
@@ -131,7 +162,8 @@ impl LagMonitor {
         })
     }
 
-    /// 分发器观察 leader commit index（AppendEntries 携带）。
+    /// The dispatcher observes the leader commit index (carried by
+    /// AppendEntries).
     pub fn observe_leader_commit(&self, idx: u64) {
         let mut st = self.st.lock().expect("lag monitor");
         let prev_obs = st.last_obs;
@@ -140,34 +172,38 @@ impl LagMonitor {
             st.leader_commit = idx;
         }
         let applied = self.applied.load(Ordering::SeqCst);
-        // 回溯：观察到落后时，pending 窗起点不晚于上一帧观察时刻（静默起点）——
-        // 分区期间攒下的落后在恢复首帧即视为已超窗。
+        // Backdating: when lag is observed, the pending window's start point
+        // is no later than the previous frame's observation time (the start
+        // of the silence) — lag accumulated during the partition is treated
+        // as already past the window on recovery's first frame.
         if st.leader_commit > applied {
             st.pending_since = Some(st.pending_since.unwrap_or(prev_obs).min(prev_obs));
         }
         self.recompute(&mut st);
     }
 
-    /// 熔断是否打开（惰性评估时间窗）。
+    /// Whether the breaker is open (lazily evaluates the time window).
     pub fn breaker_open(&self) -> bool {
         let mut st = self.st.lock().expect("lag monitor");
         self.recompute(&mut st);
         st.open
     }
 
-    /// 观察到的 leader commit index（诊断/断言）。
+    /// The observed leader commit index (diagnostics/assertions).
     pub fn leader_commit(&self) -> u64 {
         self.st.lock().expect("lag monitor").leader_commit
     }
 
     fn recompute(&self, st: &mut MonitorSt) {
-        // 维度二：心跳静默——完全分区（观察流消失）即开熔断。静默期不开 pending 窗
-        // （无从比较）；恢复首帧的回溯由 observe_leader_commit 完成。
+        // Dimension two: heartbeat silence — a full partition (observation
+        // stream gone) opens the breaker. No pending window opens during
+        // silence (nothing to compare); the backdating on recovery's first
+        // frame is done by observe_leader_commit.
         if st.last_obs.elapsed() > self.silence_limit {
             st.open = true;
             return;
         }
-        // 维度一：apply-lag。
+        // Dimension one: apply-lag.
         let applied = self.applied.load(Ordering::SeqCst);
         if st.leader_commit > applied {
             match st.pending_since {
@@ -189,10 +225,12 @@ impl LagMonitor {
 }
 
 // ============================================================================
-// 服务器-服务器 profile：目录与互连
+// Server-server profile: directory and interconnect
 // ============================================================================
 
-/// 应答侧目录：只认根签 ClusterDirectory 内的服务器身份（入群凭证认证的对向半边）。
+/// Answer-side directory: only accepts server identities inside the
+/// root-signed ClusterDirectory (the other half of enrollment-credential
+/// authentication).
 #[derive(Clone)]
 pub struct PeerDirectory {
     entries: Arc<std::sync::RwLock<BTreeMap<NodeId, ServerEntry>>>,
@@ -215,33 +253,41 @@ impl DeviceDirectory for PeerDirectory {
                 return Box::pin(async move { LookupVerdict::Active(rec) });
             }
         }
-        // 查无 ⇒ NotFound（respond 汇入同一不透明 DeviceRejected——无凭证即拒）。
+        // Not found ⇒ NotFound (respond funnels it into the same opaque
+        // DeviceRejected — no credentials, no entry).
         Box::pin(async move { LookupVerdict::NotFound })
     }
 }
 
-/// 互连管理器：缓存到各对端的 E2E 会话（`session::Tunnel` 直存——旧 `Pipe` 空包装
-/// 已删），按 RPC 开流；应答侧 `serve_loop` 收会话/收流。
+/// Interconnect manager: caches E2E sessions to each peer (`session::Tunnel`
+/// stored directly — the old empty `Pipe` wrapper was removed), opens a
+/// stream per RPC; the answer-side `serve_loop` receives sessions/streams.
 pub struct Interconnect {
     ident: Arc<ServerIdentity>,
-    /// 本机作为发起方的「设备」材料 = 身份 Ed25519 + 静态混合 X25519（与入群凭证同源）。
+    /// This machine's "device" material as initiator = identity Ed25519 +
+    /// static hybrid X25519 (same source as the enrollment credential).
     self_keys: DeviceStaticKeys,
     cluster_id: ClusterId,
     root_pub: VerifyingKey,
     nodes: Arc<std::sync::RwLock<BTreeMap<NodeId, ServerEntry>>>,
     fabric: Arc<dyn Fabric>,
     pipes: tokio::sync::Mutex<BTreeMap<NodeId, Arc<session::Tunnel>>>,
-    /// 每对端 RPC 门闩（同一互连会话至多一条在途 RPC——mux 驱动单待开流 +
-    /// yamux ACK 积压按流计，串行化后每条 RPC 完整走完生命周期，不互相拆台）。
+    /// Per-peer RPC gate (at most one in-flight RPC per interconnect session
+    /// — the mux drives a single pending stream-open and yamux ACK backlog
+    /// is per-stream; after serialization each RPC runs its full lifecycle
+    /// without tripping over the others).
     gates: std::sync::Mutex<BTreeMap<NodeId, Arc<tokio::sync::Mutex<()>>>>,
     session_cfg: session::TunnelConfig,
-    /// 会话建立/RPC 预算（缺省 5s）。
+    /// Session establishment/RPC budget (default 5s).
     pub rpc_timeout: Duration,
-    /// 应答侧握手拒绝计数（无凭证/坏握手——对发起端表现为不透明的连接终止）。
+    /// Answer-side handshake rejection count (no credentials / bad handshake
+    /// — appears to the initiator as an opaque connection termination).
     rejected_handshakes: AtomicU64,
-    /// 应答侧 accept 瞬时错误计数（退避后继续——入连服务不因单次故障退出）。
+    /// Answer-side transient accept error count (continue after backoff — the
+    /// inbound service must not exit on a single failure).
     accept_errors: AtomicU64,
-    /// 互连诊断计数（M5 排障面：拨号/RPC 成败）。
+    /// Interconnect diagnostics counters (M5 troubleshooting surface:
+    /// dial/RPC successes and failures).
     pub(crate) diag_dial_ok: AtomicU64,
     pub(crate) diag_dial_err: AtomicU64,
     pub(crate) diag_rpc_ok: AtomicU64,
@@ -249,8 +295,9 @@ pub struct Interconnect {
 }
 
 impl Interconnect {
-    /// 由根签目录与本机身份构造。`directory` 提供全部对端 ServerEntry（根验签由调用方
-    /// 在装配期完成——`ClusterDirectory::verify`）。
+    /// Construct from the root-signed directory and this machine's identity.
+    /// `directory` provides all peer ServerEntries (root verification is done
+    /// by the caller at assembly time — `ClusterDirectory::verify`).
     pub fn new(
         ident: Arc<ServerIdentity>,
         directory: &ClusterDirectory,
@@ -258,14 +305,16 @@ impl Interconnect {
     ) -> Arc<Self> {
         let mut nodes = BTreeMap::new();
         for e in &directory.servers {
-            // ServerId ↔ NodeId 映射（前 8B）。
+            // ServerId ↔ NodeId mapping (first 8B).
             let nid = u64::from_be_bytes(e.server_id.0[..8].try_into().expect("8B"));
             nodes.insert(nid, e.clone());
         }
         let nodes: Arc<std::sync::RwLock<BTreeMap<NodeId, ServerEntry>>> =
             Arc::new(std::sync::RwLock::new(nodes));
-        // 发起方「设备」材料 = 本机静态 X25519 + 身份 Ed25519（与入群凭证同源——
-        // 应答侧 PeerDirectory 按根签条目的同两把公钥比对）。
+        // Initiator "device" material = this machine's static X25519 +
+        // identity Ed25519 (same source as the enrollment credential — the
+        // answer-side PeerDirectory compares against the same two public
+        // keys from the root-signed entry).
         let key_bytes = {
             let mut b = [0u8; 64];
             b[..32].copy_from_slice(&ident.static_hybrid.x25519_secret().to_bytes());
@@ -292,12 +341,14 @@ impl Interconnect {
         })
     }
 
-    /// 集群根公钥（入群凭证验证锚；与 `ServerIdentity::root_pub` 一致）。
+    /// The cluster root public key (the enrollment-credential verification
+    /// anchor; identical to `ServerIdentity::root_pub`).
     pub fn root_pub(&self) -> &VerifyingKey {
         &self.root_pub
     }
 
-    /// 目录内全部节点号（gossip fan-out / location_query fan-out 用）。
+    /// All node ids in the directory (for gossip fan-out / location_query
+    /// fan-out).
     pub fn node_ids(&self) -> Vec<NodeId> {
         self.nodes
             .read()
@@ -307,17 +358,21 @@ impl Interconnect {
             .collect()
     }
 
-    /// 热更新互连目录映射（准入新服务器：根签新目录全网 install 后调用）。
+    /// Hot-update the interconnect directory mapping (admitting a new
+    /// server: called after the root-signed new directory is installed
+    /// network-wide).
     pub fn update_nodes(&self, entries: BTreeMap<NodeId, ServerEntry>) {
         *self.nodes.write().expect("ic nodes") = entries;
     }
 
-    /// 应答侧握手拒绝计数（无凭证/伪造凭证——admission 断言面）。
+    /// Answer-side handshake rejection count (no credentials / forged
+    /// credentials — the admission assertion surface).
     pub fn rejected_handshakes(&self) -> u64 {
         self.rejected_handshakes.load(Ordering::Relaxed)
     }
 
-    /// 应答侧 accept 瞬时错误计数（诊断面——入连服务韧性可观测）。
+    /// Answer-side transient accept error count (diagnostics surface — the
+    /// inbound service's resilience made observable).
     pub fn accept_errors(&self) -> u64 {
         self.accept_errors.load(Ordering::Relaxed)
     }
@@ -364,12 +419,17 @@ impl Interconnect {
         Ok(Arc::new(tunnel))
     }
 
-    /// 到对端开一条 RPC 流（缓存会话优先；失效重建一次）。
+    /// Open one RPC stream to a peer (cached sessions first; rebuilt once on
+    /// failure).
     ///
-    /// **锁纪律（M5 e2e 实测教训）**：全局 pipes 锁不得跨任何网络 await——对端宕机时
-    /// 其拨号（DNS NXDOMAIN 可达秒级）+ 握手会阻塞**所有**对端的 RPC（含 Raft 心跳），
-    /// 500ms 心跳/1.5s 选举超时下即触发选举抖动（A7 窗口实测）。此处在锁外完成
-    /// 开流/拨号/握手，回锁只做查插（竞态双连无害——后写者胜）。
+    /// **Lock discipline (a lesson from M5 e2e runs)**: the global pipes lock
+    /// must never be held across a network await — when a peer is down, its
+    /// dial (DNS NXDOMAIN can take seconds) + handshake would block the RPCs
+    /// of **all** peers (including Raft heartbeats), and with 500ms
+    /// heartbeats/1.5s election timeouts that triggers election flapping
+    /// (observed in the A7 window). Stream-open/dial/handshake all happen
+    /// outside the lock; back inside only for lookup+insert (a racing double
+    /// connect is harmless — last writer wins).
     async fn open_stream(&self, peer: NodeId) -> io::Result<MuxStream> {
         let cached = self.pipes.lock().await.get(&peer).cloned();
         if let Some(tunnel) = cached {
@@ -386,7 +446,7 @@ impl Interconnect {
         Ok(s)
     }
 
-    /// 每对端 RPC 门闩（无则建）。
+    /// The per-peer RPC gate (created if absent).
     fn gate_of(&self, peer: NodeId) -> Arc<tokio::sync::Mutex<()>> {
         let mut gates = self.gates.lock().expect("ic gates");
         gates
@@ -395,16 +455,21 @@ impl Interconnect {
             .clone()
     }
 
-    /// 逐出对端缓存会话（超时/IO 故障后由下一条 RPC 重建）。
+    /// Evict a peer's cached session (rebuilt by the next RPC after a
+    /// timeout/IO failure).
     async fn evict(&self, peer: NodeId) {
         self.pipes.lock().await.remove(&peer);
     }
 
-    /// 一次 RPC 往返（门闩内：开流 → 帧请求 → 帧响应；超时/IO 错误逐出会话重建）。
+    /// One RPC round trip (inside the gate: open stream → frame request →
+    /// frame response; on timeout/IO error evict the session for rebuild).
     ///
-    /// **门闩排队预算**：获取门闩同样受 `timeout` 约束（openraft 传 `hard_ttl`）——
-    /// 慢快照占住门闩期间，后续心跳/RPC 不得无限排队（排队时间计入总预算，超时按
-    /// [`WireCallError::TimedOut`] 返回，交给 openraft 走重试，而非排队到天荒地老）。
+    /// **Gate-queuing budget**: acquiring the gate is also bounded by
+    /// `timeout` (openraft passes `hard_ttl`) — while a slow snapshot holds
+    /// the gate, subsequent heartbeats/RPCs must not queue forever (queuing
+    /// time counts toward the total budget; on expiry return
+    /// [`WireCallError::TimedOut`] and let openraft retry, rather than
+    /// queueing until the end of time).
     pub async fn call(
         &self,
         peer: NodeId,
@@ -421,7 +486,8 @@ impl Interconnect {
                 return Err(WireCallError::TimedOut);
             }
         };
-        // 排队耗时从 RPC 预算中扣除（总往返不超调用方给的预算）。
+        // Queuing time is deducted from the RPC budget (the total round trip
+        // stays within the caller's budget).
         let rpc_budget = timeout.saturating_sub(t0.elapsed());
         let mut stream = match self.open_stream(peer).await {
             Ok(s) => s,
@@ -443,7 +509,8 @@ impl Interconnect {
                 Ok(resp)
             }
             Ok(Err(e)) => {
-                // 流级 IO 错误：会话可能半死——逐出，下一条 RPC 重握手。
+                // Stream-level IO error: the session may be half-dead —
+                // evict; the next RPC re-handshakes.
                 self.diag_rpc_err.fetch_add(1, Ordering::Relaxed);
                 eprintln!("interconnect: rpc to {peer} io-error: {e}");
                 self.evict(peer).await;
@@ -458,7 +525,7 @@ impl Interconnect {
         }
     }
 
-    /// 互连诊断计数（M5 排障面）。
+    /// Interconnect diagnostics counters (M5 troubleshooting surface).
     pub fn diag(&self) -> (u64, u64, u64, u64) {
         (
             self.diag_dial_ok.load(Ordering::Relaxed),
@@ -468,12 +535,16 @@ impl Interconnect {
         )
     }
 
-    /// 应答侧主循环：收入连 → 服务器-服务器 profile 应答（无凭证即拒）→ 逐流分发。
+    /// Answer-side main loop: inbound connection → server-server profile
+    /// answer (no credentials ⇒ rejected) → per-stream dispatch.
     ///
-    /// **韧性纪律**：accept 的瞬时错误（WouldBlock/ConnAborted/EMFILE 等——文件描述符
-    /// 耗尽、连接建立中途复位之类）只计数 + 指数退避后继续——单次入连故障不得永久
-    /// 杀死入连服务（旧实现任意 Err 即退出，Raft 复制/快照随之全断）。唯一退出条件 =
-    /// 织物显式关闭（[`is_fabric_closed`]）。
+    /// **Resilience discipline**: transient accept errors (WouldBlock/
+    /// ConnAborted/EMFILE etc. — fd exhaustion, mid-handshake resets and the
+    /// like) are only counted + retried after exponential backoff — a single
+    /// inbound failure must not permanently kill the inbound service (the
+    /// old implementation exited on any Err, taking Raft
+    /// replication/snapshot down with it). The only exit condition = the
+    /// fabric explicitly closing ([`is_fabric_closed`]).
     pub async fn serve_loop(self: Arc<Self>, target: RpcTarget) {
         let mut backoff = Duration::from_millis(10);
         loop {
@@ -481,7 +552,9 @@ impl Interconnect {
                 Ok(io) => io,
                 Err(e) => {
                     if is_fabric_closed(&e) {
-                        // 织物显式关闭（监听端拆除/内存织物通道消亡）——退出服务循环。
+                        // The fabric was explicitly closed (listener torn
+                        // down / in-memory fabric channel gone) — exit the
+                        // serve loop.
                         return;
                     }
                     self.accept_errors.fetch_add(1, Ordering::Relaxed);
@@ -499,8 +572,10 @@ impl Interconnect {
                 match session::respond(io, &this.ident, dir, this.session_cfg.clone()).await {
                     Ok(tunnel) => this.serve_tunnel(tunnel, target).await,
                     Err(_) => {
-                        // 无凭证/坏握手 ⇒ 会话拒（§4-2：握手层即拒——拿不到快照也进不了
-                        // Raft：分发器只存在于认证会话之内）。
+                        // No credentials / bad handshake ⇒ session rejected
+                        // (§4-2: rejected right at the handshake layer — no
+                        // snapshot, no Raft: the dispatcher only exists
+                        // inside authenticated sessions).
                         this.rejected_handshakes.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -513,7 +588,8 @@ impl Interconnect {
             match tunnel.accept_stream().await {
                 Some(stream) => {
                     let target = target.clone();
-                    // 每流一任务：IO 断裂/解码失败仅结束该流（会话保持）。
+                    // One task per stream: an IO break/decode failure ends
+                    // only that stream (the session persists).
                     tokio::spawn(async move {
                         let _ = handle_stream(stream, target).await;
                     });
@@ -524,16 +600,19 @@ impl Interconnect {
     }
 }
 
-/// accept 错误是否为「织物显式关闭」（`serve_loop` 的唯一合法退出条件）。
+/// Whether an accept error means "the fabric was explicitly closed" (the only
+/// legitimate exit condition of `serve_loop`).
 ///
-/// 约定：内存织物关闭通道 ⇒ `NotConnected`（testutil）；TCP 监听端无显式关闭路径
-/// （监听生命周期 = 织物 = 进程）——其余一切错误（WouldBlock/ConnAborted/EMFILE 等，
-/// 含未来的未知种类）一律按瞬时处理：退避后继续。
+/// Convention: the in-memory fabric closing its channel ⇒ `NotConnected`
+/// (testutil); the TCP listener has no explicit-close path (listener
+/// lifetime = fabric = process) — every other error (WouldBlock/ConnAborted/
+/// EMFILE etc., including unknown future kinds) is treated as transient:
+/// back off and continue.
 fn is_fabric_closed(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotConnected
 }
 
-/// 单流处理：一请求一响应。
+/// Single-stream handling: one request, one response.
 async fn handle_stream(mut stream: MuxStream, target: RpcTarget) -> io::Result<()> {
     let req = recv_frame(&mut stream).await?;
     let rpc: WireRpc =
@@ -547,12 +626,13 @@ async fn handle_stream(mut stream: MuxStream, target: RpcTarget) -> io::Result<(
 }
 
 // ============================================================================
-// 线格式
+// Wire format
 // ============================================================================
 
-/// 互连 RPC 请求（Raft 三类 + 客户端写/读转发 + gossip 租约）。
-/// 快照分片：`InstallSnapshotRequest.data` 即 `Vec<u8>`（openraft 0.9.25 非泛型快照
-/// 传输形态），直接 serde 承载。
+/// Interconnect RPC requests (the three Raft kinds + client write/read
+/// forwarding + gossip leases). Snapshot chunks:
+/// `InstallSnapshotRequest.data` is a plain `Vec<u8>` (openraft 0.9.25's
+/// non-generic snapshot transport shape), carried directly by serde.
 #[derive(Serialize, Deserialize)]
 pub enum WireRpc {
     Append(AppendEntriesRequest<SyncConfig>),
@@ -561,18 +641,23 @@ pub enum WireRpc {
     Write(SyncRequest),
     Read(ReadQuery),
     Gossip(GossipMsg),
-    /// 位置询问（location_query fan-out 的单跳：问「谁在托管该设备」）。
+    /// Location inquiry (a single hop of the location_query fan-out: ask
+    /// "who is hosting this device").
     Locate([u8; 32]),
-    /// 跨服转发（FRWD 流承载 ForwardEnvelope，§2.2-3）。
+    /// Cross-server forwarding (FRWD stream carrying a ForwardEnvelope,
+    /// §2.2-3).
     Forward(crate::forward::ForwardEnvelope),
-    /// dir_pull（客户端经控制流发起；此处为服务器侧 serve 实现，§3.10）。
+    /// dir_pull (initiated by the client over the control plane; here is the
+    /// server-side serve implementation, §3.10).
     DirPull {
         since: u64,
     },
 }
 
-/// 互连 RPC 响应（远端 Raft 致命错误统一折算 `Err(String)` → 调用方按 Unreachable 处理；
-/// ForwardToLeader 语义在 Write/Read 路径以 [`SyncError`] 结构化保留）。
+/// Interconnect RPC responses (remote Raft fatal errors are uniformly folded
+/// into `Err(String)` → the caller treats them as Unreachable; ForwardToLeader
+/// semantics are preserved structurally as [`SyncError`] on the Write/Read
+/// paths).
 #[derive(Serialize, Deserialize)]
 pub enum WireResp {
     Append(Result<AppendEntriesResponse<u64>, RaftError<u64>>),
@@ -581,18 +666,18 @@ pub enum WireResp {
     Write(Result<crate::proto::SyncResponse, SyncError>),
     Read(Result<ReadView, SyncError>),
     Gossip(bool),
-    /// 持有者节点号（本地租约域命中才答）。
+    /// The holder's node id (answered only on a local lease-domain hit).
     Locate(Option<NodeId>),
     Forward(crate::forward::ForwardOutcome),
     DirPull(crate::directory::DirPullResp),
 }
 
-/// 互连调用失败。
+/// Interconnect call failure.
 #[derive(Debug)]
 pub enum WireCallError {
     Io(io::Error),
     TimedOut,
-    /// 响应形态与请求不匹配（协议错）。
+    /// Response shape does not match the request (protocol error).
     Mismatch,
 }
 
@@ -615,7 +700,8 @@ impl From<WireCallError> for io::Error {
     }
 }
 
-/// 分发目标（Raft 句柄 + SM 核 + lag 监控 + 租约表 + 转发面 + 目录服务）。
+/// Dispatch target (Raft handle + SM core + lag monitor + lease table +
+/// forwarding plane + directory service).
 #[derive(Clone)]
 pub struct RpcTarget {
     pub raft: Raft<SyncConfig>,
@@ -626,11 +712,12 @@ pub struct RpcTarget {
     pub directory: Arc<crate::directory::Directory>,
 }
 
-/// 入站 RPC 分发（应答侧核心）。
+/// Inbound RPC dispatch (the answer-side core).
 pub async fn dispatch(target: &RpcTarget, rpc: WireRpc) -> WireResp {
     match rpc {
         WireRpc::Append(req) => {
-            // §4：心跳/AppendEntries 携带 leader commit index——follower 据此自监听 lag。
+            // §4: heartbeats/AppendEntries carry the leader commit index —
+            // followers self-monitor lag on it.
             target
                 .lag
                 .observe_leader_commit(req.leader_commit.map(|l| l.index).unwrap_or(0));
@@ -653,7 +740,8 @@ pub async fn dispatch(target: &RpcTarget, rpc: WireRpc) -> WireResp {
             WireResp::Write(r)
         }
         WireRpc::Read(q) => {
-            // leader 侧线性一致读：ensure_linearizable 后读本机已 apply 状态。
+            // Leader-side linearizable read: ensure_linearizable, then read
+            // this machine's applied state.
             match target.raft.ensure_linearizable().await {
                 Ok(_) => WireResp::Read(Ok(read_view(&target.sm, q))),
                 Err(e) => WireResp::Read(Err(sync_error_from_check(e))),
@@ -664,7 +752,9 @@ pub async fn dispatch(target: &RpcTarget, rpc: WireRpc) -> WireResp {
             WireResp::Gossip(true)
         }
         WireRpc::Locate(device) => {
-            // 「设备当前位置唯一真相源 = 租约域」：只按本地租约作答（TTL 内有效）。
+            // "The single source of truth for a device's current location =
+            // the lease domain": answer only from the local lease (valid
+            // within TTL).
             WireResp::Locate(target.lease.observe(&device).map(|l| l.holder))
         }
         WireRpc::Forward(env) => WireResp::Forward(target.forward.receive(env)),
@@ -672,7 +762,7 @@ pub async fn dispatch(target: &RpcTarget, rpc: WireRpc) -> WireResp {
     }
 }
 
-/// leader 侧线性一致读视图。
+/// Leader-side linearizable read view.
 pub fn read_view(sm: &SmCore, q: ReadQuery) -> ReadView {
     use crate::proto::{ReadQuery as Q, ReadView as V};
     sm.with_data(|d| match q {
@@ -719,10 +809,11 @@ fn sync_error_from_check(
 }
 
 // ============================================================================
-// 帧编解码
+// Frame encode/decode
 // ============================================================================
 
-/// 帧发送（`[u32 LE 长度][payload]`；mux::Stream 实现 futures IO）。
+/// Frame send (`[u32 LE length][payload]`; mux::Stream implements futures
+/// IO).
 async fn send_frame<W: futures::AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() > MAX_FRAME {
         return Err(io::Error::other("frame too large"));
@@ -734,7 +825,8 @@ async fn send_frame<W: futures::AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> 
     Ok(())
 }
 
-/// 帧接收（读到声明长度；EOF 由对端 close 表达）。
+/// Frame receive (read up to the declared length; EOF is expressed by the
+/// peer closing).
 async fn recv_frame<R: futures::AsyncRead + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
     use futures::AsyncReadExt;
     let mut hdr = [0u8; 4];
@@ -749,14 +841,15 @@ async fn recv_frame<R: futures::AsyncRead + Unpin>(r: &mut R) -> io::Result<Vec<
 }
 
 // ============================================================================
-// RPCError 映射辅助（network.rs 消费）
+// RPCError mapping helpers (consumed by network.rs)
 // ============================================================================
 
-/// 互连调用错误 → openraft RPCError（超时 ⇒ Timeout；其余 ⇒ Unreachable）。
+/// Interconnect call error → openraft RPCError (timeout ⇒ Timeout; the rest ⇒
+/// Unreachable).
 pub fn rpc_error_of(peer: NodeId, e: WireCallError) -> RPCError<u64, BasicNode, RaftError<u64>> {
     match e {
         WireCallError::TimedOut => RPCError::Timeout(Timeout {
-            action: openraft::network::RPCTypes::Vote, // 字段仅诊断用途
+            action: openraft::network::RPCTypes::Vote, // field is diagnostic only
             id: peer,
             target: peer,
             timeout: Duration::ZERO,
@@ -768,7 +861,8 @@ pub fn rpc_error_of(peer: NodeId, e: WireCallError) -> RPCError<u64, BasicNode, 
     }
 }
 
-/// 远端 Raft 致命错误 → RemoteError 包装（Append/Vote 线格式已带 RaftError）。
+/// Remote Raft fatal error → RemoteError wrapper (the Append/Vote wire format
+/// already carries RaftError).
 pub fn remote_error(peer: NodeId, e: RaftError<u64>) -> RPCError<u64, BasicNode, RaftError<u64>> {
     RPCError::RemoteError(RemoteError {
         target: peer,
@@ -778,7 +872,7 @@ pub fn remote_error(peer: NodeId, e: RaftError<u64>) -> RPCError<u64, BasicNode,
 }
 
 // ============================================================================
-// 单元测试：帧编解码 + LagMonitor 时序
+// Unit tests: frame encode/decode + LagMonitor timing
 // ============================================================================
 
 #[cfg(test)]
@@ -787,7 +881,8 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    /// 极简内存 futures IO 对（帧编解码单测载体）。
+    /// Minimal in-memory futures IO pair (the vehicle for frame codec unit
+    /// tests).
     struct MemIo {
         inbox: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
         outbox: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
@@ -866,38 +961,57 @@ mod tests {
             applied.clone(),
         );
         mon.observe_leader_commit(12);
-        assert!(!mon.breaker_open(), "刚观察到落后不立即熔断");
+        assert!(
+            !mon.breaker_open(),
+            "freshly observed lag does not trip the breaker immediately"
+        );
         assert_eq!(mon.leader_commit(), 12);
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(mon.breaker_open(), "持续落后超阈值 ⇒ 熔断打开");
-        // 追平 ⇒ 恢复。
+        assert!(
+            mon.breaker_open(),
+            "lag persisting past the threshold ⇒ breaker opens"
+        );
+        // Caught up ⇒ recovers.
         applied.store(12, Ordering::SeqCst);
         mon.observe_leader_commit(12);
-        assert!(!mon.breaker_open(), "追平后熔断关闭");
+        assert!(!mon.breaker_open(), "breaker closes after catching up");
     }
 
-    /// 心跳静默维度：长时间无任何 AppendEntries/心跳观察（完全分区）⇒ 熔断开启。
+    /// Heartbeat-silence dimension: a long stretch with no
+    /// AppendEntries/heartbeat observation (full partition) ⇒ breaker opens.
     ///
-    /// 旧断言（lag_monitor_not_open_without_observation）把「分区不熔断」固化成了错误
-    /// 特性：完全分区下 `leader_commit` 冻结且等于本地 applied，判「未落后」是盲区
-    /// ——分区期间吊销挡不住缓存路径放行（§4/R24）。本断言修正为正确语义：观察流
-    /// 消失本身即失联证据，静默超过 max(threshold, election_timeout) 即开熔断。
+    /// The old assertion (lag_monitor_not_open_without_observation) codified
+    /// "no breaker under partition" as a misfeature: under a full partition
+    /// `leader_commit` freezes equal to the local applied, so judging "not
+    /// lagging" is a blind spot — during the partition a revocation cannot
+    /// be blocked from passing through the cache path (§4/R24). This
+    /// assertion fixes the correct semantics: the observation stream
+    /// disappearing is itself evidence of disconnection; silence beyond
+    /// max(threshold, election_timeout) opens the breaker.
     #[tokio::test]
     async fn lag_monitor_opens_on_heartbeat_silence() {
         let applied = Arc::new(AtomicU64::new(5));
-        // silence_limit = max(50ms, 100ms) = 100ms。
+        // silence_limit = max(50ms, 100ms) = 100ms.
         let mon = LagMonitor::new(
             Duration::from_millis(50),
             Duration::from_millis(100),
             applied,
         );
-        assert!(!mon.breaker_open(), "构造时刻起算，静默未超限不开");
+        assert!(
+            !mon.breaker_open(),
+            "counted from construction; silence under the limit does not open"
+        );
         tokio::time::sleep(Duration::from_millis(120)).await;
-        assert!(mon.breaker_open(), "长时间无观察（完全分区）⇒ 熔断开启");
+        assert!(
+            mon.breaker_open(),
+            "long stretch with no observation (full partition) ⇒ breaker opens"
+        );
     }
 
-    /// 分区恢复：静默开熔断后，首帧观察到 leader_commit >> applied 时立即保持开启
-    /// （pending_since 回溯到静默起点，不重新计时），追平后才关闭。
+    /// Partition recovery: after silence opened the breaker, the first frame
+    /// observing leader_commit >> applied keeps it open immediately
+    /// (pending_since backdated to the start of the silence, no fresh
+    /// timing); it closes only after catching up.
     #[tokio::test]
     async fn lag_monitor_recovery_backdates_pending_window() {
         let applied = Arc::new(AtomicU64::new(10));
@@ -907,25 +1021,29 @@ mod tests {
             applied.clone(),
         );
         mon.observe_leader_commit(10);
-        assert!(!mon.breaker_open(), "健康（无落后）");
-        // 完全分区 200ms > silence_limit(150ms) ⇒ 熔断。
+        assert!(!mon.breaker_open(), "healthy (no lag)");
+        // Full partition 200ms > silence_limit(150ms) ⇒ breaker.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(mon.breaker_open(), "静默开熔断");
-        // 分区恢复首帧：leader 已远走（commit 30 >> applied 10）⇒ 立即仍开
-        // （pending 窗回溯到静默起点，elapsed 200ms > threshold 100ms）。
+        assert!(mon.breaker_open(), "silence opens the breaker");
+        // Recovery's first frame: the leader has moved far ahead (commit 30
+        // >> applied 10) ⇒ stays open immediately (the pending window is
+        // backdated to the start of the silence; elapsed 200ms > threshold
+        // 100ms).
         mon.observe_leader_commit(30);
         assert!(
             mon.breaker_open(),
-            "恢复首帧观察到大幅落后 ⇒ 立即保持开启（不重新计时）"
+            "recovery's first frame observing a large lag ⇒ stays open immediately (no fresh timing)"
         );
-        // 追平 ⇒ 关闭。
+        // Caught up ⇒ closes.
         applied.store(30, Ordering::SeqCst);
         mon.observe_leader_commit(30);
-        assert!(!mon.breaker_open(), "追平后熔断关闭");
+        assert!(!mon.breaker_open(), "breaker closes after catching up");
     }
 
-    /// accept 错误分类：仅 NotConnected（织物显式关闭约定）退出服务循环；
-    /// WouldBlock/ConnAborted/EMFILE 等瞬时错误一律退避重试（serve_loop 不死）。
+    /// Accept error classification: only NotConnected (the fabric's explicit
+    /// close convention) exits the serve loop; transient errors such as
+    /// WouldBlock/ConnAborted/EMFILE all retry with backoff (serve_loop never
+    /// dies).
     #[test]
     fn accept_error_classification() {
         assert!(
@@ -933,7 +1051,7 @@ mod tests {
                 io::ErrorKind::NotConnected,
                 "fabric closed"
             )),
-            "NotConnected = 织物关闭（唯一退出条件）"
+            "NotConnected = fabric closed (the only exit condition)"
         );
         assert!(!is_fabric_closed(&io::Error::new(
             io::ErrorKind::WouldBlock,

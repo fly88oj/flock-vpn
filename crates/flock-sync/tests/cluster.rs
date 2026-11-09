@@ -1,18 +1,27 @@
-//! tests/cluster：3 节点内存集群（注入 RTT 100ms）八项断言（docs/design.md §7-M4，
-//! 本批次 ask 的完成门禁）。
+//! tests/cluster: 3-node in-memory cluster (injected RTT 100ms), eight
+//! assertions (docs/design.md §7-M4, this batch's completion gate).
 //!
-//! 1. 任意节点写 → 任意节点线性一致读 ≤2s 可见（含吊销记录）；
-//! 2. kill leader → 重选举 ≤15s 且无丢提交；
-//! 3. 同设备双服务端租约冲突 → 新者胜 + 旧端踢出回调；
-//! 4. register→revoke→register IP 不复用；
-//! 5. server_keys→rewrap 往返（envelope v2 封装 → 状态机落库 → 目标服务器开封）；
-//! 6. revoke 提交后各节点 apply 回调 epoch 前进 + 杀会话钩子 ≤2s；
-//! 7. **apply-lag 熔断**——follower 落后 5s 期间注入吊销 ⇒ 拒用缓存（降级线性一致读）
-//!    且新握手被拒（§4 陈旧读边界 / R24）；7b. **完全分区**——切断（含已建立会话）后
-//!    吊销仍被拦（心跳静默熔断 + fail-closed），恢复后追平方可见；
-//! 8. 票据密钥根在 Raft 内：A 签 B 验，吊销后全网失效（epoch）。
+//! 1. Write on any node → linearizable read on any node, visible ≤2s
+//!    (including the revocation record);
+//! 2. kill leader → re-election ≤15s with no lost commits;
+//! 3. same device dual-server lease conflict → newest wins + old-side
+//!    eviction callback;
+//! 4. register→revoke→register, IP never reused;
+//! 5. server_keys→rewrap round trip (envelope v2 wrapping → state machine
+//!    persistence → the target server unwraps);
+//! 6. after a revoke commits, each node's apply callback advances the epoch +
+//!    kill-session hook ≤2s;
+//! 7. **apply-lag breaker** — inject a revocation while a follower lags 5s ⇒
+//!    the cache is refused (degraded linearizable read) and new handshakes
+//!    are rejected (§4 stale-read boundary / R24); 7b. **full partition** —
+//!    after the cut (including established sessions) the revocation is still
+//!    blocked (heartbeat-silence breaker + fail-closed); after rejoining and
+//!    catching up it becomes visible;
+//! 8. the ticket key root is inside Raft: A signs, B verifies; after a
+//!    revocation it is invalid network-wide (epoch).
 //!
-//! RTT 注入 = 每方向 50ms 线路延迟（§7-M4 100ms 校准）；节点故障 = MemoryFabric::cut。
+//! RTT injection = 50ms per-direction line delay (§7-M4 100ms calibration);
+//! node failure = MemoryFabric::cut.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,11 +40,11 @@ use flock_sync::testutil::{FabricRegistry, MemoryFabric};
 use flock_sync::ticket::TicketError;
 use flock_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
 
-/// 每方向 50ms ⇒ RTT 100ms。
+/// 50ms per direction ⇒ RTT 100ms.
 const RTT_HALF: Duration = Duration::from_millis(50);
 const NODES: [u64; 3] = [1, 2, 3];
 
-/// NodeId ↔ ServerId（与 flock_sync::wire::sid_of 同映射）。
+/// NodeId ↔ ServerId (same mapping as flock_sync::wire::sid_of).
 fn sid(n: NodeId) -> ServerId {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&n.to_be_bytes());
@@ -50,7 +59,8 @@ async fn must_write(node: &SyncNode, req: SyncRequest) -> SyncResponse {
     node.write(req).await.expect("write")
 }
 
-/// 3 节点测试集群（共享根密钥/根签目录/织物注册表）。
+/// 3-node test cluster (shared root key / root-signed directory / fabric
+/// registry).
 struct Cluster {
     root: SigningKey,
     nodes: Vec<SyncNode>,
@@ -65,7 +75,9 @@ impl Cluster {
         Cluster::new_tuned(|_| {}).await
     }
 
-    /// 按调参构建（完全分区负向用例缩短写/读转发预算——fail-closed 断言不拖满 12s）。
+    /// Build with tuning (the full-partition negative case shortens the
+    /// write/read forwarding budget — the fail-closed assertion doesn't drag
+    /// out to the full 12s).
     async fn new_tuned(tune: impl FnOnce(&mut SyncSettings)) -> Cluster {
         let root = SigningKey::from_bytes(&[7u8; 32]);
         let cluster_id = ClusterId([9u8; 16]);
@@ -74,7 +86,9 @@ impl Cluster {
         let mut settings = SyncSettings::default();
         tune(&mut settings);
 
-        // 根签目录（入群凭证公开部分——互连双向认证的材料源）。
+        // Root-signed directory (the public part of the enrollment
+        // credentials — the material source of mutual interconnect
+        // authentication).
         let mut idents = Vec::new();
         let mut entries = Vec::new();
         for &n in &NODES {
@@ -119,7 +133,8 @@ impl Cluster {
         }
     }
 
-    /// 等 leader 出现并返回**其自身**下标（≤15s）——「任一节点知道 leader」≠ leader 本体。
+    /// Wait for a leader to appear and return **its own** index (≤15s) —
+    /// "some node knows the leader" ≠ the leader itself.
     async fn leader(&self) -> (usize, NodeId) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -142,11 +157,11 @@ impl Cluster {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("15s 内未选出 leader");
+        panic!("no leader elected within 15s");
     }
 }
 
-/// 引导集群身份（票据密钥根进 Raft）。
+/// Bootstrap the cluster identity (the ticket key root goes into Raft).
 async fn bootstrap(cluster: &Cluster, node_idx: usize) {
     let resp = must_write(
         &cluster.nodes[node_idx],
@@ -157,7 +172,8 @@ async fn bootstrap(cluster: &Cluster, node_idx: usize) {
 }
 
 // ============================================================================
-// 1. 任意节点写 → 任意节点线性一致读 ≤2s（含吊销记录）
+// 1. Write on any node → linearizable read on any node ≤2s (including the
+//    revocation record)
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -165,7 +181,8 @@ async fn write_any_read_any_linearizable_within_2s() {
     let cluster = Cluster::new().await;
     bootstrap(&cluster, 0).await;
     let (leader_idx, _) = cluster.leader().await;
-    // 写入者/读取者都选非 leader 节点（写转发 + 读转发路径）。
+    // Pick non-leader nodes for both the writer and the reader (write
+    // forwarding + read forwarding paths).
     let writer = (leader_idx + 1) % 3;
     let reader = (leader_idx + 2) % 3;
 
@@ -192,20 +209,20 @@ async fn write_any_read_any_linearizable_within_2s() {
     let elapsed = t0.elapsed();
     assert!(
         matches!(v, ReadView::Verdict(VerdictW::Active { .. })),
-        "任意节点线性一致读可见: {v:?}"
+        "visible via a linearizable read on any node: {v:?}"
     );
     assert!(
         elapsed <= Duration::from_secs(2),
-        "写→读 ≤2s（实际 {:?}）",
+        "write→read ≤2s (actual {:?})",
         elapsed
     );
     assert_eq!(
         row.vip,
         flock_sync::VIP_FIRST.to_be_bytes(),
-        "首 VIP = 100.64.0.11（.1–.10 保留给服务器，§6.2）"
+        "first VIP = 100.64.0.11 (.1–.10 reserved for servers, §6.2)"
     );
 
-    // 吊销记录同样 ≤2s 线性一致可见。
+    // The revocation record is likewise linearizably visible ≤2s.
     let t1 = Instant::now();
     must_write(&cluster.nodes[writer], SyncRequest::Revoke { device: id.0 }).await;
     let v = cluster.nodes[reader]
@@ -214,17 +231,17 @@ async fn write_any_read_any_linearizable_within_2s() {
         .expect("read");
     assert!(
         matches!(v, ReadView::Verdict(VerdictW::Revoked { .. })),
-        "吊销记录线性一致可见: {v:?}"
+        "revocation record linearizably visible: {v:?}"
     );
     assert!(
         t1.elapsed() <= Duration::from_secs(2),
-        "吊销写→读 ≤2s（实际 {:?}）",
+        "revocation write→read ≤2s (actual {:?})",
         t1.elapsed()
     );
 }
 
 // ============================================================================
-// 2. kill leader → 重选举 ≤15s 且无丢提交
+// 2. kill leader → re-election ≤15s with no lost commits
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -233,7 +250,8 @@ async fn kill_leader_reelects_within_15s_no_lost_writes() {
     bootstrap(&cluster, 0).await;
     let (leader_idx, leader_id) = cluster.leader().await;
 
-    // 先写 5 条已确认提交（经非 leader 节点——写转发路径）。
+    // First write 5 confirmed commits (via a non-leader node — the write
+    // forwarding path).
     for i in 0..5u8 {
         let resp = must_write(
             &cluster.nodes[(leader_idx + 1) % 3],
@@ -249,14 +267,14 @@ async fn kill_leader_reelects_within_15s_no_lost_writes() {
         assert!(matches!(resp, SyncResponse::Device(_)));
     }
 
-    // kill leader：Raft 停机 + 织物切除（dial 拒绝）。
+    // kill leader: Raft shutdown + fabric cut (dial refused).
     cluster.nodes[leader_idx]
         .shutdown()
         .await
         .expect("leader shutdown");
     MemoryFabric::cut(&cluster.reg, &sid(leader_id));
 
-    // 重选举 ≤15s（选举超时 1.5~3s + RTT 100ms）。
+    // Re-election ≤15s (election timeout 1.5~3s + RTT 100ms).
     let t0 = Instant::now();
     let mut new_leader = None;
     while Instant::now() - t0 < Duration::from_secs(15) {
@@ -275,23 +293,24 @@ async fn kill_leader_reelects_within_15s_no_lost_writes() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let (_ni, _nl) = new_leader.expect("15s 内重选举");
+    let (_ni, _nl) = new_leader.expect("re-elected within 15s");
     assert!(
         t0.elapsed() <= Duration::from_secs(15),
-        "重选举 {:?}",
+        "re-election {:?}",
         t0.elapsed()
     );
 
-    // 无丢提交：经幸存 follower 线性一致读（读转发）= 全部 5 台设备在册。
+    // No lost commits: a linearizable read via a surviving follower (read
+    // forwarding) = all 5 devices on the books.
     let survivor = (leader_idx + 1) % 3;
     let view = cluster.nodes[survivor]
         .read_linearizable(ReadQuery::State)
         .await
         .expect("read");
     let ReadView::State(st) = view else { panic!() };
-    assert_eq!(st.devices, 5, "无丢提交（5 台在册）");
+    assert_eq!(st.devices, 5, "no lost commits (5 registered)");
 
-    // 新 leader 继续可写。
+    // The new leader keeps accepting writes.
     let resp = must_write(
         &cluster.nodes[survivor],
         SyncRequest::RegisterDevice {
@@ -305,12 +324,13 @@ async fn kill_leader_reelects_within_15s_no_lost_writes() {
     .await;
     assert!(
         matches!(resp, SyncResponse::Device(_)),
-        "新 leader 可写: {resp:?}"
+        "the new leader accepts writes: {resp:?}"
     );
 }
 
 // ============================================================================
-// 3. 同设备双服务端租约冲突 → 新者胜 + 旧端踢出回调
+// 3. Same device dual-server lease conflict → newest wins + old-side eviction
+//    callback
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -320,16 +340,17 @@ async fn lease_conflict_newer_wins_old_side_evicted() {
     let _ = cluster.leader().await;
     let device = [0xab; 32];
 
-    // 节点 1 先发布（设备连在节点 1）。
+    // Node 1 publishes first (the device is connected to node 1).
     cluster.nodes[0].publish_lease(&device).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         cluster.nodes[1].lease().observe(&device).unwrap().holder,
         1,
-        "租约传播到节点 2"
+        "the lease propagated to node 2"
     );
 
-    // 节点 2 发布同设备更新租约 ⇒ 新者胜 + 节点 1 踢出回调（事件推送 ≤1s + 反熵兜底）。
+    // Node 2 publishes a newer lease for the same device ⇒ newest wins +
+    // node 1's eviction callback (event push ≤1s + anti-entropy backstop).
     let t0 = Instant::now();
     cluster.nodes[1].publish_lease(&device).await;
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -341,27 +362,27 @@ async fn lease_conflict_newer_wins_old_side_evicted() {
     }
     assert!(
         cluster.recorders[0].evictions().contains(&device),
-        "旧端（节点 1）踢出回调触发（实际 {:?}）",
+        "old side (node 1) eviction callback fired (actual {:?})",
         cluster.recorders[0].evictions()
     );
     assert!(
         t0.elapsed() <= Duration::from_secs(3),
-        "踢出回调 ≤3s（实际 {:?}）",
+        "eviction callback ≤3s (actual {:?})",
         t0.elapsed()
     );
-    // 新者胜：各节点 observe 一致指向节点 2。
+    // Newest wins: observe on every node consistently points to node 2.
     for n in &cluster.nodes {
         assert_eq!(
             n.lease().observe(&device).unwrap().holder,
             2,
-            "新者胜（节点 {}）",
+            "newest wins (node {})",
             n.id()
         );
     }
 }
 
 // ============================================================================
-// 4. register→revoke→register IP 不复用
+// 4. register→revoke→register, IP never reused
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -403,8 +424,12 @@ async fn register_revoke_register_ip_never_reused() {
     .await;
     let SyncResponse::Device(b) = b else { panic!() };
     let (ia, ib) = (u32::from_be_bytes(a.vip), u32::from_be_bytes(b.vip));
-    assert!(ib > ia, "IP 不复用：水位线只进不退（{ia} → {ib}）");
-    // 同设备重注册拒（禁用不删除：Revoked 终态行保留）。
+    assert!(
+        ib > ia,
+        "IP not reused: the watermark only moves forward ({ia} → {ib})"
+    );
+    // Re-registering the same device rejected (disable does not delete: the
+    // Revoked terminal row is retained).
     let again = cluster.nodes[writer]
         .write(SyncRequest::RegisterDevice {
             owner: "u".into(),
@@ -422,7 +447,8 @@ async fn register_revoke_register_ip_never_reused() {
 }
 
 // ============================================================================
-// 5. server_keys→rewrap 往返（OPRF 类秘密 → envelope v2 → 状态机 → 目标服务器开封）
+// 5. server_keys→rewrap round trip (an OPAQUE-like secret → envelope v2 →
+//    state machine → the target server unwraps)
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -432,7 +458,8 @@ async fn server_keys_rewrap_roundtrip() {
     let (leader_idx, _) = cluster.leader().await;
     let writer = (leader_idx + 2) % 3;
 
-    // 目标服务器 = 节点 2（封装目标 = 其入群凭证内的混合公钥）。
+    // The target server = node 2 (the wrapping target = the hybrid public key
+    // inside its enrollment credential).
     let target_entry = &cluster.idents[1].entry;
     let entries = vec![ServerKeyEntry {
         server_id: 2,
@@ -441,7 +468,9 @@ async fn server_keys_rewrap_roundtrip() {
         vip: [100, 64, 0, 2],
     }];
 
-    // 无根签名（他签）⇒ 状态机拒绝（被入侵的在册服务器没有根密钥，无法触发 rewrap）。
+    // No root signature (foreign-signed) ⇒ state-machine rejection (a
+    // compromised in-register server holds no root key and cannot trigger a
+    // rewrap).
     let forged_root = SigningKey::from_bytes(&[8u8; 32]);
     let bad = cluster.nodes[writer]
         .write(SyncRequest::server_keys_signed(
@@ -452,7 +481,7 @@ async fn server_keys_rewrap_roundtrip() {
         .expect("write ok");
     assert!(
         matches!(bad, SyncResponse::Error(StateError::BadRootSignature)),
-        "他签 server_keys 拒: {bad:?}"
+        "foreign-signed server_keys rejected: {bad:?}"
     );
     let bad_rw = cluster.nodes[writer]
         .write(SyncRequest::rewrap_signed(&forged_root, 2, vec![1, 2, 3]))
@@ -460,10 +489,10 @@ async fn server_keys_rewrap_roundtrip() {
         .expect("write ok");
     assert!(
         matches!(bad_rw, SyncResponse::Error(StateError::BadRootSignature)),
-        "他签 rewrap 拒: {bad_rw:?}"
+        "foreign-signed rewrap rejected: {bad_rw:?}"
     );
 
-    // 根签 server_keys 落库。
+    // Root-signed server_keys lands.
     let resp = must_write(
         &cluster.nodes[writer],
         SyncRequest::server_keys_signed(&cluster.root, entries),
@@ -474,7 +503,8 @@ async fn server_keys_rewrap_roundtrip() {
         "{resp:?}"
     );
 
-    // OPRF 类秘密 → envelope v2 封装到节点 2 的混合公钥 → 根签 rewrap 提交。
+    // The OPAQUE-like secret → envelope v2 wrapped to node 2's hybrid public
+    // key → root-signed rewrap committed.
     let secret = b"opaque-oprf-key-material-32-bytes!!!";
     let mut wrapped = Vec::new();
     flock_protocol::envelope::seal_v2(&target_entry.static_hybrid_pub, &secret[..], &mut wrapped)
@@ -494,26 +524,31 @@ async fn server_keys_rewrap_roundtrip() {
     assert_eq!(
         bytes,
         wrapped.len(),
-        "OPRF key 副本数 +1 可观测（封装字节数入账）"
+        "OPRF key copy count +1 observable (wrapped byte count recorded)"
     );
 
-    // 节点 2 线性一致读取出封装副本，以自己的静态混合私钥开封 → 原秘密。
+    // Node 2 linearizably reads out the wrapped copy and unwraps it with its
+    // own static hybrid private key → the original secret.
     let view = cluster.nodes[1]
         .read_linearizable(ReadQuery::Wrap(2))
         .await
         .expect("read");
     let ReadView::Wrap(Some(got)) = view else {
-        panic!("wrap 落库: {view:?}")
+        panic!("wrap landed: {view:?}")
     };
-    assert_eq!(got, wrapped, "封装副本原样落库");
+    assert_eq!(got, wrapped, "the wrapped copy landed verbatim");
     let mut opened = Vec::new();
     flock_protocol::envelope::open_v2(&cluster.idents[1].static_hybrid, &got[..], &mut opened)
         .expect("open");
-    assert_eq!(opened, secret, "rewrap 往返：目标服务器开封得到原秘密");
+    assert_eq!(
+        opened, secret,
+        "rewrap round trip: the target server unwraps the original secret"
+    );
 }
 
 // ============================================================================
-// 6. revoke 提交后各节点 apply 回调 epoch 前进 + 杀会话钩子 ≤2s
+// 6. After a revoke commits, each node's apply callback advances the epoch +
+//    kill-session hook ≤2s
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -539,7 +574,8 @@ async fn revoke_apply_callback_epoch_and_kill_hook_within_2s() {
     };
     let id = dev_id(&[3; 32]);
 
-    // 吊销前签发的票据（epoch = 0）——清拒票据断言用。
+    // A ticket issued before the revocation (epoch = 0) — for the
+    // outstanding-ticket rejection assertion.
     let pre_ticket = cluster.nodes[writer]
         .issue_ticket(id.0, 1_000)
         .expect("ticket");
@@ -549,9 +585,10 @@ async fn revoke_apply_callback_epoch_and_kill_hook_within_2s() {
     let SyncResponse::Epoch(new_epoch) = resp else {
         panic!()
     };
-    assert!(new_epoch >= 1, "吊销推进 revocation_epoch");
+    assert!(new_epoch >= 1, "the revocation advanced revocation_epoch");
 
-    // 各节点（含 follower）apply 回调 ≤2s：epoch 前进 + 杀会话钩子触发。
+    // Apply callback on every node (including followers) ≤2s: epoch advanced
+    // + kill-session hook fired.
     for (i, rec) in cluster.recorders.iter().enumerate() {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -561,12 +598,17 @@ async fn revoke_apply_callback_epoch_and_kill_hook_within_2s() {
                 .filter(|e| e.device == id.0)
                 .collect();
             if let Some(ev) = events.last() {
-                assert_eq!(ev.new_epoch, new_epoch, "节点 {} epoch 前进一致", i + 1);
+                assert_eq!(
+                    ev.new_epoch,
+                    new_epoch,
+                    "node {} epoch advanced consistently",
+                    i + 1
+                );
                 break;
             }
             assert!(
                 Instant::now() <= deadline,
-                "节点 {} 2s 内未触发杀会话钩子（事件 {:?}）",
+                "node {} did not fire the kill-session hook within 2s (events {:?})",
                 i + 1,
                 rec.revocations()
             );
@@ -574,12 +616,14 @@ async fn revoke_apply_callback_epoch_and_kill_hook_within_2s() {
         }
         assert!(
             t_commit.elapsed() <= Duration::from_secs(2),
-            "节点 {} 回调 ≤2s（实际 {:?}）",
+            "node {} callback ≤2s (actual {:?})",
             i + 1,
             t_commit.elapsed()
         );
     }
-    // 票据 epoch 随之失效（清拒票据的本地侧数据面：吊销前签的票 ⇒ StaleEpoch）。
+    // The ticket's epoch is invalidated with it (the ticket-side data surface
+    // of outstanding-ticket rejection: a ticket issued before the revocation
+    // ⇒ StaleEpoch).
     assert!(matches!(
         cluster.nodes[writer].verify_ticket(&pre_ticket, &id.0, 1_001),
         Err(TicketError::StaleEpoch { .. })
@@ -588,7 +632,8 @@ async fn revoke_apply_callback_epoch_and_kill_hook_within_2s() {
 }
 
 // ============================================================================
-// 7. apply-lag 熔断：follower 落后 5s 期间注入吊销 ⇒ 拒用缓存 + 新握手被拒
+// 7. apply-lag breaker: inject a revocation while a follower lags 5s ⇒ cache
+//    refused + new handshakes rejected
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -600,7 +645,8 @@ async fn apply_lag_breaker_rejects_cache_and_new_handshake() {
     let lagger_idx = (leader_idx + 2) % 3;
     let lagger = &cluster.nodes[lagger_idx];
 
-    // 设备密钥用真实 Ed25519 公钥（[4;32] 非法点 ⇒ to_verdict fail-closed）。
+    // The device key uses a real Ed25519 public key ([4;32] is an illegal
+    // point ⇒ to_verdict fails closed).
     let dev = SigningKey::from_bytes(&[4u8; 32]);
     let dev_pub = *dev.verifying_key().as_bytes();
     let resp = must_write(
@@ -619,77 +665,94 @@ async fn apply_lag_breaker_rejects_cache_and_new_handshake() {
     };
     let id = dev_id(&dev_pub);
 
-    // 预热缓存：一次成功查询后该设备在 lagging follower 缓存中为 Active。
+    // Warm the cache: after one successful lookup, the device is Active in
+    // the lagging follower's cache.
     let v = lagger.dir().lookup_async(id).await;
     assert!(
         matches!(v, LookupVerdict::Active(_)),
-        "预热：查询给 Active（{v:?}）"
+        "warm-up: lookup gives Active ({v:?})"
     );
     let v = lagger.dir().lookup_async(id).await;
     assert!(matches!(v, LookupVerdict::Active(_)));
 
-    // 人为让 follower 落后 5s：apply 停摆（网络与日志照常）。
+    // Artificially make the follower lag 5s: apply stalls (network and log
+    // flow as usual).
     lagger.sm().lag.arm(Duration::from_secs(5));
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // 期间注入吊销（leader + 健康 follower 提交；lagging follower 落后）。
+    // During that window, inject a revocation (committed by the leader +
+    // healthy followers; the lagging follower falls behind).
     must_write(&cluster.nodes[writer], SyncRequest::Revoke { device: id.0 }).await;
 
-    // 熔断：观察到 leader_commit > applied 持续 >2s ⇒ 打开。
+    // Breaker: observing leader_commit > applied persisting >2s ⇒ opens.
     let deadline = Instant::now() + Duration::from_secs(4);
     while !lagger.breaker_open() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(lagger.breaker_open(), "apply-lag >2s ⇒ 熔断打开");
+    assert!(lagger.breaker_open(), "apply-lag >2s ⇒ breaker opens");
 
-    // 拒用缓存：该 follower 的目录查询走降级线性一致读（转发 leader）⇒ Revoked。
-    // 「新握手被拒」——session::respond 消费同一目录判定，Revoked ⇒ DeviceRejected。
+    // Cache refused: that follower's directory lookup takes the degraded
+    // linearizable path (forwarded to the leader) ⇒ Revoked. "New handshakes
+    // rejected" — session::respond consumes the same directory verdict;
+    // Revoked ⇒ DeviceRejected.
     let stats_before = lagger.dir().stats();
     let t_lookup = Instant::now();
     let v = lagger.dir().lookup_async(id).await;
     let stats_after = lagger.dir().stats();
     assert!(
         matches!(v, LookupVerdict::Revoked { .. }),
-        "降级线性一致读 ⇒ 吊销可见（新握手被拒）: {v:?}"
+        "degraded linearizable read ⇒ revocation visible (new handshakes rejected): {v:?}"
     );
     assert!(
         stats_after.breaker_degraded > stats_before.breaker_degraded,
-        "熔断路径计数前进（before={:?} after={:?}）",
+        "breaker-path count advanced (before={:?} after={:?})",
         stats_before,
         stats_after
     );
     assert!(
         stats_after.cache_hits == stats_before.cache_hits,
-        "熔断期拒用本地缓存（cache_hits 不前进）"
+        "local cache refused while the breaker is open (cache_hits does not advance)"
     );
     assert!(
         t_lookup.elapsed() <= Duration::from_secs(2),
-        "降级读在预算内"
+        "degraded read within budget"
     );
 
-    // 对照：健康 follower（未滞后）不受熔断影响——epoch 前进后缓存失效，同样给 Revoked。
+    // Control: the healthy follower (not lagging) is unaffected by the
+    // breaker — after the epoch advances the cache invalidates, and it also
+    // reports Revoked.
     let v2 = cluster.nodes[writer].dir().lookup_async(id).await;
     assert!(matches!(v2, LookupVerdict::Revoked { .. }));
 
-    // 追平后熔断恢复（apply 停摆结束 ⇒ applied 追上 leader_commit）。
+    // After catching up the breaker recovers (the apply stall ends ⇒ applied
+    // catches up to leader_commit).
     lagger.sm().lag.disarm();
     let deadline = Instant::now() + Duration::from_secs(8);
     while lagger.breaker_open() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(!lagger.breaker_open(), "追平后熔断恢复");
-    assert_eq!(lagger.local_epoch(), 1, "滞后节点最终 apply（epoch 前进）");
+    assert!(!lagger.breaker_open(), "breaker recovers after catching up");
+    assert_eq!(
+        lagger.local_epoch(),
+        1,
+        "the lagging node eventually applies (epoch advanced)"
+    );
 }
 
 // ============================================================================
-// 7b. 完全分区负向用例：切断后吊销仍被拦，缓存拒用（心跳静默维度）
+// 7b. Full-partition negative case: after the cut the revocation is still
+//     blocked, the cache refused (heartbeat-silence dimension)
 // ============================================================================
 
-/// 完全分区（cut = 拒新拨号 + 斩断已建立的 E2E 会话桥——观察流消失）期间，leader 侧
-/// 提交的吊销不得经被切断节点的本地缓存放行：静默超 max(lag_threshold, election_timeout)
-/// ⇒ 熔断打开 ⇒ 缓存拒用；分区下线性一致读不可达 ⇒ fail-closed（NotFound ⇒ 拒握手，
-/// 绝不回落陈旧 Active）。分区恢复后回溯语义：恢复首帧即仍开（pending 回溯），apply
-/// 追平方关闭且吊销可见。
+/// During a full partition (cut = refuse new dials + sever established E2E
+/// session bridges — the observation stream vanishes), a revocation committed
+/// on the leader side must not slip through the cut node's local cache:
+/// silence beyond max(lag_threshold, election_timeout) ⇒ breaker opens ⇒
+/// cache refused; under the partition a linearizable read is unreachable ⇒
+/// fail-closed (NotFound ⇒ handshake refused, never falling back to a stale
+/// Active). Backdating semantics on partition recovery: the first frame after
+/// recovery still finds it open (pending backdated); once apply catches up it
+/// closes and the revocation becomes visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_partition_breaker_blocks_revoked_cache_until_rejoin() {
     let cluster = Cluster::new_tuned(|s| s.forward_deadline = Duration::from_secs(3)).await;
@@ -700,7 +763,8 @@ async fn full_partition_breaker_blocks_revoked_cache_until_rejoin() {
     let cut_node = &cluster.nodes[cut_idx];
     let cut_id = cut_node.id();
 
-    // 注册设备（真实 Ed25519 公钥）并在将被切断的 follower 上预热缓存（Active）。
+    // Register a device (real Ed25519 public key) and warm the cache on the
+    // follower about to be cut (Active).
     let dev = SigningKey::from_bytes(&[6u8; 32]);
     let dev_pub = *dev.verifying_key().as_bytes();
     let resp = must_write(
@@ -717,58 +781,76 @@ async fn full_partition_breaker_blocks_revoked_cache_until_rejoin() {
     assert!(matches!(resp, SyncResponse::Device(_)));
     let id = dev_id(&dev_pub);
     let v = cut_node.dir().lookup_async(id).await;
-    assert!(matches!(v, LookupVerdict::Active(_)), "预热: {v:?}");
+    assert!(matches!(v, LookupVerdict::Active(_)), "warm-up: {v:?}");
     let v = cut_node.dir().lookup_async(id).await;
-    assert!(matches!(v, LookupVerdict::Active(_)), "缓存命中: {v:?}");
+    assert!(matches!(v, LookupVerdict::Active(_)), "cache hit: {v:?}");
     assert!(cut_node.dir().stats().cache_hits >= 1);
 
-    // —— 完全分区：切断 follower（新拨号拒绝 + 已建立会话桥斩断）——
+    // —— Full partition: cut the follower (new dials refused + established
+    //     session bridges severed) ——
     MemoryFabric::cut(&cluster.reg, &sid(cut_id));
 
-    // 分区期间其余两节点（仍有 quorum）提交吊销。
+    // During the partition the other two nodes (still quorate) commit a
+    // revocation.
     must_write(&cluster.nodes[writer], SyncRequest::Revoke { device: id.0 }).await;
 
-    // 心跳静默 > max(2s, 3s) ⇒ 熔断打开（leader_commit 冻结 == applied 的盲区由此覆盖）。
+    // Heartbeat silence > max(2s, 3s) ⇒ breaker opens (this covers the blind
+    // spot where leader_commit frozen == applied).
     let deadline = Instant::now() + Duration::from_secs(8);
     while !cut_node.breaker_open() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(cut_node.breaker_open(), "完全分区（无任何观察）⇒ 静默熔断");
+    assert!(
+        cut_node.breaker_open(),
+        "full partition (no observation at all) ⇒ silence breaker"
+    );
 
-    // 吊销仍被拦：缓存拒用（cache_hits 不前进）+ 分区下线性一致读不可达 ⇒ fail-closed
-    // （NotFound ⇒ 拒握手——绝不放行陈旧的 Active）。
+    // The revocation is still blocked: cache refused (cache_hits does not
+    // advance) + linearizable read unreachable under the partition ⇒
+    // fail-closed (NotFound ⇒ handshake refused — never letting a stale
+    // Active through).
     let before = cut_node.dir().stats();
     let v = cut_node.dir().lookup_async(id).await;
     let after = cut_node.dir().stats();
     assert!(
         matches!(v, LookupVerdict::NotFound),
-        "分区节点 fail-closed（非陈旧 Active）: {v:?}"
+        "the partitioned node fails closed (not a stale Active): {v:?}"
     );
-    assert_eq!(after.cache_hits, before.cache_hits, "熔断期拒用本地缓存");
+    assert_eq!(
+        after.cache_hits, before.cache_hits,
+        "local cache refused while the breaker is open"
+    );
     assert!(
         after.breaker_degraded > before.breaker_degraded,
-        "熔断路径计数前进"
+        "breaker-path count advanced"
     );
 
-    // —— 分区恢复：uncut（斩断过的连接需重拨——互连自动重建）——
+    // —— Partition recovery: uncut (severed connections must re-dial — the
+    //     interconnect rebuilds automatically) ——
     MemoryFabric::uncut(&cluster.reg, &sid(cut_id));
-    // 回溯语义：恢复首帧观察到 leader_commit >> applied ⇒ 立即仍开；apply 追平后关闭。
+    // Backdating semantics: recovery's first frame observes leader_commit >>
+    // applied ⇒ still open immediately; once apply catches up it closes.
     let deadline = Instant::now() + Duration::from_secs(12);
     while cut_node.breaker_open() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(!cut_node.breaker_open(), "恢复追平后熔断关闭");
-    // 追平 ⇒ epoch 前进 ⇒ 缓存失效 ⇒ 线性一致读给出 Revoked（吊销最终可见）。
+    assert!(
+        !cut_node.breaker_open(),
+        "breaker closes after recovery catch-up"
+    );
+    // Caught up ⇒ epoch advanced ⇒ cache invalidated ⇒ the linearizable read
+    // returns Revoked (the revocation finally visible).
     let v = cut_node.dir().lookup_async(id).await;
     assert!(
         matches!(v, LookupVerdict::Revoked { .. }),
-        "恢复后吊销可见: {v:?}"
+        "revocation visible after recovery: {v:?}"
     );
-    assert_eq!(cut_node.local_epoch(), 1, "被切断节点最终 apply");
+    assert_eq!(cut_node.local_epoch(), 1, "the cut node eventually applies");
 }
 
 // ============================================================================
-// 8. 票据密钥根在 Raft：A 签 B 验；吊销后全网失效（epoch）
+// 8. The ticket key root is inside Raft: A signs, B verifies; after a
+//    revocation invalid network-wide (epoch)
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -794,8 +876,9 @@ async fn ticket_root_in_raft_cross_node_and_epoch_invalidation() {
     };
     let id = dev_id(&[5; 32]).0;
 
-    // A（writer）签发；等 Bootstrap/注册在全网 apply（≤3s）后 A/B/C 全部可验——
-    // 票据密钥根在 Raft 状态内复制，任何服务器都验得。
+    // A (the writer) issues; after waiting for Bootstrap/registration to
+    // apply network-wide (≤3s), A/B/C can all verify — the ticket key root is
+    // replicated inside Raft state; any server can verify.
     let ticket = cluster.nodes[writer]
         .issue_ticket(id, 1_000)
         .expect("ticket");
@@ -808,11 +891,15 @@ async fn ticket_root_in_raft_cross_node_and_epoch_invalidation() {
         if all_ok {
             break;
         }
-        assert!(Instant::now() < deadline, "3s 内全网可验票据（根复制）");
+        assert!(
+            Instant::now() < deadline,
+            "ticket verifiable network-wide within 3s (root replication)"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // 吊销推进 epoch ⇒ 旧票据全网失效（StaleEpoch——清拒票据）。
+    // The revocation advances the epoch ⇒ the old ticket invalid network-wide
+    // (StaleEpoch — outstanding-ticket rejection).
     must_write(&cluster.nodes[writer], SyncRequest::Revoke { device: id }).await;
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -825,7 +912,10 @@ async fn ticket_root_in_raft_cross_node_and_epoch_invalidation() {
         if all_stale {
             break;
         }
-        assert!(Instant::now() < deadline, "3s 内全网票据失效（epoch 传播）");
+        assert!(
+            Instant::now() < deadline,
+            "ticket invalid network-wide within 3s (epoch propagation)"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

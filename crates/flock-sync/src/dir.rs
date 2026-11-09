@@ -1,15 +1,21 @@
-//! `session::DeviceDirectory` 的多主实现（§4 读与缓存 / §3.11 装配注入）：
-//! **设备记录缓存 + revocation_epoch 两级读 + apply-lag 熔断**。
+//! Multi-primary implementation of `session::DeviceDirectory` (§4 reads and
+//! caching / §3.11 assembly injection): **device record cache +
+//! revocation_epoch two-tier read + apply-lag circuit breaker**.
 //!
-//! - epoch 未变且缓存命中 ⇒ 本地答（中转断链后的 N 客户端重连风暴在无吊销时全部命中
-//!   本地缓存，leader 只承接真正的全局序变化——R18）；
-//! - epoch 前进（随 Raft 日志 apply 自动推进，无需额外广播）⇒ 失效缓存；
-//! - **熔断**：apply-lag > 阈值（2s，A6 时序预算）⇒ 停用本地缓存路径、降级线性一致读
-//!   （follower 经 leader 读；§4 陈旧读边界 / R24）。
+//! - epoch unchanged and cache hit ⇒ answer locally (after a relay link
+//!   failure, the N-client reconnect storm hits the local cache entirely when
+//!   there are no revocations; the leader only absorbs genuine global-order
+//!   changes — R18);
+//! - epoch advanced (advances automatically as Raft log entries apply, no
+//!   extra broadcast needed) ⇒ invalidate the cache;
+//! - **breaker**: apply-lag > threshold (2s, the A6 timing budget) ⇒ disable
+//!   the local cache path, degrade to linearizable reads (follower reads via
+//!   leader; §4 stale-read boundary / R24).
 //!
-//! 陈旧读边界（诚实披露）：leader 已 commit 的吊销在 follower 本地 apply 之前挡不住
-//! 新握手，窗口 = follower 日志落后时长；熔断把「观察到的落后 >2s」挡住，票据
-//! TTL 60s 兜底跨服重放。
+//! Stale-read boundary (honest disclosure): a revocation already committed by
+//! the leader cannot block new handshakes before the follower applies it
+//! locally; the window = how long the follower's log lags. The breaker blocks
+//! "observed lag > 2s"; the 60s ticket TTL backstops cross-server replay.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,12 +28,14 @@ use tokio::sync::watch;
 use crate::proto::{ReadQuery, ReadView, SyncError, VerdictW};
 use crate::wire::LagMonitor;
 
-/// 线性一致读能力（[`crate::node::SyncNode`] 实现；装配/测试也可注入别的源）。
+/// Linearizable-read capability ([`crate::node::SyncNode`] implements it;
+/// assembly/tests may also inject other sources).
 pub trait LinearizableReader: Send + Sync + 'static {
     fn read(&self, q: ReadQuery) -> BoxFuture<'static, Result<ReadView, SyncError>>;
 }
 
-/// 目录读统计（熔断/缓存行为可观测——测试断言「拒用缓存」用）。
+/// Directory read statistics (breaker/cache behavior made observable — used by
+/// tests asserting "cache refused").
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DirStats {
     pub cache_hits: u64,
@@ -35,7 +43,8 @@ pub struct DirStats {
     pub breaker_degraded: u64,
 }
 
-/// 两级读目录（`Arc` 装箱后使用；[`DirHandle`] 提供 DeviceDirectory 接缝）。
+/// Two-tier read directory (used boxed in an `Arc`; [`DirHandle`] provides the
+/// DeviceDirectory seam).
 pub struct SyncDirectory {
     reader: Arc<dyn LinearizableReader>,
     lag: Arc<LagMonitor>,
@@ -63,7 +72,7 @@ impl SyncDirectory {
         })
     }
 
-    /// 读统计快照。
+    /// Read-statistics snapshot.
     pub fn stats(&self) -> DirStats {
         DirStats {
             cache_hits: self.stats_cache_hits.load(Ordering::Relaxed),
@@ -72,9 +81,11 @@ impl SyncDirectory {
         }
     }
 
-    /// 目录查询主路径（async：线性一致读是网络往返——§1.3.3c 接缝契约）。
+    /// Directory lookup main path (async: a linearizable read is a network
+    /// round trip — §1.3.3c seam contract).
     pub async fn lookup_async(&self, id: DeviceId) -> LookupVerdict {
-        // epoch 变化 ⇒ 缓存全量失效（随 apply 自动推进，无需额外广播）。
+        // Epoch change ⇒ invalidate the entire cache (advances automatically
+        // with apply, no extra broadcast needed).
         {
             let mut rx = self.epoch_rx.clone();
             if rx.has_changed().unwrap_or(false) {
@@ -84,7 +95,8 @@ impl SyncDirectory {
         }
         let breaker = self.lag.breaker_open();
         if breaker {
-            // 熔断：停用本地缓存路径、降级线性一致读（§4）。
+            // Breaker: disable the local cache path, degrade to linearizable
+            // reads (§4).
             self.stats_degraded.fetch_add(1, Ordering::Relaxed);
         } else if let Some(v) = self.cache.lock().expect("dir cache").get(&id.0).cloned() {
             self.stats_cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -94,7 +106,9 @@ impl SyncDirectory {
         match self.reader.read(ReadQuery::Lookup(id.0)).await {
             Ok(ReadView::Verdict(v)) => {
                 if !breaker {
-                    // 熔断期不写缓存：避免「读后立刻又落后」的陈旧命中。
+                    // Do not write the cache while the breaker is open: avoids
+                    // stale hits from "read, then immediately fall behind
+                    // again".
                     self.cache
                         .lock()
                         .expect("dir cache")
@@ -103,15 +117,16 @@ impl SyncDirectory {
                 v.to_verdict()
             }
             _ => {
-                // 线性一致读失败（leader 不可达等）⇒ fail-closed：NotFound 外形（拒握手）。
-                // 绝不回退用陈旧缓存（§4 熔断语义）。
+                // Linearizable read failed (leader unreachable etc.) ⇒
+                // fail-closed: NotFound shape (handshake refused). Never fall
+                // back to the stale cache (§4 breaker semantics).
                 LookupVerdict::NotFound
             }
         }
     }
 }
 
-/// DeviceDirectory 接缝句柄（session::respond 注入形态）。
+/// DeviceDirectory seam handle (injection shape for session::respond).
 #[derive(Clone)]
 pub struct DirHandle(pub Arc<SyncDirectory>);
 
@@ -124,7 +139,8 @@ impl DeviceDirectory for DirHandle {
 }
 
 // ============================================================================
-// 单元测试：缓存命中 / epoch 失效 / 熔断降级 / 读失败 fail-closed
+// Unit tests: cache hit / epoch invalidation / breaker degradation /
+// read-failure fail-closed
 // ============================================================================
 
 #[cfg(test)]
@@ -160,8 +176,9 @@ mod tests {
     }
 
     fn monitor() -> Arc<LagMonitor> {
-        // 静默上限 = max(50ms, 200ms) = 200ms：本组测试关注熔断降级路径，
-        // 构造后立即查询（静默 ~0）不受静默维度干扰。
+        // Silence limit = max(50ms, 200ms) = 200ms: this test group focuses on
+        // the breaker-degradation path; querying immediately after construction
+        // (silence ~0) keeps the silence dimension out of the picture.
         LagMonitor::new(
             Duration::from_millis(50),
             Duration::from_millis(200),
@@ -186,8 +203,12 @@ mod tests {
             dir.lookup_async(id).await,
             LookupVerdict::Active(_)
         ));
-        assert_eq!(reader.reads.load(Ordering::SeqCst), 1, "第二次命中本地缓存");
-        // epoch 前进 ⇒ 缓存失效 ⇒ 再线性一致读。
+        assert_eq!(
+            reader.reads.load(Ordering::SeqCst),
+            1,
+            "second lookup hits the local cache"
+        );
+        // Epoch advanced ⇒ cache invalidated ⇒ linearizable read again.
         tx.send(1).expect("epoch advance");
         assert!(matches!(
             dir.lookup_async(id).await,
@@ -196,7 +217,7 @@ mod tests {
         assert_eq!(
             reader.reads.load(Ordering::SeqCst),
             2,
-            "epoch 前进后失效缓存"
+            "cache invalidated after epoch advanced"
         );
         let stats = dir.stats();
         assert_eq!(stats.cache_hits, 1);
@@ -211,7 +232,8 @@ mod tests {
         });
         let (_tx, rx) = watch::channel(0u64);
         let applied = Arc::new(AtomicU64::new(0));
-        // 静默上限 = max(30ms, 500ms) = 500ms > 测试窗（60ms）：熔断只由 apply-lag 触发。
+        // Silence limit = max(30ms, 500ms) = 500ms > test window (60ms): the
+        // breaker is triggered only by apply-lag.
         let lag = LagMonitor::new(
             Duration::from_millis(30),
             Duration::from_millis(500),
@@ -223,8 +245,12 @@ mod tests {
             dir.lookup_async(id).await,
             LookupVerdict::Active(_)
         ));
-        assert_eq!(dir.stats().cache_hits, 0, "首查必走线性一致读");
-        // 落后持续超阈值 ⇒ 熔断。
+        assert_eq!(
+            dir.stats().cache_hits,
+            0,
+            "first lookup must take the linearizable path"
+        );
+        // Lag persists past the threshold ⇒ breaker opens.
         lag.observe_leader_commit(5);
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(lag.breaker_open());
@@ -233,10 +259,16 @@ mod tests {
             LookupVerdict::Active(_)
         ));
         let stats = dir.stats();
-        assert_eq!(stats.breaker_degraded, 1, "熔断路径计数");
-        assert_eq!(stats.cache_hits, 0, "熔断期不命中缓存");
-        // 熔断期不做缓存写入：追平关闭熔断后，读计数不含新增线性一致读（缓存仍是
-        // 熔断前写入的条目——epoch 未变即无失效理由），线性一致读计数停在 2。
+        assert_eq!(stats.breaker_degraded, 1, "breaker path counted");
+        assert_eq!(
+            stats.cache_hits, 0,
+            "no cache hits while the breaker is open"
+        );
+        // No cache writes while the breaker is open: after catching up and the
+        // breaker closing, the read count contains no additional linearizable
+        // reads (the cache still holds the entry written before the breaker —
+        // with the epoch unchanged there is no reason to invalidate it), so the
+        // linearizable-read count stays at 2.
         applied.store(5, Ordering::SeqCst);
         lag.observe_leader_commit(5);
         assert!(!lag.breaker_open());
@@ -247,7 +279,7 @@ mod tests {
         assert_eq!(
             reader.reads.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "熔断期未写缓存（无新增线性一致读）"
+            "no cache write while the breaker was open (no new linearizable reads)"
         );
     }
 
@@ -262,7 +294,7 @@ mod tests {
         let id = DeviceId([4; 32]);
         assert!(
             matches!(dir.lookup_async(id).await, LookupVerdict::NotFound),
-            "fail-closed（拒握手）"
+            "fail-closed (handshake refused)"
         );
     }
 

@@ -1,10 +1,14 @@
-//! `Directory::serve(dir_pull)`（§3.10/§1.3.3f）：向客户端下发根签 ClusterDirectory。
+//! `Directory::serve(dir_pull)` (§3.10/§1.3.3f): distribute the root-signed
+//! ClusterDirectory to clients.
 //!
-//! - 装配期持根公钥（钉扎/邀请材料）+ 当前目录（根验签后收）；
-//! - `install`：根验签 → dir_version 回退拒收（同版本幂等重放放行）——服务器换钥/
-//!   新服务器准入 = 根签新目录 + 全网 install；
-//! - `dir_pull_response`：`since >= 当前版本` ⇒ 无新内容（304 语义），否则下发
-//!   `ClusterDirectory::to_bytes` 线格式（客户端 PinStore::record_directory 落地）。
+//! - Holds the root public key (pinning/invite material) at assembly time +
+//!   the current directory (received after root-signature verification);
+//! - `install`: root verification → reject version rollback of dir_version
+//!   (same-version idempotent replay allowed) — server re-key / new server
+//!   admission = root-sign a new directory + install fleet-wide;
+//! - `dir_pull_response`: `since >= current version` ⇒ no new content (304
+//!   semantics), otherwise distribute the `ClusterDirectory::to_bytes` wire
+//!   format (landed client-side by PinStore::record_directory).
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -13,12 +17,12 @@ use ed25519_dalek::VerifyingKey;
 use flock_protocol::trust::ClusterDirectory;
 use serde::{Deserialize, Serialize};
 
-/// 目录服务错误。
+/// Directory service error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirError {
-    /// 根签名校验失败。
+    /// Root signature verification failed.
     BadSignature,
-    /// dir_version 回退（stored ≥ got）。
+    /// dir_version rollback (stored ≥ got).
     VersionRollback { stored: u64, got: u64 },
 }
 
@@ -37,23 +41,25 @@ impl std::fmt::Display for DirError {
 }
 impl std::error::Error for DirError {}
 
-/// dir_pull 应答（线格式经 WireResp::DirPull）。
+/// dir_pull response (wire format via WireResp::DirPull).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirPullResp {
-    /// 服务器当前目录版本。
+    /// The server's current directory version.
     pub version: u64,
-    /// 新内容（None = since 已最新）。
+    /// New content (None = since is already up to date).
     pub bytes: Option<Vec<u8>>,
 }
 
-/// 根签集群目录服务（每服务器一个；serve = dir_pull 应答）。
+/// Root-signed cluster directory service (one per server; serve = the
+/// dir_pull response).
 pub struct Directory {
     root_pub: VerifyingKey,
     cur: RwLock<Option<ClusterDirectory>>,
 }
 
 impl Directory {
-    /// 装配（initial 须过根验签，否则拒装配）。
+    /// Assembly (initial must pass root verification, otherwise refuse to
+    /// assemble).
     pub fn new(root_pub: VerifyingKey, initial: &ClusterDirectory) -> Result<Self, DirError> {
         if !initial.verify(&root_pub) {
             return Err(DirError::BadSignature);
@@ -64,12 +70,12 @@ impl Directory {
         })
     }
 
-    /// 根公钥（客户端邀请/钉扎同源）。
+    /// Root public key (same source as client invites/pinning).
     pub fn root_pub(&self) -> &VerifyingKey {
         &self.root_pub
     }
 
-    /// 当前版本（无目录 = 0）。
+    /// Current version (no directory = 0).
     pub fn version(&self) -> u64 {
         self.cur
             .read()
@@ -79,13 +85,15 @@ impl Directory {
             .unwrap_or(0)
     }
 
-    /// 当前目录快照。
+    /// Current directory snapshot.
     pub fn current(&self) -> Option<ClusterDirectory> {
         self.cur.read().expect("dir").clone()
     }
 
-    /// 安装新目录：根验签 → 版本回退拒收 → 同版本幂等放行（§1.3.3f dir_pull 语义的
-    /// 服务器侧落地；准入新服务器 = 根签 dir_version+1 目录全网 install）。
+    /// Install a new directory: root verification → reject version rollback →
+    /// allow same-version idempotent replay (the server-side landing of §1.3.3f
+    /// dir_pull semantics; admitting a new server = root-sign a
+    /// dir_version+1 directory and install it fleet-wide).
     pub fn install(&self, dir: &ClusterDirectory) -> Result<(), DirError> {
         if !dir.verify(&self.root_pub) {
             return Err(DirError::BadSignature);
@@ -103,7 +111,8 @@ impl Directory {
         Ok(())
     }
 
-    /// dir_pull 应答（serve）：`since >= 当前` ⇒ None（客户端已最新）。
+    /// dir_pull response (serve): `since >= current` ⇒ None (client already up
+    /// to date).
     pub fn dir_pull_response(&self, since: u64) -> DirPullResp {
         let cur = self.cur.read().expect("dir").clone();
         match cur {
@@ -122,7 +131,8 @@ impl Directory {
         }
     }
 
-    /// 目录内全部条目（node_id → ServerEntry；供互连热更新）。
+    /// All entries in the directory (node_id → ServerEntry; for interconnect
+    /// hot updates).
     pub fn node_entries(&self) -> BTreeMap<u64, flock_protocol::session::ServerEntry> {
         let cur = self.cur.read().expect("dir").clone();
         let mut out = BTreeMap::new();
@@ -145,7 +155,7 @@ impl std::fmt::Debug for Directory {
 }
 
 // ============================================================================
-// 单元测试
+// Unit tests
 // ============================================================================
 
 #[cfg(test)]
@@ -171,23 +181,26 @@ mod tests {
         let cid = ClusterId([7; 16]);
         let v1 = ClusterDirectory::issue(&root, cid, 1, vec![entry(1)]);
         let d = Directory::new(root.verifying_key(), &v1).expect("v1");
-        // 初始 pull：since=0 ⇒ 全量。
+        // Initial pull: since=0 ⇒ full content.
         let r = d.dir_pull_response(0);
         assert_eq!(r.version, 1);
         let bytes = r.bytes.expect("full");
         let back = ClusterDirectory::from_bytes(&bytes).expect("roundtrip");
-        assert!(back.verify(&root.verifying_key()), "下发的是根签目录");
+        assert!(
+            back.verify(&root.verifying_key()),
+            "what was distributed is root-signed"
+        );
         assert_eq!(back.dir_version, 1);
-        // since=1 ⇒ 无新内容。
-        assert!(d.dir_pull_response(1).bytes.is_none(), "304 语义");
-        // 换根签的目录 ⇒ 拒。
+        // since=1 ⇒ no new content.
+        assert!(d.dir_pull_response(1).bytes.is_none(), "304 semantics");
+        // A directory signed by a different root ⇒ rejected.
         let other = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         let forged = ClusterDirectory::issue(&other, cid, 2, vec![entry(1)]);
         assert!(matches!(d.install(&forged), Err(DirError::BadSignature)));
-        // 根签 v2 ⇒ 收；同版本幂等；回退拒。
+        // Root-signed v2 ⇒ accepted; same version idempotent; rollback rejected.
         let v2 = ClusterDirectory::issue(&root, cid, 2, vec![entry(1), entry(2)]);
         d.install(&v2).expect("v2");
-        d.install(&v2).expect("同版本幂等");
+        d.install(&v2).expect("same-version idempotent");
         assert!(matches!(
             d.install(&v1),
             Err(DirError::VersionRollback { stored: 2, got: 1 })
@@ -195,7 +208,7 @@ mod tests {
         assert_eq!(d.version(), 2);
         assert!(
             d.dir_pull_response(1).bytes.is_some(),
-            "v1 客户端可刷新到 v2"
+            "a v1 client can refresh to v2"
         );
         assert_eq!(d.node_entries().len(), 2);
     }

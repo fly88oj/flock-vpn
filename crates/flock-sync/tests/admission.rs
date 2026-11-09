@@ -1,12 +1,20 @@
-//! tests/admission：集群准入与 rewrap 授权（docs/design.md §7-M4 admission 组）。
+//! tests/admission: cluster admission and rewrap authorization
+//! (docs/design.md §7-M4 admission group).
 //!
-//! 1. **无入群凭证/伪造凭证的节点在服务器-服务器握手层被拒**——拿不到快照也进不了
-//!    Raft（§4-2：openraft 网络适配器只挂在认证会话之上；R19 红线——伪节点可索要
-//!    快照与 re-wrap 即打开全网口令离线字典面）。
-//! 2. **learner 加入 → 快照同步 → add_voter（根密钥签名）→ 提升为 voter**（§4-3
-//!    授权路径定死：learner 只能收到复制流，成为 voter 必须状态机验签通过）。
-//! 3. **rewrap 无根签名 ⇒ 状态机拒绝；有签名 ⇒ 新服务器混合公钥进入封装集**
-//!    （OPRF key 副本数 +1 可观测；被入侵的单台在册服务器没有根密钥，无法触发）。
+//! 1. **Nodes without enrollment credentials / with forged credentials are
+//!    rejected at the server-server handshake layer** — no snapshot, no Raft
+//!    (§4-2: the openraft network adapter rides only on authenticated
+//!    sessions; R19 red line — a fake node able to request snapshots and
+//!    re-wraps would open a network-wide offline dictionary surface for
+//!    passwords).
+//! 2. **Learner joins → snapshot sync → add_voter (root key signature) →
+//!    promoted to voter** (the §4-3 authorization path is pinned down: a
+//!    learner only receives the replication stream; becoming a voter requires
+//!    passing state-machine signature verification).
+//! 3. **rewrap without a root signature ⇒ state-machine rejection; with the
+//!    signature ⇒ the new server's hybrid public key enters the wrapping
+//!    set** (the OPRF key copy count +1 is observable; a single compromised
+//!    in-register server holds no root key and cannot trigger it).
 
 mod common;
 
@@ -25,11 +33,13 @@ use flock_sync::ticket::TicketIssuer;
 const NODES: [u64; 3] = [1, 2, 3];
 
 // ============================================================================
-// 1. 无凭证/伪造凭证 ⇒ 服务器-服务器握手层被拒
+// 1. No credentials / forged credentials ⇒ rejected at the server-server
+//    handshake layer
 // ============================================================================
 
-/// 拨号一个真实服务器并以「无凭证 rogue 设备材料」发起会话。
-/// `pin` 决定声称的目标（真 entry 才能走通 KEM——攻击者可拿到公开材料）。
+/// Dial a real server and initiate a session with "credential-free rogue
+/// device material". `pin` decides the claimed target (only a real entry can
+/// get through the KEM — an attacker can obtain the public material).
 async fn rogue_handshake(
     c: &TestCluster,
     target: NodeId,
@@ -54,19 +64,23 @@ async fn rogue_without_credential_rejected_at_handshake() {
     bootstrap(&c, 0).await;
     let _ = c.leader().await;
 
-    // 无凭证：rogue 持随机设备密钥，对真 entry（公开材料可拼出）发起——
-    // 应答侧 PeerDirectory 只认根签目录内的身份 ⇒ 握手层拒。对发起端表现为不透明的
-    // 连接终止（flock-protocol 的时序对齐设计：DeviceRejected 不外泄具体原因）。
+    // No credentials: a rogue holding random device keys initiates toward a
+    // real entry (assemblable from public material) — the answer-side
+    // PeerDirectory only accepts identities inside the root-signed directory
+    // ⇒ rejected at the handshake layer. To the initiator this appears as an
+    // opaque connection termination (flock-protocol's timing-alignment
+    // design: DeviceRejected does not leak the specific reason).
     let target = c.node_of(2);
     let before = target.rejected_handshakes();
     let _ = rogue_handshake(&c, 2, &c.fx.root, target.entry().clone())
         .await
-        .expect_err("无凭证 rogue 必被拒");
-    // 应答端确实在握手层拒绝（计数前进）——拿不到会话 ⇒ 进不了分发器 ⇒
-    // 拿不到快照也进不了 Raft（§4-2）。
+        .expect_err("a credential-free rogue must be rejected");
+    // The answer side indeed rejected at the handshake layer (the count
+    // advanced) — no session ⇒ cannot enter the dispatcher ⇒ no snapshot and
+    // no Raft (§4-2).
     assert!(
         target.rejected_handshakes() > before,
-        "应答侧握手拒绝计数前进（before={before}, after={}）",
+        "answer-side handshake rejection count advanced (before={before}, after={})",
         target.rejected_handshakes()
     );
 }
@@ -77,22 +91,24 @@ async fn rogue_with_forged_root_rejected_at_handshake() {
     bootstrap(&c, 0).await;
     let _ = c.leader().await;
 
-    // 伪造凭证：rogue 自签一套根/凭证（他签 root）——即便声称的目标 entry 为真
-    // （KEM 可走通），其「设备身份」不在本集群根签目录内 ⇒ 应答侧握手层拒。
+    // Forged credentials: the rogue self-signs a root/credential set (a root
+    // signed by someone else) — even with the claimed target entry being real
+    // (the KEM can succeed), its "device identity" is not in this cluster's
+    // root-signed directory ⇒ the answer side rejects at the handshake layer.
     let forged_root = ed25519_dalek::SigningKey::from_bytes(&[0xEE; 32]);
     let target = c.node_of(3);
     let before = target.rejected_handshakes();
     let _ = rogue_handshake(&c, 3, &forged_root, target.entry().clone())
         .await
-        .expect_err("他签根的 rogue 必被拒");
+        .expect_err("a rogue with a foreign-signed root must be rejected");
     assert!(
         target.rejected_handshakes() > before,
-        "应答侧握手拒绝计数前进"
+        "answer-side handshake rejection count advanced"
     );
 }
 
 // ============================================================================
-// 2. learner → 快照同步 → add_voter（根签）→ 提升
+// 2. learner → snapshot sync → add_voter (root-signed) → promotion
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -101,7 +117,8 @@ async fn learner_snapshot_add_voter_promotion() {
     bootstrap(&c, 0).await;
     let (leader_idx, _) = c.leader().await;
 
-    // 预置状态：2 台设备 + 1 次吊销（epoch=1）——快照必须完整携带。
+    // Pre-seeded state: 2 devices + 1 revocation (epoch=1) — the snapshot
+    // must carry all of it.
     for i in 1u8..=2 {
         let resp = c.nodes[(leader_idx + 1) % 3]
             .write(SyncRequest::RegisterDevice {
@@ -129,8 +146,9 @@ async fn learner_snapshot_add_voter_promotion() {
         panic!()
     };
 
-    // —— 准入流水（§4-3）——
-    // (a) 运维用根密钥签发新节点入群凭证 + 新目录（dir_version=2）。
+    // —— Admission pipeline (§4-3) ——
+    // (a) Operations uses the root key to issue the new node's enrollment
+    //     credential + a new directory (dir_version=2).
     let n4 = c.fx.enroll(4);
     let dir_v2 = c.fx.directory(
         2,
@@ -141,48 +159,59 @@ async fn learner_snapshot_add_voter_promotion() {
             n4.clone(),
         ],
     );
-    // (b) 现有节点 install 新目录（根验签 + 互连映射热更新——leader 才能拨新节点）。
+    // (b) The existing nodes install the new directory (root verification +
+    //     interconnect mapping hot update — only then can the leader dial the
+    //     new node).
     for n in &c.nodes {
         n.install_directory(&dir_v2).expect("install dir v2");
     }
-    // 换根签名的目录 ⇒ 拒（准入材料不可被他签注入）。
+    // A directory signed by a different root ⇒ rejected (admission material
+    // cannot be injected under a foreign signature).
     let other_root = ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]);
     let forged_dir =
         ClusterDirectory::issue(&other_root, c.fx.cluster_id, 3, vec![n4.entry.clone()]);
     assert!(
         c.nodes[0].install_directory(&forged_dir).is_err(),
-        "他签目录拒"
+        "foreign-signed directory rejected"
     );
 
-    // dir_pull serve：下发的是根签 v2 目录（客户端 PinStore::record_directory 可直接
-    // 落地：根验签 + 版本单调）；since=2 ⇒ 无新内容（304 语义）。
+    // dir_pull serve: what is distributed is the root-signed v2 directory
+    // (the client's PinStore::record_directory can land it directly: root
+    // verification + monotonic version); since=2 ⇒ no new content (304
+    // semantics).
     let resp = c.nodes[0].directory().dir_pull_response(0);
     assert_eq!(resp.version, 2);
     let served = ClusterDirectory::from_bytes(&resp.bytes.expect("full dir")).expect("parse");
-    assert!(served.verify(&c.fx.root.verifying_key()), "根签目录");
+    assert!(
+        served.verify(&c.fx.root.verifying_key()),
+        "root-signed directory"
+    );
     assert_eq!(served.servers.len(), 4);
     assert!(
         c.nodes[0].directory().dir_pull_response(2).bytes.is_none(),
         "304"
     );
 
-    // (c) 新节点以 learner 加入（不做 initialize——不是初始成员）。
+    // (c) The new node joins as a learner (no initialize — not an initial
+    //     member).
     let n4_idx = c.build_node(&n4, &dir_v2, None).await;
 
-    // (d) leader 压实日志（触发快照 + purge）⇒ learner 只能走快照同步路径。
+    // (d) The leader compacts the log (trigger snapshot + purge) ⇒ the
+    //     learner can only take the snapshot-sync path.
     c.nodes[leader_idx]
         .snapshot_and_purge()
         .await
         .expect("snapshot+purge");
 
-    // (e) add_learner（blocking：等复制/快照追平）。
+    // (e) add_learner (blocking: waits for replication/snapshot catch-up).
     c.nodes[leader_idx]
         .add_learner(4)
         .await
         .expect("add learner");
 
-    // 快照同步断言：learner 的状态机拿到完整状态（设备/epoch/票据根），
-    // 且其日志为空（purge 后仅快照可携带这些状态）。
+    // Snapshot-sync assertion: the learner's state machine received the full
+    // state (devices/epoch/ticket root), and its log is empty (after the
+    // purge only a snapshot can carry this state).
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let got = c.nodes[n4_idx]
@@ -195,30 +224,35 @@ async fn learner_snapshot_add_voter_promotion() {
             && g.ticket_root_present
             && g.last_applied.unwrap_or(0) > 0
         {
-            assert_eq!(g.revoked, 1, "吊销记录随快照");
+            assert_eq!(g.revoked, 1, "revocation record travels with the snapshot");
             assert_eq!(g.config_version, st.config_version);
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "learner 快照同步超时（state={:?}）",
+            "learner snapshot sync timed out (state={:?})",
             g
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // learner 可读但不可写（client_write 转发 leader——非 voter 不参与表决；此处断言
-    // 其尚不在 voters 集内）。
+    // The learner can read but cannot write (client_write forwards to the
+    // leader — a non-voter does not vote; here we assert it is not yet in the
+    // voters set).
     {
         let v = c.nodes[leader_idx]
             .read_linearizable(ReadQuery::State)
             .await
             .expect("state");
         let ReadView::State(g) = v else { panic!() };
-        assert!(!g.voters.contains(&4), "提升前 node4 不是 voter");
+        assert!(
+            !g.voters.contains(&4),
+            "node4 is not a voter before promotion"
+        );
     }
 
-    // (f) add_voter 无根签名 ⇒ 状态机拒绝 + 不提升。
+    // (f) add_voter without a root signature ⇒ state-machine rejection + no
+    //     promotion.
     let forged_root = ed25519_dalek::SigningKey::from_bytes(&[0xEE; 32]);
     let bad = c.nodes[leader_idx]
         .add_voter_signed(&forged_root, 4)
@@ -226,7 +260,7 @@ async fn learner_snapshot_add_voter_promotion() {
         .expect("write ok");
     assert!(
         matches!(bad, SyncResponse::Error(StateError::BadRootSignature)),
-        "他签 add_voter 拒: {bad:?}"
+        "foreign-signed add_voter rejected: {bad:?}"
     );
     {
         let v = c.nodes[leader_idx]
@@ -234,10 +268,14 @@ async fn learner_snapshot_add_voter_promotion() {
             .await
             .expect("state");
         let ReadView::State(g) = v else { panic!() };
-        assert!(!g.voters.contains(&4), "拒绝路径不提升");
+        assert!(
+            !g.voters.contains(&4),
+            "the rejection path does not promote"
+        );
     }
 
-    // (g) add_voter 有根签名 ⇒ 状态机记录 + openraft 提升（joint 共识）。
+    // (g) add_voter with a root signature ⇒ the state machine records it +
+    //     openraft promotes (joint consensus).
     let ok = c.nodes[leader_idx]
         .add_voter_signed(&c.fx.root, 4)
         .await
@@ -246,7 +284,7 @@ async fn learner_snapshot_add_voter_promotion() {
         matches!(ok, SyncResponse::Admin(AdminAck::AddVoter { node_id: 4 })),
         "{ok:?}"
     );
-    // 成员收敛：全网 metrics 的 voters 含 4。
+    // Membership convergence: voters in metrics network-wide contain 4.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let m = c.nodes[n4_idx]
@@ -258,11 +296,15 @@ async fn learner_snapshot_add_voter_promotion() {
         if m.membership().voter_ids().any(|v| v == 4) {
             break;
         }
-        assert!(Instant::now() < deadline, "voter 提升未收敛");
+        assert!(
+            Instant::now() < deadline,
+            "voter promotion did not converge"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // 提升后 node4 可承载写（任意节点写语义）且全网可见。
+    // After promotion node4 can serve writes (any-node-write semantics) and
+    // they are visible network-wide.
     let resp = c.nodes[n4_idx]
         .write(SyncRequest::RegisterDevice {
             owner: "n4".into(),
@@ -272,18 +314,18 @@ async fn learner_snapshot_add_voter_promotion() {
             registered_at_unix: 1_700_000_000,
         })
         .await
-        .expect("voter 写");
+        .expect("voter write");
     assert!(matches!(resp, SyncResponse::Device(_)));
     let v = c.nodes[0]
         .read_linearizable(ReadQuery::State)
         .await
         .expect("read");
     let ReadView::State(g) = v else { panic!() };
-    assert_eq!(g.devices, 3, "node4 的写全网可见");
+    assert_eq!(g.devices, 3, "node4's write is visible network-wide");
 }
 
 // ============================================================================
-// 3. rewrap ±根签名（OPRF key 副本数 +1 可观测）
+// 3. rewrap ± root signature (the OPRF key copy count +1 is observable)
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -293,7 +335,9 @@ async fn rewrap_requires_root_and_targets_new_server() {
     let (leader_idx, _) = c.leader().await;
     let writer = (leader_idx + 2) % 3;
 
-    // 新服务器 node4 入目录（准入后形态——此处只测 rewrap 授权面，无需进 Raft）。
+    // The new server node4 enters the directory (the post-admission shape —
+    // this test only exercises the rewrap authorization surface; no need to
+    // enter Raft).
     let n4 = c.fx.enroll(4);
     let dir_v2 = c.fx.directory(
         2,
@@ -308,7 +352,8 @@ async fn rewrap_requires_root_and_targets_new_server() {
         n.install_directory(&dir_v2).expect("install");
     }
 
-    // 无根签名 ⇒ 状态机拒绝（被入侵的在册服务器没有根密钥，无法触发 rewrap）。
+    // No root signature ⇒ state-machine rejection (a compromised in-register
+    // server holds no root key and cannot trigger a rewrap).
     let forged = ed25519_dalek::SigningKey::from_bytes(&[0xEE; 32]);
     let bad = c.nodes[writer]
         .write(SyncRequest::rewrap_signed(&forged, 4, vec![1; 16]))
@@ -318,7 +363,9 @@ async fn rewrap_requires_root_and_targets_new_server() {
         matches!(bad, SyncResponse::Error(StateError::BadRootSignature)),
         "{bad:?}"
     );
-    // 未登记 server_keys 前即便根签也拒（封装目标必须在册——先 server_keys 后 rewrap）。
+    // Even with a root signature, rejected before server_keys is registered
+    // (the wrapping target must be on the books — server_keys first, then
+    // rewrap).
     let bad2 = c.nodes[writer]
         .write(SyncRequest::rewrap_signed(&c.fx.root, 4, vec![1; 16]))
         .await
@@ -328,7 +375,9 @@ async fn rewrap_requires_root_and_targets_new_server() {
         "{bad2:?}"
     );
 
-    // server_keys（根签）登记全套混合公钥（含新服务器——node4 仅入目录，未进 Raft）。
+    // server_keys (root-signed) registers the full set of hybrid public keys
+    // (including the new server — node4 only entered the directory, not
+    // Raft).
     let mut entries: Vec<ServerKeyEntry> = [1u64, 2, 3]
         .into_iter()
         .map(|n| {
@@ -356,7 +405,8 @@ async fn rewrap_requires_root_and_targets_new_server() {
         "{resp:?}"
     );
 
-    // 有根签名 ⇒ 封装副本 +1 可观测（wraps 集内出现 node4 条目）。
+    // With the root signature ⇒ the wrapped copy +1 is observable (a node4
+    // entry appears in the wraps set).
     let secret = b"opaque-oprf-key-material-32-bytes!!!";
     let mut wrapped = Vec::new();
     flock_protocol::envelope::seal_v2(&n4.entry.static_hybrid_pub, &secret[..], &mut wrapped)
@@ -388,23 +438,30 @@ async fn rewrap_requires_root_and_targets_new_server() {
         let ReadView::State(g) = v else { panic!() };
         g.wraps.clone()
     };
-    assert_eq!(after.len(), before + 1, "OPRF key 副本数 +1 可观测");
-    assert!(after.iter().any(|(sid, _)| *sid == 4), "node4 进入封装集");
+    assert_eq!(after.len(), before + 1, "OPRF key copy count +1 observable");
+    assert!(
+        after.iter().any(|(sid, _)| *sid == 4),
+        "node4 enters the wrapping set"
+    );
 
-    // 新服务器能取出并以自己的私钥开封（真实拿到 OPRF key 副本）。
-    // node4 不在本测试集群进程内——用其身份材料在本地验证（envelope v2 往返）。
+    // The new server can fetch and unwrap the copy with its own private key
+    // (it genuinely received the OPRF key copy). node4 is not inside this
+    // test cluster's process — verified locally with its identity material
+    // (envelope v2 round trip).
     let mut opened = Vec::new();
     flock_protocol::envelope::open_v2(&n4.static_hybrid, &wrapped[..], &mut opened).expect("open");
     assert_eq!(opened, secret);
 
-    // 票据根跨节点一致（TicketIssuer 已随第一部分落地——此处复证新目录节点可验）。
+    // The ticket root is consistent across nodes (TicketIssuer already
+    // landed with part one — re-proved here that a new-directory node can
+    // verify).
     let t = c.nodes[writer]
         .issue_ticket(dev_id_of(&[8; 32]), 1_000)
         .expect("ticket");
     assert!(c.nodes[0]
         .verify_ticket(&t, &dev_id_of(&[8; 32]), 1_001)
         .is_ok());
-    let _ = TicketIssuer::from_root(&[42; 32]); // 密钥根派生确定性
+    let _ = TicketIssuer::from_root(&[42; 32]); // key-root derivation determinism
 }
 
 fn sha(b: &[u8; 32]) -> [u8; 32] {

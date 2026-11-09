@@ -1,4 +1,5 @@
-//! 测试共享 harness（admission/forward 用；cluster.rs 自带同构副本）。
+//! Shared test harness (used by admission/forward; cluster.rs carries its own
+//! isomorphic copy).
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -13,17 +14,17 @@ use flock_sync::proto::{NodeId, SyncRequest, SyncResponse};
 use flock_sync::testutil::{FabricRegistry, MemoryFabric};
 use flock_sync::{SyncNode, SyncNodeBuilder, SyncSettings};
 
-/// 每方向 50ms ⇒ RTT 100ms（§7-M4 注入校准）。
+/// 50ms per direction ⇒ RTT 100ms (§7-M4 injection calibration).
 pub const RTT_HALF: Duration = Duration::from_millis(50);
 
-/// NodeId ↔ ServerId（与 flock_sync::wire::sid_of 同映射）。
+/// NodeId ↔ ServerId (same mapping as flock_sync::wire::sid_of).
 pub fn sid(n: NodeId) -> ServerId {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&n.to_be_bytes());
     ServerId(b)
 }
 
-/// 节点身份+目录签发材料。
+/// Node identity + directory issuance material.
 pub struct Fixture {
     pub root: SigningKey,
     pub cluster_id: ClusterId,
@@ -37,7 +38,8 @@ impl Fixture {
         }
     }
 
-    /// enroll 一个新服务器身份（运维签发入群凭证，§4-1）。
+    /// Enroll a new server identity (operations issues the enrollment
+    /// credential, §4-1).
     pub fn enroll(&self, n: NodeId) -> Arc<ServerIdentity> {
         Arc::new(ServerIdentity::enroll(
             &self.root,
@@ -47,14 +49,15 @@ impl Fixture {
         ))
     }
 
-    /// 根签目录（dir_version 递增）。
+    /// A root-signed directory (dir_version increasing).
     pub fn directory(&self, version: u64, idents: &[Arc<ServerIdentity>]) -> ClusterDirectory {
         let entries: Vec<ServerEntry> = idents.iter().map(|i| i.entry.clone()).collect();
         ClusterDirectory::issue(&self.root, self.cluster_id, version, entries)
     }
 }
 
-/// 集群（共享织物注册表；可后置加节点——准入流水）。
+/// A cluster (shared fabric registry; nodes can be added later — the
+/// admission pipeline).
 pub struct TestCluster {
     pub fx: Fixture,
     pub nodes: Vec<SyncNode>,
@@ -66,7 +69,8 @@ pub struct TestCluster {
 }
 
 impl TestCluster {
-    /// 初始 voters 集群（成员初始化 + 选主等就绪）。
+    /// An initial-voters cluster (membership initialization + leader election
+    /// etc. all ready).
     pub async fn new(voters: &[NodeId]) -> TestCluster {
         let fx = Fixture::new();
         let reg = MemoryFabric::registry();
@@ -88,7 +92,8 @@ impl TestCluster {
         c
     }
 
-    /// 构建/加入一个节点（learner 加入用 `members=None` 不做 initialize）。
+    /// Build/join a node (learner joins with `members=None`, skipping
+    /// initialize).
     pub async fn build_node(
         &mut self,
         ident: &Arc<ServerIdentity>,
@@ -119,7 +124,7 @@ impl TestCluster {
         idx
     }
 
-    /// 等 leader 出现并返回**其自身**下标（≤15s）。
+    /// Wait for a leader to appear and return **its own** index (≤15s).
     pub async fn leader(&self) -> (usize, NodeId) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -142,7 +147,7 @@ impl TestCluster {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("15s 内未选出 leader");
+        panic!("no leader elected within 15s");
     }
 
     pub fn node_of(&self, id: NodeId) -> &SyncNode {
@@ -150,7 +155,7 @@ impl TestCluster {
     }
 }
 
-/// 引导集群身份（票据密钥根进 Raft）。
+/// Bootstrap the cluster identity (the ticket key root goes into Raft).
 pub async fn bootstrap(c: &TestCluster, idx: usize) -> SyncResponse {
     c.nodes[idx]
         .write(SyncRequest::bootstrap_signed(&c.fx.root, [9; 16], [42; 32]))
@@ -158,15 +163,19 @@ pub async fn bootstrap(c: &TestCluster, idx: usize) -> SyncResponse {
         .expect("bootstrap")
 }
 
-/// 等某节点的**本地 apply** 追上（转发面读本地注册表——远端提交后需等本地 apply，
-/// 正常 < 心跳 500ms + RTT）。
+/// Wait for a node's **local apply** to catch up (the forwarding plane reads
+/// the local registry — after a remote commit you must wait for the local
+/// apply, normally < heartbeat 500ms + RTT).
 pub async fn wait_local_row(n: &SyncNode, device: &[u8; 32], what: &str) -> [u8; 4] {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(vip) = n.sm().vip_of(device) {
             return vip;
         }
-        assert!(Instant::now() < deadline, "等本地 apply（{what}）超时");
+        assert!(
+            Instant::now() < deadline,
+            "waiting for local apply ({what}) timed out"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
