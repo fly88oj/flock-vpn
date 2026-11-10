@@ -975,7 +975,7 @@ dependencies = [
 [[package]]
 name = "flock-protocol"
 version = "0.1.0"
-source = "git+https://github.com/fly88oj/flock-protocol.git?tag=v0.1.0#f570f70e6b4b64417ce5a5db3af987db49470588"
+source = "git+https://github.com/fly88oj/flock-protocol.git?tag=v0.1.0#a977c4914db003e9a92d735e7e8b153042f014fc"
 dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
